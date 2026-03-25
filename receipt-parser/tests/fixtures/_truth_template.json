@@ -1,0 +1,34 @@
+{
+  "_instructions": "Copy this file as <receipt_name>_truth.json and place the matching image as <receipt_name>.jpg in the same folder. Fill in the values you can read from the receipt. Use null for fields not present. Delete this _instructions field when done.",
+
+  "merchant": null,
+  "date": null,
+  "location": null,
+  "currency": "JPY",
+
+  "line_items": [
+    {
+      "description": "Item name here",
+      "qty": 1,
+      "unit_price": null,
+      "total": 0,
+      "tax_category": "0%",
+      "discount": null,
+      "discount_rate": null
+    }
+  ],
+
+  "subtotal": null,
+
+  "taxes": [
+    {
+      "rate": "10%",
+      "label": null,
+      "amount": 0
+    }
+  ],
+
+  "total": null,
+  "payment_method": null,
+  "invoice_number": null
+}

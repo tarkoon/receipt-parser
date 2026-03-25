@@ -1,0 +1,12 @@
+.env
+local/*
+.vscode
+**/debug/*
+.claude
+__pycache__/
+*.pyc
+.env
+.cloud_vision_usage.json
+tmp*.png
+tmp*.jpg
+.ocr_cache/

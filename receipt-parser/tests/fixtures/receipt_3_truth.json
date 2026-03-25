@@ -1,0 +1,12 @@
+{
+	"merchant": "とも笑助産院",
+	"date": "2025-12-22",
+	"location": "宗像市田1712",
+	"currency": "JPY",
+	"line_items": [],
+	"subtotal": null,
+	"taxes": [],
+	"total": 3000,
+	"payment_method": "cash",
+	"invoice_number": null
+}
