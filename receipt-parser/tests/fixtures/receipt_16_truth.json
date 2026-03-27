@@ -1,0 +1,30 @@
+{
+  "document_type": "utility_bill",
+  "merchant": "宗像地区事務組合",
+  "date": "2026-02-23",
+  "location": null,
+  "currency": "JPY",
+  "total": 6824,
+  "payment_method": "cash",
+  "invoice_number": null,
+  "account_number": "0069321-000-08",
+  "points_used": null,
+  "amount_paid": 6824,
+  "line_items": [],
+  "subtotal": null,
+  "taxes": [],
+  "service_type": "water",
+  "billing_period": {
+    "start": "2026-01-06",
+    "end": "2026-02-05"
+  },
+  "usage": {
+    "amount": 19,
+    "unit": "m3",
+    "cost_per": null,
+    "meter_previous": null,
+    "meter_current": null
+  },
+  "payer": "イーガン トリスタン ライリー",
+  "payment_reference": null
+}

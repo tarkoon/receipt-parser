@@ -4,7 +4,32 @@ from schema import Receipt
 
 
 def validate_receipt(receipt: Receipt) -> list[str]:
-    """Run all arithmetic cross-checks, return list of warning strings."""
+    """Run type-aware validation, return list of warning strings."""
+    warnings = []
+
+    doc_type = receipt.document_type
+
+    # Common: points/amount_paid consistency
+    if receipt.points_used and receipt.total:
+        expected_paid = receipt.total - receipt.points_used
+        if receipt.amount_paid and abs(receipt.amount_paid - expected_paid) > 1:
+            warnings.append(
+                f"amount_paid ({receipt.amount_paid}) != total ({receipt.total}) "
+                f"- points_used ({receipt.points_used})"
+            )
+
+    if doc_type == "receipt":
+        warnings.extend(_validate_receipt_fields(receipt))
+    elif doc_type == "utility_bill":
+        warnings.extend(_validate_utility_bill(receipt))
+    elif doc_type == "payment_slip":
+        warnings.extend(_validate_payment_slip(receipt))
+
+    return warnings
+
+
+def _validate_receipt_fields(receipt: Receipt) -> list[str]:
+    """Receipt-specific arithmetic cross-checks."""
     warnings = []
 
     # Check line item math: qty x unit_price - discount ~ total (+-1 tolerance)
@@ -33,10 +58,7 @@ def validate_receipt(receipt: Receipt) -> list[str]:
     if receipt.total is not None and receipt.subtotal is not None and receipt.taxes:
         tax_sum = sum(t.amount for t in receipt.taxes)
 
-        # Scenario 1: Tax-exclusive — subtotal + tax = total
         is_exclusive = abs((receipt.subtotal + tax_sum) - receipt.total) <= 2
-
-        # Scenario 2: Tax-inclusive — subtotal already includes tax, subtotal = total
         is_inclusive = abs(receipt.subtotal - receipt.total) <= 2
 
         if not (is_exclusive or is_inclusive):
@@ -55,6 +77,48 @@ def validate_receipt(receipt: Receipt) -> list[str]:
                     f"Unusual tax rate: {tax.rate} (expected 0%, 8%, or 10% for JP receipts)"
                 )
         except ValueError:
-            pass  # Non-numeric rate string, skip check
+            pass
+
+    return warnings
+
+
+def _validate_utility_bill(receipt: Receipt) -> list[str]:
+    """Utility bill-specific checks."""
+    warnings = []
+
+    if receipt.usage:
+        if receipt.usage.amount is not None and receipt.usage.amount <= 0:
+            warnings.append(f"usage.amount should be positive, got {receipt.usage.amount}")
+        if (receipt.usage.meter_current is not None
+                and receipt.usage.meter_previous is not None
+                and receipt.usage.meter_current <= receipt.usage.meter_previous):
+            warnings.append(
+                f"usage.meter_current ({receipt.usage.meter_current}) <= "
+                f"meter_previous ({receipt.usage.meter_previous})"
+            )
+
+    if receipt.billing_period:
+        if (receipt.billing_period.start and receipt.billing_period.end
+                and receipt.billing_period.start >= receipt.billing_period.end):
+            warnings.append(
+                f"billing_period.start ({receipt.billing_period.start}) >= "
+                f"end ({receipt.billing_period.end})"
+            )
+
+    if receipt.total is not None and receipt.total <= 0:
+        warnings.append(f"Total should be positive, got {receipt.total}")
+
+    return warnings
+
+
+def _validate_payment_slip(receipt: Receipt) -> list[str]:
+    """Payment slip-specific checks."""
+    warnings = []
+
+    if receipt.total is not None and receipt.total <= 0:
+        warnings.append(f"Total should be positive, got {receipt.total}")
+
+    if not receipt.merchant:
+        warnings.append("Payment slip has no merchant (who receives the money?)")
 
     return warnings

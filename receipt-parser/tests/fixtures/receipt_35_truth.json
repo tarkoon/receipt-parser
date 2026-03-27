@@ -1,0 +1,73 @@
+{
+  "document_type": "receipt",
+  "merchant": "マクドナルド",
+  "date": "2026-03-20",
+  "location": "糟屋郡新宮町新宮東5-4-1",
+  "currency": "JPY",
+  "total": 1140,
+  "payment_method": "cash",
+  "invoice_number": null,
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 1140,
+  "line_items": [
+    {
+      "description": "プレミアムローストコーヒーS",
+      "qty": 1,
+      "unit_price": 140,
+      "total": 140,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "ダブルチーズバーガー",
+      "qty": 1,
+      "unit_price": 510,
+      "total": 510,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "イチゴショートケーキパイ",
+      "qty": 1,
+      "unit_price": 240,
+      "total": 240,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "マックシェイク バニラM",
+      "qty": 1,
+      "unit_price": 250,
+      "total": 250,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    }
+  ],
+  "subtotal": 1140,
+  "taxes": [
+    {
+      "rate": "8%",
+      "label": "内消費税 (軽減税率)",
+      "amount": 84
+    }
+  ],
+  "service_type": null,
+  "billing_period": {
+    "start": null,
+    "end": null
+  },
+  "usage": {
+    "amount": null,
+    "unit": null,
+    "cost_per": null,
+    "meter_previous": null,
+    "meter_current": null
+  },
+  "payer": null,
+  "payment_reference": null
+}

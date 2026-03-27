@@ -53,7 +53,9 @@ To add a new fixture: drop `my_receipt.jpg` + `my_receipt_truth.json` in `tests/
 | **Receipt 5** | Printed supermarket (AEON, discount) | マックスバリュくりえいと宗像店 | 20% discount line on an item, credit card payment |
 | **Receipt 6** | Printed hardware store | スーパービバホーム 赤間店 | Rotated, 2 items only, cash payment |
 
-## Current Test Results (69/71 passing = 97%)
+## Current Test Results (162/162 = 100% on benchmark, with known gap)
+
+**Benchmark:** qwen3.5:9b × 6 fixtures × 3 runs × 9 fields = 162 checks, all passing.
 
 | Test | Receipt 1 | Receipt 2 | Receipt 3 | Receipt 4 | Receipt 5 | Receipt 6 |
 |---|---|---|---|---|---|---|
@@ -61,16 +63,21 @@ To add a new fixture: drop `my_receipt.jpg` + `my_receipt_truth.json` in `tests/
 | date | PASS | PASS | PASS | PASS | PASS | PASS |
 | currency | PASS | PASS | PASS | PASS | PASS | PASS |
 | subtotal | PASS | PASS | PASS | PASS | PASS | PASS |
-| payment_method | PASS | PASS | PASS | PASS | PASS | **FAIL** |
+| payment_method | PASS | PASS | PASS | PASS | PASS | PASS |
 | line_items_count | PASS | PASS | PASS | PASS | PASS | PASS |
-| line_items_totals | PASS | PASS | PASS | PASS | **FAIL** | PASS |
+| line_items_totals | PASS | PASS | PASS | PASS | PASS | PASS |
 | tax_amount | PASS | PASS | PASS | PASS | PASS | PASS |
 | merchant_similarity | PASS | PASS | PASS | PASS | PASS | PASS |
 
-**Receipt 5 items:** LLM merges multiple items incorrectly when processing the discount — needs model tuning or a better model.
-**Receipt 6 payment:** LLM says "credit" instead of "cash" despite お預り/お釣り indicators — LLM non-determinism.
+**Known gap:** `tax_category` per line item is NOT tested by the benchmark. The LLM frequently defaults to `"0%"` instead of correctly assigning `"8%"` or `"10%"` based on ※/X markers. This needs a new test assertion and either a prompt fix or pipeline post-processing step.
 
-## Implemented Fixes (this session)
+## Previous Test Results (before 2026-03-25 session)
+
+69/71 passing (97%). Two failures:
+- **Receipt 5 line_items_totals:** LLM set `本仕込食パン` qty=8 (misread "(8)" in product name as quantity), hallucinated `糸島のたまご` total=295 instead of 328
+- **Receipt 6 payment_method:** LLM output "credit" instead of "cash" — triggered by `クレジット` appearing in loyalty card disclaimer text
+
+## Implemented Fixes (initial session, 2026-03-24)
 
 ### 1. Price-line rejoining (normalization.py)
 **Problem:** Cloud Vision fulltext puts items and prices on separate lines, confusing the LLM.
@@ -188,21 +195,96 @@ receipt-parser/
 └── debug/              — Debug artifacts (when --debug flag used)
 ```
 
+## LLM Benchmark Session (2026-03-25)
+
+### Model Comparison
+
+Benchmarked 6 models × 6 fixtures × 3 runs using `benchmark_models.py` (located in `local/`):
+
+| Model | Accuracy | Consistency | tok/s | Avg Eval(s) | Errors |
+|---|---|---|---|---|---|
+| qwen3.5:9b | 156/162 (96%) | 100% | 22.4 | 28.1s | 0 |
+| qwen3:8b | 150/162 (93%) | 100% | 41.0 | 10.1s | 0 |
+| gemma3:4b | 132/162 (81%) | 100% | 69.5 | 12.6s | 0 |
+| qwen2.5:7b | 123/162 (76%) | 100% | 49.6 | 10.9s | 0 |
+| qwen3.5:4b | 105/162 (65%) | 100% | 55.1 | 8.6s | 0 |
+| gemma3:12b | 92/162 (57%) | 83% | 14.2 | 27.6s | 5 |
+
+Extra passes (3 instead of 2) made zero difference — validation only catches arithmetic errors, not comprehension failures.
+
+### Root Cause Analysis (with Gemini second opinion)
+
+**Receipt 5 / line_items_totals:**
+- LLM misread `本仕込食パン (8)` as qty=8 (the "(8)" is pack size, not quantity)
+- LLM hallucinated `糸島のたまご` total=295 (should be 328, price is on OCR line)
+- Verification Rule 3 ("don't change the total") actively entrenched the error
+- The `295` value appears nowhere in OCR text — pure hallucination
+
+**Receipt 6 / payment_method:**
+- LLM matched `クレジット` from `ビバ倶楽部カード(クレジット...除く)` ("excluding credit") as payment method
+- `お預り ¥1,600` + `お釣り ¥30` are definitive cash indicators but were ignored
+- `お釣り` amount was on the line ABOVE the label in OCR (unusual layout)
+
+### Fixes Applied — Pipeline Post-Processing Approach
+
+**Key learning: deterministic pipeline fixes beat prompt engineering.** Adding rules to the LLM prompt caused intermittent format violations where the model broke out of Ollama's `format=` structured output and generated explanation text. Moving logic to Python post-processing eliminated this instability.
+
+#### extraction.py
+- `sanitize_llm_response`: Added regex JSON block extraction as recovery for explanation-wrapped output (`re.search(r'\{.*\}', raw, re.DOTALL)`)
+
+#### pipeline.py — New post-processing steps
+- **Step 4.7 (payment_method):** `現計` in OCR = cash. `お預り` amount > total = cash (handles amounts on same or next line). `領収証` with no payment indicator = cash. Electronic methods only if cash indicators absent.
+- **Step 4.8 (qty hallucination):** If LLM set qty > 1 but the resulting total doesn't appear in OCR text while unit_price does → reset qty=1, total=unit_price.
+- **Step 4.9 (hallucinated totals):** If qty=1, discount=0, total ≠ unit_price, checks which value appears as a standalone number on the same OCR line as the item description. Uses word-boundary regex to avoid substring matches (e.g., `98` inside `980`). Corrects whichever value is wrong.
+
+#### schema.py — Verification rules tightened
+- Rule 3: "prefer unit_price from OCR text, set qty=1 unless explicit multiplier"
+- Rule 4: "if sum doesn't match subtotal, look for items with qty > 1 that should be qty=1"
+- Wording kept concise to avoid triggering explanation mode
+
+#### validation.py
+- Subtotal mismatch warning now includes actionable context about qty/product name confusion
+
+#### normalization.py — Improved text processing
+- **Barcode stripping:** Fixed regex to handle `JAN` with spaces (`^\d{8,}\s*(JAN|EAN)?\s*$`), item codes with spaces after them (`^0{2,}\d{1,4}[*]?\s*`)
+- **`rejoin_price_lines` rewritten:** Surgical item-section-aware approach:
+  1. Detects item section boundaries (first priced line → first summary marker like 小計)
+  2. Block matching: N priceless items followed by N price lines → matched in order
+  3. Single orphan lookback: searches up to 3 lines back for a priceless item (skips lines with existing prices)
+  4. Lines outside the item section are never modified
+
+### Approaches Tried and Rejected
+
+**Prompt-based fixes (Rules 10, 16):** Adding payment method and quantity rules directly to the LLM prompt caused intermittent format violations. The model generated explanation text ("Based on Rule 16...") instead of pure JSON. Reverted in favor of pipeline post-processing.
+
+**Option A — Paragraph-level bounding boxes:** Changed `run_cloud_vision` to use `_extract_blocks_from_response` (real bboxes) instead of fulltext. Failed: paragraph blocks for rotated receipts had nearly identical y-coordinates (~1024-1047), grouping everything into one massive line.
+
+**Option B — Word-level extraction:** Extracted word-level blocks from Cloud Vision with real bounding boxes. X-coordinate matching was excellent for associating items with prices on rotated receipts. But word-level text has spaces between Japanese characters (`小 計` instead of `小計`), breaking regex matching and LLM parsing. Scored 129/162 (80%) — major regression.
+
+**Option C — Text-based rejoining (adopted):** Enhanced `rejoin_price_lines` to detect block patterns (N items then N prices) and match them in order, within a detected item section. No bounding box changes needed. Handles both normal and rotated receipt layouts through text pattern analysis.
+
+### OCR Non-Determinism Discovery
+
+Cloud Vision is non-deterministic — same image can produce different text layouts across API calls. During testing, deleting the OCR cache and regenerating produced different formatting (labels and amounts on same line vs separate lines) that broke previously working receipts. The pipeline was hardened to handle both variants:
+- `お預り` detection handles amount on same line or next line
+- `_extract_yen_nearby` looks ahead 2 lines for ¥ values
+- `rejoin_price_lines` handles both inline and separated item/price layouts
+
+The `.ocr_cache/` directory provides determinism for known images and should be committed to git.
+
 ## What to Try Next
 
-### 1. Better LLM model
-qwen3.5:9b handles most cases but intermittently merges items incorrectly or picks wrong payment methods. Worth benchmarking:
-- **qwen3:14b** — same family, larger context for complex receipts
-- **gemma-3:12b** — strong multilingual, potentially better structured output
-- **phi-4:14b** — strong instruction following
+### 1. Fix tax_category per line item (PRIORITY)
+The LLM defaults all `tax_category` to `"0%"` instead of correctly assigning `"8%"` (reduced, marked ※/X) or `"10%"` (standard). The benchmark doesn't test this field. Needs:
+- Add `tax_category` assertion to `test_integration.py` and `benchmark_models.py`
+- Fix via pipeline post-processing (scan OCR text for ※/X markers near items) or prompt improvement
+- Be cautious with prompt changes — they can trigger explanation mode (see "Approaches Tried and Rejected")
 
-Constraint: must fit in 8GB VRAM (RTX 4070 Laptop).
+### 2. Commit OCR cache to git
+`.ocr_cache/` is not tracked. If deleted and regenerated, Cloud Vision non-determinism may produce different text requiring pipeline adjustments. Commit to preserve known-good OCR results.
 
-### 2. Image auto-rotation
+### 3. Image auto-rotation
 Detect rotated receipts before OCR and rotate to upright. Would make paragraph mode viable (better item/price grouping) and fix date misreads.
-
-### 3. Receipt 5 discount handling
-The LLM sometimes merges discount items with the wrong parent or combines multiple items. May need post-processing to detect and fix discount associations.
 
 ### What NOT to pursue
 

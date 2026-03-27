@@ -67,6 +67,39 @@ def get_api_usage() -> dict:
     }
 
 
+# ── Ollama GPU status ─────────────────────────────────────────────────
+
+def get_ollama_gpu_status() -> dict | None:
+    """Query Ollama for current model GPU/VRAM status.
+
+    Returns dict with keys:
+        model, size_bytes, size_vram_bytes, gpu_percent, full_gpu
+    Returns None if Ollama is not running or no model loaded.
+    """
+    try:
+        import urllib.request
+        resp = urllib.request.urlopen("http://localhost:11434/api/ps", timeout=5)
+        data = json.loads(resp.read().decode("utf-8"))
+        models = data.get("models", [])
+        if not models:
+            return None
+        m = models[0]
+        size = m.get("size", 0)
+        size_vram = m.get("size_vram", 0)
+        gpu_pct = (size_vram / size * 100) if size > 0 else 0
+        return {
+            "model": m.get("name", "unknown"),
+            "size_bytes": size,
+            "size_vram_bytes": size_vram,
+            "size_gb": round(size / 1024**3, 2),
+            "vram_gb": round(size_vram / 1024**3, 2),
+            "gpu_percent": round(gpu_pct, 1),
+            "full_gpu": size_vram == size and size > 0,
+        }
+    except Exception:
+        return None
+
+
 # ── Google Cloud Vision backend ───────────────────────────────────────
 
 def init_cloud_vision():
@@ -91,7 +124,11 @@ def init_cloud_vision():
 
 
 def _call_cloud_vision(image: np.ndarray, client):
-    """Make a single Cloud Vision API call. Returns the raw response."""
+    """Make a single Cloud Vision API call. Returns the raw response.
+
+    Pins to builtin/stable model for deterministic OCR within a model cycle.
+    Falls back to default (no model pin) if builtin/stable is unavailable.
+    """
     from google.cloud import vision
 
     success, buf = cv2.imencode(".png", image)
@@ -99,10 +136,26 @@ def _call_cloud_vision(image: np.ndarray, client):
         return None
 
     gcp_image = vision.Image(content=buf.tobytes())
-    response = client.document_text_detection(
-        image=gcp_image,
-        image_context=vision.ImageContext(language_hints=["ja", "en"]),
-    )
+
+    try:
+        features = [vision.Feature(
+            type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION,
+            model="builtin/stable",
+        )]
+        request = vision.AnnotateImageRequest(
+            image=gcp_image,
+            features=features,
+            image_context=vision.ImageContext(language_hints=["ja", "en"]),
+        )
+        response = client.annotate_image(request=request)
+    except Exception as e:
+        import sys
+        print(f"WARNING: builtin/stable model unavailable ({e}), "
+              f"falling back to default model", file=sys.stderr)
+        response = client.document_text_detection(
+            image=gcp_image,
+            image_context=vision.ImageContext(language_hints=["ja", "en"]),
+        )
 
     _track_api_call()
 
@@ -154,6 +207,16 @@ def _extract_fulltext_from_response(response) -> str | None:
     return response.text_annotations[0].description
 
 
+# ── OCR source tracking ──────────────────────────────────────────────
+
+_last_ocr_source: str = "unknown"  # "cache", "fresh", "digital_pdf", "unknown"
+
+
+def get_last_ocr_source() -> str:
+    """Return whether the last OCR result was from cache or a fresh API call."""
+    return _last_ocr_source
+
+
 _OCR_CACHE_DIR = Path(__file__).parent / ".ocr_cache"
 
 
@@ -179,15 +242,20 @@ def run_cloud_vision(image: np.ndarray, client=None) -> list[dict]:
     Caches results per image hash to avoid redundant API calls and
     ensure deterministic test results.
     """
+    global _last_ocr_source
+
     # Check cache first
     key = _ocr_cache_key(image)
     cache_path = _OCR_CACHE_DIR / f"{key}.txt"
     if cache_path.exists():
         fulltext = cache_path.read_text(encoding="utf-8")
+        _last_ocr_source = "cache"
         return _fulltext_to_blocks(fulltext)
 
     if client is None:
         client = init_cloud_vision()
+
+    _last_ocr_source = "fresh"
 
     response1 = _call_cloud_vision(image, client)
     fulltext1 = _extract_fulltext_from_response(response1)

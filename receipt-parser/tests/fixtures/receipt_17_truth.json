@@ -1,0 +1,37 @@
+{
+  "document_type": "receipt",
+  "merchant": "ユニクロ",
+  "date": "2025-12-22",
+  "location": "KITTE博多店",
+  "currency": "JPY",
+  "total": 3990,
+  "payment_method": "cash",
+  "invoice_number": "1585-2025-12-22-34-0074",
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 3990,
+  "line_items": [
+    {
+      "description": "MZム- スコットンクルーネックヒーター",
+      "qty": 1,
+      "unit_price": 3990,
+      "total": 3990,
+      "tax_category": "10%",
+      "discount": null,
+      "discount_rate": null
+    }
+  ],
+  "subtotal": 3990,
+  "taxes": [
+    {
+      "rate": "10%",
+      "label": "内消費税",
+      "amount": 362
+    }
+  ],
+  "service_type": null,
+  "billing_period": null,
+  "usage": null,
+  "payer": null,
+  "payment_reference": null
+}

@@ -1,0 +1,1535 @@
+{
+  "metadata": {
+    "timestamp": "2026-03-25T16:27:23.156347",
+    "platform": "Windows 11",
+    "pipeline_version": "1.2.0",
+    "passes_per_run": 2,
+    "runs_per_combo": 3,
+    "total_combinations": 18,
+    "models": [
+      "qwen3.5:9b"
+    ],
+    "fixtures": [
+      "01_supermarket_receipt",
+      "receipt_2",
+      "receipt_3",
+      "receipt_4",
+      "receipt_5",
+      "receipt_6"
+    ]
+  },
+  "runs": [
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "01_supermarket_receipt",
+      "run": 1,
+      "wall_time_s": 38.35,
+      "llm_timing": {
+        "passes": 2,
+        "total_eval_s": 18.9200942,
+        "total_prompt_eval_s": 2.7324232,
+        "total_tokens_generated": 424,
+        "total_prompt_tokens": 3329,
+        "tokens_per_second": 22.41003641514639,
+        "per_pass": [
+          {
+            "total_duration_ns": 21842901200,
+            "load_duration_ns": 10789177900,
+            "prompt_eval_count": 1942,
+            "prompt_eval_duration_ns": 1605085000,
+            "eval_count": 198,
+            "eval_duration_ns": 8911935700
+          },
+          {
+            "total_duration_ns": 12191649200,
+            "load_duration_ns": 704931400,
+            "prompt_eval_count": 1387,
+            "prompt_eval_duration_ns": 1127338200,
+            "eval_count": 226,
+            "eval_duration_ns": 10008158500
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 725.0, expected 725"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-04, expected 2026-03-04"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 660.0, expected 660"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got cash, expected cash"
+        },
+        "line_items_count": {
+          "pass": false,
+          "detail": "got 1, expected 2"
+        },
+        "line_items_totals": {
+          "pass": false,
+          "detail": "got [656.0], expected [4, 656]"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 65.0, expected 65 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'サンリブ' vs 'サンリブ くりえいと宗像' (50%)"
+        }
+      },
+      "pass_count": 7,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 725.0,
+        "date": "2026-03-04",
+        "merchant": "サンリブ",
+        "subtotal": 660.0,
+        "currency": "JPY",
+        "payment_method": "cash",
+        "line_items_count": 1,
+        "tax_sum": 65.0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "01_supermarket_receipt",
+      "run": 2,
+      "wall_time_s": 34.0,
+      "llm_timing": {
+        "passes": 2,
+        "total_eval_s": 18.8918033,
+        "total_prompt_eval_s": 2.7364591,
+        "total_tokens_generated": 424,
+        "total_prompt_tokens": 3329,
+        "tokens_per_second": 22.44359594830209,
+        "per_pass": [
+          {
+            "total_duration_ns": 19109634100,
+            "load_duration_ns": 8153463700,
+            "prompt_eval_count": 1942,
+            "prompt_eval_duration_ns": 1603840900,
+            "eval_count": 198,
+            "eval_duration_ns": 8790300000
+          },
+          {
+            "total_duration_ns": 12390344000,
+            "load_duration_ns": 727245100,
+            "prompt_eval_count": 1387,
+            "prompt_eval_duration_ns": 1132618200,
+            "eval_count": 226,
+            "eval_duration_ns": 10101503300
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 725.0, expected 725"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-04, expected 2026-03-04"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 660.0, expected 660"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got cash, expected cash"
+        },
+        "line_items_count": {
+          "pass": false,
+          "detail": "got 1, expected 2"
+        },
+        "line_items_totals": {
+          "pass": false,
+          "detail": "got [656.0], expected [4, 656]"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 65.0, expected 65 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'サンリブ' vs 'サンリブ くりえいと宗像' (50%)"
+        }
+      },
+      "pass_count": 7,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 725.0,
+        "date": "2026-03-04",
+        "merchant": "サンリブ",
+        "subtotal": 660.0,
+        "currency": "JPY",
+        "payment_method": "cash",
+        "line_items_count": 1,
+        "tax_sum": 65.0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "01_supermarket_receipt",
+      "run": 3,
+      "wall_time_s": 33.83,
+      "llm_timing": {
+        "passes": 2,
+        "total_eval_s": 18.829297,
+        "total_prompt_eval_s": 2.6997896,
+        "total_tokens_generated": 424,
+        "total_prompt_tokens": 3329,
+        "tokens_per_second": 22.518100383673378,
+        "per_pass": [
+          {
+            "total_duration_ns": 19242412800,
+            "load_duration_ns": 8177917700,
+            "prompt_eval_count": 1942,
+            "prompt_eval_duration_ns": 1606766900,
+            "eval_count": 198,
+            "eval_duration_ns": 8857337200
+          },
+          {
+            "total_duration_ns": 12163852700,
+            "load_duration_ns": 671251300,
+            "prompt_eval_count": 1387,
+            "prompt_eval_duration_ns": 1093022700,
+            "eval_count": 226,
+            "eval_duration_ns": 9971959800
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 725.0, expected 725"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-04, expected 2026-03-04"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 660.0, expected 660"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got cash, expected cash"
+        },
+        "line_items_count": {
+          "pass": false,
+          "detail": "got 1, expected 2"
+        },
+        "line_items_totals": {
+          "pass": false,
+          "detail": "got [656.0], expected [4, 656]"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 65.0, expected 65 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'サンリブ' vs 'サンリブ くりえいと宗像' (50%)"
+        }
+      },
+      "pass_count": 7,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 725.0,
+        "date": "2026-03-04",
+        "merchant": "サンリブ",
+        "subtotal": 660.0,
+        "currency": "JPY",
+        "payment_method": "cash",
+        "line_items_count": 1,
+        "tax_sum": 65.0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_2",
+      "run": 1,
+      "wall_time_s": 60.28,
+      "llm_timing": {
+        "passes": 2,
+        "total_eval_s": 41.0917667,
+        "total_prompt_eval_s": 3.0979916,
+        "total_tokens_generated": 924,
+        "total_prompt_tokens": 3822,
+        "tokens_per_second": 22.48625635266249,
+        "per_pass": [
+          {
+            "total_duration_ns": 29674700200,
+            "load_duration_ns": 8768927600,
+            "prompt_eval_count": 2028,
+            "prompt_eval_duration_ns": 1655581900,
+            "eval_count": 415,
+            "eval_duration_ns": 18507449300
+          },
+          {
+            "total_duration_ns": 25394429200,
+            "load_duration_ns": 715243000,
+            "prompt_eval_count": 1794,
+            "prompt_eval_duration_ns": 1442409700,
+            "eval_count": 509,
+            "eval_duration_ns": 22584317400
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 903.0, expected 903"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-11, expected 2026-03-11"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 837.0, expected 837"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got WAON, expected WAON"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 4, expected 4"
+        },
+        "line_items_totals": {
+          "pass": false,
+          "detail": "got [3.0, 228.0, 328.0, 834.0], expected [3, 228, 278, 328]"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 66.0, expected 66 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'マックスバリュくりえいと宗像店' vs 'マックスバリュくりえいと宗像店' (100%)"
+        }
+      },
+      "pass_count": 8,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 903.0,
+        "date": "2026-03-11",
+        "merchant": "マックスバリュくりえいと宗像店",
+        "subtotal": 837.0,
+        "currency": "JPY",
+        "payment_method": "WAON",
+        "line_items_count": 4,
+        "tax_sum": 66.0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_2",
+      "run": 2,
+      "wall_time_s": 56.69,
+      "llm_timing": {
+        "passes": 2,
+        "total_eval_s": 41.3472836,
+        "total_prompt_eval_s": 3.0389373,
+        "total_tokens_generated": 924,
+        "total_prompt_tokens": 3822,
+        "tokens_per_second": 22.347296352982184,
+        "per_pass": [
+          {
+            "total_duration_ns": 28752609500,
+            "load_duration_ns": 7667778400,
+            "prompt_eval_count": 2028,
+            "prompt_eval_duration_ns": 1611086700,
+            "eval_count": 415,
+            "eval_duration_ns": 18703894800
+          },
+          {
+            "total_duration_ns": 25454389800,
+            "load_duration_ns": 742124100,
+            "prompt_eval_count": 1794,
+            "prompt_eval_duration_ns": 1427850600,
+            "eval_count": 509,
+            "eval_duration_ns": 22643388800
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 903.0, expected 903"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-11, expected 2026-03-11"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 837.0, expected 837"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got WAON, expected WAON"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 4, expected 4"
+        },
+        "line_items_totals": {
+          "pass": false,
+          "detail": "got [3.0, 228.0, 328.0, 834.0], expected [3, 228, 278, 328]"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 66.0, expected 66 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'マックスバリュくりえいと宗像店' vs 'マックスバリュくりえいと宗像店' (100%)"
+        }
+      },
+      "pass_count": 8,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 903.0,
+        "date": "2026-03-11",
+        "merchant": "マックスバリュくりえいと宗像店",
+        "subtotal": 837.0,
+        "currency": "JPY",
+        "payment_method": "WAON",
+        "line_items_count": 4,
+        "tax_sum": 66.0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_2",
+      "run": 3,
+      "wall_time_s": 56.81,
+      "llm_timing": {
+        "passes": 2,
+        "total_eval_s": 41.2718693,
+        "total_prompt_eval_s": 3.1367133,
+        "total_tokens_generated": 924,
+        "total_prompt_tokens": 3822,
+        "tokens_per_second": 22.388130600132524,
+        "per_pass": [
+          {
+            "total_duration_ns": 28974397300,
+            "load_duration_ns": 7905792600,
+            "prompt_eval_count": 2028,
+            "prompt_eval_duration_ns": 1664754300,
+            "eval_count": 415,
+            "eval_duration_ns": 18618191800
+          },
+          {
+            "total_duration_ns": 25389465400,
+            "load_duration_ns": 626172400,
+            "prompt_eval_count": 1794,
+            "prompt_eval_duration_ns": 1471959000,
+            "eval_count": 509,
+            "eval_duration_ns": 22653677500
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 903.0, expected 903"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-11, expected 2026-03-11"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 837.0, expected 837"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got WAON, expected WAON"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 4, expected 4"
+        },
+        "line_items_totals": {
+          "pass": false,
+          "detail": "got [3.0, 228.0, 328.0, 834.0], expected [3, 228, 278, 328]"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 66.0, expected 66 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'マックスバリュくりえいと宗像店' vs 'マックスバリュくりえいと宗像店' (100%)"
+        }
+      },
+      "pass_count": 8,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 903.0,
+        "date": "2026-03-11",
+        "merchant": "マックスバリュくりえいと宗像店",
+        "subtotal": 837.0,
+        "currency": "JPY",
+        "payment_method": "WAON",
+        "line_items_count": 4,
+        "tax_sum": 66.0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_3",
+      "run": 1,
+      "wall_time_s": 27.19,
+      "llm_timing": {
+        "passes": 1,
+        "total_eval_s": 5.1726896,
+        "total_prompt_eval_s": 1.4408837,
+        "total_tokens_generated": 115,
+        "total_prompt_tokens": 1672,
+        "tokens_per_second": 22.232147855923927,
+        "per_pass": [
+          {
+            "total_duration_ns": 14885951700,
+            "load_duration_ns": 7764261200,
+            "prompt_eval_count": 1672,
+            "prompt_eval_duration_ns": 1440883700,
+            "eval_count": 115,
+            "eval_duration_ns": 5172689600
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 3000.0, expected 3000"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2025-12-22, expected 2025-12-22"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 3000.0, expected None or 3000.0"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got cash, expected cash"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 0, expected 0"
+        },
+        "line_items_totals": {
+          "pass": true,
+          "detail": "got [], expected []"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 0, expected 0 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'とも大明 助産院' vs 'とも笑助産院' (71%)"
+        }
+      },
+      "pass_count": 9,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 3000.0,
+        "date": "2025-12-22",
+        "merchant": "とも大明 助産院",
+        "subtotal": 3000.0,
+        "currency": "JPY",
+        "payment_method": "cash",
+        "line_items_count": 0,
+        "tax_sum": 0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_3",
+      "run": 2,
+      "wall_time_s": 17.4,
+      "llm_timing": {
+        "passes": 1,
+        "total_eval_s": 5.1616426,
+        "total_prompt_eval_s": 1.4108327,
+        "total_tokens_generated": 115,
+        "total_prompt_tokens": 1672,
+        "tokens_per_second": 22.27972932492459,
+        "per_pass": [
+          {
+            "total_duration_ns": 14513310500,
+            "load_duration_ns": 7416822500,
+            "prompt_eval_count": 1672,
+            "prompt_eval_duration_ns": 1410832700,
+            "eval_count": 115,
+            "eval_duration_ns": 5161642600
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 3000.0, expected 3000"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2025-12-22, expected 2025-12-22"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 3000.0, expected None or 3000.0"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got cash, expected cash"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 0, expected 0"
+        },
+        "line_items_totals": {
+          "pass": true,
+          "detail": "got [], expected []"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 0, expected 0 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'とも大明 助産院' vs 'とも笑助産院' (71%)"
+        }
+      },
+      "pass_count": 9,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 3000.0,
+        "date": "2025-12-22",
+        "merchant": "とも大明 助産院",
+        "subtotal": 3000.0,
+        "currency": "JPY",
+        "payment_method": "cash",
+        "line_items_count": 0,
+        "tax_sum": 0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_3",
+      "run": 3,
+      "wall_time_s": 17.2,
+      "llm_timing": {
+        "passes": 1,
+        "total_eval_s": 5.1233661,
+        "total_prompt_eval_s": 1.4349501,
+        "total_tokens_generated": 115,
+        "total_prompt_tokens": 1672,
+        "tokens_per_second": 22.446180451558984,
+        "per_pass": [
+          {
+            "total_duration_ns": 14487185000,
+            "load_duration_ns": 7435568100,
+            "prompt_eval_count": 1672,
+            "prompt_eval_duration_ns": 1434950100,
+            "eval_count": 115,
+            "eval_duration_ns": 5123366100
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 3000.0, expected 3000"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2025-12-22, expected 2025-12-22"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 3000.0, expected None or 3000.0"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got cash, expected cash"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 0, expected 0"
+        },
+        "line_items_totals": {
+          "pass": true,
+          "detail": "got [], expected []"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 0, expected 0 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'とも大明 助産院' vs 'とも笑助産院' (71%)"
+        }
+      },
+      "pass_count": 9,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 3000.0,
+        "date": "2025-12-22",
+        "merchant": "とも大明 助産院",
+        "subtotal": 3000.0,
+        "currency": "JPY",
+        "payment_method": "cash",
+        "line_items_count": 0,
+        "tax_sum": 0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_4",
+      "run": 1,
+      "wall_time_s": 52.04,
+      "llm_timing": {
+        "passes": 1,
+        "total_eval_s": 31.7929214,
+        "total_prompt_eval_s": 1.5913595,
+        "total_tokens_generated": 713,
+        "total_prompt_tokens": 1906,
+        "tokens_per_second": 22.426375702611587,
+        "per_pass": [
+          {
+            "total_duration_ns": 41743032900,
+            "load_duration_ns": 7360640700,
+            "prompt_eval_count": 1906,
+            "prompt_eval_duration_ns": 1591359500,
+            "eval_count": 713,
+            "eval_duration_ns": 31792921400
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 2279.0, expected 2279"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-22, expected 2026-03-22"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 2111.0, expected 2111"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got cash, expected cash"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 10, expected 10"
+        },
+        "line_items_totals": {
+          "pass": true,
+          "detail": "got [5.0, 115.0, 129.0, 159.0, 184.0, 199.0, 225.0, 328.0, 368.0, 399.0], expected [5, 115, 129, 159, 184, 199, 225, 328, 368, 399]"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 168.0, expected 168 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'業務スーパー 新宗像店' vs '業務スーパー' (71%)"
+        }
+      },
+      "pass_count": 9,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 2279.0,
+        "date": "2026-03-22",
+        "merchant": "業務スーパー 新宗像店",
+        "subtotal": 2111.0,
+        "currency": "JPY",
+        "payment_method": "cash",
+        "line_items_count": 10,
+        "tax_sum": 168.0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_4",
+      "run": 2,
+      "wall_time_s": 44.72,
+      "llm_timing": {
+        "passes": 1,
+        "total_eval_s": 31.9780278,
+        "total_prompt_eval_s": 1.5606088,
+        "total_tokens_generated": 713,
+        "total_prompt_tokens": 1906,
+        "tokens_per_second": 22.296559514530163,
+        "per_pass": [
+          {
+            "total_duration_ns": 42025562500,
+            "load_duration_ns": 7443679900,
+            "prompt_eval_count": 1906,
+            "prompt_eval_duration_ns": 1560608800,
+            "eval_count": 713,
+            "eval_duration_ns": 31978027800
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 2279.0, expected 2279"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-22, expected 2026-03-22"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 2111.0, expected 2111"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got cash, expected cash"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 10, expected 10"
+        },
+        "line_items_totals": {
+          "pass": true,
+          "detail": "got [5.0, 115.0, 129.0, 159.0, 184.0, 199.0, 225.0, 328.0, 368.0, 399.0], expected [5, 115, 129, 159, 184, 199, 225, 328, 368, 399]"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 168.0, expected 168 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'業務スーパー 新宗像店' vs '業務スーパー' (71%)"
+        }
+      },
+      "pass_count": 9,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 2279.0,
+        "date": "2026-03-22",
+        "merchant": "業務スーパー 新宗像店",
+        "subtotal": 2111.0,
+        "currency": "JPY",
+        "payment_method": "cash",
+        "line_items_count": 10,
+        "tax_sum": 168.0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_4",
+      "run": 3,
+      "wall_time_s": 44.68,
+      "llm_timing": {
+        "passes": 1,
+        "total_eval_s": 32.0819424,
+        "total_prompt_eval_s": 1.5603424,
+        "total_tokens_generated": 713,
+        "total_prompt_tokens": 1906,
+        "tokens_per_second": 22.224340132223414,
+        "per_pass": [
+          {
+            "total_duration_ns": 41969072900,
+            "load_duration_ns": 7405992700,
+            "prompt_eval_count": 1906,
+            "prompt_eval_duration_ns": 1560342400,
+            "eval_count": 713,
+            "eval_duration_ns": 32081942400
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 2279.0, expected 2279"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-22, expected 2026-03-22"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 2111.0, expected 2111"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got cash, expected cash"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 10, expected 10"
+        },
+        "line_items_totals": {
+          "pass": true,
+          "detail": "got [5.0, 115.0, 129.0, 159.0, 184.0, 199.0, 225.0, 328.0, 368.0, 399.0], expected [5, 115, 129, 159, 184, 199, 225, 328, 368, 399]"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 168.0, expected 168 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'業務スーパー 新宗像店' vs '業務スーパー' (71%)"
+        }
+      },
+      "pass_count": 9,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 2279.0,
+        "date": "2026-03-22",
+        "merchant": "業務スーパー 新宗像店",
+        "subtotal": 2111.0,
+        "currency": "JPY",
+        "payment_method": "cash",
+        "line_items_count": 10,
+        "tax_sum": 168.0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_5",
+      "run": 1,
+      "wall_time_s": 82.6,
+      "llm_timing": {
+        "passes": 2,
+        "total_eval_s": 61.0750359,
+        "total_prompt_eval_s": 3.2822445,
+        "total_tokens_generated": 1371,
+        "total_prompt_tokens": 4020,
+        "tokens_per_second": 22.447796874729303,
+        "per_pass": [
+          {
+            "total_duration_ns": 35954272100,
+            "load_duration_ns": 7592225300,
+            "prompt_eval_count": 2001,
+            "prompt_eval_duration_ns": 1684472300,
+            "eval_count": 575,
+            "eval_duration_ns": 25798808800
+          },
+          {
+            "total_duration_ns": 38484174300,
+            "load_duration_ns": 674599300,
+            "prompt_eval_count": 2019,
+            "prompt_eval_duration_ns": 1597772200,
+            "eval_count": 796,
+            "eval_duration_ns": 35276227100
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 2514.0, expected 2514"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-23, expected 2026-03-23"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 2328.0, expected 2328"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got credit, expected credit"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 8, expected 8"
+        },
+        "line_items_totals": {
+          "pass": true,
+          "detail": "got [78.0, 148.0, 168.0, 328.0, 338.0, 373.0, 398.0, 497.0], expected [78, 148, 168, 328, 338, 373, 398, 497]"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 186.0, expected 186 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'マックスバリュくりえいと宗像店' vs 'マックスバリュくりえいと宗像店' (100%)"
+        }
+      },
+      "pass_count": 9,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 2514.0,
+        "date": "2026-03-23",
+        "merchant": "マックスバリュくりえいと宗像店",
+        "subtotal": 2328.0,
+        "currency": "JPY",
+        "payment_method": "credit",
+        "line_items_count": 8,
+        "tax_sum": 186.0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_5",
+      "run": 2,
+      "wall_time_s": 77.52,
+      "llm_timing": {
+        "passes": 2,
+        "total_eval_s": 61.2904927,
+        "total_prompt_eval_s": 3.2946664,
+        "total_tokens_generated": 1371,
+        "total_prompt_tokens": 4020,
+        "tokens_per_second": 22.368885280636682,
+        "per_pass": [
+          {
+            "total_duration_ns": 35917618600,
+            "load_duration_ns": 7650082000,
+            "prompt_eval_count": 2001,
+            "prompt_eval_duration_ns": 1653176400,
+            "eval_count": 575,
+            "eval_duration_ns": 25775171500
+          },
+          {
+            "total_duration_ns": 38764306000,
+            "load_duration_ns": 684660800,
+            "prompt_eval_count": 2019,
+            "prompt_eval_duration_ns": 1641490000,
+            "eval_count": 796,
+            "eval_duration_ns": 35515321200
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 2514.0, expected 2514"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-23, expected 2026-03-23"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 2328.0, expected 2328"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got credit, expected credit"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 8, expected 8"
+        },
+        "line_items_totals": {
+          "pass": true,
+          "detail": "got [78.0, 148.0, 168.0, 328.0, 338.0, 373.0, 398.0, 497.0], expected [78, 148, 168, 328, 338, 373, 398, 497]"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 186.0, expected 186 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'マックスバリュくりえいと宗像店' vs 'マックスバリュくりえいと宗像店' (100%)"
+        }
+      },
+      "pass_count": 9,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 2514.0,
+        "date": "2026-03-23",
+        "merchant": "マックスバリュくりえいと宗像店",
+        "subtotal": 2328.0,
+        "currency": "JPY",
+        "payment_method": "credit",
+        "line_items_count": 8,
+        "tax_sum": 186.0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_5",
+      "run": 3,
+      "wall_time_s": 79.34,
+      "llm_timing": {
+        "passes": 2,
+        "total_eval_s": 61.3858449,
+        "total_prompt_eval_s": 3.3437662,
+        "total_tokens_generated": 1371,
+        "total_prompt_tokens": 4020,
+        "tokens_per_second": 22.33413912007587,
+        "per_pass": [
+          {
+            "total_duration_ns": 36180700700,
+            "load_duration_ns": 7734602500,
+            "prompt_eval_count": 2001,
+            "prompt_eval_duration_ns": 1672986100,
+            "eval_count": 575,
+            "eval_duration_ns": 25803648700
+          },
+          {
+            "total_duration_ns": 38871202500,
+            "load_duration_ns": 670004100,
+            "prompt_eval_count": 2019,
+            "prompt_eval_duration_ns": 1670780100,
+            "eval_count": 796,
+            "eval_duration_ns": 35582196200
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": true,
+          "detail": "got 2514.0, expected 2514"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-23, expected 2026-03-23"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 2328.0, expected 2328"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got credit, expected credit"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 8, expected 8"
+        },
+        "line_items_totals": {
+          "pass": true,
+          "detail": "got [78.0, 148.0, 168.0, 328.0, 338.0, 373.0, 398.0, 497.0], expected [78, 148, 168, 328, 338, 373, 398, 497]"
+        },
+        "tax_amount": {
+          "pass": true,
+          "detail": "got 186.0, expected 186 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'マックスバリュくりえいと宗像店' vs 'マックスバリュくりえいと宗像店' (100%)"
+        }
+      },
+      "pass_count": 9,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 2514.0,
+        "date": "2026-03-23",
+        "merchant": "マックスバリュくりえいと宗像店",
+        "subtotal": 2328.0,
+        "currency": "JPY",
+        "payment_method": "credit",
+        "line_items_count": 8,
+        "tax_sum": 186.0
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_6",
+      "run": 1,
+      "wall_time_s": 51.82,
+      "llm_timing": {
+        "passes": 2,
+        "total_eval_s": 25.9963807,
+        "total_prompt_eval_s": 2.817609,
+        "total_tokens_generated": 584,
+        "total_prompt_tokens": 3335,
+        "tokens_per_second": 22.464665629396634,
+        "per_pass": [
+          {
+            "total_duration_ns": 22193935900,
+            "load_duration_ns": 7875015200,
+            "prompt_eval_count": 1901,
+            "prompt_eval_duration_ns": 1619100400,
+            "eval_count": 271,
+            "eval_duration_ns": 12045921100
+          },
+          {
+            "total_duration_ns": 16360808900,
+            "load_duration_ns": 719550100,
+            "prompt_eval_count": 1434,
+            "prompt_eval_duration_ns": 1198508600,
+            "eval_count": 313,
+            "eval_duration_ns": 13950459600
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": false,
+          "detail": "got 2063.6, expected 1570"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-22, expected 2026-03-22"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 1428.0, expected 1428"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got cash, expected cash"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 2, expected 2"
+        },
+        "line_items_totals": {
+          "pass": false,
+          "detail": "got [448.0, 1428.0], expected [448, 980]"
+        },
+        "tax_amount": {
+          "pass": false,
+          "detail": "got 187.6, expected 142 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'スーパービバホーム 赤間店' vs 'スーパービバホーム 赤間店' (100%)"
+        }
+      },
+      "pass_count": 6,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 2063.6,
+        "date": "2026-03-22",
+        "merchant": "スーパービバホーム 赤間店",
+        "subtotal": 1428.0,
+        "currency": "JPY",
+        "payment_method": "cash",
+        "line_items_count": 2,
+        "tax_sum": 187.6
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_6",
+      "run": 2,
+      "wall_time_s": 40.96,
+      "llm_timing": {
+        "passes": 2,
+        "total_eval_s": 25.9628947,
+        "total_prompt_eval_s": 2.7611172,
+        "total_tokens_generated": 584,
+        "total_prompt_tokens": 3335,
+        "tokens_per_second": 22.493639740409993,
+        "per_pass": [
+          {
+            "total_duration_ns": 21957185300,
+            "load_duration_ns": 7605883100,
+            "prompt_eval_count": 1901,
+            "prompt_eval_duration_ns": 1590191200,
+            "eval_count": 271,
+            "eval_duration_ns": 12111062500
+          },
+          {
+            "total_duration_ns": 16197920100,
+            "load_duration_ns": 681174300,
+            "prompt_eval_count": 1434,
+            "prompt_eval_duration_ns": 1170926000,
+            "eval_count": 313,
+            "eval_duration_ns": 13851832200
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": false,
+          "detail": "got 2063.6, expected 1570"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-22, expected 2026-03-22"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 1428.0, expected 1428"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got cash, expected cash"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 2, expected 2"
+        },
+        "line_items_totals": {
+          "pass": false,
+          "detail": "got [448.0, 1428.0], expected [448, 980]"
+        },
+        "tax_amount": {
+          "pass": false,
+          "detail": "got 187.6, expected 142 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'スーパービバホーム 赤間店' vs 'スーパービバホーム 赤間店' (100%)"
+        }
+      },
+      "pass_count": 6,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 2063.6,
+        "date": "2026-03-22",
+        "merchant": "スーパービバホーム 赤間店",
+        "subtotal": 1428.0,
+        "currency": "JPY",
+        "payment_method": "cash",
+        "line_items_count": 2,
+        "tax_sum": 187.6
+      }
+    },
+    {
+      "model": "qwen3.5:9b",
+      "fixture": "receipt_6",
+      "run": 3,
+      "wall_time_s": 41.37,
+      "llm_timing": {
+        "passes": 2,
+        "total_eval_s": 25.9552947,
+        "total_prompt_eval_s": 2.7886547,
+        "total_tokens_generated": 584,
+        "total_prompt_tokens": 3335,
+        "tokens_per_second": 22.50022612919899,
+        "per_pass": [
+          {
+            "total_duration_ns": 22147805200,
+            "load_duration_ns": 7920537500,
+            "prompt_eval_count": 1901,
+            "prompt_eval_duration_ns": 1550574500,
+            "eval_count": 271,
+            "eval_duration_ns": 12022948700
+          },
+          {
+            "total_duration_ns": 16439778800,
+            "load_duration_ns": 736065000,
+            "prompt_eval_count": 1434,
+            "prompt_eval_duration_ns": 1238080200,
+            "eval_count": 313,
+            "eval_duration_ns": 13932346000
+          }
+        ]
+      },
+      "fields": {
+        "total": {
+          "pass": false,
+          "detail": "got 2063.6, expected 1570"
+        },
+        "date": {
+          "pass": true,
+          "detail": "got 2026-03-22, expected 2026-03-22"
+        },
+        "currency": {
+          "pass": true,
+          "detail": "got JPY, expected JPY"
+        },
+        "subtotal": {
+          "pass": true,
+          "detail": "got 1428.0, expected 1428"
+        },
+        "payment_method": {
+          "pass": true,
+          "detail": "got cash, expected cash"
+        },
+        "line_items_count": {
+          "pass": true,
+          "detail": "got 2, expected 2"
+        },
+        "line_items_totals": {
+          "pass": false,
+          "detail": "got [448.0, 1428.0], expected [448, 980]"
+        },
+        "tax_amount": {
+          "pass": false,
+          "detail": "got 187.6, expected 142 (tol +-5)"
+        },
+        "merchant_similarity": {
+          "pass": true,
+          "detail": "'スーパービバホーム 赤間店' vs 'スーパービバホーム 赤間店' (100%)"
+        }
+      },
+      "pass_count": 6,
+      "total_fields": 9,
+      "error": null,
+      "extracted": {
+        "total": 2063.6,
+        "date": "2026-03-22",
+        "merchant": "スーパービバホーム 赤間店",
+        "subtotal": 1428.0,
+        "currency": "JPY",
+        "payment_method": "cash",
+        "line_items_count": 2,
+        "tax_sum": 187.6
+      }
+    }
+  ],
+  "summary": {
+    "qwen3.5:9b": {
+      "accuracy": 0.8888888888888888,
+      "accuracy_fraction": "144/162",
+      "field_stats": {
+        "total": {
+          "pass_rate": 0.8333333333333334,
+          "passes": 15,
+          "total": 18
+        },
+        "date": {
+          "pass_rate": 1.0,
+          "passes": 18,
+          "total": 18
+        },
+        "currency": {
+          "pass_rate": 1.0,
+          "passes": 18,
+          "total": 18
+        },
+        "subtotal": {
+          "pass_rate": 1.0,
+          "passes": 18,
+          "total": 18
+        },
+        "payment_method": {
+          "pass_rate": 1.0,
+          "passes": 18,
+          "total": 18
+        },
+        "line_items_count": {
+          "pass_rate": 0.8333333333333334,
+          "passes": 15,
+          "total": 18
+        },
+        "line_items_totals": {
+          "pass_rate": 0.5,
+          "passes": 9,
+          "total": 18
+        },
+        "tax_amount": {
+          "pass_rate": 0.8333333333333334,
+          "passes": 15,
+          "total": 18
+        },
+        "merchant_similarity": {
+          "pass_rate": 1.0,
+          "passes": 18,
+          "total": 18
+        }
+      },
+      "timing": {
+        "mean_eval_s": 30.740480422222223,
+        "median_eval_s": 28.89465105,
+        "std_eval_s": 18.120630584679155,
+        "mean_wall_s": 47.6,
+        "mean_tps": 22.394894544951065
+      },
+      "consistency": {
+        "consistent_fields": 54,
+        "total_fields": 54,
+        "consistency_rate": 1.0
+      },
+      "errors": []
+    }
+  }
+}

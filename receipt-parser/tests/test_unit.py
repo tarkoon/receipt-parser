@@ -126,7 +126,7 @@ def test_receipt_instantiation():
 @patch("pipeline.extract_with_verification")
 @patch("pipeline.run_cloud_vision")
 @patch("pipeline.init_cloud_vision")
-@patch("pipeline.check_ollama_available")
+@patch("pipeline.check_model_available")
 def test_pipeline_with_mocked_inference(mock_check, mock_init_cv, mock_ocr, mock_extract):
     mock_check.return_value = None
     mock_init_cv.return_value = MagicMock()
@@ -163,7 +163,7 @@ def test_pipeline_with_mocked_inference(mock_check, mock_init_cv, mock_ocr, mock
 
 @patch("pipeline.run_cloud_vision")
 @patch("pipeline.init_cloud_vision")
-@patch("pipeline.check_ollama_available")
+@patch("pipeline.check_model_available")
 def test_pipeline_blank_image_returns_error(mock_check, mock_init_cv, mock_ocr):
     mock_check.return_value = None
     mock_init_cv.return_value = MagicMock()

@@ -1,0 +1,100 @@
+{
+  "document_type": "receipt",
+  "merchant": "スーパービバホーム",
+  "date": "2026-03-17",
+  "location": "赤間店",
+  "currency": "JPY",
+  "total": 4814,
+  "payment_method": "cash",
+  "invoice_number": null,
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 4814,
+  "line_items": [
+    {
+      "description": "チャイム用押釦 EG121",
+      "qty": 1,
+      "unit_price": 448,
+      "total": 448,
+      "tax_category": "10%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "マーキーギヤ",
+      "qty": 1,
+      "unit_price": 1980,
+      "total": 1980,
+      "tax_category": "10%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "バラ鉄引きバネ SR1",
+      "qty": 1,
+      "unit_price": 318,
+      "total": 318,
+      "tax_category": "10%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "カラー3分3個鈴",
+      "qty": 1,
+      "unit_price": 275,
+      "total": 275,
+      "tax_category": "10%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "自在ゴムキャスター",
+      "qty": 1,
+      "unit_price": 628,
+      "total": 628,
+      "tax_category": "10%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "鉄枠戸車 42ミリ V",
+      "qty": 1,
+      "unit_price": 500,
+      "total": 500,
+      "tax_category": "10%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "PA 埋め込みスイッチ",
+      "qty": 1,
+      "unit_price": 228,
+      "total": 228,
+      "tax_category": "10%",
+      "discount": null,
+      "discount_rate": null
+    }
+  ],
+  "subtotal": 4377,
+  "taxes": [
+    {
+      "rate": "10%",
+      "label": "外税10.0% 消費税等",
+      "amount": 437
+    }
+  ],
+  "service_type": null,
+  "billing_period": {
+    "start": null,
+    "end": null
+  },
+  "usage": {
+    "amount": null,
+    "unit": null,
+    "cost_per": null,
+    "meter_previous": null,
+    "meter_current": null
+  },
+  "payer": null,
+  "payment_reference": null
+}

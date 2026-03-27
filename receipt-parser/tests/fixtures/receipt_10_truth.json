@@ -1,0 +1,49 @@
+{
+  "document_type": "receipt",
+  "merchant": "ダイソー ビバモール赤間店",
+  "date": "2026-03-25",
+  "location": null,
+  "currency": "JPY",
+  "total": 550,
+  "payment_method": "cash",
+  "invoice_number": "T7240001022681",
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 550,
+  "line_items": [
+    {
+      "description": "バルーンスタンド",
+      "qty": 2,
+      "unit_price": 100,
+      "total": 200,
+      "tax_category": "10%"
+    },
+    {
+      "description": "革風ストラップ リール付",
+      "qty": 1,
+      "unit_price": 100,
+      "total": 100,
+      "tax_category": "10%"
+    },
+    {
+      "description": "フルーツニットキーホルダ",
+      "qty": 1,
+      "unit_price": 200,
+      "total": 200,
+      "tax_category": "10%"
+    }
+  ],
+  "subtotal": 500,
+  "taxes": [
+    {
+      "rate": "10%",
+      "label": "外税",
+      "amount": 50
+    }
+  ],
+  "service_type": null,
+  "billing_period": null,
+  "usage": null,
+  "payer": null,
+  "payment_reference": null
+}

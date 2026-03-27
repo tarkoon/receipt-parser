@@ -1,8 +1,15 @@
 {
+  "document_type": "receipt",
   "merchant": "マックスバリュくりえいと宗像店",
   "date": "2026-03-11",
   "location": null,
   "currency": "JPY",
+  "total": 903,
+  "payment_method": "WAON",
+  "invoice_number": null,
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 903,
   "line_items": [
     {
       "description": "たまご三昧",
@@ -41,7 +48,9 @@
       "amount": 66
     }
   ],
-  "total": 903,
-  "payment_method": "WAON",
-  "invoice_number": null
+  "service_type": null,
+  "billing_period": null,
+  "usage": null,
+  "payer": null,
+  "payment_reference": null
 }

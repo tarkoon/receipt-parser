@@ -1,0 +1,81 @@
+{
+  "document_type": "receipt",
+  "merchant": "ゆめマート",
+  "date": "2026-03-25",
+  "location": "赤間",
+  "currency": "JPY",
+  "total": 2328,
+  "payment_method": "cash",
+  "invoice_number": "レシートNo1605",
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 2328,
+  "line_items": [
+    {
+      "description": "ハウしょうが大容",
+      "qty": 1,
+      "unit_price": 328,
+      "total": 328,
+      "tax_category": "8%"
+    },
+    {
+      "description": "広島風お好み焼き",
+      "qty": 1,
+      "unit_price": 598,
+      "total": 478,
+      "tax_category": "8%",
+      "discount": 120,
+      "discount_rate": "20%"
+    },
+    {
+      "description": "肉豆腐",
+      "qty": 1,
+      "unit_price": 398,
+      "total": 318,
+      "tax_category": "8%",
+      "discount": 80,
+      "discount_rate": "20%"
+    },
+    {
+      "description": "ダノンオイコス加",
+      "qty": 2,
+      "unit_price": 178,
+      "total": 356,
+      "tax_category": "8%"
+    },
+    {
+      "description": "ヤマザキロイヤル",
+      "qty": 1,
+      "unit_price": 198,
+      "total": 198,
+      "tax_category": "8%"
+    },
+    {
+      "description": "ヤマザキランチパ",
+      "qty": 1,
+      "unit_price": 158,
+      "total": 158,
+      "tax_category": "8%"
+    },
+    {
+      "description": "すみっコスポンジ",
+      "qty": 1,
+      "unit_price": 320,
+      "total": 320,
+      "tax_category": "8%"
+    }
+  ],
+  "subtotal": 2156,
+  "taxes": [
+    {
+      "rate": "8%",
+      "label": "外税",
+      "amount": 172
+    }
+  ],
+  "service_type": null,
+  "billing_period": null,
+  "usage": null,
+  "payer": null,
+  "payment_reference": null
+}

@@ -1,8 +1,15 @@
 {
+  "document_type": "receipt",
   "merchant": "業務スーパー",
   "date": "2026-03-22",
   "location": null,
   "currency": "JPY",
+  "total": 2279,
+  "payment_method": "cash",
+  "invoice_number": "T4140001022100",
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 2279,
   "line_items": [
     {
       "description": "アマンディ ホイ",
@@ -88,7 +95,9 @@
       "amount": 0
     }
   ],
-  "total": 2279,
-  "payment_method": "cash",
-  "invoice_number": "T4140001022100"
+  "service_type": null,
+  "billing_period": null,
+  "usage": null,
+  "payer": null,
+  "payment_reference": null
 }

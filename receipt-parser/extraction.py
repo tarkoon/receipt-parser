@@ -1,6 +1,7 @@
-"""extraction.py — LLM extraction via Ollama structured output, multi-pass."""
+"""extraction.py — LLM extraction via OpenRouter (default) or Ollama, multi-pass."""
 
 import json
+import os
 import re
 import signal
 import platform
@@ -10,10 +11,36 @@ import ollama as ollama_client
 from schema import Receipt, generate_extraction_prompt, generate_verification_prompt
 
 OLLAMA_TIMEOUT_SECONDS = 180
+DEFAULT_MODEL = "deepseek/deepseek-v3.2"
+OLLAMA_PREFIX = "ollama/"
 
 
-def check_ollama_available(model: str = "qwen3.5:9b") -> None:
-    """Verify Ollama is running and the model is pulled. Call at pipeline init."""
+def _is_ollama_model(model: str) -> bool:
+    """Check if model should use Ollama backend (prefixed with 'ollama/')."""
+    return model.startswith(OLLAMA_PREFIX)
+
+
+def _ollama_model_name(model: str) -> str:
+    """Strip the 'ollama/' prefix to get the actual Ollama model name."""
+    return model[len(OLLAMA_PREFIX):]
+
+
+# ── Model availability check ────────────────────────────────────────
+
+def check_model_available(model: str = DEFAULT_MODEL) -> None:
+    """Verify the LLM backend is reachable."""
+    if _is_ollama_model(model):
+        _check_ollama_available(_ollama_model_name(model))
+    else:
+        if not os.environ.get("OPENROUTER_API_KEY"):
+            raise RuntimeError(
+                "OPENROUTER_API_KEY not set. Add it to .env or set it in your environment.\n"
+                "Get a key at https://openrouter.ai/keys"
+            )
+
+
+def _check_ollama_available(model: str) -> None:
+    """Verify Ollama is running and the model is pulled."""
     try:
         models = ollama_client.list()
         available = [m.model or "" for m in models.models] if hasattr(models, 'models') else []
@@ -27,6 +54,8 @@ def check_ollama_available(model: str = "qwen3.5:9b") -> None:
             ) from e
         raise
 
+
+# ── JSON schema for structured output ────────────────────────────────
 
 def get_ollama_schema() -> dict:
     """Return a flattened JSON schema with $ref pointers resolved."""
@@ -51,6 +80,8 @@ def get_ollama_schema() -> dict:
     result = resolve_refs(schema)
     return result  # type: ignore[return-value]
 
+
+# ── Response parsing ─────────────────────────────────────────────────
 
 def sanitize_llm_response(raw: str) -> str:
     """Strip markdown code fences and extract JSON block from LLM output.
@@ -83,6 +114,12 @@ def _coerce_llm_output(data: dict) -> dict:
                 continue
             if "total" not in item or item["total"] is None:
                 continue
+            # Coerce discount_rate null to empty string (schema requires str)
+            if item.get("discount_rate") is None:
+                item["discount_rate"] = ""
+            # Coerce discount null to 0
+            if item.get("discount") is None:
+                item["discount"] = 0
             # Coerce tax_category to valid Literal values
             tc = item.get("tax_category")
             if tc is None or tc not in ("8%", "10%", "0%"):
@@ -138,8 +175,75 @@ def _parse_llm_json(raw: str) -> dict:
                 return {"error": f"LLM output failed validation: {e2}", "raw": raw}
 
 
+# ── OpenRouter backend ───────────────────────────────────────────────
+
+_openrouter_client = None
+
+
+def _get_openrouter_client():
+    """Get or create the OpenRouter client (OpenAI-compatible)."""
+    global _openrouter_client
+    if _openrouter_client is None:
+        from openai import OpenAI
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "OPENROUTER_API_KEY not set. Add it to .env or set it in your environment.\n"
+                "Get a key at https://openrouter.ai/keys"
+            )
+        _openrouter_client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+            timeout=OLLAMA_TIMEOUT_SECONDS,
+        )
+    return _openrouter_client
+
+
+def _openrouter_chat(
+    model: str,
+    messages: list,
+    temperature: float = 0.0,
+    max_tokens: int = 4096,
+) -> str:
+    """Call OpenRouter API and return the response content."""
+    client = _get_openrouter_client()
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        response_format={"type": "json_object"},
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return response.choices[0].message.content
+
+
+# ── Ollama backend ───────────────────────────────────────────────────
+
+_RETRYABLE_ERRORS = ("GGML_ASSERT", "model failed to load", "resource limitations")
+_MAX_RETRIES = 2
+_RETRY_DELAY = 5
+
+
 def _ollama_chat_with_timeout(timeout: int = OLLAMA_TIMEOUT_SECONDS, **kwargs: object) -> dict:
-    """Wrapper around ollama.chat() with a wall-clock timeout."""
+    """Wrapper around ollama.chat() with a wall-clock timeout and retry for transient errors."""
+    import time
+
+    last_error: Exception | None = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return _ollama_chat_once(timeout, **kwargs)
+        except Exception as e:
+            err_str = str(e)
+            if any(msg in err_str for msg in _RETRYABLE_ERRORS) and attempt < _MAX_RETRIES:
+                last_error = e
+                time.sleep(_RETRY_DELAY)
+                continue
+            raise
+    raise last_error  # type: ignore[misc]  # unreachable but satisfies type checker
+
+
+def _ollama_chat_once(timeout: int, **kwargs: object) -> dict:
+    """Single attempt at ollama.chat() with a wall-clock timeout."""
     if platform.system() != "Windows":
         def _handler(signum: int, frame: object) -> None:
             raise TimeoutError(f"Ollama did not respond within {timeout}s")
@@ -169,32 +273,57 @@ def _ollama_chat_with_timeout(timeout: int = OLLAMA_TIMEOUT_SECONDS, **kwargs: o
         return result[0]  # type: ignore[return-value]
 
 
-def extract_with_llm(ocr_text: str, model: str = "qwen3.5:9b") -> dict:
-    """Single-pass extraction with Ollama structured output enforcement."""
-    prompt = generate_extraction_prompt(ocr_text)
+# ── Unified LLM chat ────────────────────────────────────────────────
 
-    response = _ollama_chat_with_timeout(
+def _llm_chat(
+    model: str,
+    messages: list,
+    schema: dict,
+    temperature: float = 0.0,
+    max_tokens: int = 4096,
+) -> str:
+    """Unified LLM chat — dispatches to Ollama or OpenRouter."""
+    if _is_ollama_model(model):
+        response = _ollama_chat_with_timeout(
+            model=_ollama_model_name(model),
+            messages=messages,
+            format=schema,
+            options={"temperature": temperature, "num_predict": max_tokens},
+            think=False,
+            keep_alive="60m",
+        )
+        return response["message"]["content"]
+    else:
+        return _openrouter_chat(model, messages, temperature, max_tokens)
+
+
+# ── Extraction functions ─────────────────────────────────────────────
+
+def extract_with_llm(ocr_text: str, model: str = DEFAULT_MODEL, doc_type: str = "receipt") -> dict:
+    """Single-pass extraction with structured output enforcement."""
+    prompt = generate_extraction_prompt(ocr_text, doc_type=doc_type)
+
+    raw = _llm_chat(
         model=model,
         messages=[{"role": "user", "content": prompt}],
-        format=get_ollama_schema(),
-        options={"temperature": 0.0, "num_predict": 4096},
-        think=False,
+        schema=get_ollama_schema(),
     )
 
-    return _parse_llm_json(sanitize_llm_response(response["message"]["content"]))
+    return _parse_llm_json(sanitize_llm_response(raw))
 
 
 def extract_with_verification(
     ocr_text: str,
-    model: str = "qwen3.5:9b",
+    model: str = DEFAULT_MODEL,
     passes: int = 1,
     validate_fn=None,
+    doc_type: str = "receipt",
 ) -> tuple[dict, list[dict]]:
     """Multi-pass text extraction. Pass 1 extracts. Pass 2+ self-corrects."""
     passes = max(1, passes)
     history = []
 
-    extracted = extract_with_llm(ocr_text, model=model)
+    extracted = extract_with_llm(ocr_text, model=model, doc_type=doc_type)
     warnings = []
     if validate_fn and "error" not in extracted:
         try:
@@ -215,15 +344,13 @@ def extract_with_verification(
             validation_warnings=warnings,
         )
 
-        response = _ollama_chat_with_timeout(
+        raw = _llm_chat(
             model=model,
             messages=[{"role": "user", "content": verification_prompt}],
-            format=get_ollama_schema(),
-            options={"temperature": 0.0, "num_predict": 4096},
-            think=False,
+            schema=get_ollama_schema(),
         )
 
-        raw = sanitize_llm_response(response["message"]["content"])
+        raw = sanitize_llm_response(raw)
         if raw.strip():
             extracted = _parse_llm_json(raw)
 

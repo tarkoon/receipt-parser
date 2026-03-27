@@ -1,0 +1,21 @@
+{
+  "document_type": "payment_slip",
+  "merchant": "スマートビリングサービス株式会社",
+  "date": null,
+  "location": null,
+  "currency": "JPY",
+  "total": 6270,
+  "payment_method": null,
+  "invoice_number": null,
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 6270,
+  "line_items": [],
+  "subtotal": null,
+  "taxes": [],
+  "service_type": null,
+  "billing_period": null,
+  "usage": null,
+  "payer": "イーガンミニー",
+  "payment_reference": "00087121103"
+}

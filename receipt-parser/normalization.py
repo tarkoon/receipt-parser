@@ -5,9 +5,9 @@ import unicodedata
 
 # Price-only line: ¥-prefixed (¥656, ¥2,279, ¥168)) or number + JP tax marker (278※, 3除)
 _PRICE_LINE_RE = re.compile(
-    r'^[¥￥]\s*[\d,]+[)）]?\s*$'
+    r'^[¥￥]\s*[\d,]+\s*[)）軽]?\s*$'
     r'|'
-    r'^\d[\d,]*\s*[※X除]\s*$'
+    r'^\d[\d,]*\s*[※X除軽]\s*$'
 )
 
 
@@ -30,45 +30,127 @@ def strip_barcode_lines(text: str) -> str:
     cleaned = []
     for line in lines:
         stripped = line.strip()
-        # Skip lines that are just barcode numbers (13+ digits optionally followed by JAN/EAN)
-        if re.match(r'^\d{8,}(JAN|EAN)?$', stripped):
+        # Skip lines that are just barcode numbers (8+ digits optionally followed by JAN/EAN)
+        if re.match(r'^\d{8,}\s*(JAN|EAN)?\s*$', stripped):
             continue
         # Strip inline item codes at start of lines (e.g., "000406アマンディ" → "アマンディ")
-        stripped = re.sub(r'^0{2,}\d{1,4}[*]?', '', stripped)
+        stripped = re.sub(r'^0{2,}\d{1,4}[*]?\s*', '', stripped)
         if stripped:
             cleaned.append(stripped)
     return '\n'.join(cleaned)
 
 
 def rejoin_price_lines(text: str) -> str:
-    """Join orphan price lines with the preceding item or label line.
+    """Join orphan price lines with their corresponding item lines.
 
-    Cloud Vision's fulltext mode often puts items/labels and their ¥ prices
-    on separate lines. This joins each orphan price upward:
-    - With a bare summary keyword (小計, 合計, …) if that's the previous line
-    - With any Japanese-text line that doesn't already contain ¥
+    Only operates within the item section of the receipt — between the first
+    item-like line and the subtotal (小計) or equivalent summary marker.
+    Lines outside this zone are left untouched.
+
+    Within the item zone, handles:
+    1. Single orphan: price line joined to the nearest priceless item above.
+    2. Block pattern: N priceless items followed by N price lines → matched in order.
     """
     lines = text.split('\n')
+
+    def _is_price(s: str) -> bool:
+        return bool(_PRICE_LINE_RE.match(s.strip()))
+
+    # Markers that signal the END of the item section
+    _SECTION_END = re.compile(r'小計|合計|現計|税率|外税|内税|消費税|WAON|クレジット|お預り|お釣り')
+
+    def _is_item_candidate(s: str) -> bool:
+        """Line that looks like an item: has Japanese text, no ¥, not a summary."""
+        s = s.strip()
+        if not s or _is_price(s):
+            return False
+        if not re.search(r'[\u3000-\u9fff]', s):
+            return False
+        if '¥' in s or '￥' in s:
+            return False
+        if _SECTION_END.search(s):
+            return False
+        return True
+
+    # --- Step 1: Find the item section boundaries ---
+    # Item section starts at the first line with ¥ or a price-line pattern,
+    # and ends at the first summary marker (小計, 合計, etc.)
+    item_start = None
+    item_end = len(lines)
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if item_start is None:
+            # Look for the first line that has a price or is a priced item
+            if '¥' in s or '￥' in s or _is_price(s) or (
+                    _is_item_candidate(s) and i + 1 < len(lines) and _is_price(lines[i + 1].strip())):
+                item_start = i
+        elif _SECTION_END.search(s):
+            item_end = i
+            break
+
+    if item_start is None:
+        return text  # No item section found, return as-is
+
+    # --- Step 2: Within the item section, do block matching ---
+    before = lines[:item_start]
+    section = lines[item_start:item_end]
+    after = lines[item_end:]
+
+    # Block matching: find runs of priceless items followed by price lines
+    resolved = list(section)
+    i = 0
+    while i < len(resolved):
+        if not _is_item_candidate(resolved[i].strip()):
+            i += 1
+            continue
+
+        # Count consecutive item-candidate lines
+        istart = i
+        while i < len(resolved) and _is_item_candidate(resolved[i].strip()):
+            i += 1
+        iend = i
+
+        # Count consecutive price lines immediately after
+        pstart = i
+        while i < len(resolved) and _is_price(resolved[i].strip()):
+            i += 1
+        pend = i
+
+        pairs = min(iend - istart, pend - pstart)
+        if pairs == 0:
+            continue
+
+        for j in range(pairs):
+            resolved[istart + j] += '  ' + resolved[pstart + j].strip()
+        for j in range(pairs):
+            resolved[pstart + j] = None  # mark for removal
+
+    section = [l for l in resolved if l is not None]
+
+    # --- Step 3: Single orphan pass within the item section ---
     result: list[str] = []
-
-    for line in lines:
+    for line in section:
         stripped = line.strip()
-
-        if not _PRICE_LINE_RE.match(stripped):
+        if not _is_price(stripped):
             result.append(line)
             continue
 
-        # Join upward with previous line if it's a suitable target
-        if result:
-            prev = result[-1].strip()
-            has_jp = bool(re.search(r'[\u3000-\u9fff]', prev))
-            if has_jp and '¥' not in prev:
-                result[-1] += '  ' + stripped
-                continue
+        # Look back for nearest priceless item candidate
+        joined = False
+        for back in range(1, min(4, len(result) + 1)):
+            prev = result[-back].strip()
+            if _is_item_candidate(prev):
+                result[-back] += '  ' + stripped
+                joined = True
+                break
+            # Stop at lines with prices or non-item content
+            if '¥' in prev or '￥' in prev or not re.search(r'[\u3000-\u9fff]', prev):
+                break
 
-        result.append(line)
+        if not joined:
+            result.append(line)
 
-    return '\n'.join(result)
+    return '\n'.join(before + result + after)
 
 
 def clean_handwritten_ocr(text: str) -> str:

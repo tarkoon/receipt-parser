@@ -1,0 +1,64 @@
+{
+  "document_type": "receipt",
+  "merchant": "チャオ",
+  "date": "2026-03-14",
+  "location": "宗像市稲元2-1-7",
+  "currency": "JPY",
+  "total": 648,
+  "payment_method": "cash",
+  "invoice_number": null,
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 648,
+  "line_items": [
+    {
+      "description": "テイクアウト",
+      "qty": 1,
+      "unit_price": 200,
+      "total": 200,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "テイクアウト",
+      "qty": 1,
+      "unit_price": 200,
+      "total": 200,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "テイクアウト",
+      "qty": 1,
+      "unit_price": 200,
+      "total": 200,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    }
+  ],
+  "subtotal": 600,
+  "taxes": [
+    {
+      "rate": "8%",
+      "label": "8%税",
+      "amount": 48
+    }
+  ],
+  "service_type": null,
+  "billing_period": {
+    "start": null,
+    "end": null
+  },
+  "usage": {
+    "amount": null,
+    "unit": null,
+    "cost_per": null,
+    "meter_previous": null,
+    "meter_current": null
+  },
+  "payer": null,
+  "payment_reference": null
+}

@@ -1,0 +1,105 @@
+{
+  "document_type": "receipt",
+  "merchant": "サンリブ宗像",
+  "date": "2026-03-10",
+  "location": "宗像",
+  "currency": "JPY",
+  "total": 4029,
+  "payment_method": "cash",
+  "invoice_number": null,
+  "account_number": null,
+  "points_used": 492,
+  "amount_paid": 3537,
+  "line_items": [
+    {
+      "description": "牛肉",
+      "qty": 1,
+      "unit_price": 2025,
+      "total": 1012,
+      "tax_category": "8%",
+      "discount": 1013,
+      "discount_rate": "50%"
+    },
+    {
+      "description": "K醇良本みりん",
+      "qty": 1,
+      "unit_price": 348,
+      "total": 348,
+      "tax_category": "10%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "生乳低脂肪牛乳",
+      "qty": 1,
+      "unit_price": 278,
+      "total": 278,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "野菜つまもの",
+      "qty": 1,
+      "unit_price": 199,
+      "total": 199,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "Kサワークリーム",
+      "qty": 1,
+      "unit_price": 318,
+      "total": 318,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "ハグチョコマスコ",
+      "qty": 1,
+      "unit_price": 1100,
+      "total": 1100,
+      "tax_category": "10%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "KTミニチョコセ",
+      "qty": 1,
+      "unit_price": 450,
+      "total": 450,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    }
+  ],
+  "subtotal": 3705,
+  "taxes": [
+    {
+      "rate": "8%",
+      "label": "8%内税",
+      "amount": 180
+    },
+    {
+      "rate": "10%",
+      "label": "10%内税",
+      "amount": 144
+    }
+  ],
+  "service_type": null,
+  "billing_period": {
+    "start": null,
+    "end": null
+  },
+  "usage": {
+    "amount": null,
+    "unit": null,
+    "cost_per": null,
+    "meter_previous": null,
+    "meter_current": null
+  },
+  "payer": null,
+  "payment_reference": null
+}
