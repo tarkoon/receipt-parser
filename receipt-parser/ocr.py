@@ -6,6 +6,7 @@ Returns blocks in the format:
 
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -271,7 +272,14 @@ def run_cloud_vision(image: np.ndarray, client=None) -> list[dict]:
     if fulltext2:
         has_yen1 = '¥' in fulltext1
         has_yen2 = '¥' in fulltext2
-        if (has_yen2 and not has_yen1) or len(fulltext2) > len(fulltext1):
+        # Count inline prices (¥ on same line as Japanese text = better layout)
+        inline1 = len(re.findall(r'[\u3000-\u9fff].*¥|¥.*[\u3000-\u9fff]', fulltext1))
+        inline2 = len(re.findall(r'[\u3000-\u9fff].*¥|¥.*[\u3000-\u9fff]', fulltext2))
+        if (has_yen2 and not has_yen1):
+            fulltext = fulltext2
+        elif inline2 > inline1 + 2:
+            fulltext = fulltext2  # Prefer layout with more inline item+price pairing
+        elif len(fulltext2) > len(fulltext1):
             fulltext = fulltext2
 
     # Save to cache

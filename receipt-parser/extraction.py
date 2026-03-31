@@ -1,4 +1,4 @@
-"""extraction.py — LLM extraction via OpenRouter (default) or Ollama, multi-pass."""
+"""extraction.py — LLM extraction via DeepSeek API (default), OpenRouter, or Ollama, multi-pass."""
 
 import json
 import os
@@ -11,8 +11,9 @@ import ollama as ollama_client
 from schema import Receipt, generate_extraction_prompt, generate_verification_prompt
 
 OLLAMA_TIMEOUT_SECONDS = 180
-DEFAULT_MODEL = "deepseek/deepseek-v3.2"
+DEFAULT_MODEL = "deepseek-chat"
 OLLAMA_PREFIX = "ollama/"
+_LLM_SEED = 42  # Fixed seed for deterministic output
 
 
 def _is_ollama_model(model: str) -> bool:
@@ -32,10 +33,11 @@ def check_model_available(model: str = DEFAULT_MODEL) -> None:
     if _is_ollama_model(model):
         _check_ollama_available(_ollama_model_name(model))
     else:
-        if not os.environ.get("OPENROUTER_API_KEY"):
+        if not os.environ.get("DEEPSEEK_API_KEY") and not os.environ.get("OPENROUTER_API_KEY"):
             raise RuntimeError(
-                "OPENROUTER_API_KEY not set. Add it to .env or set it in your environment.\n"
-                "Get a key at https://openrouter.ai/keys"
+                "No API key set. Add DEEPSEEK_API_KEY or OPENROUTER_API_KEY to .env.\n"
+                "DeepSeek: https://platform.deepseek.com/api_keys\n"
+                "OpenRouter: https://openrouter.ai/keys"
             )
 
 
@@ -114,6 +116,13 @@ def _coerce_llm_output(data: dict) -> dict:
                 continue
             if "total" not in item or item["total"] is None:
                 continue
+            # Coerce numeric fields to float (LLM may return strings)
+            for nfield in ("total", "unit_price", "qty", "discount"):
+                if nfield in item and item[nfield] is not None:
+                    try:
+                        item[nfield] = float(str(item[nfield]).replace(',', ''))
+                    except (TypeError, ValueError):
+                        pass
             # Coerce discount_rate null to empty string (schema requires str)
             if item.get("discount_rate") is None:
                 item["discount_rate"] = ""
@@ -177,26 +186,33 @@ def _parse_llm_json(raw: str) -> dict:
 
 # ── OpenRouter backend ───────────────────────────────────────────────
 
-_openrouter_client = None
+_api_client = None
 
 
-def _get_openrouter_client():
-    """Get or create the OpenRouter client (OpenAI-compatible)."""
-    global _openrouter_client
-    if _openrouter_client is None:
+def _get_api_client():
+    """Get or create the API client (DeepSeek direct or OpenRouter fallback)."""
+    global _api_client
+    if _api_client is None:
         from openai import OpenAI
-        api_key = os.environ.get("OPENROUTER_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "OPENROUTER_API_KEY not set. Add it to .env or set it in your environment.\n"
-                "Get a key at https://openrouter.ai/keys"
+        deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
+        openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+        if deepseek_key:
+            _api_client = OpenAI(
+                base_url="https://api.deepseek.com",
+                api_key=deepseek_key,
+                timeout=OLLAMA_TIMEOUT_SECONDS,
             )
-        _openrouter_client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=api_key,
-            timeout=OLLAMA_TIMEOUT_SECONDS,
-        )
-    return _openrouter_client
+        elif openrouter_key:
+            _api_client = OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=openrouter_key,
+                timeout=OLLAMA_TIMEOUT_SECONDS,
+            )
+        else:
+            raise RuntimeError(
+                "No API key set. Add DEEPSEEK_API_KEY or OPENROUTER_API_KEY to .env."
+            )
+    return _api_client
 
 
 def _openrouter_chat(
@@ -205,14 +221,15 @@ def _openrouter_chat(
     temperature: float = 0.0,
     max_tokens: int = 4096,
 ) -> str:
-    """Call OpenRouter API and return the response content."""
-    client = _get_openrouter_client()
+    """Call DeepSeek/OpenRouter API and return the response content."""
+    client = _get_api_client()
     response = client.chat.completions.create(
         model=model,
         messages=messages,
         response_format={"type": "json_object"},
         temperature=temperature,
         max_tokens=max_tokens,
+        seed=_LLM_SEED,
     )
     return response.choices[0].message.content
 

@@ -39,7 +39,7 @@ FIELD_REGISTRY: list[FieldMeta] = [
     FieldMeta(
         name="merchant",
         debug_color_bgr=(255, 165, 0),
-        prompt_hint="The store/merchant name is usually the largest text at the very top of the receipt. IMPORTANT: If both an English brand name and a Japanese name appear (e.g. 'VIVAHOME' and 'スーパービバホーム'), ALWAYS use the Japanese name. If a subtitle describes the business (e.g. '自家製生パスタの店') but a proper name also appears (e.g. 'チャオ'), use the proper name. Do NOT use the parent company name (e.g. アークランズ株式会社), branch location alone (e.g. 赤間店), or corporate registration name (e.g. 有限会社...). For handwritten receipts (領収証), the merchant name is near the stamp/seal at the bottom. For payment slips, this is the company receiving the money (受取人).",
+        prompt_hint="The store/merchant name is the consumer-facing BRAND name, usually the largest text at the very top of the receipt. Use the brand name exactly as it appears most prominently — keep the original script (English, Japanese, etc.). For example: 'HANDS' not 'ハンズ' if the receipt header says 'HANDS', 'カルディコーヒーファーム' if that is the prominent name. For stores with a Japanese name and branch location, include both (e.g. 'カルディコーヒーファーム サンリブくりえいと宗像店'). If a subtitle describes the business type (e.g. '自家製生パスタの店', 'まちのパン屋さん') but a proper name also appears (e.g. 'チャオ', 'Pain Brié'), use the proper name, not the description. Do NOT use the parent company name (e.g. アークランズ株式会社, 株式会社ハンズ), franchisee/operator name (e.g. 有限会社..., 片野SS), or corporate registration name. For gas stations, use the fuel brand (e.g. 'ENEOS') not the station operator. For handwritten receipts (領収証), the merchant name is near the stamp/seal at the bottom. For payment slips, this is the company receiving the money (受取人).",
         extraction_aliases=["店名", "store", "shop", "受取人"],
     ),
     FieldMeta(
@@ -99,7 +99,7 @@ FIELD_REGISTRY: list[FieldMeta] = [
     FieldMeta(
         name="line_items",
         debug_color_bgr=(255, 255, 0),
-        prompt_hint="Match description, quantity, unit price, and line total on the same row. If quantity is not shown, assume 1. For tax_category: if the receipt shows '10%内税対象' or '8%対象', set tax_category to the matching rate. Items marked ※ or X are reduced 8% tax. Items marked '除' are exempt. OCR may merge multiple items into one line — look for multiple prices (e.g. '食品ポリ袋L3除日清チャック付328※' = two items: ¥3 and ¥328). Common JP receipt items: レジ袋 (plastic bag). DISCOUNTS: If a discount line follows an item (e.g., '割引 20%' with -¥94), do NOT create a separate line item. Instead merge it into the parent item: set total to the price AFTER discount (unit_price - discount), set discount to the discount amount, and set discount_rate to the rate string (e.g., '20%'). The total must always be positive.",
+        prompt_hint="Match description, quantity, unit price, and line total on the same row. If quantity is not shown, assume 1. For tax_category: if the receipt shows '10%内税対象' or '8%対象', set tax_category to the matching rate. Items marked ※, *, or X are reduced 8% tax. Items marked '除' are exempt. OCR may merge multiple items into one line — look for multiple prices (e.g. '食品ポリ袋L3除日清チャック付328※' = two items: ¥3 and ¥328). Lines like '部門 NNN' or '部門NNN' followed by a price are department-coded items (common in small shops/bakeries) — treat them as line items with description '部門NNN'. Common JP receipt items: レジ袋 (plastic bag). DISCOUNTS: If a discount line follows an item (e.g., '割引 20%' with -¥94), do NOT create a separate line item. Instead merge it into the parent item: set total to the price AFTER discount (unit_price - discount), set discount to the discount amount, and set discount_rate to the rate string (e.g., '20%'). The total must always be positive.",
         doc_types=["receipt"],
     ),
     FieldMeta(
@@ -280,7 +280,7 @@ RULES:
    Do NOT add tax unless actual tax numbers are handwritten. Empty pre-printed form labels (税抜金額, 消費税額, etc.) with no numbers filled in mean no tax — output taxes as an empty list.
    Do NOT create line_items for handwritten receipts unless individual items are listed.
 8. 令和7年=2025, 令和8年=2026. If OCR shows just '7年' or '8年' with no era name, assume 令和.
-9. The merchant name should NOT include parent company names like AEON/イオン or corporate suffixes like 株式会社. Use the specific store name only. If both English and Japanese names appear (e.g. VIVAHOME and スーパービバホーム), prefer the Japanese consumer-facing name. Do NOT use branch locations alone (e.g. 赤間店) or business subtitles — look for the actual store/brand name.
+9. The merchant name is the consumer-facing BRAND name, NOT the parent company (AEON/イオン), corporate entity (株式会社..., 有限会社...), franchisee/operator name, or abbreviation. Look for the brand logo/name at the very top — it's often in English or stylized text (e.g. 'click', 'ENEOS', 'KALDI'). Do NOT use business registration names, owner names, or abbreviations like コウソ. Include the branch name if present (e.g. 'カルディコーヒーファーム サンリブくりえいと宗像店'). For gas stations, use the fuel brand not the station operator.
 10. If the receipt shows a specific payment method like WAON, クレジット, Suica, PayPay, etc., use that. Only default to "cash" if no electronic payment is named and you see お預り (cash tendered) or 現計 (cash total).
 11. OCR may put item names and their prices on SEPARATE lines. Associate each item with the ¥ amount on the NEXT line. Example: "サニーレタス" followed by "¥129" means サニーレタス costs 129.
 12. The subtotal (小計) is the sum of item prices BEFORE tax. The tax lines (外税8%税額, 消費税 etc.) show the TAX amount, NOT the subtotal. Do NOT confuse 小計 with tax.
@@ -299,7 +299,7 @@ RULES:
 5. The merchant is the utility company (gas, water, electric provider). Do NOT include 株式会社 or similar suffixes.
 6. The total is the ご請求額 or 引落予定額 (amount to be charged).
 7. For date: use the payment/debit date (引落予定日) if shown, else the meter reading date (検針日).
-8. service_type must be one of: gas, water, electric, sewage, internet, phone.
+8. service_type must be one of: gas, water, electric, sewage, internet, phone. If the bill covers both 水道 (water supply) and 下水道 (sewage), use 'water' — combined water/sewage bills are water bills.
 9. Extract billing_period as start/end dates in YYYY-MM-DD format from 前回検針日 → 今回検針日 or 使用期間.
 10. Extract usage: amount (ご使用量), unit (m3/kWh/L), cost_per (単価, price per unit — null if not shown or if tiered pricing), meter_previous (前回指針), meter_current (今回指針).
 11. payment_method should be "bank_payment" if 口座引落/口座振替/振替 is mentioned, else null.
@@ -314,7 +314,7 @@ RULES:
 2. Amounts: Remove currency symbols (¥, $, ￥). Output as numbers, not strings.
 3. 令和7年=2025, 令和8年=2026. If OCR shows just '7年' or '8年' with no era name, assume 令和.
 4. Set document_type to "payment_slip".
-5. The merchant is the company receiving the money (受取人). Do NOT include 株式会社 or similar suffixes.
+5. The merchant is the company receiving the money (受取人). Look for the 受取人 field specifically. Do NOT use the credit card company, payment processor, or intermediary (e.g., do NOT use アプラス if the 受取人 is a different company). Do NOT include 株式会社 or similar suffixes.
 6. For date: use the payment date (stamp date, 収納日) if visible, else the due date (支払期限, 納付期限).
 7. The total is the 金額 (amount).
 8. payer is the person/entity making the payment (依頼人).
@@ -339,6 +339,8 @@ FIELD-SPECIFIC RULES:
 
 OCR TEXT:
 {ocr_text}
+
+Respond with a single JSON object containing all extracted fields.
 """
     return prompt
 
@@ -383,5 +385,7 @@ VALIDATION WARNINGS:
 
 ORIGINAL OCR TEXT:
 {ocr_text}
+
+Respond with a single JSON object containing all extracted fields.
 """
     return prompt

@@ -33,8 +33,14 @@ def strip_barcode_lines(text: str) -> str:
         # Skip lines that are just barcode numbers (8+ digits optionally followed by JAN/EAN)
         if re.match(r'^\d{8,}\s*(JAN|EAN)?\s*$', stripped):
             continue
-        # Strip inline item codes at start of lines (e.g., "000406アマンディ" → "アマンディ")
-        stripped = re.sub(r'^0{2,}\d{1,4}[*]?\s*', '', stripped)
+        # Strip inline item codes at start of lines, preserving tax markers
+        # e.g., "000406*トーラク" → "※トーラク" (preserve * as ※ tax marker)
+        m_code = re.match(r'^0{2,}\d{1,4}(\*?)\s*', stripped)
+        if m_code:
+            had_marker = m_code.group(1) == '*'
+            stripped = stripped[m_code.end():]
+            if had_marker and stripped:
+                stripped = '※' + stripped  # Preserve tax marker
         if stripped:
             cleaned.append(stripped)
     return '\n'.join(cleaned)
@@ -143,9 +149,12 @@ def rejoin_price_lines(text: str) -> str:
                 result[-back] += '  ' + stripped
                 joined = True
                 break
-            # Stop at lines with prices or non-item content
-            if '¥' in prev or '￥' in prev or not re.search(r'[\u3000-\u9fff]', prev):
-                break
+            # Stop at pure price lines or non-Japanese content
+            if _is_price(prev):
+                break  # Pure price line = boundary
+            if not re.search(r'[\u3000-\u9fff]', prev):
+                break  # Non-Japanese line = boundary
+            # Lines with ¥ AND Japanese text = priced items → skip over them
 
         if not joined:
             result.append(line)

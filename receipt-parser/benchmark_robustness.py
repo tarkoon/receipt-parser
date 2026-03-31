@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 import time
 from collections import defaultdict
@@ -161,10 +162,17 @@ def _instrumented_run_cloud_vision(image: np.ndarray, client=None) -> list[dict]
     if fulltext2:
         has_yen1 = '¥' in fulltext1
         has_yen2 = '¥' in fulltext2
+        # Count inline prices (¥ on same line as Japanese text = better layout)
+        inline1 = len(re.findall(r'[\u3000-\u9fff].*¥|¥.*[\u3000-\u9fff]', fulltext1))
+        inline2 = len(re.findall(r'[\u3000-\u9fff].*¥|¥.*[\u3000-\u9fff]', fulltext2))
         if has_yen2 and not has_yen1:
             fulltext = fulltext2
             chose_b = True
             chose_b_reason = "yen_symbol"
+        elif inline2 > inline1 + 2:
+            fulltext = fulltext2
+            chose_b = True
+            chose_b_reason = "better_layout"
         elif len(fulltext2) > len(fulltext1):
             fulltext = fulltext2
             chose_b = True
@@ -707,6 +715,7 @@ def run_robustness_benchmark(
                 try:
                     result = pipeline_mod.process_document(
                         fixture_image, model=model, passes=passes,
+                        apply_user_rules=False,
                     )
                 except Exception as e:
                     error = str(e)

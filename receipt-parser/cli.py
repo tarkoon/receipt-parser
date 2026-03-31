@@ -76,7 +76,7 @@ def parse(
     input_path: Path = typer.Argument(..., help="Image, PDF, or directory to process"),
     output: Path = typer.Option(None, "--output", "-o", help="Output file (default: stdout)"),
     model: str = typer.Option(DEFAULT_MODEL, "--model", "-m",
-                              help="LLM model (default: OpenRouter; prefix 'ollama/' for Ollama)"),
+                              help="LLM model (default: DeepSeek; prefix 'ollama/' for Ollama)"),
     passes: int = typer.Option(1, "--passes", "-p", min=1, max=3,
                                help="Extraction passes (2+ enables verification)"),
     format: str = typer.Option("json", "--format", "-f", help="Output format: json or csv"),

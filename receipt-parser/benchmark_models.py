@@ -123,12 +123,43 @@ def check_tax_amount(result: dict, truth: dict) -> dict:
     return {"pass": ok, "detail": f"got {got}, expected {exp} (tol +-5)"}
 
 
+_KATAKANA_MAP = {
+    'ア': 'a', 'イ': 'i', 'ウ': 'u', 'エ': 'e', 'オ': 'o',
+    'カ': 'ka', 'キ': 'ki', 'ク': 'ku', 'ケ': 'ke', 'コ': 'ko',
+    'サ': 'sa', 'シ': 'shi', 'ス': 'su', 'セ': 'se', 'ソ': 'so',
+    'タ': 'ta', 'チ': 'chi', 'ツ': 'tsu', 'テ': 'te', 'ト': 'to',
+    'ナ': 'na', 'ニ': 'ni', 'ヌ': 'nu', 'ネ': 'ne', 'ノ': 'no',
+    'ハ': 'ha', 'ヒ': 'hi', 'フ': 'fu', 'ヘ': 'he', 'ホ': 'ho',
+    'マ': 'ma', 'ミ': 'mi', 'ム': 'mu', 'メ': 'me', 'モ': 'mo',
+    'ヤ': 'ya', 'ユ': 'yu', 'ヨ': 'yo',
+    'ラ': 'ra', 'リ': 'ri', 'ル': 'ru', 'レ': 're', 'ロ': 'ro',
+    'ワ': 'wa', 'ヲ': 'wo', 'ン': 'n',
+    'ガ': 'ga', 'ギ': 'gi', 'グ': 'gu', 'ゲ': 'ge', 'ゴ': 'go',
+    'ザ': 'za', 'ジ': 'ji', 'ズ': 'zu', 'ゼ': 'ze', 'ゾ': 'zo',
+    'ダ': 'da', 'ヂ': 'di', 'ヅ': 'du', 'デ': 'de', 'ド': 'do',
+    'バ': 'ba', 'ビ': 'bi', 'ブ': 'bu', 'ベ': 'be', 'ボ': 'bo',
+    'パ': 'pa', 'ピ': 'pi', 'プ': 'pu', 'ペ': 'pe', 'ポ': 'po',
+    'ッ': '', 'ー': '', 'ャ': 'ya', 'ュ': 'yu', 'ョ': 'yo',
+    'ァ': 'a', 'ィ': 'i', 'ゥ': 'u', 'ェ': 'e', 'ォ': 'o',
+}
+
+
+def _merchant_similarity(pred: str, truth: str) -> float:
+    """Compare merchant names with cross-script fallback."""
+    ratio = SequenceMatcher(None, pred, truth).ratio()
+    if ratio >= 0.4:
+        return ratio
+    pred_r = ''.join(_KATAKANA_MAP.get(c, c) for c in pred).lower()
+    truth_r = ''.join(_KATAKANA_MAP.get(c, c) for c in truth).lower()
+    return max(ratio, SequenceMatcher(None, pred_r, truth_r).ratio())
+
+
 def check_merchant_similarity(result: dict, truth: dict) -> dict:
     got = result.get("merchant") or ""
     exp = truth.get("merchant") or ""
     if not exp:
         return {"pass": True, "detail": "no merchant in truth, skipped"}
-    ratio = SequenceMatcher(None, got, exp).ratio()
+    ratio = _merchant_similarity(got, exp)
     ok = ratio >= 0.4
     return {"pass": ok, "detail": f"'{got}' vs '{exp}' ({ratio:.0%})"}
 

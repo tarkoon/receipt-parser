@@ -94,13 +94,31 @@ def _apply_merchant_mapping(result: dict) -> dict:
 
 # ── Financial Extraction Helpers ─────────────────────────────────────
 
+# Match ¥ or ￥ prefix, or 円 suffix amounts
+_YEN_INLINE = re.compile(r'[¥￥]\s*([\d,]+)|(?<!\d)([\d,]+)\s*円')
+
+
+def _parse_yen_match(m) -> float | None:
+    """Extract the numeric value from a yen regex match."""
+    if m is None:
+        return None
+    val = m.group(1) or m.group(2)
+    return float(val.replace(',', '')) if val else None
+
+
 def _extract_yen_nearby(lines: list[str], idx: int, look_ahead: int = 2):
-    """Extract ¥ value from line idx (inline) or the next N pure-¥ lines."""
-    m = re.search(r'[¥￥]\s*([\d,]+)', lines[idx].strip())
-    if m:
-        return float(m.group(1).replace(',', ''))
+    """Extract ¥ value from line idx (inline) or the next N lines with ¥ values."""
+    val = _parse_yen_match(_YEN_INLINE.search(lines[idx].strip()))
+    if val is not None:
+        return val
     for j in range(idx + 1, min(idx + 1 + look_ahead, len(lines))):
-        m = re.match(r'^[¥￥]\s*([\d,]+)[)）]?\s*$', lines[j].strip())
+        stripped = lines[j].strip()
+        # Match pure ¥/円 lines AND lines with leading text before ¥ (e.g. "1 ¥3,990")
+        m = re.match(r'^[¥￥]\s*([\d,]+)[)）]?\s*$', stripped)
+        if not m:
+            m = re.match(r'^[\d\s]*[¥￥]\s*([\d,]+)[)）]?\s*$', stripped)
+        if not m:
+            m = re.match(r'^([\d,]+)\s*円[)）]?\s*$', stripped)
         if m:
             return float(m.group(1).replace(',', ''))
     return None
@@ -109,15 +127,17 @@ def _extract_yen_nearby(lines: list[str], idx: int, look_ahead: int = 2):
 def _extract_yen_max_nearby(lines: list[str], idx: int, look_ahead: int = 5):
     """Extract the LARGEST ¥ value from line idx or the next N lines."""
     values: list[float] = []
-    m = re.search(r'[¥￥]\s*([\d,]+)', lines[idx].strip())
-    if m:
-        return float(m.group(1).replace(',', ''))
+    val = _parse_yen_match(_YEN_INLINE.search(lines[idx].strip()))
+    if val is not None:
+        return val
     for j in range(idx + 1, min(idx + 1 + look_ahead, len(lines))):
         stripped = lines[j].strip()
         m = re.match(r'^[¥￥]\s*([\d,]+)[)）]?\s*$', stripped)
+        if not m:
+            m = re.match(r'^([\d,]+)\s*円[)）]?\s*$', stripped)
         if m:
             values.append(float(m.group(1).replace(',', '')))
-        elif re.search(r'小\s*計|現\s*計|お釣り|お釣銭|釣\s*銭|お預り|お預り金|^預$', stripped):
+        elif re.search(r'小\s*計|現\s*計|お釣り|お釣銭|釣\s*銭|お預り|お預り金|^預$|支払い?方法|支払い?\s|現金|釣銭|クレジット', stripped):
             break
     return max(values) if values else None
 
@@ -125,16 +145,20 @@ def _extract_yen_max_nearby(lines: list[str], idx: int, look_ahead: int = 5):
 def _extract_yen_min_nearby(lines: list[str], idx: int, look_ahead: int = 3):
     """Extract the SMALLEST ¥ value from line idx or the next N lines."""
     values: list[float] = []
-    m = re.search(r'[¥￥]\s*([\d,]+)', lines[idx].strip())
-    if m:
-        return float(m.group(1).replace(',', ''))
+    val = _parse_yen_match(_YEN_INLINE.search(lines[idx].strip()))
+    if val is not None:
+        return val
     for j in range(idx + 1, min(idx + 1 + look_ahead, len(lines))):
         stripped = lines[j].strip()
         m = re.match(r'^[¥￥]\s*([\d,]+)[)）]?\s*$', stripped)
+        if not m:
+            m = re.match(r'^([\d,]+)\s*円[)）]?\s*$', stripped)
         if m:
             values.append(float(m.group(1).replace(',', '')))
         elif re.search(r'合\s*計|小\s*計|現\s*計|お釣り|お釣銭|釣\s*銭|お預り|お預り金', stripped):
             break
+        elif re.search(r'\d+%', stripped) and re.search(r'対象|消費税|内税|外税|軽減', stripped) and stripped != lines[idx].strip():
+            break  # New rate section boundary (must look like a section header)
     return min(values) if values else None
 
 
@@ -152,8 +176,8 @@ def _extract_financial_totals(text: str) -> dict:
         if rate_ctx_m:
             _rate_context = rate_ctx_m.group(1) + '%'
 
-        if '消費税等' in line and _rate_context and '対象' not in line:
-            val = _extract_yen_min_nearby(lines, i, look_ahead=3)
+        if re.search(r'消費税[等額]', line) and _rate_context and '対象' not in line:
+            val = _extract_yen_min_nearby(lines, i, look_ahead=5)
             if val is not None:
                 taxes.append({'rate': _rate_context, 'label': '内消費税等', 'amount': val})
             _rate_context = None
@@ -163,7 +187,12 @@ def _extract_financial_totals(text: str) -> dict:
             if val is not None:
                 result['subtotal'] = val
 
-        if (re.search(r'合\s*計', line) or re.match(r'^計$', line)) and not re.search(r'税\s*合\s*計', line) and '対象' not in line:
+        is_total_line = re.search(r'合\s*計', line)
+        if not is_total_line and re.match(r'^計$', line) and i > 0:
+            prev_context = ' '.join(l.strip() for l in lines[max(0, i - 3):i])
+            if '合' in prev_context or '税' in prev_context or '対象' in prev_context:
+                is_total_line = True
+        if is_total_line and not re.search(r'税\s*合\s*計', line) and '対象' not in line:
             val_max = _extract_yen_max_nearby(lines, i, look_ahead=5)
             val_first = _extract_yen_nearby(lines, i, look_ahead=3)
             if val_max is not None:
@@ -197,6 +226,35 @@ def _extract_financial_totals(text: str) -> dict:
             val = _extract_yen_nearby(lines, i)
             if val is not None:
                 taxes.append({'rate': 'unknown', 'label': '税合計', 'amount': val})
+
+        # Handle standalone "内税" line with ¥ value (e.g. "内税 ¥9,061")
+        if re.match(r'^内税$', line) and '対象' not in line:
+            val = _extract_yen_nearby(lines, i)
+            if val is not None and not taxes:
+                rate = _rate_context or 'unknown'
+                taxes.append({'rate': rate, 'label': '内税', 'amount': val})
+
+        # Handle inline "消費税等 (rate%) amount円" patterns (single or multi-line)
+        m_inline_tax = re.search(r'消費税[等額]?\s*\(?\s*(\d+(?:\.\d+)?)\s*%\s*\)?\s*(\d[\d,]*)\s*円', line)
+        if m_inline_tax:
+            rate_str = str(int(float(m_inline_tax.group(1)))) + '%'
+            tax_val = float(m_inline_tax.group(2).replace(',', ''))
+            taxes.append({'rate': rate_str, 'label': '内消費税等', 'amount': tax_val})
+        elif re.search(r'消費税[等額]?\s*\(?\s*\d+(?:\.\d+)?\s*%\s*\)?', line):
+            # Rate on this line, amount on next line (e.g. "消費税等 (10.00%)\n438円)")
+            rate_m = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
+            if rate_m and i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                amt_m = re.match(r'^(\d[\d,]*)\s*円[)）]?\s*$', next_line)
+                if amt_m:
+                    rate_str = str(int(float(rate_m.group(1)))) + '%'
+                    tax_val = float(amt_m.group(1).replace(',', ''))
+                    taxes.append({'rate': rate_str, 'label': '内消費税等', 'amount': tax_val})
+
+    # Sanity check: remove tax entries where amount >= total (clearly wrong)
+    total = result.get('total')
+    if taxes and total:
+        taxes = [t for t in taxes if t['amount'] < total]
 
     if taxes:
         result['taxes'] = taxes
@@ -237,7 +295,7 @@ def _extract_rate_bases(text: str) -> dict[str, float | None]:
     return bases
 
 
-def _find_subset_sum(items, target, max_k=3, tolerance=1.0):
+def _find_subset_sum(items, target, max_k=3, tolerance=5.0):
     from itertools import combinations
     for k in range(1, min(max_k + 1, len(items) + 1)):
         for combo in combinations(items, k):
@@ -289,10 +347,10 @@ def _assign_tax_categories(items, unified_text, ocr_totals, rate_bases):
         for line in ocr_lines:
             if desc_prefix not in line:
                 continue
-            if re.search(r'[※X\*軽]', line):
-                item_rates[idx] = "8%"
             if '除' in line:
                 item_rates[idx] = "10%"
+            elif re.search(r'[※X\*軽]', line):
+                item_rates[idx] = "8%"
             break
 
     for idx, item in enumerate(items):
@@ -322,14 +380,24 @@ def _assign_tax_categories(items, unified_text, ocr_totals, rate_bases):
 
     subset_matched = False
     if minority_rate and unassigned:
-        minority_base = rate_bases.get(minority_rate)
-        if minority_base is not None:
-            unassigned_items = [(i, items[i].get("total", 0)) for i in unassigned]
-            match = _find_subset_sum(unassigned_items, minority_base)
+        unassigned_items = [(i, items[i].get("total", 0)) for i in unassigned]
+        # Try both rate bases — the minority base is more selective (fewer items)
+        for try_rate in [minority_rate, majority_rate]:
+            try_base = rate_bases.get(try_rate)
+            if try_base is None:
+                continue
+            # Use larger tolerance for tax-category subset matching (tax rounding, discounts)
+            match = _find_subset_sum(unassigned_items, try_base, tolerance=50.0)
             if match is not None:
+                other_rate = minority_rate if try_rate == majority_rate else majority_rate
                 subset_matched = True
                 for i in match:
-                    item_rates[i] = minority_rate
+                    item_rates[i] = try_rate
+                # Assign remaining to the other rate
+                for i in unassigned:
+                    if i not in item_rates:
+                        item_rates[i] = other_rate
+                break
 
     if subset_matched:
         default_rate = majority_rate
@@ -499,19 +567,35 @@ def process_document(
 
     if "error" not in extracted:
         extracted["document_type"] = doc_type
+        # Type safety: ensure financial values are numeric
+        for fkey in ("total", "subtotal"):
+            v = extracted.get(fkey)
+            if v is not None:
+                try:
+                    extracted[fkey] = float(v)
+                except (TypeError, ValueError):
+                    extracted[fkey] = None
 
     # ── Receipt post-processing ──
     if doc_type == "receipt" and "error" not in extracted:
         # 4.5: Financial totals override
+        # Sanity check: OCR subtotal should be plausible (not an item price)
+        ocr_total_val = ocr_totals.get("total")
         if "subtotal" in ocr_totals:
-            extracted["subtotal"] = ocr_totals["subtotal"]
+            ocr_sub_val = ocr_totals["subtotal"]
+            if ocr_total_val and ocr_sub_val < ocr_total_val * 0.5:
+                del ocr_totals["subtotal"]  # Too low — likely an item price, not subtotal
+            else:
+                extracted["subtotal"] = ocr_sub_val
         if "total" in ocr_totals:
-            ocr_total = ocr_totals["total"]
-            ocr_first = ocr_totals.get("total_first")
-            ocr_sub = ocr_totals.get("subtotal")
+            ocr_total = float(ocr_totals["total"])
+            ocr_first = float(ocr_totals["total_first"]) if ocr_totals.get("total_first") is not None else None
+            ocr_sub = float(ocr_totals["subtotal"]) if ocr_totals.get("subtotal") is not None else None
             # If max is way higher than subtotal, it's likely a tender amount.
-            # Prefer first value (which is closer to 合計) in that case.
-            if ocr_sub and ocr_total > ocr_sub * 2:
+            # If total < subtotal, it's likely a tax amount, not the total.
+            if ocr_sub and ocr_total < ocr_sub:
+                pass  # Don't override — OCR total is suspect (tax/other amount)
+            elif ocr_sub and ocr_total > ocr_sub * 2:
                 # OCR max is way too high (likely tender amount)
                 if ocr_first and ocr_first <= ocr_sub * 1.15:
                     extracted["total"] = ocr_first
@@ -539,6 +623,8 @@ def process_document(
         western = re.search(r'(20\d{2})\s*年\s*0?(\d{1,2})\s*月\s*0?(\d{1,2})\s*日', unified_text)
         if not western:
             western = re.search(r'(20\d{2})/\s*(\d{1,2})/\s*(\d{1,2})', unified_text)
+        if not western:
+            western = re.search(r'(20\d{2})-(\d{1,2})-(\d{1,2})', unified_text)
         if western:
             year = int(western.group(1))
             if 2010 <= year <= 2019:
@@ -563,14 +649,60 @@ def process_document(
             has_cash = True
         if not has_cash and '現金' in unified_text:
             has_cash = True
+        # Strong cash evidence: tender + change labels present
+        change_m = re.search(r'(?:お釣り|お釣銭|釣銭|おつり|釣\s*[¥￥])\s*[¥￥]?\s*([\d,]+)', unified_text)
+        change_amount = float(change_m.group(1).replace(',', '')) if change_m else -1
+        has_tender = bool(re.search(r'お預り|お預り金|預\s*[¥￥]', unified_text))
+        has_change_label = bool(re.search(r'釣', unified_text))
+        # Strong if: tender + change labels both present AND change isn't explicitly ¥0
+        strong_cash = has_cash and has_tender and has_change_label and change_amount != 0
+
         if has_cash:
             existing = extracted.get("payment_method")
-            if not existing or existing == "cash":
+            # Override electronic payments only with strong evidence (non-zero change)
+            if strong_cash:
+                extracted["payment_method"] = "cash"
+            elif not existing or existing == "cash":
                 extracted["payment_method"] = "cash"
         elif extracted.get("payment_method") == "cash":
             is_printed = any(kw in unified_text for kw in ['小計', '合計', '対象', '税率'])
             if is_printed:
                 extracted["payment_method"] = None
+
+        # 4.7b: Fallback — if total exists but 0 line items, try to create from OCR
+        if not extracted.get("line_items") and extracted.get("total"):
+            # Look for 部門 NNN pattern (department-coded items in small shops)
+            dept_m = re.search(r'部門\s*(\d+)\s*', unified_text)
+            if dept_m:
+                extracted["line_items"] = [{
+                    "description": f"部門{dept_m.group(1).strip()}",
+                    "qty": 1,
+                    "unit_price": extracted["total"],
+                    "total": extracted["total"],
+                    "tax_category": "0%",
+                    "discount": 0,
+                    "discount_rate": "",
+                }]
+
+        # 4.7c: Remove zero-total line items (LLM hallucinations)
+        if extracted.get("line_items"):
+            extracted["line_items"] = [
+                item for item in extracted["line_items"]
+                if isinstance(item, dict) and (
+                    item.get("total", 0) > 0 or
+                    (item.get("unit_price") is not None and item.get("unit_price") > 0)
+                )
+            ]
+
+        # 4.7d: Handwritten receipt guard — remove spurious single item that equals total
+        # Handwritten receipts (領収証) have only a total, no itemized list.
+        # The LLM sometimes creates a single line item duplicating the total.
+        is_handwritten = not any(kw in unified_text for kw in ['小計', '合計', '対象', '税率'])
+        if is_handwritten and extracted.get("line_items") and extracted.get("total"):
+            items = extracted["line_items"]
+            if len(items) == 1 and isinstance(items[0], dict):
+                if abs(items[0].get("total", 0) - extracted["total"]) < 1:
+                    extracted["line_items"] = []
 
         # 4.8: Qty hallucination fix
         if extracted.get("line_items"):
@@ -707,16 +839,79 @@ def process_document(
         if points is not None:
             extracted["points_used"] = points
 
+        # 4.12: Fix pre-tax item totals for inclusive-tax receipts
+        # If sum of items != subtotal/total but items appear to be pre-tax amounts, fix them
+        if extracted.get("line_items") and extracted.get("total"):
+            item_sum = sum(i.get("total", 0) for i in extracted["line_items"] if isinstance(i, dict))
+            receipt_total = extracted["total"]
+            receipt_subtotal = extracted.get("subtotal") or receipt_total
+            # If items sum to a pre-tax amount that matches total/(1+rate), fix to match total
+            items_fixed = False
+            if len(extracted["line_items"]) == 1 and abs(item_sum - receipt_total) > 1:
+                item = extracted["line_items"][0]
+                if isinstance(item, dict) and abs(item_sum * 1.10 - receipt_total) < 2:
+                    item["total"] = receipt_total
+                    if item.get("unit_price") and abs(item["unit_price"] - item_sum) < 1:
+                        item["unit_price"] = receipt_total
+                    items_fixed = True
+                elif isinstance(item, dict) and abs(item_sum * 1.08 - receipt_total) < 2:
+                    item["total"] = receipt_total
+                    if item.get("unit_price") and abs(item["unit_price"] - item_sum) < 1:
+                        item["unit_price"] = receipt_total
+                    items_fixed = True
+
+            # Recompute subtotal from corrected items
+            if items_fixed:
+                extracted["subtotal"] = sum(
+                    i.get("total", 0) for i in extracted["line_items"] if isinstance(i, dict)
+                )
+
+        # 4.13: Default subtotal = total for receipts when not found
+        if extracted.get("subtotal") is None and extracted.get("total") is not None:
+            extracted["subtotal"] = extracted["total"]
+
     # ── Utility bill post-processing ──
     elif doc_type == "utility_bill" and "error" not in extracted:
-        if re.search(r'口座引落|口座振替|振替させて', unified_text):
-            extracted["payment_method"] = "bank_payment"
-        elif re.search(r'領入済|コンビニ|収納済', unified_text):
+        # Check for convenience store payment evidence (overrides bank_payment)
+        paid_at_store = bool(re.search(
+            r'ローソン|セブン|ファミリーマート|コンビニ|収納代行|領収.*いたしました',
+            unified_text,
+        ))
+        if paid_at_store:
             extracted["payment_method"] = "cash"
+        elif re.search(r'口座引落|口座振替|振替させて', unified_text):
+            extracted["payment_method"] = "bank_payment"
+        elif re.search(r'領入済|収納済', unified_text):
+            extracted["payment_method"] = "cash"
+
+        # Service type: bills with both 水道 and 下水道 are water bills
+        if extracted.get("service_type") == "sewage" and re.search(r'水道', unified_text):
+            # Only override if 水道 appears (not just 下水道)
+            water_hits = len(re.findall(r'水道', unified_text))
+            sewage_hits = len(re.findall(r'下水道', unified_text))
+            if water_hits > sewage_hits:
+                extracted["service_type"] = "water"
+
+        # Date: prefer 領収日付 stamp date (often formatted as 'YY.M.D)
+        ryoshu_date = re.search(r"領収日付[:\s]*'?(\d{2})\.(\d{1,2})\.(\d{1,2})", unified_text)
+        if not ryoshu_date:
+            # OCR often fragments labels — look for the date pattern directly
+            ryoshu_date = re.search(r"'(\d{2})\.(\d{1,2})\.(\d{1,2})", unified_text)
+        if ryoshu_date:
+            y = int(ryoshu_date.group(1))
+            year = 2000 + y if y < 100 else y
+            extracted["date"] = f"{year:04d}-{int(ryoshu_date.group(2)):02d}-{int(ryoshu_date.group(3)):02d}"
 
     # ── Universal cash detection (all document types) ──
     if "error" not in extracted and not extracted.get("payment_method"):
         if re.search(r'領収証|領収書', unified_text) and not re.search(r'小計|合計|対象|税率', unified_text):
+            extracted["payment_method"] = "cash"
+
+    # ── Final cash fallback: tender + change labels present but payment still unset ──
+    if "error" not in extracted and not extracted.get("payment_method"):
+        has_tender_label = bool(re.search(r'お預り', unified_text))
+        has_change_label_final = bool(re.search(r'釣', unified_text))
+        if has_tender_label and has_change_label_final:
             extracted["payment_method"] = "cash"
 
     # ── Common post-processing ──
