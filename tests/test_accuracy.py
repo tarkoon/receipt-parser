@@ -1,0 +1,129 @@
+"""Accuracy tests — field checks against cached pipeline results and OCR variants.
+
+Auto-discovers:
+1. Image fixtures: tests/fixtures/receipt_N.jpg + receipt_N_truth.json (cached OCR)
+2. OCR variants: tests/ocr_variants/receipt_N_vM.txt (injected text, skips OCR)
+
+Run with:
+    python -m pytest tests/test_accuracy.py -v
+    python -m pytest tests/test_accuracy.py -v --json-report --json-report-file=tests/results/accuracy/latest.json
+"""
+
+import json
+import os
+import re
+from pathlib import Path
+
+import pytest
+
+FIXTURES = Path(__file__).parent / "fixtures"
+VARIANTS = Path(__file__).parent / "ocr_variants"
+
+# Skip if Cloud Vision is not configured (needed for image fixtures)
+_cv_available = True
+try:
+    if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
+        _cv_available = False
+    else:
+        from receipt_parser.ocr import init_cloud_vision
+        init_cloud_vision()
+except Exception:
+    _cv_available = False
+
+
+# ---------------------------------------------------------------------------
+# Fixture discovery
+# ---------------------------------------------------------------------------
+
+def _find_image(base: str) -> Path | None:
+    for ext in (".jpg", ".jpeg", ".png", ".pdf", ".tiff", ".bmp"):
+        candidate = FIXTURES / f"{base}{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _extract_base_name(variant_stem: str) -> str:
+    """receipt_14_v1 -> receipt_14, receipt_1_v3 -> receipt_1."""
+    return re.sub(r'_v\d+$', '', variant_stem)
+
+
+def _discover_test_cases():
+    cases = []
+
+    # Image fixtures (process_document with cached OCR)
+    if _cv_available:
+        for truth_file in sorted(FIXTURES.glob("*_truth.json")):
+            if truth_file.name == "_truth_template.json":
+                continue
+            base = truth_file.stem.replace("_truth", "")
+            image = _find_image(base)
+            if not image:
+                continue
+            truth = json.loads(truth_file.read_text(encoding="utf-8"))
+            cases.append((base, {"type": "image", "path": image}, truth))
+
+    # OCR variant fixtures (process_ocr_text, skip OCR)
+    if VARIANTS.exists():
+        for variant_file in sorted(VARIANTS.glob("*.txt")):
+            stem = variant_file.stem
+            base = _extract_base_name(stem)
+            truth_file = FIXTURES / f"{base}_truth.json"
+            if not truth_file.exists():
+                continue
+            truth = json.loads(truth_file.read_text(encoding="utf-8"))
+            cases.append((stem, {"type": "ocr_text", "path": variant_file}, truth))
+
+    return cases
+
+
+_CASES = _discover_test_cases()
+_CASE_IDS = [c[0] for c in _CASES]
+_RESULTS_CACHE: dict[str, dict] = {}
+
+# Collect check results for summary plugin
+_check_results: list[dict] = []
+
+
+def _get_result(case_id: str, source: dict) -> dict:
+    if case_id not in _RESULTS_CACHE:
+        if source["type"] == "image":
+            from receipt_parser.pipeline import process_document
+            _RESULTS_CACHE[case_id] = process_document(
+                source["path"], passes=3, apply_user_rules=False,
+            )
+        else:
+            from receipt_parser.pipeline import process_ocr_text
+            ocr_text = source["path"].read_text(encoding="utf-8")
+            _RESULTS_CACHE[case_id] = process_ocr_text(
+                ocr_text, passes=3, apply_user_rules=False,
+            )
+    return _RESULTS_CACHE[case_id]
+
+
+# ---------------------------------------------------------------------------
+# Parametrized test
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name,source,truth", _CASES, ids=_CASE_IDS)
+def test_fields(name, source, truth):
+    """Run all applicable field checks for this fixture/variant."""
+    from receipt_parser.checks import get_checks_for
+
+    result = _get_result(name, source)
+    checks = get_checks_for(truth)
+    failures = []
+    for field_name, check_fn in checks.items():
+        check_result = check_fn(result, truth)
+        # Record for summary
+        _check_results.append({
+            "fixture": name,
+            "field": field_name,
+            "pass": check_result["pass"],
+            "detail": check_result.get("detail", ""),
+            "source_type": source["type"],
+        })
+        if not check_result["pass"]:
+            failures.append(f"{field_name}: {check_result.get('detail', 'failed')}")
+
+    assert not failures, "Failed checks:\n" + "\n".join(f"  - {f}" for f in failures)

@@ -15,7 +15,7 @@ import numpy as np
 
 from .schema import Receipt, VALID_TAX_RATES, REDUCED_RATE, STANDARD_RATE
 from .preprocess import load_image, try_extract_text_layer
-from .ocr import init_cloud_vision, run_cloud_vision, blocks_to_structured_text, compute_ocr_confidence
+from .ocr import init_cloud_vision, run_cloud_vision, blocks_to_structured_text, compute_ocr_confidence, OCRResult
 from .llm import check_model_available, extract_with_verification, DEFAULT_MODEL
 from .validation import validate_receipt
 from .normalize import (normalize_fullwidth, clean_handwritten_ocr, strip_barcode_lines,
@@ -92,17 +92,17 @@ def _extract_points_used(text: str) -> float | None:
     return None
 
 
-# ── User Merchant Mapping ────────────────────────────────────────────
+# ── Merchant Mapping ─────────────────────────────────────────────────
 
-_USER_RULES_PATH = Path(__file__).parent / "merchant_rules.json"
+_MERCHANT_RULES_PATH = Path(__file__).parent / "merchant_rules.json"
 
 
 def _apply_merchant_mapping(result: dict) -> dict:
-    """Apply user_rules.json merchant alias mapping."""
-    if not _USER_RULES_PATH.exists():
+    """Apply merchant_rules.json merchant alias mapping."""
+    if not _MERCHANT_RULES_PATH.exists():
         return result
     try:
-        rules = json.loads(_USER_RULES_PATH.read_text(encoding="utf-8"))
+        rules = json.loads(_MERCHANT_RULES_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return result
 
@@ -570,10 +570,13 @@ def _compute_posthoc_confidence(extracted: dict, warnings: list[str]) -> dict:
 # ── Result Builder ───────────────────────────────────────────────────
 
 def _build_result(receipt, final_warnings, pass_history, model, debug=False, trace=None,
-                   ocr_confidence=None, llm_confidence=None):
+                   ocr_confidence=None, llm_confidence=None,
+                   ocr_source=None, ocr_retried=None, ocr_retry_reason=None,
+                   ocr_text=None):
     result = receipt.model_dump()
     result["_warnings"] = final_warnings
     result["_pass_count"] = len(pass_history)
+    result["_pass_history"] = pass_history
     result["_model"] = model
     result["_pipeline_version"] = "3.0.0"
     line_item_warnings = [w for w in final_warnings if "Line " in w]
@@ -582,10 +585,17 @@ def _build_result(receipt, final_warnings, pass_history, model, debug=False, tra
         result["_ocr_confidence"] = round(ocr_confidence, 4)
     if llm_confidence is not None:
         result["_llm_confidence"] = llm_confidence
+    if ocr_source is not None:
+        result["_ocr_source"] = ocr_source
+    if ocr_retried is not None:
+        result["_ocr_retried"] = ocr_retried
+    if ocr_retry_reason is not None:
+        result["_ocr_retry_reason"] = ocr_retry_reason
+    if ocr_text is not None:
+        result["_ocr_text"] = ocr_text
     if debug and trace:
         result["_debug_dir"] = str(trace.debug_dir)
         result["_trace"] = trace.summary()
-        result["_pass_history"] = pass_history
     return result
 
 
@@ -598,6 +608,8 @@ def process_document(
     passes: int = 1,
     ocr_engine=None,
     apply_user_rules: bool = True,
+    skip_ocr_cache: bool = False,
+    **kwargs,
 ) -> dict:
     """Main pipeline. Uses Cloud Vision OCR + LLM extraction (OpenRouter or Ollama)."""
     file_path = Path(file_path)
@@ -663,19 +675,21 @@ def process_document(
         ocr_engine = init_cloud_vision()
 
     # Step 3: OCR per page, concatenate
-    all_ocr_blocks = []
+    all_ocr_results: list[OCRResult] = []
     text_parts = []
 
     for i, page_img in enumerate(images):
-        blocks = run_cloud_vision(page_img, ocr_engine)
-        all_ocr_blocks.append(blocks)
+        ocr_result = run_cloud_vision(page_img, ocr_engine, skip_cache=skip_ocr_cache)
+        all_ocr_results.append(ocr_result)
+        blocks = ocr_result.blocks
 
         if len(blocks) < 3:
             rotated = cv2.rotate(page_img, cv2.ROTATE_90_CLOCKWISE)
-            rotated_blocks = run_cloud_vision(rotated, ocr_engine)
-            if len(rotated_blocks) > len(blocks):
-                blocks = rotated_blocks
-                all_ocr_blocks[-1] = blocks
+            rotated_result = run_cloud_vision(rotated, ocr_engine, skip_cache=skip_ocr_cache)
+            if len(rotated_result.blocks) > len(blocks):
+                ocr_result = rotated_result
+                blocks = ocr_result.blocks
+                all_ocr_results[-1] = ocr_result
 
         if debug:
             assert debug_dir is not None
@@ -691,7 +705,7 @@ def process_document(
     unified_text = strip_barcode_lines(unified_text)
 
     # Compute aggregate OCR confidence
-    all_blocks_flat = [b for page_blocks in all_ocr_blocks for b in page_blocks]
+    all_blocks_flat = [b for r in all_ocr_results for b in r.blocks]
     ocr_conf = compute_ocr_confidence(all_blocks_flat)
 
     # Step 0: Detect document type
@@ -1190,11 +1204,94 @@ def process_document(
 
     if debug and images:
         assert debug_dir is not None
-        draw_field_overlay(images[0], all_ocr_blocks[0], extracted, debug_dir / "10_field_overlay.png")
+        draw_field_overlay(images[0], all_ocr_results[0].blocks, extracted, debug_dir / "10_field_overlay.png")
         (debug_dir / "pipeline_trace.txt").write_text(trace.summary())
 
-    result = _build_result(receipt, final_warnings, pass_history, model, debug=debug, trace=trace,
-                           ocr_confidence=ocr_conf, llm_confidence=posthoc_conf)
+    # Aggregate OCR metadata from first page result
+    primary_ocr = all_ocr_results[0] if all_ocr_results else None
+    result = _build_result(
+        receipt, final_warnings, pass_history, model, debug=debug, trace=trace,
+        ocr_confidence=ocr_conf, llm_confidence=posthoc_conf,
+        ocr_source=primary_ocr.source if primary_ocr else None,
+        ocr_retried=primary_ocr.retried if primary_ocr else None,
+        ocr_retry_reason=primary_ocr.retry_reason if primary_ocr else None,
+        ocr_text=primary_ocr.chosen_text if primary_ocr else None,
+    )
+    if apply_user_rules:
+        result = _apply_merchant_mapping(result)
+    return result
+
+
+# ── OCR Text Entry Point ──────────────────────────────────────────────
+
+def process_ocr_text(
+    ocr_text: str,
+    model: str = DEFAULT_MODEL,
+    passes: int = 1,
+    apply_user_rules: bool = True,
+) -> dict:
+    """Run the pipeline from OCR text onwards (skip image loading + OCR).
+
+    Used for:
+    - Testing against saved OCR variants (regression tests)
+    - Debugging with specific OCR output
+    - Benchmarking LLM extraction independently of OCR variance
+    """
+    check_model_available(model)
+
+    # Normalize text
+    unified_text = normalize_fullwidth(ocr_text)
+    unified_text = strip_barcode_lines(unified_text)
+
+    # Detect document type
+    doc_type = detect_document_type(unified_text)
+
+    # Receipt-specific pre-processing
+    ocr_conf = 0.9  # default confidence for injected text
+    ocr_totals = {}
+    if doc_type == "receipt":
+        ocr_totals = _extract_financial_totals(unified_text)
+        unified_text = rejoin_price_lines(unified_text)
+        unified_text = clean_handwritten_ocr(unified_text, ocr_confidence=ocr_conf)
+
+    if not unified_text.strip():
+        return {
+            "_error": "OCR text is empty.",
+            "_warnings": [], "_pass_count": 0, "_model": model,
+            "_pipeline_version": "3.0.0", "_line_items_reliable": False,
+        }
+
+    # LLM extraction with verification
+    extracted, pass_history = extract_with_verification(
+        unified_text, model=model, passes=passes,
+        validate_fn=validate_receipt, doc_type=doc_type,
+    )
+
+    if "error" not in extracted:
+        extracted["document_type"] = doc_type
+        for fkey in ("total", "subtotal"):
+            v = extracted.get(fkey)
+            if v is not None:
+                try:
+                    extracted[fkey] = float(v)
+                except (TypeError, ValueError):
+                    extracted[fkey] = None
+
+    # Strip _confidence if present
+    extracted.pop("_confidence", None)
+
+    # Final validation
+    try:
+        receipt = Receipt(**extracted)
+    except Exception:
+        receipt = Receipt()
+    final_warnings = validate_receipt(receipt)
+
+    result = _build_result(
+        receipt, final_warnings, pass_history, model,
+        ocr_confidence=ocr_conf, ocr_source="injected",
+        ocr_text=ocr_text,
+    )
     if apply_user_rules:
         result = _apply_merchant_mapping(result)
     return result

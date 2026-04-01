@@ -13,7 +13,7 @@ from receipt_parser.schema import Receipt, generate_extraction_prompt, get_debug
 from receipt_parser.llm import get_ollama_schema, _extract_confidence
 from receipt_parser.validation import validate_receipt
 from receipt_parser.normalize import normalize_fullwidth, clean_handwritten_ocr
-from receipt_parser.ocr import compute_ocr_confidence
+from receipt_parser.ocr import compute_ocr_confidence, OCRResult
 
 
 # --- Normalization tests ---
@@ -238,12 +238,16 @@ def test_receipt_instantiation():
 def test_pipeline_with_mocked_inference(mock_check, mock_init_cv, mock_ocr, mock_extract):
     mock_check.return_value = None
     mock_init_cv.return_value = MagicMock()
-    mock_ocr.return_value = [
+    mock_blocks = [
         {"text": "セブンイレブン", "confidence": 0.95, "x": 100, "y": 10,
          "bbox": [[0, 0], [200, 0], [200, 20], [0, 20]]},
         {"text": "合計 ¥150", "confidence": 0.92, "x": 100, "y": 50,
          "bbox": [[0, 40], [200, 40], [200, 60], [0, 60]]},
     ]
+    mock_ocr.return_value = OCRResult(
+        blocks=mock_blocks, confidence=0.93, source="fresh",
+        chosen_text="セブンイレブン\n合計 ¥150",
+    )
     mock_extract.return_value = (
         {"merchant": "セブンイレブン", "total": 150, "line_items": [],
          "taxes": [], "subtotal": None, "date": None, "currency": "JPY",
@@ -275,7 +279,7 @@ def test_pipeline_with_mocked_inference(mock_check, mock_init_cv, mock_ocr, mock
 def test_pipeline_blank_image_returns_error(mock_check, mock_init_cv, mock_ocr):
     mock_check.return_value = None
     mock_init_cv.return_value = MagicMock()
-    mock_ocr.return_value = []
+    mock_ocr.return_value = OCRResult(source="fresh")
 
     img = np.zeros((100, 200, 3), dtype=np.uint8)
     tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)

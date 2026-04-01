@@ -6,6 +6,8 @@ import re
 import signal
 import platform
 import threading
+import time
+from dataclasses import dataclass
 
 import ollama as ollama_client
 from .schema import Receipt, generate_extraction_prompt, generate_verification_prompt
@@ -14,6 +16,18 @@ OLLAMA_TIMEOUT_SECONDS = 180
 DEFAULT_MODEL = "deepseek-chat"
 OLLAMA_PREFIX = "ollama/"
 _LLM_SEED = 42  # Fixed seed for deterministic output
+
+
+@dataclass
+class LLMResult:
+    """Structured result from _llm_chat()."""
+    content: str = ""
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    eval_duration_ns: int | None = None
+    total_duration_ns: int | None = None
+    load_duration_ns: int | None = None
+    backend: str = "unknown"  # "api" or "ollama"
 
 
 def _is_ollama_model(model: str) -> bool:
@@ -216,9 +230,10 @@ def _openrouter_chat(
     messages: list,
     temperature: float = 0.0,
     max_tokens: int = 4096,
-) -> str:
-    """Call DeepSeek/OpenRouter API and return the response content."""
+) -> LLMResult:
+    """Call DeepSeek/OpenRouter API and return structured result."""
     client = _get_api_client()
+    t0 = time.perf_counter()
     response = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -227,7 +242,16 @@ def _openrouter_chat(
         max_tokens=max_tokens,
         seed=_LLM_SEED,
     )
-    return response.choices[0].message.content
+    elapsed_ns = int((time.perf_counter() - t0) * 1e9)
+    usage = response.usage
+    return LLMResult(
+        content=response.choices[0].message.content,
+        input_tokens=usage.prompt_tokens if usage else None,
+        output_tokens=usage.completion_tokens if usage else None,
+        eval_duration_ns=elapsed_ns,
+        total_duration_ns=elapsed_ns,
+        backend="api",
+    )
 
 
 def _instructor_extract(
@@ -323,7 +347,7 @@ def _llm_chat(
     schema: dict,
     temperature: float = 0.0,
     max_tokens: int = 4096,
-) -> str:
+) -> LLMResult:
     """Unified LLM chat — dispatches to Ollama or OpenRouter."""
     if _is_ollama_model(model):
         response = _ollama_chat_with_timeout(
@@ -334,7 +358,15 @@ def _llm_chat(
             think=False,
             keep_alive="60m",
         )
-        return response["message"]["content"]
+        return LLMResult(
+            content=response["message"]["content"],
+            input_tokens=response.get("prompt_eval_count"),
+            output_tokens=response.get("eval_count"),
+            eval_duration_ns=response.get("eval_duration"),
+            total_duration_ns=response.get("total_duration"),
+            load_duration_ns=response.get("load_duration"),
+            backend="ollama",
+        )
     else:
         return _openrouter_chat(model, messages, temperature, max_tokens)
 
@@ -346,8 +378,10 @@ def extract_with_llm(
     model: str = DEFAULT_MODEL,
     doc_type: str = "receipt",
     use_instructor: bool = False,
-) -> dict:
+) -> tuple[dict, LLMResult | None]:
     """Single-pass extraction with structured output enforcement.
+
+    Returns (parsed_dict, llm_result) where llm_result contains timing metadata.
 
     Args:
         use_instructor: If True and available, use instructor for Pydantic-native
@@ -359,15 +393,29 @@ def extract_with_llm(
     if use_instructor and not _is_ollama_model(model):
         receipt = _instructor_extract(model=model, messages=messages)
         if receipt is not None:
-            return receipt.model_dump()
+            return receipt.model_dump(), None
 
-    raw = _llm_chat(
+    llm_result = _llm_chat(
         model=model,
         messages=messages,
         schema=get_ollama_schema(),
     )
 
-    return _parse_llm_json(sanitize_llm_response(raw))
+    return _parse_llm_json(sanitize_llm_response(llm_result.content)), llm_result
+
+
+def _llm_result_to_timing(result: LLMResult | None) -> dict | None:
+    """Convert LLMResult to a serializable timing dict for pass history."""
+    if result is None:
+        return None
+    return {
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "eval_duration_ns": result.eval_duration_ns,
+        "total_duration_ns": result.total_duration_ns,
+        "load_duration_ns": result.load_duration_ns,
+        "backend": result.backend,
+    }
 
 
 def extract_with_verification(
@@ -381,7 +429,7 @@ def extract_with_verification(
     passes = max(1, passes)
     history = []
 
-    extracted = extract_with_llm(ocr_text, model=model, doc_type=doc_type)
+    extracted, llm_result = extract_with_llm(ocr_text, model=model, doc_type=doc_type)
     warnings = []
     if validate_fn and "error" not in extracted:
         try:
@@ -390,7 +438,10 @@ def extract_with_verification(
         except Exception:
             warnings = ["Schema validation failed on pass 1"]
 
-    history.append({"pass": 1, "extraction": extracted, "warnings": warnings})
+    history.append({
+        "pass": 1, "extraction": extracted, "warnings": warnings,
+        "llm_timing": _llm_result_to_timing(llm_result),
+    })
 
     for pass_num in range(2, passes + 1):
         if not warnings:
@@ -402,13 +453,13 @@ def extract_with_verification(
             validation_warnings=warnings,
         )
 
-        raw = _llm_chat(
+        llm_result = _llm_chat(
             model=model,
             messages=[{"role": "user", "content": verification_prompt}],
             schema=get_ollama_schema(),
         )
 
-        raw = sanitize_llm_response(raw)
+        raw = sanitize_llm_response(llm_result.content)
         if raw.strip():
             extracted = _parse_llm_json(raw)
 
@@ -420,6 +471,9 @@ def extract_with_verification(
             except Exception:
                 warnings = [f"Schema validation failed on pass {pass_num}"]
 
-        history.append({"pass": pass_num, "extraction": extracted, "warnings": warnings})
+        history.append({
+            "pass": pass_num, "extraction": extracted, "warnings": warnings,
+            "llm_timing": _llm_result_to_timing(llm_result),
+        })
 
     return extracted, history

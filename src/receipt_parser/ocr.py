@@ -7,17 +7,33 @@ Returns blocks in the format:
 import json
 import os
 import re
+import threading
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+# ── OCR result dataclass ──────────────────────────────────────────────
+
+@dataclass
+class OCRResult:
+    """Structured result from run_cloud_vision()."""
+    blocks: list[dict] = field(default_factory=list)
+    confidence: float = 0.0
+    retried: bool = False
+    retry_reason: str | None = None
+    source: str = "unknown"      # "cache", "fresh", "digital_pdf"
+    chosen_text: str = ""
+
+
 # ── API call tracking ─────────────────────────────────────────────────
 
 _USAGE_FILE = Path(__file__).parent / ".cloud_vision_usage.json"
 _FREE_TIER_LIMIT = 1000
 _WARNING_THRESHOLD = 100  # Warn when within this many of the limit
+_usage_lock = threading.Lock()
 
 
 def _load_usage() -> dict:
@@ -39,9 +55,10 @@ def _save_usage(data: dict):
 
 def _track_api_call():
     """Increment the API call counter and warn if approaching the free tier limit."""
-    usage = _load_usage()
-    usage["calls"] += 1
-    _save_usage(usage)
+    with _usage_lock:
+        usage = _load_usage()
+        usage["calls"] += 1
+        _save_usage(usage)
 
     remaining = _FREE_TIER_LIMIT - usage["calls"]
     if remaining <= _WARNING_THRESHOLD and remaining > 0:
@@ -208,16 +225,6 @@ def _extract_fulltext_from_response(response) -> str | None:
     return response.text_annotations[0].description
 
 
-# ── OCR source tracking ──────────────────────────────────────────────
-
-_last_ocr_source: str = "unknown"  # "cache", "fresh", "digital_pdf", "unknown"
-
-
-def get_last_ocr_source() -> str:
-    """Return whether the last OCR result was from cache or a fresh API call."""
-    return _last_ocr_source
-
-
 _OCR_CACHE_DIR = Path(__file__).parent / ".ocr_cache"
 
 
@@ -267,8 +274,8 @@ def _pick_better_fulltext(ft1: str, ft2: str) -> str:
     return ft1
 
 
-def run_cloud_vision(image: np.ndarray, client=None) -> list[dict]:
-    """Run Google Cloud Vision OCR and return text blocks.
+def run_cloud_vision(image: np.ndarray, client=None, *, skip_cache: bool = False) -> OCRResult:
+    """Run Google Cloud Vision OCR and return structured result.
 
     Uses fulltext output which handles rotated images correctly.
     Caches results per image hash to avoid redundant API calls and
@@ -276,44 +283,65 @@ def run_cloud_vision(image: np.ndarray, client=None) -> list[dict]:
 
     Single-call by default. Makes a second call only if OCR confidence
     is below the retry threshold (0.75), cutting API usage ~50%.
-    """
-    global _last_ocr_source
 
-    # Check cache first
-    key = _ocr_cache_key(image)
-    cache_path = _OCR_CACHE_DIR / f"{key}.txt"
-    if cache_path.exists():
-        fulltext = cache_path.read_text(encoding="utf-8")
-        _last_ocr_source = "cache"
-        return _fulltext_to_blocks(fulltext)
+    Args:
+        skip_cache: If True, bypass cache read/write and always make fresh
+            API calls. Used by benchmarks to test OCR variance.
+    """
+    # Check cache first (unless skipping)
+    if not skip_cache:
+        key = _ocr_cache_key(image)
+        cache_path = _OCR_CACHE_DIR / f"{key}.txt"
+        if cache_path.exists():
+            fulltext = cache_path.read_text(encoding="utf-8")
+            blocks = _fulltext_to_blocks(fulltext)
+            return OCRResult(
+                blocks=blocks,
+                confidence=compute_ocr_confidence(blocks),
+                source="cache",
+                chosen_text=fulltext,
+            )
 
     if client is None:
         client = init_cloud_vision()
-
-    _last_ocr_source = "fresh"
 
     response1 = _call_cloud_vision(image, client)
     fulltext1 = _extract_fulltext_from_response(response1)
 
     if not fulltext1:
-        return []
+        return OCRResult(source="fresh")
 
     # Compute confidence from first call — retry only if low quality
     blocks1 = _extract_blocks_from_response(response1)
     confidence1 = compute_ocr_confidence(blocks1) if blocks1 else 0.0
 
     fulltext = fulltext1
+    retried = False
+    retry_reason = None
+
     if confidence1 < _OCR_CONFIDENCE_RETRY_THRESHOLD:
+        retried = True
+        retry_reason = f"confidence {confidence1:.3f} < {_OCR_CONFIDENCE_RETRY_THRESHOLD}"
         response2 = _call_cloud_vision(image, client)
         fulltext2 = _extract_fulltext_from_response(response2)
         if fulltext2:
             fulltext = _pick_better_fulltext(fulltext1, fulltext2)
 
-    # Save to cache
-    _OCR_CACHE_DIR.mkdir(exist_ok=True)
-    cache_path.write_text(fulltext, encoding="utf-8")
+    # Save to cache (unless skipping)
+    if not skip_cache:
+        _OCR_CACHE_DIR.mkdir(exist_ok=True)
+        cache_path = _OCR_CACHE_DIR / f"{_ocr_cache_key(image)}.txt"
+        cache_path.write_text(fulltext, encoding="utf-8")
 
-    return _fulltext_to_blocks(fulltext)
+    blocks = _fulltext_to_blocks(fulltext)
+    return OCRResult(
+        blocks=blocks,
+        confidence=compute_ocr_confidence(blocks),
+        retried=retried,
+        retry_reason=retry_reason,
+        source="fresh",
+        chosen_text=fulltext,
+    )
 
 
 # ── Shared text grouping ──────────────────────────────────────────────

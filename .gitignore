@@ -13,3 +13,4 @@ tmp*.jpg
 dist/
 build/
 .pytest_cache/
+tests/results/

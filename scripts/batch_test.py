@@ -31,7 +31,7 @@ for i, expr in enumerate(BATCHES, 1):
     log(f"{'='*60}")
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", "tests/test_integration.py",
+            [sys.executable, "-m", "pytest", "tests/test_accuracy.py",
              "-v", "--tb=line", "-k", expr],
             capture_output=True, text=True, timeout=1500,
         )

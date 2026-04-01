@@ -6,6 +6,33 @@
 ## Testing Rules
 - **NEVER modify truth/fixture files** (`*_truth.json`) without explicit permission from the user. Fix the pipeline to produce correct output — do not change the expected answers.
 
+## Running Tests & Benchmarks
+```bash
+# Unit + validation tests (fast, no API calls)
+python -m pytest tests/test_unit.py tests/test_validation.py -v
+
+# Accuracy tests (cached OCR, needs Cloud Vision configured)
+python -m pytest tests/test_accuracy.py -v
+
+# Accuracy tests with JSON report
+python -m pytest tests/test_accuracy.py -v --json-report --json-report-file=tests/results/accuracy/latest.json
+
+# Robustness benchmark (fresh OCR, multiple runs)
+python tests/benchmark.py --workers 4
+
+# Benchmark specific fixtures
+python tests/benchmark.py --fixtures receipt_14 receipt_29 --runs 5
+
+# CI mode (cached OCR, 1 run, exit non-zero on failure)
+python tests/benchmark.py --ci
+```
+
+## Project Structure
+- `src/receipt_parser/` — installable Python package (core pipeline)
+- `tests/` — pytest tests + benchmark + fixtures + OCR variants
+- `scripts/` — one-off utilities (benchmark_models.py, etc.)
+- `docs/` — planning documents
+
 ## Windows / Conda Environment
 - Always set `PYTHONIOENCODING=utf-8` when running Python commands (Japanese text breaks cp932 default)
 - Never rely on stdout for Japanese/non-ASCII output through `conda run` — write results to a UTF-8 file instead, then read the file

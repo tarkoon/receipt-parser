@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "pytest-json-report>=1.5"]
 
 [project.scripts]
 receipt-parser = "receipt_parser.cli:app"

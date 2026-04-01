@@ -1,8 +1,8 @@
 """benchmark_models.py -- Compare LLM models on receipt extraction accuracy and speed.
 
 Usage:
-    conda run -n financial-aid python benchmark_models.py --pull --runs 3
-    conda run -n financial-aid python benchmark_models.py --models qwen3.5:4b --fixtures 01_supermarket_receipt --runs 1
+    python scripts/benchmark_models.py --pull --runs 3
+    python scripts/benchmark_models.py --models qwen3.5:4b --fixtures receipt_1 --runs 1
 """
 
 import argparse
@@ -39,7 +39,7 @@ BENCHMARK_MODELS = [
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures"
 
 # ---------------------------------------------------------------------------
-# Fixture discovery (mirrors test_integration.py)
+# Fixture discovery
 # ---------------------------------------------------------------------------
 
 def discover_fixtures(names: list[str] | None = None) -> list[tuple[str, Path, dict]]:
@@ -63,7 +63,7 @@ def discover_fixtures(names: list[str] | None = None) -> list[tuple[str, Path, d
     return fixtures
 
 # ---------------------------------------------------------------------------
-# 9 field checks (same logic as test_integration.py)
+# Field checks (canonical versions in receipt_parser.checks)
 # ---------------------------------------------------------------------------
 
 def check_total(result: dict, truth: dict) -> dict:
@@ -219,7 +219,7 @@ FIELD_CHECKS = {
 }
 
 # ---------------------------------------------------------------------------
-# Instrumentation -- capture Ollama timing without modifying extraction.py
+# Instrumentation -- capture Ollama timing without modifying llm.py
 # ---------------------------------------------------------------------------
 
 _timing_collector: list[dict] = []
@@ -476,7 +476,7 @@ def run_benchmark(
 
     # Init OCR engine once
     try:
-        from ocr import init_cloud_vision
+        from receipt_parser.ocr import init_cloud_vision
         init_cloud_vision()
     except Exception as e:
         print(f"  WARNING: Cloud Vision init: {e} (will rely on OCR cache)")
