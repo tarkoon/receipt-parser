@@ -6,6 +6,11 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
+def pytest_addoption(parser):
+    parser.addoption("--workers", type=int, default=4,
+                     help="Concurrent fixture processing for accuracy tests (default: 4)")
+
+
 # ---------------------------------------------------------------------------
 # Accuracy summary plugin — prints per-field pass rates after test_accuracy
 # ---------------------------------------------------------------------------

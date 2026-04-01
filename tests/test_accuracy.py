@@ -12,6 +12,7 @@ Run with:
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pytest
@@ -85,20 +86,48 @@ _RESULTS_CACHE: dict[str, dict] = {}
 _check_results: list[dict] = []
 
 
+def _process_one(case_id: str, source: dict) -> tuple[str, dict]:
+    """Process a single fixture/variant. Thread-safe — each call is independent."""
+    if source["type"] == "image":
+        from receipt_parser.pipeline import process_document
+        result = process_document(source["path"], passes=3, apply_user_rules=False)
+    else:
+        from receipt_parser.pipeline import process_ocr_text
+        ocr_text = source["path"].read_text(encoding="utf-8")
+        result = process_ocr_text(ocr_text, passes=3, apply_user_rules=False)
+    return case_id, result
+
+
 def _get_result(case_id: str, source: dict) -> dict:
     if case_id not in _RESULTS_CACHE:
-        if source["type"] == "image":
-            from receipt_parser.pipeline import process_document
-            _RESULTS_CACHE[case_id] = process_document(
-                source["path"], passes=3, apply_user_rules=False,
-            )
-        else:
-            from receipt_parser.pipeline import process_ocr_text
-            ocr_text = source["path"].read_text(encoding="utf-8")
-            _RESULTS_CACHE[case_id] = process_ocr_text(
-                ocr_text, passes=3, apply_user_rules=False,
-            )
+        _, result = _process_one(case_id, source)
+        _RESULTS_CACHE[case_id] = result
     return _RESULTS_CACHE[case_id]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def preprocess_fixtures(request):
+    """Pre-process all fixtures concurrently before tests run."""
+    workers = request.config.getoption("--workers", default=4)
+    if workers <= 1 or not _CASES:
+        return
+
+    from receipt_parser.ocr import init_cloud_vision
+    # Warm up Cloud Vision client (shared across threads)
+    try:
+        init_cloud_vision()
+    except Exception:
+        return
+
+    print(f"\nPre-processing {len(_CASES)} fixtures with {workers} workers...")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_process_one, name, source): name
+            for name, source, _truth in _CASES
+        }
+        for future in as_completed(futures):
+            case_id, result = future.result()
+            _RESULTS_CACHE[case_id] = result
 
 
 # ---------------------------------------------------------------------------
