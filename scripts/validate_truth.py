@@ -248,7 +248,7 @@ def _validate_payment_slip(data: dict, errors: list, warnings: list):
 
 def discover_truth_files(search_all: bool = False) -> list[Path]:
     """Find all truth JSON files."""
-    project_root = Path(__file__).resolve().parent
+    project_root = Path(__file__).resolve().parent.parent
     files = []
 
     # Fixtures directory

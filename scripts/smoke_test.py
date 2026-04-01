@@ -1,8 +1,6 @@
 """Quick smoke test for schema, pipeline, and validation changes."""
-import sys
-sys.path.insert(0, '.')
 
-from schema import Document, Receipt, LineItem, TaxEntry, BillingPeriod, UsageData
+from receipt_parser.schema import Document, Receipt, LineItem, TaxEntry, BillingPeriod, UsageData
 
 # 1. Receipt alias
 assert Receipt is Document, 'Receipt should be alias for Document'
@@ -26,7 +24,7 @@ assert u.usage.cost_per is None
 print('  [OK] Schema models')
 
 # 4. Prompt generation per type
-from schema import generate_extraction_prompt, generate_verification_prompt
+from receipt_parser.schema import generate_extraction_prompt, generate_verification_prompt
 prompt_r = generate_extraction_prompt('test text', doc_type='receipt')
 prompt_u = generate_extraction_prompt('test text', doc_type='utility_bill')
 prompt_p = generate_extraction_prompt('test text', doc_type='payment_slip')
@@ -36,14 +34,14 @@ assert 'payment_slip' in prompt_p
 print('  [OK] Type-specific prompts')
 
 # 5. Document type detection
-from pipeline import detect_document_type
+from receipt_parser.pipeline import detect_document_type
 assert detect_document_type('小計 ¥1000 合計 ¥1100') == 'receipt'
 assert detect_document_type('ガス検針のお知らせ 使用量 15.2m3 ご請求額 基本料金') == 'utility_bill'
 assert detect_document_type('払込票受領証 受取人 依頼人') == 'payment_slip'
 print('  [OK] Document type detection')
 
 # 6. Type-aware validation
-from validation import validate_receipt
+from receipt_parser.validation import validate_receipt
 r2 = Document(document_type='receipt', total=1000, subtotal=900, taxes=[TaxEntry(rate='10%', amount=100)])
 assert len(validate_receipt(r2)) == 0
 
@@ -59,7 +57,7 @@ assert any('merchant' in w.lower() for w in warnings)
 print('  [OK] Type-aware validation')
 
 # 7. Merchant mapping
-from pipeline import _apply_merchant_mapping
+from receipt_parser.pipeline import _apply_merchant_mapping
 result = {'merchant': 'スマートビリングサービス株式会社'}
 mapped = _apply_merchant_mapping(result)
 assert mapped['merchant'] == 'Bizmo'
@@ -67,7 +65,7 @@ assert mapped.get('_category') == 'internet'
 print('  [OK] Merchant mapping')
 
 # 8. Ollama schema generation
-from extraction import get_ollama_schema
+from receipt_parser.llm import get_ollama_schema
 schema = get_ollama_schema()
 assert 'properties' in schema
 assert 'document_type' in schema['properties']

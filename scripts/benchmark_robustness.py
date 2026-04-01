@@ -21,17 +21,15 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import cv2
 import numpy as np
 
-import ocr as ocr_mod
-import pipeline as pipeline_mod
-from ocr import (
+import receipt_parser.ocr as ocr_mod
+import receipt_parser.pipeline as pipeline_mod
+from receipt_parser.ocr import (
     init_cloud_vision, _call_cloud_vision, _extract_fulltext_from_response,
     _extract_blocks_from_response, _fulltext_to_blocks, _pick_better_fulltext,
     compute_ocr_confidence, _OCR_CONFIDENCE_RETRY_THRESHOLD,
@@ -44,8 +42,8 @@ from benchmark_models import (
     check_tax_amount, check_merchant_similarity, check_tax_categories,
     check_item_descriptions,
 )
-import extraction
-from extraction import check_model_available
+import receipt_parser.llm as extraction
+from receipt_parser.llm import check_model_available
 
 # ---------------------------------------------------------------------------
 # Constants

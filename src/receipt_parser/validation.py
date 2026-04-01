@@ -1,6 +1,6 @@
 """validation.py — Schema-driven arithmetic & consistency checks."""
 
-from schema import Receipt, VALID_TAX_RATES
+from .schema import Receipt, VALID_TAX_RATES
 
 
 def validate_receipt(receipt: Receipt) -> list[str]:

@@ -1,4 +1,4 @@
-"""normalization.py — Full-width number conversion (NFKC), OCR text cleanup."""
+"""normalize.py — Full-width number conversion (NFKC), OCR text cleanup."""
 
 import re
 import unicodedata

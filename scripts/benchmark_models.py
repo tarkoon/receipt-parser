@@ -16,15 +16,13 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import ollama as ollama_client
-import extraction
-from ocr import get_ollama_gpu_status
-from pipeline import process_document
+import receipt_parser.llm as extraction
+from receipt_parser.ocr import get_ollama_gpu_status
+from receipt_parser.pipeline import process_document
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -38,7 +36,7 @@ BENCHMARK_MODELS = [
     "qwen2.5:7b",
 ]
 
-FIXTURES_DIR = Path(__file__).parent / "tests" / "fixtures"
+FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures"
 
 # ---------------------------------------------------------------------------
 # Fixture discovery (mirrors test_integration.py)

@@ -7,14 +7,13 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 import typer
 
-from pipeline import process_document, process_batch
-from extraction import DEFAULT_MODEL
-
-__version__ = "3.0.0"
+from .pipeline import process_document, process_batch
+from .llm import DEFAULT_MODEL
+from . import __version__
 
 app = typer.Typer(help="Receipt Parser — extract structured data from receipts and invoices.")
 
@@ -105,7 +104,7 @@ def parse(
 
     is_batch = len(files) > 1
 
-    from ocr import init_cloud_vision
+    from .ocr import init_cloud_vision
     engine = init_cloud_vision()
 
     # Use batch processing for multiple files with workers > 1
@@ -201,7 +200,7 @@ def parse(
 @app.command()
 def usage():
     """Show Cloud Vision API usage for the current month."""
-    from ocr import get_api_usage
+    from .ocr import get_api_usage
     stats = get_api_usage()
     typer.echo(f"Cloud Vision API Usage ({stats['month']}):")
     typer.echo(f"  Calls this month: {stats['calls']}")

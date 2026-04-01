@@ -9,11 +9,11 @@ from unittest.mock import patch, MagicMock
 import cv2
 import numpy as np
 
-from schema import Receipt, generate_extraction_prompt, get_debug_color_map
-from extraction import get_ollama_schema, _extract_confidence
-from validation import validate_receipt
-from normalization import normalize_fullwidth, clean_handwritten_ocr
-from ocr import compute_ocr_confidence
+from receipt_parser.schema import Receipt, generate_extraction_prompt, get_debug_color_map
+from receipt_parser.llm import get_ollama_schema, _extract_confidence
+from receipt_parser.validation import validate_receipt
+from receipt_parser.normalize import normalize_fullwidth, clean_handwritten_ocr
+from receipt_parser.ocr import compute_ocr_confidence
 
 
 # --- Normalization tests ---
@@ -131,24 +131,24 @@ def test_extract_confidence_missing():
 # --- Era date conversion tests ---
 
 def test_era_reiwa():
-    from pipeline import _era_to_western_year
+    from receipt_parser.pipeline import _era_to_western_year
     assert _era_to_western_year(8, "令和") == 2026
     assert _era_to_western_year(1, "令和") == 2019
 
 
 def test_era_heisei():
-    from pipeline import _era_to_western_year
+    from receipt_parser.pipeline import _era_to_western_year
     assert _era_to_western_year(31, "平成") == 2019
     assert _era_to_western_year(1, "平成") == 1989
 
 
 def test_era_default_assumes_reiwa():
-    from pipeline import _era_to_western_year
+    from receipt_parser.pipeline import _era_to_western_year
     assert _era_to_western_year(8) == 2026
 
 
 def test_era_invalid():
-    from pipeline import _era_to_western_year
+    from receipt_parser.pipeline import _era_to_western_year
     assert _era_to_western_year(0) is None
     assert _era_to_western_year(100) is None
 
@@ -185,7 +185,7 @@ def test_pydantic_coerces_string_amounts():
 # --- Configurable tax rates tests ---
 
 def test_valid_tax_rates_constant():
-    from schema import VALID_TAX_RATES, REDUCED_RATE, STANDARD_RATE, EXEMPT_RATE
+    from receipt_parser.schema import VALID_TAX_RATES, REDUCED_RATE, STANDARD_RATE, EXEMPT_RATE
     assert REDUCED_RATE in VALID_TAX_RATES
     assert STANDARD_RATE in VALID_TAX_RATES
     assert EXEMPT_RATE in VALID_TAX_RATES
@@ -231,10 +231,10 @@ def test_receipt_instantiation():
 
 # --- Pipeline tests with mocked Cloud Vision + LLM ---
 
-@patch("pipeline.extract_with_verification")
-@patch("pipeline.run_cloud_vision")
-@patch("pipeline.init_cloud_vision")
-@patch("pipeline.check_model_available")
+@patch("receipt_parser.pipeline.extract_with_verification")
+@patch("receipt_parser.pipeline.run_cloud_vision")
+@patch("receipt_parser.pipeline.init_cloud_vision")
+@patch("receipt_parser.pipeline.check_model_available")
 def test_pipeline_with_mocked_inference(mock_check, mock_init_cv, mock_ocr, mock_extract):
     mock_check.return_value = None
     mock_init_cv.return_value = MagicMock()
@@ -257,7 +257,7 @@ def test_pipeline_with_mocked_inference(mock_check, mock_init_cv, mock_ocr, mock
     try:
         cv2.imwrite(tmp.name, img)
         tmp.close()
-        from pipeline import process_document
+        from receipt_parser.pipeline import process_document
         result = process_document(Path(tmp.name), passes=1)
     finally:
         os.unlink(tmp.name)
@@ -269,9 +269,9 @@ def test_pipeline_with_mocked_inference(mock_check, mock_init_cv, mock_ocr, mock
     assert "_pipeline_version" in result
 
 
-@patch("pipeline.run_cloud_vision")
-@patch("pipeline.init_cloud_vision")
-@patch("pipeline.check_model_available")
+@patch("receipt_parser.pipeline.run_cloud_vision")
+@patch("receipt_parser.pipeline.init_cloud_vision")
+@patch("receipt_parser.pipeline.check_model_available")
 def test_pipeline_blank_image_returns_error(mock_check, mock_init_cv, mock_ocr):
     mock_check.return_value = None
     mock_init_cv.return_value = MagicMock()
@@ -282,7 +282,7 @@ def test_pipeline_blank_image_returns_error(mock_check, mock_init_cv, mock_ocr):
     try:
         cv2.imwrite(tmp.name, img)
         tmp.close()
-        from pipeline import process_document
+        from receipt_parser.pipeline import process_document
         result = process_document(Path(tmp.name), passes=1)
     finally:
         os.unlink(tmp.name)
@@ -293,7 +293,7 @@ def test_pipeline_blank_image_returns_error(mock_check, mock_init_cv, mock_ocr):
 # --- API usage tracking tests ---
 
 def test_api_usage_tracking():
-    from ocr import _load_usage, _save_usage, get_api_usage, _USAGE_FILE
+    from receipt_parser.ocr import _load_usage, _save_usage, get_api_usage, _USAGE_FILE
     _save_usage({"month": "2099-01", "calls": 0})
     stats = get_api_usage()
     assert stats["calls"] == 0

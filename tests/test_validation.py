@@ -1,7 +1,7 @@
 """Validation edge cases — tax-inclusive, tolerance boundaries, empty receipts."""
 
-from schema import Receipt
-from validation import validate_receipt
+from receipt_parser.schema import Receipt
+from receipt_parser.validation import validate_receipt
 
 
 def test_empty_receipt_no_warnings():

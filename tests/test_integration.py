@@ -21,12 +21,12 @@ try:
     import os
     if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
         pytest.skip("GOOGLE_CLOUD_PROJECT not set", allow_module_level=True)
-    from ocr import init_cloud_vision
+    from receipt_parser.ocr import init_cloud_vision
     init_cloud_vision()
 except Exception as e:
     pytest.skip(f"Cloud Vision not available: {e}", allow_module_level=True)
 
-from pipeline import process_document
+from receipt_parser.pipeline import process_document
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

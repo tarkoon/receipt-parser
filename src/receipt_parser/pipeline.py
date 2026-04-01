@@ -13,14 +13,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from schema import Receipt, VALID_TAX_RATES, REDUCED_RATE, STANDARD_RATE
-from preprocessing import load_image, try_extract_text_layer
-from ocr import init_cloud_vision, run_cloud_vision, blocks_to_structured_text, compute_ocr_confidence
-from extraction import check_model_available, extract_with_verification, DEFAULT_MODEL
-from validation import validate_receipt
-from normalization import (normalize_fullwidth, clean_handwritten_ocr, strip_barcode_lines,
-                          rejoin_price_lines)
-from debug_visual import PipelineTrace, draw_ocr_bboxes, draw_field_overlay
+from .schema import Receipt, VALID_TAX_RATES, REDUCED_RATE, STANDARD_RATE
+from .preprocess import load_image, try_extract_text_layer
+from .ocr import init_cloud_vision, run_cloud_vision, blocks_to_structured_text, compute_ocr_confidence
+from .llm import check_model_available, extract_with_verification, DEFAULT_MODEL
+from .validation import validate_receipt
+from .normalize import (normalize_fullwidth, clean_handwritten_ocr, strip_barcode_lines,
+                        rejoin_price_lines)
+from .tracing import PipelineTrace, draw_ocr_bboxes, draw_field_overlay
 
 
 # ── Japanese Era Constants ───────────────────────────────────────────
@@ -94,7 +94,7 @@ def _extract_points_used(text: str) -> float | None:
 
 # ── User Merchant Mapping ────────────────────────────────────────────
 
-_USER_RULES_PATH = Path(__file__).parent / "user_rules.json"
+_USER_RULES_PATH = Path(__file__).parent / "merchant_rules.json"
 
 
 def _apply_merchant_mapping(result: dict) -> dict:

@@ -1,4 +1,4 @@
-"""debug_visual.py — Bounding box drawing, field overlay, pipeline trace."""
+"""tracing.py — Bounding box drawing, field overlay, pipeline trace."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,7 +8,7 @@ import json
 import cv2
 import numpy as np
 
-from schema import get_debug_color_map
+from .schema import get_debug_color_map
 
 
 @dataclass

@@ -7,7 +7,7 @@ from pathlib import Path
 RESULTS_FILE = Path(__file__).parent / "batch_test_results.txt"
 
 BATCHES = [
-    "01_supermarket_receipt or receipt_10 or receipt_11 or receipt_12 or receipt_13 or receipt_14 or receipt_15 or receipt_16 or receipt_17",
+    "receipt_1 or receipt_10 or receipt_11 or receipt_12 or receipt_13 or receipt_14 or receipt_15 or receipt_16 or receipt_17",
     "receipt_18 or receipt_19 or receipt_2 or receipt_20 or receipt_21 or receipt_22 or receipt_23 or receipt_24 or receipt_25",
     "receipt_26 or receipt_27 or receipt_28 or receipt_29 or receipt_3 or receipt_30 or receipt_31 or receipt_32 or receipt_33",
     "receipt_34 or receipt_35 or receipt_36 or receipt_4 or receipt_5 or receipt_6 or receipt_7 or receipt_8 or receipt_9",

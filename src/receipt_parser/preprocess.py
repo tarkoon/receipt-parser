@@ -1,4 +1,4 @@
-"""preprocessing.py — Image enhancement, PDF conversion, multi-page handling."""
+"""preprocess.py — Image enhancement, PDF conversion, multi-page handling."""
 
 from pathlib import Path
 import cv2

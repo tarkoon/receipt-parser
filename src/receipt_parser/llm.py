@@ -1,4 +1,4 @@
-"""extraction.py — LLM extraction via DeepSeek API (default), OpenRouter, or Ollama, multi-pass."""
+"""llm.py — LLM extraction via DeepSeek API (default), OpenRouter, or Ollama, multi-pass."""
 
 import json
 import os
@@ -8,7 +8,7 @@ import platform
 import threading
 
 import ollama as ollama_client
-from schema import Receipt, generate_extraction_prompt, generate_verification_prompt
+from .schema import Receipt, generate_extraction_prompt, generate_verification_prompt
 
 OLLAMA_TIMEOUT_SECONDS = 180
 DEFAULT_MODEL = "deepseek-chat"
