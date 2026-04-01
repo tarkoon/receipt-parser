@@ -7,7 +7,6 @@
   "currency": "JPY",
   "total": null,
   "payment_method": null,
-  "invoice_number": null,
   "account_number": null,
   "points_used": null,
   "amount_paid": null,

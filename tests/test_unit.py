@@ -217,7 +217,7 @@ def test_prompt_includes_hints_and_aliases():
 def test_debug_color_map_has_all_fields():
     color_map = get_debug_color_map()
     expected_fields = ["merchant", "date", "location", "currency", "line_items",
-                       "subtotal", "taxes", "total", "payment_method", "invoice_number"]
+                       "subtotal", "taxes", "total", "payment_method"]
     for field in expected_fields:
         assert field in color_map, f"Missing field: {field}"
 
@@ -251,7 +251,7 @@ def test_pipeline_with_mocked_inference(mock_check, mock_init_cv, mock_ocr, mock
     mock_extract.return_value = (
         {"merchant": "セブンイレブン", "total": 150, "line_items": [],
          "taxes": [], "subtotal": None, "date": None, "currency": "JPY",
-         "payment_method": None, "invoice_number": None, "location": None,
+         "payment_method": None, "location": None,
          "raw_text_summary": "convenience store receipt"},
         [{"pass": 1, "extraction": {}, "warnings": []}]
     )

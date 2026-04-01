@@ -73,11 +73,6 @@ FIELD_REGISTRY: list[FieldMeta] = [
         extraction_aliases=["支払", "payment"],
     ),
     FieldMeta(
-        name="invoice_number",
-        debug_color_bgr=(0, 128, 128),
-        extraction_aliases=["番号", "No.", "invoice"],
-    ),
-    FieldMeta(
         name="account_number",
         debug_color_bgr=(100, 100, 0),
         prompt_hint="Customer or account number for recurring bill tracking. Look for お客様番号 or similar.",
@@ -293,7 +288,6 @@ class Document(BaseModel):
     currency: Optional[str] = None
     total: Optional[float] = None
     payment_method: Optional[str] = None
-    invoice_number: Optional[str] = None
     account_number: Optional[str] = None
     points_used: Optional[float] = None
     amount_paid: Optional[float] = None
@@ -325,7 +319,7 @@ class Document(BaseModel):
             return None
 
     @field_validator("merchant", "date", "location", "currency", "payment_method",
-                     "invoice_number", "account_number", "payer", "payment_reference",
+                     "account_number", "payer", "payment_reference",
                      "service_type", "raw_text_summary", mode="before")
     @classmethod
     def coerce_null_strings(cls, v):

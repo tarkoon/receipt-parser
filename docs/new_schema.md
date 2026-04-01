@@ -127,7 +127,6 @@ total               Amount due / purchase total
 payment_method      "cash" | "credit" | "bank_payment" | null
                     null unless explicitly stated on document.
                     auto_debit only when bill says 口座引落/振替
-invoice_number      Receipt number, bill reference, etc.
 account_number      Customer/account number (NEW — for recurring bill tracking)
 points_used         Loyalty points applied (NEW — d-point, WAON point, etc.)
 amount_paid         Actual out-of-pocket cost: total - points_used (NEW)
@@ -205,7 +204,6 @@ class Document(BaseModel):
     currency: Optional[str] = None
     total: Optional[float] = None
     payment_method: Optional[str] = None
-    invoice_number: Optional[str] = None
     account_number: Optional[str] = None
     points_used: Optional[float] = None
     amount_paid: Optional[float] = None

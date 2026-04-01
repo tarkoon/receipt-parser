@@ -34,7 +34,6 @@ def _flatten_for_csv(result: dict, file_path: str = "") -> list[dict]:
         "total": result.get("total", ""),
         "subtotal": result.get("subtotal", ""),
         "payment_method": result.get("payment_method", ""),
-        "invoice_number": result.get("invoice_number", ""),
         "location": result.get("location", ""),
     }
 
@@ -65,7 +64,7 @@ def _flatten_for_csv(result: dict, file_path: str = "") -> list[dict]:
 
 CSV_FIELDNAMES = [
     "file", "merchant", "date", "currency", "total", "subtotal",
-    "payment_method", "invoice_number", "location",
+    "payment_method", "location",
     "item_description", "item_qty", "item_unit_price", "item_total",
     "item_tax_category", "tax_rates", "tax_amounts",
 ]

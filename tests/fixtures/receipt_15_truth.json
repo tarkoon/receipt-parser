@@ -6,7 +6,6 @@
   "currency": "JPY",
   "total": 15946,
   "payment_method": "bank_payment",
-  "invoice_number": null,
   "account_number": null,
   "points_used": null,
   "amount_paid": 15946,

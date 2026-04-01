@@ -24,7 +24,7 @@ USAGE_UNITS = {"m3", "kWh", "L", None}
 
 COMMON_FIELDS = {
     "document_type", "merchant", "date", "location", "currency",
-    "total", "payment_method", "invoice_number", "account_number",
+    "total", "payment_method", "account_number",
     "points_used", "amount_paid",
     "line_items", "subtotal", "taxes",
     "service_type", "billing_period", "usage",
