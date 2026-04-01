@@ -102,91 +102,74 @@ def sanitize_llm_response(raw: str) -> str:
 
 
 def _coerce_llm_output(data: dict) -> dict:
-    """Fix common LLM output mismatches before Pydantic validation."""
-    if "line_items" in data and isinstance(data["line_items"], list):
-        fixed_items = []
-        for item in data["line_items"]:
-            if not isinstance(item, dict):
-                continue
-            if "quantity" in item and "qty" not in item:
-                item["qty"] = item.pop("quantity")
-            if "name" in item and "description" not in item:
-                item["description"] = item.pop("name")
-            if not item.get("description"):
-                continue
-            if "total" not in item or item["total"] is None:
-                continue
-            # Coerce numeric fields to float (LLM may return strings)
-            for nfield in ("total", "unit_price", "qty", "discount"):
-                if nfield in item and item[nfield] is not None:
-                    try:
-                        item[nfield] = float(str(item[nfield]).replace(',', ''))
-                    except (TypeError, ValueError):
-                        pass
-            # Coerce discount_rate null to empty string (schema requires str)
-            if item.get("discount_rate") is None:
-                item["discount_rate"] = ""
-            # Coerce discount null to 0
-            if item.get("discount") is None:
-                item["discount"] = 0
-            # Coerce tax_category to valid Literal values
-            tc = item.get("tax_category")
-            if tc is None or tc not in ("8%", "10%", "0%"):
-                if tc and "8" in str(tc):
-                    item["tax_category"] = "8%"
-                elif tc and "10" in str(tc):
-                    item["tax_category"] = "10%"
-                else:
-                    item["tax_category"] = "0%"
-            fixed_items.append(item)
-        data["line_items"] = fixed_items
+    """Legacy coercion — now mostly handled by Pydantic model_validator.
 
-    if "taxes" in data:
-        taxes = data["taxes"]
-        if isinstance(taxes, (int, float)):
-            data["taxes"] = [{"rate": "unknown", "label": None, "amount": taxes}]
-        elif isinstance(taxes, dict):
-            data["taxes"] = [taxes]
-        elif taxes is None:
-            data["taxes"] = []
-
-    # Fix Japanese era dates: years < 100 are era years (令和 N → 2018+N)
-    if "date" in data and data["date"]:
-        date_str = str(data["date"])
-        m = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', date_str)
-        if m:
-            year = int(m.group(1))
-            if year < 100:
-                data["date"] = f"{2018 + year:04d}-{m.group(2)}-{m.group(3)}"
-            elif 2000 <= year <= 2018:
-                era_year = year - 2000
-                if 1 <= era_year <= 20:
-                    data["date"] = f"{2018 + era_year:04d}-{m.group(2)}-{m.group(3)}"
-
+    Kept as a thin pass-through for the fallback JSON parsing path.
+    The Document model's handle_llm_aliases model_validator handles:
+    - quantity → qty, name → description aliases
+    - Numeric field coercion
+    - Tax format normalization
+    - Era date fixes
+    """
     return data
 
 
+def _extract_confidence(data: dict) -> dict | None:
+    """Extract and validate the _confidence field from LLM output."""
+    conf = data.pop("_confidence", None)
+    if not isinstance(conf, dict):
+        return None
+    validated = {}
+    for key, val in conf.items():
+        try:
+            v = float(val)
+            if 0.0 <= v <= 1.0:
+                validated[key] = round(v, 4)
+        except (TypeError, ValueError):
+            pass
+    return validated if validated else None
+
+
 def _parse_llm_json(raw: str) -> dict:
-    """Parse LLM JSON output with Pydantic validation, coercion fallback."""
+    """Parse LLM JSON output with Pydantic validation, coercion fallback.
+
+    Extracts _confidence before Pydantic validation (not part of schema).
+    """
+    confidence = None
     try:
-        receipt = Receipt.model_validate_json(raw)
-        return receipt.model_dump()
+        data = json.loads(raw)
+        confidence = _extract_confidence(data)
+        receipt = Receipt(**data)
+        result = receipt.model_dump()
+        if confidence:
+            result["_confidence"] = confidence
+        return result
     except Exception:
+        pass
+    try:
+        data = json.loads(raw)
+        confidence = _extract_confidence(data)
+        data = _coerce_llm_output(data)
+        receipt = Receipt(**data)
+        result = receipt.model_dump()
+        if confidence:
+            result["_confidence"] = confidence
+        return result
+    except Exception as e2:
         try:
             data = json.loads(raw)
-            data = _coerce_llm_output(data)
-            receipt = Receipt(**data)
-            return receipt.model_dump()
-        except Exception as e2:
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                return {"error": f"LLM output failed validation: {e2}", "raw": raw}
+            confidence = _extract_confidence(data)
+            if confidence:
+                data["_confidence"] = confidence
+            return data
+        except json.JSONDecodeError:
+            return {"error": f"LLM output failed validation: {e2}", "raw": raw}
 
 
 # ── OpenRouter backend ───────────────────────────────────────────────
 
 _api_client = None
+_instructor_client = None
 
 
 def _get_api_client():
@@ -215,6 +198,19 @@ def _get_api_client():
     return _api_client
 
 
+def _get_instructor_client():
+    """Get or create an instructor-patched client for Pydantic-native structured output."""
+    global _instructor_client
+    if _instructor_client is None:
+        try:
+            import instructor
+            base_client = _get_api_client()
+            _instructor_client = instructor.from_openai(base_client)
+        except ImportError:
+            return None
+    return _instructor_client
+
+
 def _openrouter_chat(
     model: str,
     messages: list,
@@ -232,6 +228,35 @@ def _openrouter_chat(
         seed=_LLM_SEED,
     )
     return response.choices[0].message.content
+
+
+def _instructor_extract(
+    model: str,
+    messages: list,
+    temperature: float = 0.0,
+    max_tokens: int = 4096,
+    max_retries: int = 2,
+) -> Receipt | None:
+    """Use instructor for Pydantic-native structured output with automatic retry.
+
+    Returns a validated Receipt object directly, or None if instructor is unavailable.
+    Falls back to manual parsing if instructor extraction fails.
+    """
+    client = _get_instructor_client()
+    if client is None:
+        return None
+    try:
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            response_model=Receipt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            seed=_LLM_SEED,
+            max_retries=max_retries,
+        )
+    except Exception:
+        return None
 
 
 # ── Ollama backend ───────────────────────────────────────────────────
@@ -316,13 +341,29 @@ def _llm_chat(
 
 # ── Extraction functions ─────────────────────────────────────────────
 
-def extract_with_llm(ocr_text: str, model: str = DEFAULT_MODEL, doc_type: str = "receipt") -> dict:
-    """Single-pass extraction with structured output enforcement."""
+def extract_with_llm(
+    ocr_text: str,
+    model: str = DEFAULT_MODEL,
+    doc_type: str = "receipt",
+    use_instructor: bool = False,
+) -> dict:
+    """Single-pass extraction with structured output enforcement.
+
+    Args:
+        use_instructor: If True and available, use instructor for Pydantic-native
+            structured output. Default False — JSON mode is more deterministic.
+    """
     prompt = generate_extraction_prompt(ocr_text, doc_type=doc_type)
+    messages = [{"role": "user", "content": prompt}]
+
+    if use_instructor and not _is_ollama_model(model):
+        receipt = _instructor_extract(model=model, messages=messages)
+        if receipt is not None:
+            return receipt.model_dump()
 
     raw = _llm_chat(
         model=model,
-        messages=[{"role": "user", "content": prompt}],
+        messages=messages,
         schema=get_ollama_schema(),
     )
 

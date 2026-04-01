@@ -1,13 +1,13 @@
 """benchmark_robustness.py -- Stress-test pipeline against OCR variation.
 
-Bypasses OCR cache to make fresh Cloud Vision API calls every run, captures
-both dual-call responses, tracks per-field accuracy, attributes failures to
-OCR vs LLM variance, and analyzes whether dual-call is needed.
+Bypasses OCR cache to make fresh Cloud Vision API calls every run,
+uses confidence-based retry (single-call default, retry if confidence < 0.75),
+tracks per-field accuracy, and attributes failures to OCR vs LLM variance.
 
 Usage:
     python benchmark_robustness.py
-    python benchmark_robustness.py --runs 3 --fixtures receipt_2 receipt_8
-    python benchmark_robustness.py --runs 5 --budget-limit 150
+    python benchmark_robustness.py --runs 4 --fixtures receipt_2 receipt_8
+    python benchmark_robustness.py --runs 4 --budget-limit 200
     python benchmark_robustness.py --resume robustness_results.json
 """
 
@@ -33,13 +33,16 @@ import ocr as ocr_mod
 import pipeline as pipeline_mod
 from ocr import (
     init_cloud_vision, _call_cloud_vision, _extract_fulltext_from_response,
-    _fulltext_to_blocks, get_api_usage, get_ollama_gpu_status,
+    _extract_blocks_from_response, _fulltext_to_blocks, _pick_better_fulltext,
+    compute_ocr_confidence, _OCR_CONFIDENCE_RETRY_THRESHOLD,
+    get_api_usage, get_ollama_gpu_status,
 )
 from benchmark_models import (
     discover_fixtures, FIELD_CHECKS,
     check_total, check_date, check_currency, check_subtotal,
     check_payment_method, check_line_items_count, check_line_items_totals,
     check_tax_amount, check_merchant_similarity, check_tax_categories,
+    check_item_descriptions,
 )
 import extraction
 from extraction import check_model_available
@@ -50,15 +53,16 @@ from extraction import check_model_available
 
 DEBUG_DIR = Path(__file__).parent / "robustness_debug"
 DEFAULT_OUTPUT = Path(__file__).parent / "robustness_results.json"
-DEFAULT_MODEL = "qwen3.5:9b"
+DEFAULT_MODEL = extraction.DEFAULT_MODEL  # deepseek-chat
 DEFAULT_BUDGET_LIMIT = 200
 
 # ---------------------------------------------------------------------------
-# LLM timing instrumentation — capture Ollama durations per call
+# LLM timing instrumentation — capture durations per call (Ollama + API)
 # ---------------------------------------------------------------------------
 
 _timing_collector: list[dict] = []
 _original_chat_with_timeout = extraction._ollama_chat_with_timeout
+_original_openrouter_chat = extraction._openrouter_chat
 
 
 def _instrumented_chat_with_timeout(timeout: int = extraction.OLLAMA_TIMEOUT_SECONDS, **kwargs):
@@ -71,26 +75,66 @@ def _instrumented_chat_with_timeout(timeout: int = extraction.OLLAMA_TIMEOUT_SEC
         "prompt_eval_duration_ns": response.get("prompt_eval_duration"),
         "eval_count": response.get("eval_count"),
         "eval_duration_ns": response.get("eval_duration"),
+        "backend": "ollama",
     })
     return response
 
 
+def _instrumented_openrouter_chat(model, messages, temperature=0.0, max_tokens=4096):
+    """Wrapper that captures API call wall time and token usage."""
+    client = extraction._get_api_client()
+    t0 = time.perf_counter()
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        response_format={"type": "json_object"},
+        temperature=temperature,
+        max_tokens=max_tokens,
+        seed=extraction._LLM_SEED,
+    )
+    elapsed_ns = int((time.perf_counter() - t0) * 1e9)
+    usage = response.usage
+    _timing_collector.append({
+        "total_duration_ns": elapsed_ns,
+        "load_duration_ns": 0,
+        "prompt_eval_count": usage.prompt_tokens if usage else None,
+        "prompt_eval_duration_ns": None,
+        "eval_count": usage.completion_tokens if usage else None,
+        "eval_duration_ns": elapsed_ns,
+        "input_tokens": usage.prompt_tokens if usage else None,
+        "output_tokens": usage.completion_tokens if usage else None,
+        "backend": "api",
+    })
+    return response.choices[0].message.content
+
+
 def _install_llm_instrumentation():
     extraction._ollama_chat_with_timeout = _instrumented_chat_with_timeout
+    extraction._openrouter_chat = _instrumented_openrouter_chat
 
 
 def _restore_llm_instrumentation():
     extraction._ollama_chat_with_timeout = _original_chat_with_timeout
+    extraction._openrouter_chat = _original_openrouter_chat
+
+
+# DeepSeek pricing (per million tokens)
+_DEEPSEEK_INPUT_COST_PER_M = 0.27
+_DEEPSEEK_OUTPUT_COST_PER_M = 1.10
 
 
 def _aggregate_timing(entries: list[dict]) -> dict:
-    """Aggregate Ollama timing entries into a summary dict."""
+    """Aggregate LLM timing entries into a summary dict with token usage and cost."""
     total_duration_ns = sum(t.get("total_duration_ns") or 0 for t in entries)
     load_ns = sum(t.get("load_duration_ns") or 0 for t in entries)
     eval_ns = sum(t.get("eval_duration_ns") or 0 for t in entries)
     prompt_ns = sum(t.get("prompt_eval_duration_ns") or 0 for t in entries)
     total_tokens = sum(t.get("eval_count") or 0 for t in entries)
     total_prompt_tokens = sum(t.get("prompt_eval_count") or 0 for t in entries)
+    input_tokens = sum(t.get("input_tokens") or 0 for t in entries)
+    output_tokens = sum(t.get("output_tokens") or 0 for t in entries)
+    cost_usd = (input_tokens * _DEEPSEEK_INPUT_COST_PER_M +
+                output_tokens * _DEEPSEEK_OUTPUT_COST_PER_M) / 1_000_000
     return {
         "passes": len(entries),
         "total_duration_s": total_duration_ns / 1e9,
@@ -99,6 +143,9 @@ def _aggregate_timing(entries: list[dict]) -> dict:
         "eval_s": eval_ns / 1e9,
         "tokens_generated": total_tokens,
         "prompt_tokens": total_prompt_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": round(cost_usd, 6),
         "tokens_per_second": total_tokens / (eval_ns / 1e9) if eval_ns else 0,
         "per_pass": entries,
     }
@@ -116,11 +163,12 @@ def _reset_collector():
     """Reset the OCR collector before each pipeline run."""
     global _ocr_collector
     _ocr_collector = {
-        "call_a_text": None,
-        "call_b_text": None,
+        "call_1_text": None,
+        "call_1_confidence": None,
+        "call_2_text": None,
+        "retried": False,
+        "retry_reason": None,
         "chosen_text": None,
-        "chose_b": False,
-        "chose_b_reason": None,
     }
 
 
@@ -129,58 +177,49 @@ _benchmark_api_calls = 0
 
 
 def _instrumented_run_cloud_vision(image: np.ndarray, client=None) -> list[dict]:
-    """Replacement for run_cloud_vision that skips cache and captures both calls."""
+    """Replacement for run_cloud_vision that skips cache.
+
+    Uses confidence-based retry: single call by default, retry only if
+    OCR confidence < threshold (matching pipeline v3.0.0 behavior).
+    """
     global _ocr_collector, _benchmark_api_calls
 
     if client is None:
         client = init_cloud_vision()
 
-    # Call A
+    # Call 1
     response1 = _call_cloud_vision(image, client)
     fulltext1 = _extract_fulltext_from_response(response1)
     _benchmark_api_calls += 1
 
     if not fulltext1:
-        _ocr_collector["call_a_text"] = ""
-        _ocr_collector["call_b_text"] = ""
+        _ocr_collector["call_1_text"] = ""
         _ocr_collector["chosen_text"] = ""
         return []
 
-    # Call B
-    response2 = _call_cloud_vision(image, client)
-    fulltext2 = _extract_fulltext_from_response(response2)
-    _benchmark_api_calls += 1
+    # Compute confidence from first call
+    blocks1 = _extract_blocks_from_response(response1)
+    confidence1 = compute_ocr_confidence(blocks1) if blocks1 else 0.0
 
-    _ocr_collector["call_a_text"] = fulltext1
-    _ocr_collector["call_b_text"] = fulltext2 or ""
+    _ocr_collector["call_1_text"] = fulltext1
+    _ocr_collector["call_1_confidence"] = round(confidence1, 4)
 
-    # Pick-best logic (mirrors ocr.run_cloud_vision)
     fulltext = fulltext1
-    chose_b = False
-    chose_b_reason = None
 
-    if fulltext2:
-        has_yen1 = '¥' in fulltext1
-        has_yen2 = '¥' in fulltext2
-        # Count inline prices (¥ on same line as Japanese text = better layout)
-        inline1 = len(re.findall(r'[\u3000-\u9fff].*¥|¥.*[\u3000-\u9fff]', fulltext1))
-        inline2 = len(re.findall(r'[\u3000-\u9fff].*¥|¥.*[\u3000-\u9fff]', fulltext2))
-        if has_yen2 and not has_yen1:
-            fulltext = fulltext2
-            chose_b = True
-            chose_b_reason = "yen_symbol"
-        elif inline2 > inline1 + 2:
-            fulltext = fulltext2
-            chose_b = True
-            chose_b_reason = "better_layout"
-        elif len(fulltext2) > len(fulltext1):
-            fulltext = fulltext2
-            chose_b = True
-            chose_b_reason = "longer"
+    # Confidence-based retry: only call again if quality is low
+    if confidence1 < _OCR_CONFIDENCE_RETRY_THRESHOLD:
+        response2 = _call_cloud_vision(image, client)
+        fulltext2 = _extract_fulltext_from_response(response2)
+        _benchmark_api_calls += 1
+
+        _ocr_collector["retried"] = True
+        _ocr_collector["retry_reason"] = f"confidence {confidence1:.3f} < {_OCR_CONFIDENCE_RETRY_THRESHOLD}"
+        _ocr_collector["call_2_text"] = fulltext2 or ""
+
+        if fulltext2:
+            fulltext = _pick_better_fulltext(fulltext1, fulltext2)
 
     _ocr_collector["chosen_text"] = fulltext
-    _ocr_collector["chose_b"] = chose_b
-    _ocr_collector["chose_b_reason"] = chose_b_reason
 
     # Set OCR source metadata (the real module's global)
     ocr_mod._last_ocr_source = "fresh"
@@ -273,14 +312,17 @@ def _attribute_failure(
 # ---------------------------------------------------------------------------
 
 def _estimate_api_calls(n_fixtures: int, n_runs: int, no_rotation: bool) -> int:
-    """Estimate total API calls for the benchmark run."""
-    calls_per_fixture_per_run = 2  # dual-call
+    """Estimate total API calls for the benchmark run.
+
+    Single-call default with confidence-based retry (~10% of images need retry).
+    """
+    calls_per_fixture_per_run = 1  # single-call default
+    retry_estimate = max(1, int(n_fixtures * 0.10))  # ~10% need retry
     if not no_rotation:
-        # ~2 out of 13 fixtures need rotation, each rotation = 2 more calls
-        rotation_extras = max(1, int(n_fixtures * 0.15)) * 2
+        rotation_extras = max(1, int(n_fixtures * 0.15))
     else:
         rotation_extras = 0
-    return (n_fixtures * calls_per_fixture_per_run + rotation_extras) * n_runs
+    return (n_fixtures * calls_per_fixture_per_run + retry_estimate + rotation_extras) * n_runs
 
 
 def _check_budget(estimated_calls: int, budget_limit: int, force: bool) -> bool:
@@ -337,35 +379,29 @@ def _save_failure_variant(
 
 
 # ---------------------------------------------------------------------------
-# Dual-call analysis
+# OCR confidence & retry analysis
 # ---------------------------------------------------------------------------
 
-def _compute_dual_call_analysis(fixture_runs: list[dict]) -> dict:
-    """Compute dual-call statistics for a fixture's runs."""
-    ab_sims = []
-    times_b_chosen = 0
-    b_reasons: dict[str, int] = defaultdict(int)
+def _compute_ocr_analysis(fixture_runs: list[dict]) -> dict:
+    """Compute OCR confidence and retry statistics for a fixture's runs."""
+    confidences = []
+    retried_count = 0
 
     for run in fixture_runs:
         ocr_data = run.get("ocr_data", {})
-        a_text = ocr_data.get("call_a_text", "")
-        b_text = ocr_data.get("call_b_text", "")
-        sim = _text_similarity(a_text, b_text)
-        ab_sims.append(sim)
-
-        if ocr_data.get("chose_b", False):
-            times_b_chosen += 1
-            reason = ocr_data.get("chose_b_reason", "unknown")
-            b_reasons[reason] += 1
+        conf = ocr_data.get("call_1_confidence")
+        if conf is not None:
+            confidences.append(conf)
+        if ocr_data.get("retried", False):
+            retried_count += 1
 
     n = len(fixture_runs) or 1
     return {
-        "mean_ab_similarity": sum(ab_sims) / len(ab_sims) if ab_sims else 0,
-        "min_ab_similarity": min(ab_sims) if ab_sims else 0,
-        "max_ab_similarity": max(ab_sims) if ab_sims else 0,
-        "times_b_chosen": times_b_chosen,
-        "times_b_chosen_pct": round(times_b_chosen / n * 100, 1),
-        "b_chosen_reasons": dict(b_reasons),
+        "mean_confidence": sum(confidences) / len(confidences) if confidences else 0,
+        "min_confidence": min(confidences) if confidences else 0,
+        "max_confidence": max(confidences) if confidences else 0,
+        "retried_count": retried_count,
+        "retried_pct": round(retried_count / n * 100, 1),
     }
 
 
@@ -397,11 +433,10 @@ def _compute_overall_summary(per_fixture: dict, metadata: dict) -> dict:
     perfect_fixtures = []
     fragile_fixtures = []
 
-    # Dual-call aggregation
-    all_ab_sims = []
-    total_b_chosen = 0
+    # OCR confidence & retry aggregation
+    all_confidences = []
+    total_retried = 0
     total_runs = 0
-    b_reasons_all: dict[str, int] = defaultdict(int)
 
     for fixture_name, fdata in per_fixture.items():
         runs = fdata.get("runs", [])
@@ -427,13 +462,11 @@ def _compute_overall_summary(per_fixture: dict, metadata: dict) -> dict:
         else:
             fragile_fixtures.append(fixture_name)
 
-        # Dual-call
+        # OCR confidence & retry
         ocr_analysis = fdata.get("ocr_analysis", {})
-        if ocr_analysis.get("mean_ab_similarity") is not None:
-            all_ab_sims.append(ocr_analysis["mean_ab_similarity"])
-        total_b_chosen += ocr_analysis.get("times_b_chosen", 0)
-        for reason, count in ocr_analysis.get("b_chosen_reasons", {}).items():
-            b_reasons_all[reason] += count
+        if ocr_analysis.get("mean_confidence") is not None:
+            all_confidences.append(ocr_analysis["mean_confidence"])
+        total_retried += ocr_analysis.get("retried_count", 0)
 
     # Per-field robustness
     field_robustness = {}
@@ -442,28 +475,26 @@ def _compute_overall_summary(per_fixture: dict, metadata: dict) -> dict:
         passes = field_pass_counts.get(field_name, 0)
         field_robustness[field_name] = round(passes / total, 4) if total else 1.0
 
-    # Dual-call recommendation
-    mean_ab = sum(all_ab_sims) / len(all_ab_sims) if all_ab_sims else 1.0
-    b_pct = (total_b_chosen / total_runs * 100) if total_runs else 0
-
-    if mean_ab > 0.99 and b_pct < 5:
-        dual_rec = (f"SUGGEST: Consider single-call mode (saves 50% API budget). "
-                    f"B chosen only {b_pct:.1f}% of runs, mean A-B similarity {mean_ab:.3f}")
-    elif b_pct > 20:
-        dual_rec = (f"KEEP: Dual-call is valuable. B chosen {b_pct:.1f}% of runs "
-                    f"(reasons: {dict(b_reasons_all)})")
-    else:
-        dual_rec = (f"INCONCLUSIVE: B chosen {b_pct:.1f}% of runs, "
-                    f"mean A-B similarity {mean_ab:.3f}. Need more runs to determine.")
+    # OCR retry summary
+    mean_conf = sum(all_confidences) / len(all_confidences) if all_confidences else 1.0
+    retry_pct = (total_retried / total_runs * 100) if total_runs else 0
+    ocr_retry_summary = (
+        f"Mean OCR confidence: {mean_conf:.3f}. "
+        f"Retried {total_retried}/{total_runs} runs ({retry_pct:.1f}%). "
+        f"Single-call mode saves ~{100 - retry_pct:.0f}% API budget vs dual-call."
+    )
 
     score = total_field_passes / total_field_checks if total_field_checks else 1.0
 
-    # LLM timing aggregation
+    # LLM timing & token aggregation
     all_eval_s = []
     all_load_s = []
     all_tps = []
     all_wall_s = []
     total_tokens = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cost = 0.0
     for fdata in per_fixture.values():
         for run in fdata.get("runs", []):
             timing = run.get("llm_timing", {})
@@ -476,13 +507,68 @@ def _compute_overall_summary(per_fixture: dict, metadata: dict) -> dict:
             if run.get("wall_time_s"):
                 all_wall_s.append(run["wall_time_s"])
             total_tokens += timing.get("tokens_generated", 0)
+            total_input_tokens += timing.get("input_tokens", 0)
+            total_output_tokens += timing.get("output_tokens", 0)
+            total_cost += timing.get("cost_usd", 0)
 
+    n_runs = total_runs or 1
     llm_timing_summary = {
         "mean_eval_s": sum(all_eval_s) / len(all_eval_s) if all_eval_s else 0,
         "mean_load_s": sum(all_load_s) / len(all_load_s) if all_load_s else 0,
         "mean_tps": sum(all_tps) / len(all_tps) if all_tps else 0,
         "mean_wall_s": sum(all_wall_s) / len(all_wall_s) if all_wall_s else 0,
         "total_tokens": total_tokens,
+    }
+
+    # Token & cost summary
+    cost_summary = {
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "total_cost_usd": round(total_cost, 4),
+        "cost_per_receipt_usd": round(total_cost / n_runs, 6) if n_runs else 0,
+        "avg_input_tokens_per_receipt": round(total_input_tokens / n_runs),
+        "avg_output_tokens_per_receipt": round(total_output_tokens / n_runs),
+    }
+
+    # Override summary
+    total_overrides = 0
+    override_by_field: dict[str, int] = defaultdict(int)
+    for fdata in per_fixture.values():
+        oa = fdata.get("override_analysis", {})
+        total_overrides += oa.get("total_overrides", 0)
+        for field, count in oa.get("by_field", {}).items():
+            override_by_field[field] += count
+    override_summary = {
+        "total_overrides": total_overrides,
+        "overrides_per_receipt": round(total_overrides / n_runs, 2),
+        "by_field": dict(override_by_field),
+    }
+
+    # Determinism summary
+    deterministic_count = sum(
+        1 for fdata in per_fixture.values()
+        if fdata.get("determinism", {}).get("is_deterministic", False)
+    )
+    determinism_summary = {
+        "deterministic_fixtures": deterministic_count,
+        "total_fixtures": len(per_fixture),
+        "rate": round(deterministic_count / len(per_fixture), 4) if per_fixture else 1.0,
+    }
+
+    # Warning summary
+    total_warnings = sum(
+        fdata.get("warning_analysis", {}).get("total_warnings", 0)
+        for fdata in per_fixture.values()
+    )
+    clean_runs_total = sum(
+        fdata.get("warning_analysis", {}).get("clean_runs", 0)
+        for fdata in per_fixture.values()
+    )
+    warning_summary = {
+        "total_warnings": total_warnings,
+        "warnings_per_receipt": round(total_warnings / n_runs, 2),
+        "clean_runs": clean_runs_total,
+        "clean_rate": round(clean_runs_total / n_runs, 4) if n_runs else 1.0,
     }
 
     return {
@@ -497,8 +583,12 @@ def _compute_overall_summary(per_fixture: dict, metadata: dict) -> dict:
         "fragile_fixtures": fragile_fixtures,
         "field_robustness": field_robustness,
         "variance_attribution": dict(variance_attribution),
-        "dual_call_recommendation": dual_rec,
+        "ocr_retry_summary": ocr_retry_summary,
         "llm_timing_summary": llm_timing_summary,
+        "cost_summary": cost_summary,
+        "override_summary": override_summary,
+        "determinism_summary": determinism_summary,
+        "warning_summary": warning_summary,
     }
 
 
@@ -511,18 +601,14 @@ def _print_run_line(fixture_idx: int, n_fixtures: int, fixture_name: str,
     """Print a single run result line."""
     pc = run_data["pass_count"]
     tf = run_data["total_fields"]
-    ab_sim = run_data.get("ocr_data", {}).get("ab_similarity", 0)
-    chose = "B" if run_data.get("ocr_data", {}).get("chose_b") else "A"
-    reason = ""
-    if chose == "B":
-        reason = f" ({run_data['ocr_data'].get('chose_b_reason', '')})"
+    ocr_data = run_data.get("ocr_data", {})
+    conf = ocr_data.get("call_1_confidence", 0)
+    retried = "retry" if ocr_data.get("retried") else "1-call"
     wall = run_data.get("wall_time_s", 0)
 
     # LLM timing
     timing = run_data.get("llm_timing", {})
-    tps = timing.get("tokens_per_second", 0)
     eval_s = timing.get("eval_s", 0)
-    load_s = timing.get("load_s", 0)
 
     # Find failed fields
     failed = [f for f, r in run_data.get("fields", {}).items() if not r.get("pass")]
@@ -532,17 +618,15 @@ def _print_run_line(fixture_idx: int, n_fixtures: int, fixture_name: str,
         fail_str = f"  <- {', '.join(failed)} [{', '.join(attrs)}]"
 
     status = f"{pc}/{tf}" if not run_data.get("error") else "ERROR"
-    print(f"  Run {run_idx}: {status:5s}  A-B sim: {ab_sim:.2f}  "
-          f"chose: {chose}{reason}  "
-          f"LLM: {eval_s:.1f}s ({tps:.0f} tok/s, load {load_s:.1f}s)  "
-          f"wall: {wall:.1f}s{fail_str}")
+    print(f"  Run {run_idx}: {status:5s}  OCR conf: {conf:.2f} ({retried})  "
+          f"LLM: {eval_s:.1f}s  wall: {wall:.1f}s{fail_str}")
 
 
 def _print_summary(overall: dict, metadata: dict):
     """Print final summary to console."""
-    print(f"\n{'=' * 60}")
+    print(f"\n{'=' * 70}")
     print("=== Summary ===")
-    print(f"{'=' * 60}")
+    print(f"{'=' * 70}")
     print(f"Overall: {overall['robustness_summary']}")
     print(f"Perfect: {overall['perfect_fixtures']}/{overall['perfect_fixtures'] + len(overall['fragile_fixtures'])} fixtures")
     if overall["fragile_fixtures"]:
@@ -557,8 +641,8 @@ def _print_summary(overall: dict, metadata: dict):
     else:
         print("  No failures to attribute.")
 
-    print(f"\nDual-Call Analysis:")
-    print(f"  {overall['dual_call_recommendation']}")
+    print(f"\nOCR Confidence & Retry:")
+    print(f"  {overall.get('ocr_retry_summary', 'N/A')}")
 
     print(f"\nPer-Field Robustness:")
     for field, score in sorted(overall["field_robustness"].items(),
@@ -571,15 +655,46 @@ def _print_summary(overall: dict, metadata: dict):
     if llm_summary:
         print(f"\nLLM Performance ({metadata.get('model', '?')}):")
         print(f"  Mean eval time:   {llm_summary.get('mean_eval_s', 0):6.1f}s")
-        print(f"  Mean load time:   {llm_summary.get('mean_load_s', 0):6.1f}s")
-        print(f"  Mean tok/s:       {llm_summary.get('mean_tps', 0):6.1f}")
         print(f"  Mean wall time:   {llm_summary.get('mean_wall_s', 0):6.1f}s")
-        print(f"  Total tokens:     {llm_summary.get('total_tokens', 0)}")
+
+    # Token usage & cost
+    cost = overall.get("cost_summary", {})
+    if cost.get("total_input_tokens"):
+        print(f"\nToken Usage & Cost:")
+        print(f"  Avg input tokens:   {cost.get('avg_input_tokens_per_receipt', 0):,}")
+        print(f"  Avg output tokens:  {cost.get('avg_output_tokens_per_receipt', 0):,}")
+        print(f"  Cost per receipt:   ${cost.get('cost_per_receipt_usd', 0):.4f}")
+        print(f"  Total cost:         ${cost.get('total_cost_usd', 0):.4f}")
+
+    # Override analysis
+    overrides = overall.get("override_summary", {})
+    print(f"\nPipeline Override Analysis:")
+    print(f"  Overrides per receipt: {overrides.get('overrides_per_receipt', 0):.1f}")
+    if overrides.get("by_field"):
+        for field, count in sorted(overrides["by_field"].items(),
+                                   key=lambda x: -x[1]):
+            print(f"    {field:20s} {count:3d} overrides")
+    else:
+        print(f"  No overrides — LLM output used as-is.")
+
+    # Determinism
+    det = overall.get("determinism_summary", {})
+    print(f"\nDeterminism:")
+    print(f"  {det.get('deterministic_fixtures', 0)}/{det.get('total_fixtures', 0)} "
+          f"fixtures produce identical output across runs ({det.get('rate', 0):.0%})")
+
+    # Warnings
+    warns = overall.get("warning_summary", {})
+    print(f"\nValidation Warnings:")
+    print(f"  Clean runs (0 warnings): {warns.get('clean_runs', 0)}/{metadata.get('runs_per_fixture', 0) * len(overall.get('perfect_fixture_names', []) + overall.get('fragile_fixtures', []))}"
+          f" ({warns.get('clean_rate', 0):.0%})")
+    print(f"  Avg warnings/receipt:    {warns.get('warnings_per_receipt', 0):.1f}")
 
     usage = get_api_usage()
-    print(f"\nAPI calls used this session: {metadata.get('api_calls_used', '?')}")
-    print(f"API calls remaining: {usage['remaining']}")
-    print(f"Results saved: {metadata.get('output_path', '?')}")
+    print(f"\nAPI Budget:")
+    print(f"  Calls this session: {metadata.get('api_calls_used', '?')}")
+    print(f"  Remaining:          {usage['remaining']}")
+    print(f"\nResults saved: {metadata.get('output_path', '?')}")
 
     variant_count = sum(1 for f in DEBUG_DIR.glob("*.txt")) if DEBUG_DIR.exists() else 0
     if variant_count:
@@ -727,11 +842,6 @@ def run_robustness_benchmark(
 
                 # Capture OCR data from collector
                 ocr_data = dict(_ocr_collector)
-                ab_sim = _text_similarity(
-                    ocr_data.get("call_a_text", ""),
-                    ocr_data.get("call_b_text", ""),
-                )
-                ocr_data["ab_similarity"] = round(ab_sim, 4)
 
                 # Evaluate fields
                 field_results = {}
@@ -740,6 +850,39 @@ def run_robustness_benchmark(
 
                 pass_count = sum(1 for f in field_results.values() if f["pass"])
                 total_fields = len(field_results)
+
+                # Compute LLM vs pipeline override tracking
+                llm_raw_extraction = (
+                    result.get("_pass_history", [{}])[0].get("extraction", {})
+                    if result.get("_pass_history") else {}
+                )
+                final_summary = {
+                    "total": result.get("total"),
+                    "date": result.get("date"),
+                    "merchant": result.get("merchant"),
+                    "subtotal": result.get("subtotal"),
+                    "currency": result.get("currency"),
+                    "payment_method": result.get("payment_method"),
+                    "line_items_count": len(result.get("line_items", [])),
+                    "tax_sum": sum(
+                        t.get("amount", 0) for t in result.get("taxes", [])
+                    ),
+                }
+                override_fields = []
+                for key in ("total", "subtotal", "payment_method", "date"):
+                    llm_val = llm_raw_extraction.get(key)
+                    final_val = final_summary.get(key)
+                    if llm_val != final_val and final_val is not None:
+                        override_fields.append(key)
+                llm_tax_sum = sum(
+                    t.get("amount", 0) for t in llm_raw_extraction.get("taxes", [])
+                    if isinstance(t, dict)
+                )
+                if abs(llm_tax_sum - final_summary["tax_sum"]) > 1:
+                    override_fields.append("taxes")
+                llm_items_count = len(llm_raw_extraction.get("line_items", []))
+                if llm_items_count != final_summary["line_items_count"]:
+                    override_fields.append("line_items")
 
                 # Build run record
                 run_record = {
@@ -753,28 +896,25 @@ def run_robustness_benchmark(
                     "error": error,
                     "fields": field_results,
                     "ocr_data": {
-                        "call_a_text": ocr_data.get("call_a_text", ""),
-                        "call_b_text": ocr_data.get("call_b_text", ""),
+                        "call_1_text": ocr_data.get("call_1_text", ""),
+                        "call_1_confidence": ocr_data.get("call_1_confidence"),
+                        "call_2_text": ocr_data.get("call_2_text", ""),
+                        "retried": ocr_data.get("retried", False),
+                        "retry_reason": ocr_data.get("retry_reason"),
                         "chosen_text": ocr_data.get("chosen_text", ""),
-                        "chose_b": ocr_data.get("chose_b", False),
-                        "chose_b_reason": ocr_data.get("chose_b_reason"),
-                        "ab_similarity": ocr_data["ab_similarity"],
                     },
                     "ocr_text": ocr_data.get("chosen_text", ""),
-                    "llm_raw": result.get("_pass_history", [{}])[0].get("extraction", {})
-                               if result.get("_pass_history") else {},
-                    "final_result_summary": {
-                        "total": result.get("total"),
-                        "date": result.get("date"),
-                        "merchant": result.get("merchant"),
-                        "subtotal": result.get("subtotal"),
-                        "currency": result.get("currency"),
-                        "payment_method": result.get("payment_method"),
-                        "line_items_count": len(result.get("line_items", [])),
-                        "tax_sum": sum(
-                            t.get("amount", 0) for t in result.get("taxes", [])
-                        ),
+                    "llm_raw": llm_raw_extraction,
+                    "final_result_summary": final_summary,
+                    "confidence": {
+                        "ocr": result.get("_ocr_confidence"),
+                        "llm": result.get("_llm_confidence"),
                     },
+                    "warnings": result.get("_warnings", []),
+                    "warning_count": len(result.get("_warnings", [])),
+                    "overrides": override_fields,
+                    "override_count": len(override_fields),
+                    "llm_passes_used": result.get("_pass_count", 1),
                 }
 
                 fixture_runs.append(run_record)
@@ -855,8 +995,8 @@ def _finalize_fixture(fixture_name: str, fdata: dict, saved_variants: dict):
             ):
                 variants_saved += 1
 
-    # Dual-call analysis
-    fdata["ocr_analysis"] = _compute_dual_call_analysis(runs)
+    # OCR confidence & retry analysis
+    fdata["ocr_analysis"] = _compute_ocr_analysis(runs)
     fdata["ocr_analysis"]["cross_run_similarity"] = _compute_cross_run_similarity(runs)
 
     # Per-field robustness
@@ -883,6 +1023,45 @@ def _finalize_fixture(fixture_name: str, fdata: dict, saved_variants: dict):
     fdata["field_robustness"] = field_robustness
     fdata["failure_variants_saved"] = variants_saved
 
+    # Determinism score: are all runs producing identical output?
+    summaries = [json.dumps(r.get("final_result_summary", {}), sort_keys=True)
+                 for r in runs]
+    unique_outputs = len(set(summaries))
+    fdata["determinism"] = {
+        "unique_outputs": unique_outputs,
+        "is_deterministic": unique_outputs == 1,
+        "score": round(1.0 / unique_outputs, 4) if unique_outputs else 1.0,
+    }
+
+    # Override analysis
+    all_overrides = [o for r in runs for o in r.get("overrides", [])]
+    override_counts: dict[str, int] = defaultdict(int)
+    for o in all_overrides:
+        override_counts[o] += 1
+    fdata["override_analysis"] = {
+        "total_overrides": len(all_overrides),
+        "overrides_per_run": round(len(all_overrides) / len(runs), 2) if runs else 0,
+        "by_field": dict(override_counts),
+    }
+
+    # Warning analysis
+    all_warnings = [w for r in runs for w in r.get("warnings", [])]
+    fdata["warning_analysis"] = {
+        "total_warnings": len(all_warnings),
+        "warnings_per_run": round(len(all_warnings) / len(runs), 2) if runs else 0,
+        "clean_runs": sum(1 for r in runs if r.get("warning_count", 0) == 0),
+        "clean_rate": round(
+            sum(1 for r in runs if r.get("warning_count", 0) == 0) / len(runs), 4
+        ) if runs else 1.0,
+    }
+
+    # Confidence summary
+    ocr_confs = [r.get("confidence", {}).get("ocr") for r in runs
+                 if r.get("confidence", {}).get("ocr") is not None]
+    fdata["confidence_summary"] = {
+        "mean_ocr": round(sum(ocr_confs) / len(ocr_confs), 4) if ocr_confs else None,
+    }
+
     # Overall fixture status
     all_pass = all(
         all(f["pass"] for f in r["fields"].values())
@@ -892,8 +1071,9 @@ def _finalize_fixture(fixture_name: str, fdata: dict, saved_variants: dict):
 
     total_pass = sum(r["pass_count"] for r in runs)
     total_checks = sum(r["total_fields"] for r in runs)
-    status = f"ROBUST ({total_pass}/{total_checks})" if all_pass else \
-             f"FRAGILE ({total_pass}/{total_checks})"
+    det_tag = "" if fdata["determinism"]["is_deterministic"] else " NON-DET"
+    status = f"ROBUST ({total_pass}/{total_checks}){det_tag}" if all_pass else \
+             f"FRAGILE ({total_pass}/{total_checks}){det_tag}"
     if variants_saved:
         status += f" - {variants_saved} OCR variant(s) saved"
     print(f"  -> {status}")
@@ -911,10 +1091,9 @@ def _assemble_results(metadata: dict, per_fixture: dict) -> dict:
             # Keep ocr_data but truncate raw text fields for JSON output
             if "ocr_data" in clean_run:
                 od = dict(clean_run["ocr_data"])
-                od["call_a_hash"] = str(hash(od.get("call_a_text", "")))[:12]
-                od["call_b_hash"] = str(hash(od.get("call_b_text", "")))[:12]
-                od.pop("call_a_text", None)
-                od.pop("call_b_text", None)
+                od["call_1_hash"] = str(hash(od.get("call_1_text", "")))[:12]
+                od.pop("call_1_text", None)
+                od.pop("call_2_text", None)
                 od.pop("chosen_text", None)
                 clean_run["ocr_data"] = od
             # Remove full OCR text and LLM raw from JSON (saved in debug dir)
@@ -947,6 +1126,85 @@ def _save_results(results: dict, output_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Historical comparison
+# ---------------------------------------------------------------------------
+
+def _compare_results(current: dict, previous: dict):
+    """Compare current benchmark results against a previous run and print deltas."""
+    curr_overall = current.get("overall", {})
+    prev_overall = previous.get("overall", {})
+
+    print(f"\n{'=' * 70}")
+    print("=== Comparison vs Previous Benchmark ===")
+    print(f"{'=' * 70}")
+    print(f"Previous: {previous.get('metadata', {}).get('timestamp', '?')}")
+    print(f"Current:  {current.get('metadata', {}).get('timestamp', '?')}")
+
+    # Accuracy delta
+    curr_score = curr_overall.get("robustness_score", 0)
+    prev_score = prev_overall.get("robustness_score", 0)
+    delta = curr_score - prev_score
+    arrow = "+" if delta > 0 else "" if delta == 0 else ""
+    print(f"\nAccuracy: {prev_score:.1%} -> {curr_score:.1%} ({arrow}{delta:+.1%})")
+
+    # Per-field comparison
+    curr_fields = curr_overall.get("field_robustness", {})
+    prev_fields = prev_overall.get("field_robustness", {})
+    all_fields = sorted(set(list(curr_fields.keys()) + list(prev_fields.keys())))
+    changed_fields = []
+    for field in all_fields:
+        curr_rate = curr_fields.get(field, 0)
+        prev_rate = prev_fields.get(field, 0)
+        if curr_rate != prev_rate:
+            changed_fields.append((field, prev_rate, curr_rate))
+    if changed_fields:
+        print(f"\nField changes:")
+        for field, prev_rate, curr_rate in changed_fields:
+            delta = curr_rate - prev_rate
+            print(f"  {field:25s} {prev_rate:6.1%} -> {curr_rate:6.1%} ({delta:+.1%})")
+    else:
+        print(f"\nNo per-field accuracy changes.")
+
+    # Speed delta
+    curr_timing = curr_overall.get("llm_timing_summary", {})
+    prev_timing = prev_overall.get("llm_timing_summary", {})
+    curr_wall = curr_timing.get("mean_wall_s", 0)
+    prev_wall = prev_timing.get("mean_wall_s", 0)
+    if prev_wall > 0:
+        speed_change = (curr_wall - prev_wall) / prev_wall * 100
+        print(f"\nSpeed: {prev_wall:.1f}s -> {curr_wall:.1f}s ({speed_change:+.1f}%)")
+
+    # Cost delta
+    curr_cost = curr_overall.get("cost_summary", {})
+    prev_cost = prev_overall.get("cost_summary", {})
+    curr_cpr = curr_cost.get("cost_per_receipt_usd", 0)
+    prev_cpr = prev_cost.get("cost_per_receipt_usd", 0)
+    if prev_cpr > 0:
+        cost_change = (curr_cpr - prev_cpr) / prev_cpr * 100
+        print(f"Cost:  ${prev_cpr:.4f} -> ${curr_cpr:.4f} per receipt ({cost_change:+.1f}%)")
+
+    # Determinism delta
+    curr_det = curr_overall.get("determinism_summary", {}).get("rate", 0)
+    prev_det = prev_overall.get("determinism_summary", {}).get("rate", 0)
+    if curr_det != prev_det:
+        print(f"Determinism: {prev_det:.0%} -> {curr_det:.0%}")
+
+    # Fixtures that changed status
+    curr_fragile = set(curr_overall.get("fragile_fixtures", []))
+    prev_fragile = set(prev_overall.get("fragile_fixtures", []))
+    fixed = prev_fragile - curr_fragile
+    regressed = curr_fragile - prev_fragile
+    if fixed:
+        print(f"\nFixed (were fragile, now robust): {', '.join(sorted(fixed))}")
+    if regressed:
+        print(f"Regressed (were robust, now fragile): {', '.join(sorted(regressed))}")
+    if not fixed and not regressed:
+        print(f"\nNo fixture status changes.")
+
+    print(f"{'=' * 70}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -965,16 +1223,18 @@ def main():
     parser.add_argument("--no-rotation", action="store_true",
                         help="Skip rotation fallback (saves ~4 calls per rotation fixture per run)")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
-                        help=f"Ollama model (default: {DEFAULT_MODEL})")
+                        help=f"LLM model (default: {DEFAULT_MODEL})")
     parser.add_argument("--passes", type=int, default=2,
                         help="LLM verification passes (default: 2)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from partial results JSON")
+    parser.add_argument("--compare", type=str, default=None,
+                        help="Compare results against a previous benchmark JSON")
     parser.add_argument("--force", action="store_true",
                         help="Skip budget warnings")
     args = parser.parse_args()
 
-    run_robustness_benchmark(
+    results = run_robustness_benchmark(
         runs=args.runs,
         fixture_names=args.fixtures,
         output_path=Path(args.output),
@@ -985,6 +1245,14 @@ def main():
         resume_path=Path(args.resume) if args.resume else None,
         force=args.force,
     )
+
+    if args.compare:
+        compare_path = Path(args.compare)
+        if compare_path.exists():
+            previous = json.loads(compare_path.read_text(encoding="utf-8"))
+            _compare_results(results, previous)
+        else:
+            print(f"Comparison file not found: {compare_path}")
 
 
 if __name__ == "__main__":

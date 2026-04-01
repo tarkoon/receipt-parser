@@ -177,6 +177,35 @@ def check_tax_categories(result: dict, truth: dict) -> dict:
     return {"pass": ok, "detail": f"got {pred_cats}, expected {true_cats}"}
 
 
+def check_item_descriptions(result: dict, truth: dict) -> dict:
+    """Fuzzy-match item descriptions: each truth item must match a result item at >= 0.5."""
+    true_items = truth.get("line_items", [])
+    pred_items = result.get("line_items", [])
+    if not true_items:
+        return {"pass": True, "detail": "no line items in truth, skipped"}
+    true_descs = [i.get("description", "") for i in true_items]
+    pred_descs = [i.get("description", "") for i in pred_items]
+    matched = 0
+    mismatches = []
+    for td in true_descs:
+        best_ratio = 0
+        best_match = ""
+        for pd in pred_descs:
+            ratio = _merchant_similarity(td, pd)
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = pd
+        if best_ratio >= 0.5:
+            matched += 1
+        else:
+            mismatches.append(f"'{td}' (best: '{best_match}' {best_ratio:.0%})")
+    ok = matched == len(true_descs)
+    detail = f"{matched}/{len(true_descs)} matched"
+    if mismatches:
+        detail += f"; unmatched: {', '.join(mismatches[:3])}"
+    return {"pass": ok, "detail": detail}
+
+
 FIELD_CHECKS = {
     "total": check_total,
     "date": check_date,
@@ -188,6 +217,7 @@ FIELD_CHECKS = {
     "tax_amount": check_tax_amount,
     "merchant_similarity": check_merchant_similarity,
     "tax_categories": check_tax_categories,
+    "item_descriptions": check_item_descriptions,
 }
 
 # ---------------------------------------------------------------------------

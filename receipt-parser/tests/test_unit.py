@@ -10,9 +10,10 @@ import cv2
 import numpy as np
 
 from schema import Receipt, generate_extraction_prompt, get_debug_color_map
-from extraction import get_ollama_schema
+from extraction import get_ollama_schema, _extract_confidence
 from validation import validate_receipt
 from normalization import normalize_fullwidth, clean_handwritten_ocr
+from ocr import compute_ocr_confidence
 
 
 # --- Normalization tests ---
@@ -81,6 +82,113 @@ def test_tax_inclusive_no_false_warning():
         taxes=[{"rate": "8%", "amount": 24}],
     )
     assert validate_receipt(receipt) == []
+
+
+# --- OCR confidence tests ---
+
+def test_ocr_confidence_empty():
+    assert compute_ocr_confidence([]) == 0.0
+
+
+def test_ocr_confidence_uniform():
+    blocks = [
+        {"text": "hello", "confidence": 0.95},
+        {"text": "world", "confidence": 0.95},
+    ]
+    assert abs(compute_ocr_confidence(blocks) - 0.95) < 0.001
+
+
+def test_ocr_confidence_weighted():
+    blocks = [
+        {"text": "a", "confidence": 0.5},      # 1 char, weight 1
+        {"text": "bbbbb", "confidence": 1.0},   # 5 chars, weight 5
+    ]
+    expected = (0.5 * 1 + 1.0 * 5) / 6  # 0.9167
+    assert abs(compute_ocr_confidence(blocks) - expected) < 0.001
+
+
+# --- LLM confidence extraction tests ---
+
+def test_extract_confidence_valid():
+    data = {"merchant": "test", "_confidence": {"merchant": 0.9, "total": 0.8}}
+    conf = _extract_confidence(data)
+    assert conf == {"merchant": 0.9, "total": 0.8}
+    assert "_confidence" not in data  # should be popped
+
+
+def test_extract_confidence_invalid_values():
+    data = {"_confidence": {"merchant": 1.5, "total": "bad", "date": -0.1, "subtotal": 0.7}}
+    conf = _extract_confidence(data)
+    assert conf == {"subtotal": 0.7}
+
+
+def test_extract_confidence_missing():
+    data = {"merchant": "test"}
+    conf = _extract_confidence(data)
+    assert conf is None
+
+
+# --- Era date conversion tests ---
+
+def test_era_reiwa():
+    from pipeline import _era_to_western_year
+    assert _era_to_western_year(8, "令和") == 2026
+    assert _era_to_western_year(1, "令和") == 2019
+
+
+def test_era_heisei():
+    from pipeline import _era_to_western_year
+    assert _era_to_western_year(31, "平成") == 2019
+    assert _era_to_western_year(1, "平成") == 1989
+
+
+def test_era_default_assumes_reiwa():
+    from pipeline import _era_to_western_year
+    assert _era_to_western_year(8) == 2026
+
+
+def test_era_invalid():
+    from pipeline import _era_to_western_year
+    assert _era_to_western_year(0) is None
+    assert _era_to_western_year(100) is None
+
+
+# --- Pydantic coercion tests ---
+
+def test_pydantic_coerces_quantity_alias():
+    r = Receipt(**{"total": 100, "line_items": [
+        {"name": "item1", "quantity": 2, "unit_price": 50, "total": 100}
+    ]})
+    assert r.line_items[0].description == "item1"
+    assert r.line_items[0].qty == 2
+
+
+def test_pydantic_coerces_tax_category():
+    r = Receipt(**{"total": 100, "line_items": [
+        {"description": "item", "total": 100, "tax_category": "8percent"}
+    ]})
+    assert r.line_items[0].tax_category == "8%"
+
+
+def test_pydantic_coerces_taxes_from_number():
+    r = Receipt(**{"total": 100, "taxes": 24})
+    assert len(r.taxes) == 1
+    assert r.taxes[0].amount == 24
+
+
+def test_pydantic_coerces_string_amounts():
+    r = Receipt(**{"total": "1,500", "subtotal": "1,200"})
+    assert r.total == 1500.0
+    assert r.subtotal == 1200.0
+
+
+# --- Configurable tax rates tests ---
+
+def test_valid_tax_rates_constant():
+    from schema import VALID_TAX_RATES, REDUCED_RATE, STANDARD_RATE, EXEMPT_RATE
+    assert REDUCED_RATE in VALID_TAX_RATES
+    assert STANDARD_RATE in VALID_TAX_RATES
+    assert EXEMPT_RATE in VALID_TAX_RATES
 
 
 # --- Schema tests ---

@@ -1,12 +1,19 @@
 # Project Setup
-
 - Python: Use `python` instead of `python3`. Conda is installed - Use the environment `financial-aid`
-- Default Ollama model: `qwen3.5:9b` (reasoning model - requires `think=False` for structured output calls)
+- Default LLM: DeepSeek V3.2 via direct API (api.deepseek.com). Always use `seed=42` for deterministic output.
 - Prefer latest library versions over pinning old ones - adapt code to new APIs instead of downgrading
 
 ## Testing Rules
-
 - **NEVER modify truth/fixture files** (`*_truth.json`) without explicit permission from the user. Fix the pipeline to produce correct output — do not change the expected answers.
+
+## Windows / Conda Environment
+- Always set `PYTHONIOENCODING=utf-8` when running Python commands (Japanese text breaks cp932 default)
+- Never rely on stdout for Japanese/non-ASCII output through `conda run` — write results to a UTF-8 file instead, then read the file
+- For diagnostic/debug scripts: always write output to a JSON or text file with `encoding='utf-8'`, never print to console
+
+## LLM Pipeline Debugging
+- When debugging LLM-based pipelines, confirm determinism FIRST (same input → same output). If the model API supports seed/temperature controls, lock those down before investigating individual failures.
+- After the first failing test run, STOP and classify errors (deterministic vs non-deterministic, code bug vs model behavior vs OCR variance). Present the classification and proposed fix strategy BEFORE running tests again.
 
 ## UI Design & Review Workflow
 

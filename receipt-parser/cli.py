@@ -3,6 +3,7 @@
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -10,10 +11,10 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import typer
 
-from pipeline import process_document
+from pipeline import process_document, process_batch
 from extraction import DEFAULT_MODEL
 
-__version__ = "1.2.0"
+__version__ = "3.0.0"
 
 app = typer.Typer(help="Receipt Parser — extract structured data from receipts and invoices.")
 
@@ -82,6 +83,8 @@ def parse(
     format: str = typer.Option("json", "--format", "-f", help="Output format: json or csv"),
     debug: bool = typer.Option(False, "--debug", "-d", help="Save debug artifacts"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Print OCR text and warnings"),
+    workers: int = typer.Option(1, "--workers", "-w", min=1, max=16,
+                                help="Concurrent workers for batch processing (default: 1)"),
     version: bool = typer.Option(False, "--version", callback=version_callback,
                                  is_eager=True, help="Show version"),
 ):
@@ -105,42 +108,69 @@ def parse(
     from ocr import init_cloud_vision
     engine = init_cloud_vision()
 
-    results = []
-    for file in files:
+    # Use batch processing for multiple files with workers > 1
+    if is_batch and workers > 1:
+        effective_workers = min(workers, len(files))
         if verbose:
-            typer.echo(f"Processing: {file.name}", err=True)
+            typer.echo(f"Batch processing {len(files)} files with {effective_workers} workers", err=True)
 
-        try:
-            result = process_document(
-                file, model=model, debug=debug,
-                passes=passes, ocr_engine=engine,
-            )
-            result["_file"] = str(file)
+        batch_start = time.perf_counter()
 
+        def _on_progress(file_path, result, completed, total):
             if verbose:
-                warnings = result.get("_warnings", [])
-                history = result.get("_pass_history", [])
-                for entry in history:
-                    n = entry["pass"]
-                    w = entry["warnings"]
-                    status = f"{len(w)} warnings" if w else "clean"
-                    typer.echo(f"  Pass {n}: {status}", err=True)
-                if warnings:
-                    typer.echo("  Final warnings:", err=True)
-                    for w in warnings:
-                        typer.echo(f"    - {w}", err=True)
+                status = "OK" if "_error" not in result else f"ERROR: {result['_error']}"
+                typer.echo(f"  [{completed}/{total}] {file_path.name}: {status}", err=True)
 
-                if debug:
-                    trace = result.get("_trace", "")
-                    if trace:
-                        typer.echo(f"\n{trace}", err=True)
+        results = process_batch(
+            files, model=model, debug=debug, passes=passes,
+            ocr_engine=engine, max_workers=effective_workers,
+            on_progress=_on_progress if verbose else None,
+        )
 
-        except Exception as e:
-            result = {"_file": str(file), "_error": str(e)}
+        if verbose:
+            elapsed = time.perf_counter() - batch_start
+            per_file = elapsed / len(files)
+            typer.echo(f"  Batch complete: {elapsed:.1f}s total, "
+                       f"{per_file:.1f}s/file avg ({len(files)/elapsed:.1f} files/min)",
+                       err=True)
+    else:
+        # Sequential processing
+        results = []
+        for file in files:
             if verbose:
-                typer.echo(f"  Error: {e}", err=True)
+                typer.echo(f"Processing: {file.name}", err=True)
 
-        results.append(result)
+            try:
+                result = process_document(
+                    file, model=model, debug=debug,
+                    passes=passes, ocr_engine=engine,
+                )
+                result["_file"] = str(file)
+
+                if verbose:
+                    warnings = result.get("_warnings", [])
+                    history = result.get("_pass_history", [])
+                    for entry in history:
+                        n = entry["pass"]
+                        w = entry["warnings"]
+                        status = f"{len(w)} warnings" if w else "clean"
+                        typer.echo(f"  Pass {n}: {status}", err=True)
+                    if warnings:
+                        typer.echo("  Final warnings:", err=True)
+                        for w in warnings:
+                            typer.echo(f"    - {w}", err=True)
+
+                    if debug:
+                        trace = result.get("_trace", "")
+                        if trace:
+                            typer.echo(f"\n{trace}", err=True)
+
+            except Exception as e:
+                result = {"_file": str(file), "_error": str(e)}
+                if verbose:
+                    typer.echo(f"  Error: {e}", err=True)
+
+            results.append(result)
 
     final_output = results if is_batch else results[0]
 

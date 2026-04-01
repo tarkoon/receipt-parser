@@ -21,17 +21,18 @@ def normalize_fullwidth(text: str) -> str:
 
 
 def strip_barcode_lines(text: str) -> str:
-    """Remove JAN/EAN barcode lines from OCR text.
+    """Remove barcode lines from OCR text.
 
-    Receipts often have barcode numbers like '4580374970018JAN' on separate lines.
+    Handles JAN/EAN, UPC-A, GTIN-14, Code 128, and other long digit-only lines.
     These confuse the LLM into misinterpreting them as prices or quantities.
     """
     lines = text.split('\n')
     cleaned = []
     for line in lines:
         stripped = line.strip()
-        # Skip lines that are just barcode numbers (8+ digits optionally followed by JAN/EAN)
-        if re.match(r'^\d{8,}\s*(JAN|EAN)?\s*$', stripped):
+        # Skip lines that are just long digit sequences (8+ digits) — covers
+        # JAN/EAN, UPC-A, GTIN-14, Code 128, and other barcode formats
+        if re.match(r'^\d{8,}\s*(JAN|EAN|UPC|GTIN)?\s*$', stripped, re.IGNORECASE):
             continue
         # Strip inline item codes at start of lines, preserving tax markers
         # e.g., "000406*トーラク" → "※トーラク" (preserve * as ※ tax marker)
@@ -162,20 +163,28 @@ def rejoin_price_lines(text: str) -> str:
     return '\n'.join(before + result + after)
 
 
-def clean_handwritten_ocr(text: str) -> str:
+def clean_handwritten_ocr(text: str, ocr_confidence: float | None = None) -> str:
     """Clean up OCR text from handwritten receipts (領収証).
 
     Handwritten receipt forms have pre-printed labels (税抜金額, 消費税額, etc.)
     that Cloud Vision OCR fragments into confusing noise. This strips those
     fragments so the LLM sees only the actual handwritten content.
+
+    Detection uses OCR confidence when available (handwritten = low avg confidence),
+    with line count as fallback.
     """
     lines = text.strip().split('\n')
 
-    # Handwritten receipt detection: short text (< 20 lines), has 金額 or standalone ¥NNNN,
-    # and does NOT have typical printed receipt markers like 小計 or 合計 with ¥ amounts
+    # Handwritten receipt detection:
+    # Primary: low OCR confidence (< 0.7) suggests handwritten content
+    # Fallback: short text (< 35 lines), no printed receipt markers
     is_printed = any('小計' in l or '合計' in l for l in lines)
-    is_short = len(lines) < 35
-    if is_printed or not is_short:
+    if ocr_confidence is not None:
+        is_handwritten = ocr_confidence < 0.7 and not is_printed
+    else:
+        is_short = len(lines) < 35
+        is_handwritten = is_short and not is_printed
+    if not is_handwritten:
         return text  # Printed receipt, don't clean
 
     # Remove common pre-printed form label fragments

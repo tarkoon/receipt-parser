@@ -1,23 +1,51 @@
 """pipeline.py — Orchestrates all pipeline stages.
 
 Uses Google Cloud Vision OCR → text → LLM (OpenRouter or Ollama) for structured extraction.
+Supports batch processing with concurrent API calls via process_batch().
 """
 
 import json
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from schema import Receipt
+from schema import Receipt, VALID_TAX_RATES, REDUCED_RATE, STANDARD_RATE
 from preprocessing import load_image, try_extract_text_layer
-from ocr import init_cloud_vision, run_cloud_vision, blocks_to_structured_text
+from ocr import init_cloud_vision, run_cloud_vision, blocks_to_structured_text, compute_ocr_confidence
 from extraction import check_model_available, extract_with_verification, DEFAULT_MODEL
 from validation import validate_receipt
 from normalization import (normalize_fullwidth, clean_handwritten_ocr, strip_barcode_lines,
                           rejoin_price_lines)
 from debug_visual import PipelineTrace, draw_ocr_bboxes, draw_field_overlay
+
+
+# ── Japanese Era Constants ───────────────────────────────────────────
+# Era name → base year (era year 1 = base + 1)
+_ERA_TABLE = {
+    "令和": 2018,   # 令和1年 = 2019
+    "平成": 1988,   # 平成1年 = 1989
+}
+_DEFAULT_ERA_BASE = 2018  # Assume 令和 when era name is not found
+
+
+def _era_to_western_year(era_year: int, era_name: str | None = None) -> int | None:
+    """Convert Japanese era year to western year.
+
+    Args:
+        era_year: The year within the era (e.g. 8 for 令和8年)
+        era_name: The era name if detected from OCR text (e.g. "令和", "平成")
+
+    Returns:
+        Western year (e.g. 2026) or None if era_year is invalid.
+    """
+    if era_year < 1 or era_year > 99:
+        return None
+    base = _ERA_TABLE.get(era_name, _DEFAULT_ERA_BASE) if era_name else _DEFAULT_ERA_BASE
+    return base + era_year
 
 
 # ── Document Type Detection ──────────────────────────────────────────
@@ -106,6 +134,10 @@ def _parse_yen_match(m) -> float | None:
     return float(val.replace(',', '')) if val else None
 
 
+# Suffix chars allowed after ¥ amounts: closing parens + JP tax rate markers
+_YEN_SUFFIX = r'[)）軽※X除]'
+
+
 def _extract_yen_nearby(lines: list[str], idx: int, look_ahead: int = 2):
     """Extract ¥ value from line idx (inline) or the next N lines with ¥ values."""
     val = _parse_yen_match(_YEN_INLINE.search(lines[idx].strip()))
@@ -114,11 +146,11 @@ def _extract_yen_nearby(lines: list[str], idx: int, look_ahead: int = 2):
     for j in range(idx + 1, min(idx + 1 + look_ahead, len(lines))):
         stripped = lines[j].strip()
         # Match pure ¥/円 lines AND lines with leading text before ¥ (e.g. "1 ¥3,990")
-        m = re.match(r'^[¥￥]\s*([\d,]+)[)）]?\s*$', stripped)
+        m = re.match(rf'^[¥￥]\s*([\d,]+){_YEN_SUFFIX}?\s*$', stripped)
         if not m:
-            m = re.match(r'^[\d\s]*[¥￥]\s*([\d,]+)[)）]?\s*$', stripped)
+            m = re.match(rf'^[\d\s]*[¥￥]\s*([\d,]+){_YEN_SUFFIX}?\s*$', stripped)
         if not m:
-            m = re.match(r'^([\d,]+)\s*円[)）]?\s*$', stripped)
+            m = re.match(rf'^([\d,]+)\s*円{_YEN_SUFFIX}?\s*$', stripped)
         if m:
             return float(m.group(1).replace(',', ''))
     return None
@@ -132,9 +164,9 @@ def _extract_yen_max_nearby(lines: list[str], idx: int, look_ahead: int = 5):
         return val
     for j in range(idx + 1, min(idx + 1 + look_ahead, len(lines))):
         stripped = lines[j].strip()
-        m = re.match(r'^[¥￥]\s*([\d,]+)[)）]?\s*$', stripped)
+        m = re.match(rf'^[¥￥]\s*([\d,]+){_YEN_SUFFIX}?\s*$', stripped)
         if not m:
-            m = re.match(r'^([\d,]+)\s*円[)）]?\s*$', stripped)
+            m = re.match(rf'^([\d,]+)\s*円{_YEN_SUFFIX}?\s*$', stripped)
         if m:
             values.append(float(m.group(1).replace(',', '')))
         elif re.search(r'小\s*計|現\s*計|お釣り|お釣銭|釣\s*銭|お預り|お預り金|^預$|支払い?方法|支払い?\s|現金|釣銭|クレジット', stripped):
@@ -150,9 +182,9 @@ def _extract_yen_min_nearby(lines: list[str], idx: int, look_ahead: int = 3):
         return val
     for j in range(idx + 1, min(idx + 1 + look_ahead, len(lines))):
         stripped = lines[j].strip()
-        m = re.match(r'^[¥￥]\s*([\d,]+)[)）]?\s*$', stripped)
+        m = re.match(rf'^[¥￥]\s*([\d,]+){_YEN_SUFFIX}?\s*$', stripped)
         if not m:
-            m = re.match(r'^([\d,]+)\s*円[)）]?\s*$', stripped)
+            m = re.match(rf'^([\d,]+)\s*円{_YEN_SUFFIX}?\s*$', stripped)
         if m:
             values.append(float(m.group(1).replace(',', '')))
         elif re.search(r'合\s*計|小\s*計|現\s*計|お釣り|お釣銭|釣\s*銭|お預り|お預り金', stripped):
@@ -186,6 +218,10 @@ def _extract_financial_totals(text: str) -> dict:
             val = _extract_yen_nearby(lines, i)
             if val is not None:
                 result['subtotal'] = val
+                # Also check for an alternative value in case the first is an item price
+                val_max = _extract_yen_max_nearby(lines, i, look_ahead=5)
+                if val_max and val_max != val:
+                    result['_subtotal_alt'] = val_max
 
         is_total_line = re.search(r'合\s*計', line)
         if not is_total_line and re.match(r'^計$', line) and i > 0:
@@ -251,6 +287,58 @@ def _extract_financial_totals(text: str) -> dict:
                     tax_val = float(amt_m.group(1).replace(',', ''))
                     taxes.append({'rate': rate_str, 'label': '内消費税等', 'amount': tax_val})
 
+    # Parse 内訳 (breakdown) sections for per-rate tax amounts and rate bases
+    # Pattern: "内訳 10%\n<inclusive_base>\n<tax>\nR 8%\n<inclusive_base>\n<tax>"
+    breakdown_rate_bases: dict[str, float] = {}
+    if not taxes:
+        breakdown_taxes = []
+        in_breakdown = False
+        current_rate = None
+        breakdown_nums: list[float] = []
+
+        def _save_breakdown_entry():
+            if current_rate and len(breakdown_nums) >= 2:
+                tax_amt = min(breakdown_nums[:2])
+                inclusive_base = max(breakdown_nums[:2])
+                pre_tax_base = inclusive_base - tax_amt
+                breakdown_taxes.append({
+                    'rate': current_rate, 'label': '内訳', 'amount': tax_amt
+                })
+                if pre_tax_base > 0:
+                    breakdown_rate_bases[current_rate] = pre_tax_base
+
+        for raw in lines:
+            line = raw.strip()
+            if '内訳' in line:
+                in_breakdown = True
+            if in_breakdown:
+                rate_m = re.match(r'^(?:R\s*)?(\d+)%\s*$', line) or re.search(r'内訳\s*(\d+)%', line)
+                if rate_m:
+                    _save_breakdown_entry()
+                    current_rate = rate_m.group(1) + '%'
+                    breakdown_nums = []
+                    continue
+                if current_rate:
+                    num_m = re.match(r'^([\d,]+)\s*$', line)
+                    if num_m:
+                        breakdown_nums.append(float(num_m.group(1).replace(',', '')))
+                    elif not line:
+                        continue
+                    else:
+                        _save_breakdown_entry()
+                        current_rate = None
+                        break
+        _save_breakdown_entry()
+        if breakdown_taxes:
+            taxes = breakdown_taxes
+
+    # Use total_first as subtotal fallback when explicit subtotal not found
+    if 'subtotal' not in result and result.get('total_first') is not None:
+        total_first = result['total_first']
+        total_val = result.get('total')
+        if total_val and total_first < total_val and total_first >= total_val * 0.5:
+            result['subtotal'] = total_first
+
     # Sanity check: remove tax entries where amount >= total (clearly wrong)
     total = result.get('total')
     if taxes and total:
@@ -258,6 +346,9 @@ def _extract_financial_totals(text: str) -> dict:
 
     if taxes:
         result['taxes'] = taxes
+
+    if breakdown_rate_bases:
+        result['_breakdown_rate_bases'] = breakdown_rate_bases
 
     return result
 
@@ -310,23 +401,24 @@ def _assign_tax_categories(items, unified_text, ocr_totals, rate_bases):
     if not items:
         return
 
+    valid_rates = set(VALID_TAX_RATES) - {"0%"}
     detected_rates: set[str] = set()
     for tax in ocr_totals.get("taxes", []):
         rate = tax.get("rate", "")
-        if rate in ("8%", "10%"):
+        if rate in valid_rates:
             detected_rates.add(rate)
     for rate in rate_bases:
-        if rate in ("8%", "10%"):
+        if rate in valid_rates:
             detected_rates.add(rate)
     if re.search(r'軽減税率.*8%', unified_text):
-        detected_rates.add("8%")
+        detected_rates.add(REDUCED_RATE)
     for m in re.finditer(r'(\d+)%\s*(?:内税|外税)', unified_text):
         r = m.group(1) + "%"
-        if r in ("8%", "10%"):
+        if r in valid_rates:
             detected_rates.add(r)
     for m in re.finditer(r'(?:内税|外税)\s*(\d+)%', unified_text):
         r = m.group(1) + "%"
-        if r in ("8%", "10%"):
+        if r in valid_rates:
             detected_rates.add(r)
 
     if not detected_rates:
@@ -348,17 +440,12 @@ def _assign_tax_categories(items, unified_text, ocr_totals, rate_bases):
             if desc_prefix not in line:
                 continue
             if '除' in line:
-                item_rates[idx] = "10%"
+                item_rates[idx] = STANDARD_RATE
             elif re.search(r'[※X\*軽]', line):
-                item_rates[idx] = "8%"
+                item_rates[idx] = REDUCED_RATE
             break
 
-    for idx, item in enumerate(items):
-        if idx in item_rates:
-            continue
-        desc = item.get("description", "")
-        if 'レジ袋' in desc or 'ポリ袋' in desc:
-            item_rates[idx] = "10%"
+    # Note: レジ袋/ポリ袋 hardcode removed — LLM assigns tax category from context
 
     unassigned = [i for i in range(len(items)) if i not in item_rates]
     if not unassigned:
@@ -403,10 +490,10 @@ def _assign_tax_categories(items, unified_text, ocr_totals, rate_bases):
         default_rate = majority_rate
     else:
         marker_rates = set(item_rates.values())
-        if "8%" in marker_rates and "10%" not in marker_rates:
-            default_rate = "10%"
-        elif "10%" in marker_rates and "8%" not in marker_rates:
-            default_rate = "8%"
+        if REDUCED_RATE in marker_rates and STANDARD_RATE not in marker_rates:
+            default_rate = STANDARD_RATE
+        elif STANDARD_RATE in marker_rates and REDUCED_RATE not in marker_rates:
+            default_rate = REDUCED_RATE
         else:
             default_rate = majority_rate
 
@@ -417,16 +504,84 @@ def _assign_tax_categories(items, unified_text, ocr_totals, rate_bases):
         items[idx]["tax_category"] = rate
 
 
+# ── Confidence Router ────────────────────────────────────────────────
+
+_HIGH_OCR_CONFIDENCE = 0.85
+_HIGH_LLM_CONFIDENCE = 0.7
+_LOW_LLM_CONFIDENCE = 0.5
+
+# Financial fields always get overridden by OCR evidence when OCR is reliable,
+# because LLM self-reported confidence is not calibrated for numeric accuracy.
+_FINANCIAL_FIELDS = {"total", "subtotal", "taxes", "points_used"}
+
+
+def _should_override_field(field: str, ocr_conf: float, llm_conf: dict | None) -> bool:
+    """Decide whether regex should override LLM output for a given field.
+
+    For financial fields (total, subtotal, taxes): always override when OCR
+    is reliable — LLM confidence is unreliable for numeric accuracy.
+
+    For other fields: override only when LLM confidence is low.
+    """
+    if ocr_conf < _HIGH_OCR_CONFIDENCE:
+        return False  # OCR too unreliable for regex extraction
+    if field in _FINANCIAL_FIELDS:
+        return True  # Always override financial fields with OCR evidence
+    if llm_conf is None:
+        return True  # No confidence info — fall back to legacy behavior
+    field_conf = llm_conf.get(field, 0.0)
+    return field_conf < _LOW_LLM_CONFIDENCE
+
+
+def _should_use_regex_as_validation(field: str, ocr_conf: float, llm_conf: dict | None) -> bool:
+    """Use regex as a validation signal (warn on disagreement) but don't override."""
+    if ocr_conf < _HIGH_OCR_CONFIDENCE:
+        return False
+    if field in _FINANCIAL_FIELDS:
+        return False  # Financial fields get overridden, not just validated
+    if llm_conf is None:
+        return False
+    field_conf = llm_conf.get(field, 0.0)
+    return _LOW_LLM_CONFIDENCE <= field_conf < _HIGH_LLM_CONFIDENCE
+
+
+def _compute_posthoc_confidence(extracted: dict, warnings: list[str]) -> dict:
+    """Compute per-field confidence from validation results (post-hoc).
+
+    Instead of asking the LLM for confidence (which changes the prompt and output),
+    derive confidence from validation warnings and field presence.
+    """
+    conf = {}
+    warning_text = " ".join(warnings)
+
+    for field in ("merchant", "date", "total", "subtotal", "taxes",
+                   "payment_method", "line_items", "points_used"):
+        val = extracted.get(field)
+        if val is None or (isinstance(val, list) and len(val) == 0):
+            conf[field] = 0.0
+        elif field in warning_text.lower():
+            conf[field] = 0.4  # Field mentioned in warnings
+        else:
+            conf[field] = 0.9  # No warnings for this field
+
+    return conf
+
+
 # ── Result Builder ───────────────────────────────────────────────────
 
-def _build_result(receipt, final_warnings, pass_history, model, debug=False, trace=None):
+def _build_result(receipt, final_warnings, pass_history, model, debug=False, trace=None,
+                   ocr_confidence=None, llm_confidence=None):
     result = receipt.model_dump()
     result["_warnings"] = final_warnings
     result["_pass_count"] = len(pass_history)
     result["_model"] = model
-    result["_pipeline_version"] = "2.0.0"
+    result["_pipeline_version"] = "3.0.0"
     line_item_warnings = [w for w in final_warnings if "Line " in w]
     result["_line_items_reliable"] = len(line_item_warnings) == 0
+    if ocr_confidence is not None:
+        result["_ocr_confidence"] = round(ocr_confidence, 4)
+    if llm_confidence is not None:
+        result["_llm_confidence"] = llm_confidence
     if debug and trace:
         result["_debug_dir"] = str(trace.debug_dir)
         result["_trace"] = trace.summary()
@@ -484,6 +639,7 @@ def process_document(
                     if entry["warnings"]:
                         trace.log_step(f"pass{n}_warnings", data="\n".join(entry["warnings"]))
 
+            llm_conf_pdf = extracted.pop("_confidence", None)
             try:
                 receipt = Receipt(**extracted)
             except Exception:
@@ -496,7 +652,8 @@ def process_document(
                     "SKIPPED: Digital PDF fast path — no OCR bounding boxes available.")
                 (debug_dir / "pipeline_trace.txt").write_text(trace.summary())
 
-            result = _build_result(receipt, final_warnings, pass_history, model, debug=debug, trace=trace)
+            result = _build_result(receipt, final_warnings, pass_history, model, debug=debug, trace=trace,
+                                   ocr_confidence=1.0, llm_confidence=llm_conf_pdf)
             if apply_user_rules:
                 result = _apply_merchant_mapping(result)
             return result
@@ -533,6 +690,10 @@ def process_document(
     unified_text = normalize_fullwidth(unified_text)
     unified_text = strip_barcode_lines(unified_text)
 
+    # Compute aggregate OCR confidence
+    all_blocks_flat = [b for page_blocks in all_ocr_blocks for b in page_blocks]
+    ocr_conf = compute_ocr_confidence(all_blocks_flat)
+
     # Step 0: Detect document type
     doc_type = detect_document_type(unified_text)
 
@@ -541,7 +702,7 @@ def process_document(
     if doc_type == "receipt":
         ocr_totals = _extract_financial_totals(unified_text)
         unified_text = rejoin_price_lines(unified_text)
-        unified_text = clean_handwritten_ocr(unified_text)
+        unified_text = clean_handwritten_ocr(unified_text, ocr_confidence=ocr_conf)
 
     if not unified_text.strip():
         return {
@@ -577,34 +738,41 @@ def process_document(
                     extracted[fkey] = None
 
     # ── Receipt post-processing ──
+    llm_conf = extracted.get("_confidence")
     if doc_type == "receipt" and "error" not in extracted:
-        # 4.5: Financial totals override
+        # 4.5: Financial totals override — gated by confidence router
         # Sanity check: OCR subtotal should be plausible (not an item price)
         ocr_total_val = ocr_totals.get("total")
         if "subtotal" in ocr_totals:
             ocr_sub_val = ocr_totals["subtotal"]
             if ocr_total_val and ocr_sub_val < ocr_total_val * 0.5:
-                del ocr_totals["subtotal"]  # Too low — likely an item price, not subtotal
-            else:
+                # First value too low — try alternative subtotal (next ¥ value)
+                alt_sub = ocr_totals.get("_subtotal_alt")
+                if alt_sub and alt_sub >= ocr_total_val * 0.5:
+                    ocr_totals["subtotal"] = alt_sub
+                    ocr_sub_val = alt_sub
+                else:
+                    del ocr_totals["subtotal"]
+            if "subtotal" in ocr_totals and _should_override_field("subtotal", ocr_conf, llm_conf):
                 extracted["subtotal"] = ocr_sub_val
-        if "total" in ocr_totals:
+            elif extracted.get("subtotal") is None:
+                extracted["subtotal"] = ocr_sub_val  # Fill missing fields regardless
+        if "total" in ocr_totals and _should_override_field("total", ocr_conf, llm_conf):
             ocr_total = float(ocr_totals["total"])
             ocr_first = float(ocr_totals["total_first"]) if ocr_totals.get("total_first") is not None else None
             ocr_sub = float(ocr_totals["subtotal"]) if ocr_totals.get("subtotal") is not None else None
-            # If max is way higher than subtotal, it's likely a tender amount.
-            # If total < subtotal, it's likely a tax amount, not the total.
             if ocr_sub and ocr_total < ocr_sub:
-                pass  # Don't override — OCR total is suspect (tax/other amount)
+                pass  # Don't override — OCR total is suspect
             elif ocr_sub and ocr_total > ocr_sub * 2:
-                # OCR max is way too high (likely tender amount)
                 if ocr_first and ocr_first <= ocr_sub * 1.15:
                     extracted["total"] = ocr_first
-                # else: don't override — LLM total or subtotal-based fallback
             else:
                 extracted["total"] = ocr_total
+        elif "total" in ocr_totals and extracted.get("total") is None:
+            extracted["total"] = float(ocr_totals["total"])  # Fill missing
         if "subtotal" in ocr_totals and "total" in ocr_totals:
             computed_tax = ocr_totals["total"] - ocr_totals["subtotal"]
-            if computed_tax >= 0:
+            if computed_tax >= 0 and _should_override_field("taxes", ocr_conf, llm_conf):
                 llm_tax = sum(t.get("amount", 0) for t in extracted.get("taxes", []))
                 if abs(llm_tax - computed_tax) > 5:
                     if extracted.get("taxes"):
@@ -616,10 +784,10 @@ def process_document(
                             extracted["taxes"] = [{"rate": "unknown", "label": None, "amount": computed_tax}]
                     elif computed_tax > 0:
                         extracted["taxes"] = [{"rate": "unknown", "label": None, "amount": computed_tax}]
-        if ocr_totals.get("taxes"):
+        if ocr_totals.get("taxes") and _should_override_field("taxes", ocr_conf, llm_conf):
             extracted["taxes"] = ocr_totals["taxes"]
 
-        # 4.6: Date fix
+        # 4.6: Date fix — supports 令和 and 平成 eras
         western = re.search(r'(20\d{2})\s*年\s*0?(\d{1,2})\s*月\s*0?(\d{1,2})\s*日', unified_text)
         if not western:
             western = re.search(r'(20\d{2})/\s*(\d{1,2})/\s*(\d{1,2})', unified_text)
@@ -631,9 +799,28 @@ def process_document(
                 year += 10
             extracted["date"] = f"{year:04d}-{int(western.group(2)):02d}-{int(western.group(3)):02d}"
         else:
-            era = re.search(r'(?<!\d)(\d)\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', unified_text)
-            if era and 1 <= int(era.group(1)) <= 9:
-                extracted["date"] = f"{2018 + int(era.group(1)):04d}-{int(era.group(2)):02d}-{int(era.group(3)):02d}"
+            # Try named era first: 令和8年 or 平成31年
+            era_named = re.search(r'(令和|平成)\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', unified_text)
+            if era_named:
+                era_name = era_named.group(1)
+                era_year = int(era_named.group(2))
+                w_year = _era_to_western_year(era_year, era_name)
+                if w_year:
+                    extracted["date"] = f"{w_year:04d}-{int(era_named.group(3)):02d}-{int(era_named.group(4)):02d}"
+            else:
+                # Unnamed era: single digit year (assume 令和)
+                era = re.search(r'(?<!\d)(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', unified_text)
+                if era:
+                    era_year = int(era.group(1))
+                    # Detect era from nearby text context
+                    era_name = None
+                    for name in _ERA_TABLE:
+                        if name in unified_text:
+                            era_name = name
+                            break
+                    w_year = _era_to_western_year(era_year, era_name)
+                    if w_year and 1989 <= w_year <= 2100:
+                        extracted["date"] = f"{w_year:04d}-{int(era.group(2)):02d}-{int(era.group(3)):02d}"
 
         # 4.7: Payment method fix
         has_cash = '現計' in unified_text
@@ -663,6 +850,8 @@ def process_document(
             if strong_cash:
                 extracted["payment_method"] = "cash"
             elif not existing or existing == "cash":
+                extracted["payment_method"] = "cash"
+            elif _should_override_field("payment_method", ocr_conf, llm_conf) and not existing:
                 extracted["payment_method"] = "cash"
         elif extracted.get("payment_method") == "cash":
             is_printed = any(kw in unified_text for kw in ['小計', '合計', '対象', '税率'])
@@ -746,6 +935,44 @@ def process_document(
                                 item["total"] = unit_price * correct_qty - item.get("discount", 0)
                             break
                     break
+
+        # 4.8c: Collapsed-item expansion
+        # When the LLM collapses N individually-listed identical items into 1
+        # item with qty=N, expand back to N separate items.
+        # Guards: only triggers when the receipt lists items individually (N
+        # separate OCR lines) AND no ×N bulk quantity pattern exists in OCR.
+        if extracted.get("line_items") and len(extracted["line_items"]) == 1:
+            item = extracted["line_items"][0]
+            if isinstance(item, dict):
+                qty = item.get("qty", 1)
+                unit_price = item.get("unit_price")
+                desc = item.get("description", "")
+                if qty > 1 and unit_price is not None and desc:
+                    # Count separate OCR lines containing the description
+                    ocr_lines = unified_text.split('\n')
+                    ocr_desc_count = sum(
+                        1 for line in ocr_lines
+                        if desc in line and '小計' not in line and '合計' not in line
+                    )
+                    # Check that OCR does NOT have a bulk qty pattern (×N, xN)
+                    price_str = str(int(unit_price)) if unit_price == int(unit_price) else str(unit_price)
+                    has_bulk_pattern = bool(re.search(
+                        re.escape(price_str) + r'\s*[×xX]\s*\d+', unified_text
+                    ))
+                    if ocr_desc_count >= qty and not has_bulk_pattern:
+                        expanded = []
+                        for _ in range(int(qty)):
+                            expanded.append({
+                                "description": desc,
+                                "qty": 1,
+                                "unit_price": unit_price,
+                                "total": unit_price,
+                                "tax_category": item.get("tax_category", "0%"),
+                                "discount": 0,
+                                "discount_rate": "",
+                            })
+                        extracted["line_items"] = expanded
+                        extracted["subtotal"] = unit_price * qty
 
         # 4.9: Fix hallucinated line item totals/unit_prices
         if extracted.get("line_items"):
@@ -832,12 +1059,24 @@ def process_document(
         # 4.10: Tax categories
         if extracted.get("line_items"):
             rate_bases = _extract_rate_bases(unified_text)
+            # Merge breakdown rate bases (from 内訳 section) with regex-extracted bases
+            breakdown_bases = ocr_totals.get('_breakdown_rate_bases', {})
+            for rate, base in breakdown_bases.items():
+                if rate not in rate_bases or rate_bases[rate] is None:
+                    rate_bases[rate] = base
             _assign_tax_categories(extracted["line_items"], unified_text, ocr_totals, rate_bases)
 
-        # 4.11: Points used
+        # 4.11: Points used — gated by confidence + OCR evidence
         points = _extract_points_used(unified_text)
         if points is not None:
-            extracted["points_used"] = points
+            if _should_override_field("points_used", ocr_conf, llm_conf) or extracted.get("points_used") is None:
+                extracted["points_used"] = points
+        elif extracted.get("points_used") is not None:
+            # LLM claims points were used, but OCR regex found no evidence.
+            # Verify: require ポイント利用 or ポイント値引 in text to keep the LLM value.
+            has_points_evidence = bool(re.search(r'ポイント利用|ポイント値引', unified_text))
+            if not has_points_evidence:
+                extracted["points_used"] = None
 
         # 4.12: Fix pre-tax item totals for inclusive-tax receipts
         # If sum of items != subtotal/total but items appear to be pre-tax amounts, fix them
@@ -866,7 +1105,22 @@ def process_document(
                     i.get("total", 0) for i in extracted["line_items"] if isinstance(i, dict)
                 )
 
-        # 4.13: Default subtotal = total for receipts when not found
+        # 4.13: Inclusive tax subtotal fix
+        # When all OCR tax entries are truly inclusive (内税), subtotal = total.
+        # "内税" means tax-inclusive pricing. Do NOT confuse with "内消費税等"
+        # which comes from "(うち消費税等)" meaning "of which is tax" (informational).
+        if extracted.get("subtotal") and extracted.get("total") and extracted.get("taxes"):
+            ocr_tax_labels = [t.get("label", "") for t in ocr_totals.get("taxes", [])]
+            # Only true inclusive: label is exactly "内税" or starts with "内税"
+            all_inclusive = ocr_tax_labels and all(
+                (lbl or '').startswith('内税') for lbl in ocr_tax_labels
+            )
+            if all_inclusive and "subtotal" not in ocr_totals:
+                tax_sum = sum(t.get("amount", 0) for t in extracted["taxes"])
+                if extracted["subtotal"] and abs(extracted["subtotal"] + tax_sum - extracted["total"]) < 2:
+                    extracted["subtotal"] = extracted["total"]
+
+        # Default subtotal = total for receipts when not found
         if extracted.get("subtotal") is None and extracted.get("total") is not None:
             extracted["subtotal"] = extracted["total"]
 
@@ -921,6 +1175,9 @@ def process_document(
         if total is not None:
             extracted["amount_paid"] = total - points if points else total
 
+    # Strip _confidence if present (LLM may include it even though not requested)
+    extracted.pop("_confidence", None)
+
     # Step 5: Final validation
     try:
         receipt = Receipt(**extracted)
@@ -928,12 +1185,88 @@ def process_document(
         receipt = Receipt()
     final_warnings = validate_receipt(receipt)
 
+    # Compute post-hoc confidence from validation results
+    posthoc_conf = _compute_posthoc_confidence(extracted, final_warnings)
+
     if debug and images:
         assert debug_dir is not None
         draw_field_overlay(images[0], all_ocr_blocks[0], extracted, debug_dir / "10_field_overlay.png")
         (debug_dir / "pipeline_trace.txt").write_text(trace.summary())
 
-    result = _build_result(receipt, final_warnings, pass_history, model, debug=debug, trace=trace)
+    result = _build_result(receipt, final_warnings, pass_history, model, debug=debug, trace=trace,
+                           ocr_confidence=ocr_conf, llm_confidence=posthoc_conf)
     if apply_user_rules:
         result = _apply_merchant_mapping(result)
     return result
+
+
+# ── Batch Processing ────────────────────────────────────────────────
+
+def process_batch(
+    file_paths: list[Path],
+    model: str = DEFAULT_MODEL,
+    debug: bool = False,
+    passes: int = 1,
+    ocr_engine=None,
+    apply_user_rules: bool = True,
+    max_workers: int = 4,
+    on_progress=None,
+) -> list[dict]:
+    """Process multiple documents concurrently.
+
+    Uses ThreadPoolExecutor for parallel LLM API calls (I/O-bound).
+    The Cloud Vision client and OCR cache are thread-safe.
+
+    Args:
+        file_paths: List of image/PDF paths to process.
+        max_workers: Maximum concurrent API calls (default: 4).
+        on_progress: Optional callback(file_path, result, index, total)
+            called as each file completes.
+
+    Returns:
+        List of result dicts in the same order as file_paths.
+    """
+    if not file_paths:
+        return []
+
+    check_model_available(model)
+    if ocr_engine is None:
+        ocr_engine = init_cloud_vision()
+
+    total = len(file_paths)
+    results: list[dict | None] = [None] * total
+    start_time = time.perf_counter()
+
+    def _process_one(idx: int, file_path: Path) -> tuple[int, dict]:
+        try:
+            result = process_document(
+                file_path, model=model, debug=debug,
+                passes=passes, ocr_engine=ocr_engine,
+                apply_user_rules=apply_user_rules,
+            )
+            result["_file"] = str(file_path)
+        except Exception as e:
+            result = {"_file": str(file_path), "_error": str(e)}
+        return idx, result
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_process_one, i, fp): i
+            for i, fp in enumerate(file_paths)
+        }
+        for future in as_completed(futures):
+            idx, result = future.result()
+            results[idx] = result
+            completed += 1
+            if on_progress:
+                on_progress(file_paths[idx], result, completed, total)
+
+    elapsed = time.perf_counter() - start_time
+    # Inject batch metadata into each result
+    for r in results:
+        if r:
+            r["_batch_total_s"] = round(elapsed, 2)
+            r["_batch_workers"] = max_workers
+
+    return results  # type: ignore[return-value]

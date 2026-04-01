@@ -6,9 +6,10 @@ EXTENDING THE SCHEMA section in the build plan.
 """
 
 from __future__ import annotations
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from typing import Literal, Optional
 import json
+import re
 
 
 # ── Field Registry ────────────────────────────────────────────────────
@@ -172,14 +173,76 @@ def get_debug_color_map() -> dict[str, tuple[int, int, int]]:
 
 # ── Pydantic Models ───────────────────────────────────────────────────
 
+# ── Configurable Tax Rates ───────────────────────────────────────────
+VALID_TAX_RATES = ("8%", "10%", "0%")
+REDUCED_RATE = "8%"
+STANDARD_RATE = "10%"
+EXEMPT_RATE = "0%"
+
+TaxCategoryType = Literal["8%", "10%", "0%"]
+
+
+def _coerce_numeric(v) -> float | None:
+    """Coerce a value to float, handling strings with commas."""
+    if v is None:
+        return None
+    try:
+        return float(str(v).replace(',', ''))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_tax_category(v) -> str:
+    """Coerce tax_category to a valid literal value."""
+    if v in VALID_TAX_RATES:
+        return v
+    if v and "8" in str(v):
+        return REDUCED_RATE
+    if v and "10" in str(v):
+        return STANDARD_RATE
+    return EXEMPT_RATE
+
+
 class LineItem(BaseModel):
+    model_config = {"populate_by_name": True}
+
     description: str
     qty: float = 1
     unit_price: Optional[float] = None
     total: float
-    tax_category: Literal["8%", "10%", "0%"] = "0%"
+    tax_category: TaxCategoryType = EXEMPT_RATE
     discount: float = 0
     discount_rate: str = ""
+
+    @field_validator("total", "unit_price", "qty", "discount", mode="before")
+    @classmethod
+    def coerce_numeric_fields(cls, v):
+        if v is None:
+            return v
+        try:
+            return float(str(v).replace(',', ''))
+        except (TypeError, ValueError):
+            return v
+
+    @field_validator("tax_category", mode="before")
+    @classmethod
+    def coerce_tax_category(cls, v):
+        return _coerce_tax_category(v)
+
+    @field_validator("discount_rate", mode="before")
+    @classmethod
+    def coerce_discount_rate(cls, v):
+        return "" if v is None else str(v)
+
+    @field_validator("discount", mode="before")
+    @classmethod
+    def coerce_discount_default(cls, v):
+        if v is None:
+            return 0
+        try:
+            return float(str(v).replace(',', ''))
+        except (TypeError, ValueError):
+            return 0
 
     @field_validator("total")
     @classmethod
@@ -193,6 +256,16 @@ class TaxEntry(BaseModel):
     rate: str
     label: Optional[str] = None
     amount: float
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def coerce_amount(cls, v):
+        if v is None:
+            return 0
+        try:
+            return float(str(v).replace(',', ''))
+        except (TypeError, ValueError):
+            return 0
 
 
 class BillingPeriod(BaseModel):
@@ -210,6 +283,8 @@ class UsageData(BaseModel):
 
 class Document(BaseModel):
     """Unified extraction model for all document types."""
+    model_config = {"populate_by_name": True}
+
     # Common
     document_type: Literal["receipt", "utility_bill", "payment_slip"] = "receipt"
     merchant: Optional[str] = None
@@ -238,6 +313,78 @@ class Document(BaseModel):
     payment_reference: Optional[str] = None
 
     raw_text_summary: Optional[str] = None
+
+    @field_validator("total", "subtotal", "points_used", "amount_paid", mode="before")
+    @classmethod
+    def coerce_financial_fields(cls, v):
+        if v is None or v == "null":
+            return None
+        try:
+            return float(str(v).replace(',', ''))
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator("merchant", "date", "location", "currency", "payment_method",
+                     "invoice_number", "account_number", "payer", "payment_reference",
+                     "service_type", "raw_text_summary", mode="before")
+    @classmethod
+    def coerce_null_strings(cls, v):
+        """Convert the string 'null' to actual None for optional string fields."""
+        if v == "null" or v == "None":
+            return None
+        return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def handle_llm_aliases(cls, data):
+        """Handle common LLM output mismatches before field validation."""
+        if not isinstance(data, dict):
+            return data
+
+        # Strip _confidence (metadata, not a schema field)
+        data.pop("_confidence", None)
+
+        # Coerce line_items: handle 'quantity' → 'qty', 'name' → 'description'
+        if "line_items" in data and isinstance(data["line_items"], list):
+            fixed = []
+            for item in data["line_items"]:
+                if not isinstance(item, dict):
+                    continue
+                if "quantity" in item and "qty" not in item:
+                    item["qty"] = item.pop("quantity")
+                if "name" in item and "description" not in item:
+                    item["description"] = item.pop("name")
+                if not item.get("description"):
+                    continue
+                if "total" not in item or item["total"] is None:
+                    continue
+                fixed.append(item)
+            data["line_items"] = fixed
+
+        # Coerce taxes from various formats
+        taxes = data.get("taxes")
+        if isinstance(taxes, (int, float)):
+            data["taxes"] = [{"rate": "unknown", "label": None, "amount": taxes}]
+        elif isinstance(taxes, dict):
+            data["taxes"] = [taxes]
+        elif taxes is None:
+            data["taxes"] = []
+
+        # Fix Japanese era dates in LLM output
+        date_val = data.get("date")
+        if date_val:
+            date_str = str(date_val)
+            m = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', date_str)
+            if m:
+                year = int(m.group(1))
+                if year < 100:
+                    data["date"] = f"{2018 + year:04d}-{m.group(2)}-{m.group(3)}"
+                elif 2000 <= year <= 2018:
+                    era_year = year - 2000
+                    if 1 <= era_year <= 20:
+                        data["date"] = f"{2018 + era_year:04d}-{m.group(2)}-{m.group(3)}"
+
+        return data
 
 
 # Backward compatibility

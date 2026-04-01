@@ -1,6 +1,6 @@
 """validation.py — Schema-driven arithmetic & consistency checks."""
 
-from schema import Receipt
+from schema import Receipt, VALID_TAX_RATES
 
 
 def validate_receipt(receipt: Receipt) -> list[str]:
@@ -67,14 +67,20 @@ def _validate_receipt_fields(receipt: Receipt) -> list[str]:
                 f"+/- taxes ({tax_sum}) under either inclusive or exclusive tax model."
             )
 
-    # Check JP tax rates are plausible (0%, 8%, or 10%)
+    # Check JP tax rates are plausible
+    valid_rate_values = set()
+    for r in VALID_TAX_RATES:
+        try:
+            valid_rate_values.add(float(r.replace('%', '')))
+        except ValueError:
+            pass
     for tax in receipt.taxes:
         rate_str = tax.rate.replace('%', '').strip()
         try:
             rate_val = float(rate_str)
-            if rate_val not in (0, 8, 10):
+            if rate_val not in valid_rate_values:
                 warnings.append(
-                    f"Unusual tax rate: {tax.rate} (expected 0%, 8%, or 10% for JP receipts)"
+                    f"Unusual tax rate: {tax.rate} (expected one of {VALID_TAX_RATES} for JP receipts)"
                 )
         except ValueError:
             pass

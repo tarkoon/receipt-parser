@@ -227,6 +227,19 @@ def _ocr_cache_key(image: np.ndarray) -> str:
     return hashlib.md5(image.tobytes()).hexdigest()
 
 
+def compute_ocr_confidence(blocks: list[dict]) -> float:
+    """Weighted average of block confidences, weighted by text length.
+
+    Returns a document-level OCR quality score between 0.0 and 1.0.
+    """
+    if not blocks:
+        return 0.0
+    total_chars = sum(len(b["text"]) for b in blocks)
+    if total_chars == 0:
+        return 0.0
+    return sum(b["confidence"] * len(b["text"]) for b in blocks) / total_chars
+
+
 def _fulltext_to_blocks(fulltext: str) -> list[dict]:
     """Convert fulltext string to block dicts (one per line)."""
     lines = [l.strip() for l in fulltext.split('\n') if l.strip()]
@@ -236,12 +249,33 @@ def _fulltext_to_blocks(fulltext: str) -> list[dict]:
     } for i, line in enumerate(lines)]
 
 
+_OCR_CONFIDENCE_RETRY_THRESHOLD = 0.75
+
+
+def _pick_better_fulltext(ft1: str, ft2: str) -> str:
+    """Select the better OCR fulltext from two API call results."""
+    has_yen1 = '¥' in ft1
+    has_yen2 = '¥' in ft2
+    inline1 = len(re.findall(r'[\u3000-\u9fff].*¥|¥.*[\u3000-\u9fff]', ft1))
+    inline2 = len(re.findall(r'[\u3000-\u9fff].*¥|¥.*[\u3000-\u9fff]', ft2))
+    if has_yen2 and not has_yen1:
+        return ft2
+    elif inline2 > inline1 + 2:
+        return ft2
+    elif len(ft2) > len(ft1):
+        return ft2
+    return ft1
+
+
 def run_cloud_vision(image: np.ndarray, client=None) -> list[dict]:
     """Run Google Cloud Vision OCR and return text blocks.
 
     Uses fulltext output which handles rotated images correctly.
     Caches results per image hash to avoid redundant API calls and
     ensure deterministic test results.
+
+    Single-call by default. Makes a second call only if OCR confidence
+    is below the retry threshold (0.75), cutting API usage ~50%.
     """
     global _last_ocr_source
 
@@ -264,23 +298,16 @@ def run_cloud_vision(image: np.ndarray, client=None) -> list[dict]:
     if not fulltext1:
         return []
 
-    # Retry and pick the better result
-    response2 = _call_cloud_vision(image, client)
-    fulltext2 = _extract_fulltext_from_response(response2)
+    # Compute confidence from first call — retry only if low quality
+    blocks1 = _extract_blocks_from_response(response1)
+    confidence1 = compute_ocr_confidence(blocks1) if blocks1 else 0.0
 
     fulltext = fulltext1
-    if fulltext2:
-        has_yen1 = '¥' in fulltext1
-        has_yen2 = '¥' in fulltext2
-        # Count inline prices (¥ on same line as Japanese text = better layout)
-        inline1 = len(re.findall(r'[\u3000-\u9fff].*¥|¥.*[\u3000-\u9fff]', fulltext1))
-        inline2 = len(re.findall(r'[\u3000-\u9fff].*¥|¥.*[\u3000-\u9fff]', fulltext2))
-        if (has_yen2 and not has_yen1):
-            fulltext = fulltext2
-        elif inline2 > inline1 + 2:
-            fulltext = fulltext2  # Prefer layout with more inline item+price pairing
-        elif len(fulltext2) > len(fulltext1):
-            fulltext = fulltext2
+    if confidence1 < _OCR_CONFIDENCE_RETRY_THRESHOLD:
+        response2 = _call_cloud_vision(image, client)
+        fulltext2 = _extract_fulltext_from_response(response2)
+        if fulltext2:
+            fulltext = _pick_better_fulltext(fulltext1, fulltext2)
 
     # Save to cache
     _OCR_CACHE_DIR.mkdir(exist_ok=True)
