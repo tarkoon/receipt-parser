@@ -1,54 +1,54 @@
 {
-  "document_type": "receipt",
-  "merchant": "スーパービバホーム",
-  "date": "2026-03-25",
-  "location": "赤間店",
-  "currency": "JPY",
-  "total": 1240,
-  "payment_method": "cash",
-  "account_number": null,
-  "points_used": null,
-  "amount_paid": 1240,
-  "line_items": [
-    {
-      "description": "PA 埋め込みスイッチ",
-      "qty": 1,
-      "unit_price": 228,
-      "total": 205,
-      "tax_category": "10%",
-      "discount": 23,
-      "discount_rate": "10%"
-    },
-    {
-      "description": "EXTRAビリー状 4g",
-      "qty": 1,
-      "unit_price": 598,
-      "total": 538,
-      "tax_category": "10%",
-      "discount": 60,
-      "discount_rate": "10%"
-    },
-    {
-      "description": "PAアルカリボタン電池2P",
-      "qty": 1,
-      "unit_price": 428,
-      "total": 385,
-      "tax_category": "10%",
-      "discount": 43,
-      "discount_rate": "10%"
-    }
-  ],
-  "subtotal": 1128,
-  "taxes": [
-    {
-      "rate": "10%",
-      "label": "外税",
-      "amount": 112
-    }
-  ],
-  "service_type": null,
-  "billing_period": null,
-  "usage": null,
-  "payer": null,
-  "payment_reference": null
+	"document_type": "receipt",
+	"merchant": "スーパービバホーム",
+	"date": "2026-03-25",
+	"location": "宗像市赤間",
+	"currency": "JPY",
+	"total": 1240,
+	"payment_method": "cash",
+	"account_number": null,
+	"points_used": null,
+	"amount_paid": 1240,
+	"line_items": [
+		{
+			"description": "PA 埋め込みスイッチ",
+			"qty": 1,
+			"unit_price": 228,
+			"total": 205,
+			"tax_category": "10%",
+			"discount": 23,
+			"discount_rate": "10%"
+		},
+		{
+			"description": "EXTRAビリー状 4g",
+			"qty": 1,
+			"unit_price": 598,
+			"total": 538,
+			"tax_category": "10%",
+			"discount": 60,
+			"discount_rate": "10%"
+		},
+		{
+			"description": "PAアルカリボタン電池2P",
+			"qty": 1,
+			"unit_price": 428,
+			"total": 385,
+			"tax_category": "10%",
+			"discount": 43,
+			"discount_rate": "10%"
+		}
+	],
+	"subtotal": 1128,
+	"taxes": [
+		{
+			"rate": "10%",
+			"label": "外税",
+			"amount": 112
+		}
+	],
+	"service_type": null,
+	"billing_period": null,
+	"usage": null,
+	"payer": null,
+	"payment_reference": null
 }

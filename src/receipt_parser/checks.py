@@ -105,6 +105,20 @@ def check_merchant_similarity(result: dict, truth: dict) -> dict:
             "detail": f"'{got}' vs '{exp}' ({ratio:.0%})"}
 
 
+def check_location(result: dict, truth: dict) -> dict:
+    exp = truth.get("location")
+    if exp is None:
+        got = result.get("location")
+        ok = got is None
+        return {"pass": ok, "expected": None, "got": got,
+                "detail": f"got {got}, expected null"}
+    got = result.get("location") or ""
+    ratio = fuzzy_similarity(got, exp)
+    ok = ratio >= 0.5
+    return {"pass": ok, "expected": exp, "got": got,
+            "detail": f"'{got}' vs '{exp}' ({ratio:.0%})"}
+
+
 COMMON_CHECKS = {
     "total": check_total,
     "date": check_date,
@@ -113,6 +127,7 @@ COMMON_CHECKS = {
     "document_type": check_document_type,
     "amount_paid": check_amount_paid,
     "merchant_similarity": check_merchant_similarity,
+    "location": check_location,
 }
 
 

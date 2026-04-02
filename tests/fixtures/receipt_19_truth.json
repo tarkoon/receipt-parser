@@ -1,63 +1,63 @@
 {
-  "document_type": "receipt",
-  "merchant": "コジマ×ビックカメラ",
-  "date": "2025-12-23",
-  "location": "八幡店",
-  "currency": "JPY",
-  "total": 32580,
-  "payment_method": "cash",
-  "account_number": null,
-  "points_used": null,
-  "amount_paid": 32580,
-  "line_items": [
-    {
-      "description": "AirPods MKP93JA",
-      "qty": 1,
-      "unit_price": 24800,
-      "total": 24800,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    },
-    {
-      "description": "ワイヤレスジュ KW7",
-      "qty": 1,
-      "unit_price": 7120,
-      "total": 7120,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    },
-    {
-      "description": "ラッピング S コジマ_ホウソウ_クリスマス",
-      "qty": 1,
-      "unit_price": 330,
-      "total": 330,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    },
-    {
-      "description": "ラッピング S コジマ_ホウソウ_クリスマス",
-      "qty": 1,
-      "unit_price": 330,
-      "total": 330,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    }
-  ],
-  "subtotal": 32580,
-  "taxes": [
-    {
-      "rate": "10%",
-      "label": "内消費税",
-      "amount": 2961
-    }
-  ],
-  "service_type": null,
-  "billing_period": null,
-  "usage": null,
-  "payer": null,
-  "payment_reference": null
+	"document_type": "receipt",
+	"merchant": "コジマ×ビックカメラ",
+	"date": "2025-12-23",
+	"location": "北九州市八幡区",
+	"currency": "JPY",
+	"total": 32580,
+	"payment_method": "cash",
+	"account_number": null,
+	"points_used": null,
+	"amount_paid": 32580,
+	"line_items": [
+		{
+			"description": "AirPods MKP93JA",
+			"qty": 1,
+			"unit_price": 24800,
+			"total": 24800,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		},
+		{
+			"description": "ワイヤレスジュ KW7",
+			"qty": 1,
+			"unit_price": 7120,
+			"total": 7120,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		},
+		{
+			"description": "ラッピング S コジマ_ホウソウ_クリスマス",
+			"qty": 1,
+			"unit_price": 330,
+			"total": 330,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		},
+		{
+			"description": "ラッピング S コジマ_ホウソウ_クリスマス",
+			"qty": 1,
+			"unit_price": 330,
+			"total": 330,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		}
+	],
+	"subtotal": 32580,
+	"taxes": [
+		{
+			"rate": "10%",
+			"label": "内消費税",
+			"amount": 2961
+		}
+	],
+	"service_type": null,
+	"billing_period": null,
+	"usage": null,
+	"payer": null,
+	"payment_reference": null
 }

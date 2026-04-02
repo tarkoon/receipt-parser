@@ -87,6 +87,7 @@ def rejoin_price_lines(text: str) -> str:
     for i, line in enumerate(lines):
         s = line.strip()
         if item_start is None:
+            # Look for the first line that has a price or is a priced item.
             # Look for the first line that has a price or is a priced item
             if '¥' in s or '￥' in s or _is_price(s) or (
                     _is_item_candidate(s) and i + 1 < len(lines) and _is_price(lines[i + 1].strip())):
@@ -102,6 +103,30 @@ def rejoin_price_lines(text: str) -> str:
     before = lines[:item_start]
     section = lines[item_start:item_end]
     after = lines[item_end:]
+
+    # Step 2a: Pull item candidates from "before" zone into the section start
+    # if there are more leading prices than items.  E.g., the section might start
+    # with one item name followed by two prices — the extra price belongs to
+    # an item that ended up just above the section boundary.
+    lead_items = 0
+    for l in section:
+        if _is_item_candidate(l.strip()):
+            lead_items += 1
+        else:
+            break
+    lead_prices = 0
+    for l in section[lead_items:]:
+        if _is_price(l.strip()):
+            lead_prices += 1
+        else:
+            break
+    deficit = lead_prices - lead_items
+    while deficit > 0 and before:
+        if _is_item_candidate(before[-1].strip()):
+            section.insert(0, before.pop())
+            deficit -= 1
+        else:
+            break
 
     # Block matching: find runs of priceless items followed by price lines
     resolved = list(section)
@@ -159,6 +184,26 @@ def rejoin_price_lines(text: str) -> str:
 
         if not joined:
             result.append(line)
+
+    # --- Step 4: Handle orphan prices at section start ---
+    # When item names appear in the "before" zone (just above the detected section
+    # start), their prices land inside the section as unmatched orphans.
+    # E.g.: "ミルクカスタードシュー" (before) → "¥138軽" (section orphan).
+    # Attach leading orphan prices to trailing item candidates in "before".
+    while result and before and _is_price(result[0].strip()):
+        # Find the last item candidate in "before"
+        attached = False
+        for bi in range(len(before) - 1, -1, -1):
+            if _is_item_candidate(before[bi].strip()):
+                before[bi] += '  ' + result[0].strip()
+                result.pop(0)
+                attached = True
+                break
+            # Stop at non-candidate lines that aren't blank
+            if before[bi].strip():
+                break
+        if not attached:
+            break
 
     return '\n'.join(before + result + after)
 

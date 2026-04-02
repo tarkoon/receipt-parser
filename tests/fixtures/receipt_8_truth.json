@@ -1,74 +1,74 @@
 {
-  "document_type": "receipt",
-  "merchant": "コスモス",
-  "date": "2026-03-24",
-  "location": null,
-  "currency": "JPY",
-  "total": 2241,
-  "payment_method": "cash",
-  "account_number": null,
-  "points_used": null,
-  "amount_paid": 2241,
-  "line_items": [
-    {
-      "description": "使い捨てフェイスタオル",
-      "qty": 1,
-      "unit_price": 398,
-      "total": 398,
-      "tax_category": "10%"
-    },
-    {
-      "description": "きのこたけのこ 袋",
-      "qty": 1,
-      "unit_price": 298,
-      "total": 298,
-      "tax_category": "8%"
-    },
-    {
-      "description": "コアラのマーチシェアパ",
-      "qty": 1,
-      "unit_price": 258,
-      "total": 258,
-      "tax_category": "8%"
-    },
-    {
-      "description": "抗菌綿棒 2個組",
-      "qty": 1,
-      "unit_price": 198,
-      "total": 198,
-      "tax_category": "10%"
-    },
-    {
-      "description": "ツイジョイ 2種のアップル",
-      "qty": 1,
-      "unit_price": 109,
-      "total": 109,
-      "tax_category": "8%"
-    },
-    {
-      "description": "ムヒのこどもかぜシロップ",
-      "qty": 1,
-      "unit_price": 980,
-      "total": 980,
-      "tax_category": "10%"
-    }
-  ],
-  "subtotal": 2241,
-  "taxes": [
-    {
-      "rate": "8%",
-      "label": "内税",
-      "amount": 49
-    },
-    {
-      "rate": "10%",
-      "label": "内税",
-      "amount": 143
-    }
-  ],
-  "service_type": null,
-  "billing_period": null,
-  "usage": null,
-  "payer": null,
-  "payment_reference": null
+	"document_type": "receipt",
+	"merchant": "コスモス",
+	"date": "2026-03-24",
+	"location": "宗像市",
+	"currency": "JPY",
+	"total": 2241,
+	"payment_method": "cash",
+	"account_number": null,
+	"points_used": null,
+	"amount_paid": 2241,
+	"line_items": [
+		{
+			"description": "使い捨てフェイスタオル",
+			"qty": 1,
+			"unit_price": 398,
+			"total": 398,
+			"tax_category": "10%"
+		},
+		{
+			"description": "きのこたけのこ 袋",
+			"qty": 1,
+			"unit_price": 298,
+			"total": 298,
+			"tax_category": "8%"
+		},
+		{
+			"description": "コアラのマーチシェアパ",
+			"qty": 1,
+			"unit_price": 258,
+			"total": 258,
+			"tax_category": "8%"
+		},
+		{
+			"description": "抗菌綿棒 2個組",
+			"qty": 1,
+			"unit_price": 198,
+			"total": 198,
+			"tax_category": "10%"
+		},
+		{
+			"description": "ツイジョイ 2種のアップル",
+			"qty": 1,
+			"unit_price": 109,
+			"total": 109,
+			"tax_category": "8%"
+		},
+		{
+			"description": "ムヒのこどもかぜシロップ",
+			"qty": 1,
+			"unit_price": 980,
+			"total": 980,
+			"tax_category": "10%"
+		}
+	],
+	"subtotal": 2241,
+	"taxes": [
+		{
+			"rate": "8%",
+			"label": "内税",
+			"amount": 49
+		},
+		{
+			"rate": "10%",
+			"label": "内税",
+			"amount": 143
+		}
+	],
+	"service_type": null,
+	"billing_period": null,
+	"usage": null,
+	"payer": null,
+	"payment_reference": null
 }

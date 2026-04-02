@@ -1,81 +1,81 @@
 {
-  "document_type": "receipt",
-  "merchant": "スーパービバホーム",
-  "date": "2026-03-13",
-  "location": "赤間店",
-  "currency": "JPY",
-  "total": 1633,
-  "payment_method": "cash",
-  "account_number": null,
-  "points_used": null,
-  "amount_paid": 1633,
-  "line_items": [
-    {
-      "description": "レジ袋 大",
-      "qty": 1,
-      "unit_price": 5,
-      "total": 5,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    },
-    {
-      "description": "お部屋の消臭力",
-      "qty": 2,
-      "unit_price": 228,
-      "total": 456,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    },
-    {
-      "description": "A●キュキュ1250",
-      "qty": 1,
-      "unit_price": 548,
-      "total": 548,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    },
-    {
-      "description": "エアダスター",
-      "qty": 1,
-      "unit_price": 278,
-      "total": 278,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    },
-    {
-      "description": "輪ゴム小分P約100g",
-      "qty": 1,
-      "unit_price": 198,
-      "total": 198,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    }
-  ],
-  "subtotal": 1485,
-  "taxes": [
-    {
-      "rate": "10%",
-      "label": "外税10.0% 消費税等",
-      "amount": 148
-    }
-  ],
-  "service_type": null,
-  "billing_period": {
-    "start": null,
-    "end": null
-  },
-  "usage": {
-    "amount": null,
-    "unit": null,
-    "cost_per": null,
-    "meter_previous": null,
-    "meter_current": null
-  },
-  "payer": null,
-  "payment_reference": null
+	"document_type": "receipt",
+	"merchant": "スーパービバホーム",
+	"date": "2026-03-13",
+	"location": "宗像市赤間",
+	"currency": "JPY",
+	"total": 1633,
+	"payment_method": "cash",
+	"account_number": null,
+	"points_used": null,
+	"amount_paid": 1633,
+	"line_items": [
+		{
+			"description": "レジ袋 大",
+			"qty": 1,
+			"unit_price": 5,
+			"total": 5,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		},
+		{
+			"description": "お部屋の消臭力",
+			"qty": 2,
+			"unit_price": 228,
+			"total": 456,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		},
+		{
+			"description": "A●キュキュ1250",
+			"qty": 1,
+			"unit_price": 548,
+			"total": 548,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		},
+		{
+			"description": "エアダスター",
+			"qty": 1,
+			"unit_price": 278,
+			"total": 278,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		},
+		{
+			"description": "輪ゴム小分P約100g",
+			"qty": 1,
+			"unit_price": 198,
+			"total": 198,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		}
+	],
+	"subtotal": 1485,
+	"taxes": [
+		{
+			"rate": "10%",
+			"label": "外税10.0% 消費税等",
+			"amount": 148
+		}
+	],
+	"service_type": null,
+	"billing_period": {
+		"start": null,
+		"end": null
+	},
+	"usage": {
+		"amount": null,
+		"unit": null,
+		"cost_per": null,
+		"meter_previous": null,
+		"meter_current": null
+	},
+	"payer": null,
+	"payment_reference": null
 }

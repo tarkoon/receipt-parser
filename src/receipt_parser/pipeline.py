@@ -120,6 +120,106 @@ def _apply_merchant_mapping(result: dict) -> dict:
     return result
 
 
+# ── Location Resolver ───────────────────────────────────────────────
+
+_ADMIN_SUFFIX_RE = re.compile(r'[市区町村]')
+
+
+_LOCATION_CLUE_RE = re.compile(
+    r'[\w\u3000-\u9fff]+店'           # X店, X支店, X赤間店, etc.
+    r'|[\w\u3000-\u9fff]+モール'       # Xモール (mall)
+    r'|[都道府県市区町村郡]'             # Address text with admin units
+    r'|〒\d{3}'                        # Postal code
+)
+
+
+def _location_needs_resolution(location: str | None, ocr_text: str = "") -> bool:
+    """Check if the location needs resolution via a focused LLM call.
+
+    Triggers when:
+    - Location has a value but lacks 市/区/町/村 suffix (partial location)
+    - Location is null BUT the OCR text contains location clues (X店, address lines,
+      postal codes, etc.) suggesting a physical location can be determined
+    """
+    if location and _ADMIN_SUFFIX_RE.search(location):
+        return False  # Already has admin level — no resolution needed
+    if location:
+        return True   # Has a partial value — needs resolution
+    # Location is null: only trigger if OCR has location clues
+    if ocr_text and _LOCATION_CLUE_RE.search(ocr_text):
+        return True
+    return False
+
+
+def _location_has_ocr_evidence(location: str, ocr_text: str) -> bool:
+    """Check if at least part of the location string has evidence in the OCR text.
+
+    Splits the location into meaningful substrings (removing admin suffixes like
+    市/区/町/村) and checks if any appear in the OCR. This prevents hallucinated
+    locations that are inferred only from phone area codes or world knowledge.
+    """
+    if not location or not ocr_text:
+        return False
+    # Check if full location appears
+    if location in ocr_text:
+        return True
+    # Extract meaningful parts by stripping admin suffixes
+    parts = re.split(r'[市区町村郡県都道府]', location)
+    for part in parts:
+        part = part.strip()
+        if len(part) >= 2 and part in ocr_text:
+            return True
+    return False
+
+
+def _resolve_location(extracted: dict, ocr_text: str, model: str) -> str | None:
+    """Use a focused LLM call to resolve a partial location to city/ward level.
+
+    Extracts clues from the OCR text (branch name, phone number, address fragments)
+    and asks the LLM to determine the city/municipality.
+    """
+    from .llm import _llm_chat, _LLM_SEED, sanitize_llm_response
+
+    merchant = extracted.get("merchant") or ""
+    raw_location = extracted.get("location") or ""
+
+    # Extract phone number from OCR for area code hints
+    phone_match = re.search(r'(?:TEL|電話|☎)\s*[:\s]?\s*(0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{2,4})', ocr_text)
+    phone_hint = phone_match.group(1) if phone_match else ""
+
+    # Extract any address-like lines from OCR
+    addr_lines = []
+    for line in ocr_text.split('\n'):
+        if re.search(r'[都道府県市区町村郡]|〒\d{3}', line):
+            addr_lines.append(line.strip())
+
+    prompt = f"""Given these clues from a Japanese receipt, determine the city (市) or ward (区) where this store is located.
+Output ONLY a JSON object with a single "location" field. The location should be at the 市区町村 level, e.g. "宗像市赤間", "福岡市博多区", "北九州市八幡区".
+
+Clues:
+- Merchant/brand: {merchant}
+- Current location value: {raw_location or 'unknown'}
+- Phone number: {phone_hint or 'not found'}
+- Address fragments from receipt: {'; '.join(addr_lines) if addr_lines else 'none found'}
+
+Respond with a JSON object: {{"location": "..."}} or {{"location": null}} if you cannot determine it."""
+
+    try:
+        result = _llm_chat(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            schema={"type": "object", "properties": {"location": {"type": ["string", "null"]}}, "required": ["location"]},
+        )
+        import json as _json
+        data = _json.loads(sanitize_llm_response(result.content))
+        resolved = data.get("location")
+        if resolved and _ADMIN_SUFFIX_RE.search(resolved):
+            return resolved
+    except Exception:
+        pass
+    return None
+
+
 # ── Financial Extraction Helpers ─────────────────────────────────────
 
 # Match ¥ or ￥ prefix, or 円 suffix amounts
@@ -174,6 +274,24 @@ def _extract_yen_max_nearby(lines: list[str], idx: int, look_ahead: int = 5):
     return max(values) if values else None
 
 
+def _extract_all_yen_nearby(lines: list[str], idx: int, look_ahead: int = 6) -> list[float]:
+    """Extract ALL ¥ values from the next N lines (for candidate analysis)."""
+    values: list[float] = []
+    val = _parse_yen_match(_YEN_INLINE.search(lines[idx].strip()))
+    if val is not None:
+        values.append(val)
+    for j in range(idx + 1, min(idx + 1 + look_ahead, len(lines))):
+        stripped = lines[j].strip()
+        m = re.match(rf'^[¥￥]\s*([\d,]+){_YEN_SUFFIX}?\s*$', stripped)
+        if not m:
+            m = re.match(rf'^([\d,]+)\s*円{_YEN_SUFFIX}?\s*$', stripped)
+        if m:
+            values.append(float(m.group(1).replace(',', '')))
+        elif re.search(r'合\s*計|現\s*計|お釣り|お預り', stripped):
+            break
+    return values
+
+
 def _extract_yen_min_nearby(lines: list[str], idx: int, look_ahead: int = 3):
     """Extract the SMALLEST ¥ value from line idx or the next N lines."""
     values: list[float] = []
@@ -218,10 +336,15 @@ def _extract_financial_totals(text: str) -> dict:
             val = _extract_yen_nearby(lines, i)
             if val is not None:
                 result['subtotal'] = val
-                # Also check for an alternative value in case the first is an item price
-                val_max = _extract_yen_max_nearby(lines, i, look_ahead=5)
-                if val_max and val_max != val:
-                    result['_subtotal_alt'] = val_max
+                # Collect all nearby values as alternatives for subtotal validation.
+                # When orphan item prices leak past 小計 in OCR, the first value
+                # may be an item price. We need a smarter alt than just max (which
+                # picks up 課税対象額).
+                all_nearby = _extract_all_yen_nearby(lines, i, look_ahead=6)
+                alts = [v for v in all_nearby if v != val]
+                if alts:
+                    result['_subtotal_alt'] = max(alts)
+                    result['_subtotal_candidates'] = all_nearby
 
         is_total_line = re.search(r'合\s*計', line)
         if not is_total_line and re.match(r'^計$', line) and i > 0:
@@ -652,6 +775,13 @@ def process_document(
                         trace.log_step(f"pass{n}_warnings", data="\n".join(entry["warnings"]))
 
             llm_conf_pdf = extracted.pop("_confidence", None)
+
+            # Location resolution for PDF path
+            if "error" not in extracted and _location_needs_resolution(extracted.get("location"), digital_text):
+                resolved = _resolve_location(extracted, digital_text, model)
+                if resolved:
+                    extracted["location"] = resolved
+
             try:
                 receipt = Receipt(**extracted)
             except Exception:
@@ -760,13 +890,28 @@ def process_document(
         if "subtotal" in ocr_totals:
             ocr_sub_val = ocr_totals["subtotal"]
             if ocr_total_val and ocr_sub_val < ocr_total_val * 0.5:
-                # First value too low — try alternative subtotal (next ¥ value)
-                alt_sub = ocr_totals.get("_subtotal_alt")
-                if alt_sub and alt_sub >= ocr_total_val * 0.5:
-                    ocr_totals["subtotal"] = alt_sub
-                    ocr_sub_val = alt_sub
+                # First value too low (likely an orphan item price that leaked past 小計).
+                # Find the best candidate: value closest to total but ≤ total.
+                # This avoids picking 課税対象額 (which is close to but > subtotal).
+                candidates = ocr_totals.get("_subtotal_candidates", [])
+                best_sub = None
+                if candidates and ocr_total_val:
+                    plausible = [v for v in candidates
+                                 if ocr_total_val * 0.5 <= v <= ocr_total_val]
+                    if plausible:
+                        # Prefer the smallest plausible value (subtotal ≤ total)
+                        best_sub = min(plausible)
+                if best_sub:
+                    ocr_totals["subtotal"] = best_sub
+                    ocr_sub_val = best_sub
                 else:
-                    del ocr_totals["subtotal"]
+                    # Fallback to alt
+                    alt_sub = ocr_totals.get("_subtotal_alt")
+                    if alt_sub and alt_sub >= ocr_total_val * 0.5:
+                        ocr_totals["subtotal"] = alt_sub
+                        ocr_sub_val = alt_sub
+                    else:
+                        del ocr_totals["subtotal"]
             if "subtotal" in ocr_totals and _should_override_field("subtotal", ocr_conf, llm_conf):
                 extracted["subtotal"] = ocr_sub_val
             elif extracted.get("subtotal") is None:
@@ -1182,6 +1327,10 @@ def process_document(
         if has_tender_label and has_change_label_final:
             extracted["payment_method"] = "cash"
 
+    # ── Location: clear for utility bills and payment slips (location not applicable) ──
+    if "error" not in extracted and doc_type in ("utility_bill", "payment_slip"):
+        extracted["location"] = None
+
     # ── Common post-processing ──
     if "error" not in extracted:
         total = extracted.get("total")
@@ -1191,6 +1340,17 @@ def process_document(
 
     # Strip _confidence if present (LLM may include it even though not requested)
     extracted.pop("_confidence", None)
+
+    # ── Location resolution (confidence-gated, receipts only) ──
+    if "error" not in extracted and doc_type == "receipt" and _location_needs_resolution(extracted.get("location"), unified_text):
+        resolved = _resolve_location(extracted, unified_text, model)
+        if resolved:
+            extracted["location"] = resolved
+
+    # ── Location validation: clear if no OCR evidence supports it ──
+    if "error" not in extracted and doc_type == "receipt" and extracted.get("location"):
+        if not _location_has_ocr_evidence(extracted["location"], unified_text):
+            extracted["location"] = None
 
     # Step 5: Final validation
     try:
@@ -1279,6 +1439,17 @@ def process_ocr_text(
 
     # Strip _confidence if present
     extracted.pop("_confidence", None)
+
+    # ── Location resolution (confidence-gated, receipts only) ──
+    if "error" not in extracted and doc_type == "receipt" and _location_needs_resolution(extracted.get("location"), unified_text):
+        resolved = _resolve_location(extracted, unified_text, model)
+        if resolved:
+            extracted["location"] = resolved
+
+    # ── Location validation: clear if no OCR evidence supports it ──
+    if "error" not in extracted and doc_type == "receipt" and extracted.get("location"):
+        if not _location_has_ocr_evidence(extracted["location"], unified_text):
+            extracted["location"] = None
 
     # Final validation
     try:
