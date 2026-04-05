@@ -76,6 +76,55 @@ def test_standard_tax_rates_no_warning():
     assert len(tax_warnings) == 0
 
 
+# --- Tax ratio cross-check tests ---
+
+def test_tax_ratio_8pct_correct():
+    receipt = Receipt(total=1080, subtotal=1000, taxes=[{"rate": "8%", "amount": 80}])
+    assert not any("Tax ratio" in w for w in validate_receipt(receipt))
+
+
+def test_tax_ratio_10pct_correct():
+    receipt = Receipt(total=1100, subtotal=1000, taxes=[{"rate": "10%", "amount": 100}])
+    assert not any("Tax ratio" in w for w in validate_receipt(receipt))
+
+
+def test_tax_ratio_mismatch_warns():
+    receipt = Receipt(total=1500, subtotal=1000, taxes=[{"rate": "10%", "amount": 500}])
+    assert any("Tax ratio" in w for w in validate_receipt(receipt))
+
+
+def test_tax_ratio_with_existing_taxes():
+    receipt = Receipt(total=324, subtotal=300, taxes=[{"rate": "8%", "amount": 24}])
+    assert not any("Tax ratio" in w for w in validate_receipt(receipt))
+
+
+def test_tax_ratio_skip_when_missing():
+    r1 = Receipt(total=100, taxes=[{"rate": "8%", "amount": 8}])
+    r2 = Receipt(subtotal=100, taxes=[{"rate": "8%", "amount": 8}])
+    r3 = Receipt(total=100, subtotal=100)
+    assert not any("Tax ratio" in w for w in validate_receipt(r1))
+    assert not any("Tax ratio" in w for w in validate_receipt(r2))
+    assert not any("Tax ratio" in w for w in validate_receipt(r3))
+
+
+# --- Discount rate consistency tests ---
+
+def test_discount_rate_consistency():
+    receipt = Receipt(line_items=[{
+        "description": "item", "qty": 1, "unit_price": 467,
+        "total": 373, "discount": 94, "discount_rate": "20%",
+    }])
+    assert not any("discount_rate" in w for w in validate_receipt(receipt))
+
+
+def test_discount_rate_inconsistent_warns():
+    receipt = Receipt(line_items=[{
+        "description": "item", "qty": 1, "unit_price": 200,
+        "total": 100, "discount": 100, "discount_rate": "20%",
+    }])
+    assert any("discount_rate" in w for w in validate_receipt(receipt))
+
+
 def test_multiple_issues():
     """Receipt with multiple issues should return multiple warnings."""
     receipt = Receipt(

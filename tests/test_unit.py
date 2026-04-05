@@ -14,6 +14,37 @@ from receipt_parser.llm import get_ollama_schema, _extract_confidence
 from receipt_parser.validation import validate_receipt
 from receipt_parser.normalize import normalize_fullwidth, clean_handwritten_ocr
 from receipt_parser.ocr import compute_ocr_confidence, OCRResult
+from receipt_parser.checks import check_tree_edit_distance
+
+
+# --- Tree Edit Distance tests ---
+
+def test_tree_ed_identical():
+    d = {"total": 100, "merchant": "Test", "line_items": [{"description": "a", "total": 100}]}
+    result = check_tree_edit_distance(d, d)
+    assert result["score"] == 1.0
+    assert result["pass"]
+
+
+def test_tree_ed_wrong_value():
+    truth = {"total": 100, "merchant": "Test"}
+    result_d = {"total": 100, "merchant": "Wrong", "extra": "value"}
+    result = check_tree_edit_distance(result_d, truth)
+    assert result["score"] < 1.0
+
+
+def test_tree_ed_missing_line_item():
+    truth = {"line_items": [{"description": "a", "total": 50}, {"description": "b", "total": 50}]}
+    result_d = {"line_items": [{"description": "a", "total": 50}]}
+    result = check_tree_edit_distance(result_d, truth)
+    assert result["score"] < 1.0
+
+
+def test_tree_ed_completely_wrong():
+    truth = {"total": 100, "merchant": "Store", "date": "2026-01-01"}
+    result_d = {"total": 999, "merchant": "Wrong", "date": "1999-01-01"}
+    result = check_tree_edit_distance(result_d, truth)
+    assert result["score"] < 0.5
 
 
 # --- Normalization tests ---

@@ -884,6 +884,23 @@ def postprocess_receipt(
                 if abs(total - unit_price * qty) < 1 and abs(total - expected) > 1:
                     item["total"] = expected
 
+    # 4.9b2: Fix misattributed discounts — if no discount/rate is set but
+    # total != qty * unit_price, the LLM likely applied a nearby discount
+    # to the wrong item. Reset total to qty * unit_price.
+    if extracted.get("line_items"):
+        for item in extracted["line_items"]:
+            if not isinstance(item, dict):
+                continue
+            discount = item.get("discount") or 0
+            discount_rate = item.get("discount_rate") or ""
+            unit_price = item.get("unit_price")
+            total = item.get("total")
+            qty = item.get("qty", 1)
+            if discount == 0 and not discount_rate and unit_price is not None and total is not None:
+                expected = qty * unit_price
+                if abs(expected - total) > 1:
+                    item["total"] = expected
+
     # 4.9c: Detect discounts from OCR text
     if extracted.get("line_items"):
         ocr_lines = unified_text.split('\n')

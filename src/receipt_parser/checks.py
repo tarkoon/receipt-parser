@@ -355,6 +355,75 @@ SLIP_CHECKS = {
 
 
 # ---------------------------------------------------------------------------
+# Tree Edit Distance metric
+# ---------------------------------------------------------------------------
+
+def _flatten_dict(d: dict, prefix: str = "") -> list[tuple[str, object]]:
+    """Flatten a dict into a list of (key_path, value) tuples."""
+    items = []
+    for key, val in d.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(val, dict):
+            items.extend(_flatten_dict(val, path))
+        elif isinstance(val, list):
+            for i, item in enumerate(val):
+                if isinstance(item, dict):
+                    items.extend(_flatten_dict(item, f"{path}[{i}]"))
+                else:
+                    items.append((f"{path}[{i}]", item))
+        else:
+            items.append((path, val))
+    return items
+
+
+def check_tree_edit_distance(result: dict, truth: dict) -> dict:
+    """Compute normalized tree edit distance between result and truth.
+
+    Measures structural correctness of the entire JSON output.
+    Returns a score from 0.0 (completely different) to 1.0 (identical).
+    Only compares keys present in the truth file (ignores pipeline metadata).
+    """
+    truth_keys_top = {k for k in truth if not k.startswith("_")}
+
+    result_clean = {k: result.get(k) for k in truth_keys_top}
+    truth_clean = {k: truth[k] for k in truth_keys_top}
+
+    result_flat = _flatten_dict(result_clean)
+    truth_flat = _flatten_dict(truth_clean)
+
+    truth_paths = {k for k, _ in truth_flat}
+    result_paths = {k for k, _ in result_flat}
+    truth_map = dict(truth_flat)
+    result_map = dict(result_flat)
+
+    insertions = len(result_paths - truth_paths)
+    deletions = len(truth_paths - result_paths)
+    substitutions = 0
+    for key in truth_paths & result_paths:
+        tv, rv = truth_map[key], result_map[key]
+        if isinstance(tv, (int, float)) and isinstance(rv, (int, float)):
+            if abs(tv - rv) > 1:
+                substitutions += 1
+        elif tv != rv:
+            substitutions += 1
+
+    total_edits = insertions + deletions + substitutions
+    truth_size = max(len(truth_flat), 1)
+    score = max(0.0, 1.0 - total_edits / truth_size)
+
+    ok = score >= 0.5
+    return {
+        "pass": ok,
+        "score": round(score, 4),
+        "detail": f"score={score:.2%} (edits={total_edits}: +{insertions} -{deletions} ~{substitutions}, truth_size={truth_size})",
+    }
+
+
+# Add tree_edit_distance to common checks
+COMMON_CHECKS["tree_edit_distance"] = check_tree_edit_distance
+
+
+# ---------------------------------------------------------------------------
 # Unified accessor
 # ---------------------------------------------------------------------------
 
