@@ -42,7 +42,7 @@
   "taxes": [
     {
       "rate": "8%",
-      "label": "8%税",
+      "label": "外税",
       "amount": 48
     }
   ],

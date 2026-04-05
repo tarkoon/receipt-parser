@@ -131,24 +131,24 @@ def test_extract_confidence_missing():
 # --- Era date conversion tests ---
 
 def test_era_reiwa():
-    from receipt_parser.pipeline import _era_to_western_year
+    from receipt_parser.patterns import era_to_western_year as _era_to_western_year
     assert _era_to_western_year(8, "令和") == 2026
     assert _era_to_western_year(1, "令和") == 2019
 
 
 def test_era_heisei():
-    from receipt_parser.pipeline import _era_to_western_year
+    from receipt_parser.patterns import era_to_western_year as _era_to_western_year
     assert _era_to_western_year(31, "平成") == 2019
     assert _era_to_western_year(1, "平成") == 1989
 
 
 def test_era_default_assumes_reiwa():
-    from receipt_parser.pipeline import _era_to_western_year
+    from receipt_parser.patterns import era_to_western_year as _era_to_western_year
     assert _era_to_western_year(8) == 2026
 
 
 def test_era_invalid():
-    from receipt_parser.pipeline import _era_to_western_year
+    from receipt_parser.patterns import era_to_western_year as _era_to_western_year
     assert _era_to_western_year(0) is None
     assert _era_to_western_year(100) is None
 
@@ -206,9 +206,10 @@ def test_ollama_schema_no_refs():
 
 
 def test_prompt_includes_hints_and_aliases():
-    prompt = generate_extraction_prompt("test OCR text")
+    system_prompt, user_prompt = generate_extraction_prompt("test OCR text")
+    prompt = system_prompt + user_prompt
     assert "merchant" in prompt
-    assert "PAGE" in prompt
+    assert "PAGE" in prompt or "OCR TEXT" in prompt
     assert "店名" in prompt
     assert "合計" in prompt
     assert "Look for labels:" in prompt

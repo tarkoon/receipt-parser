@@ -12,6 +12,7 @@ Run with:
 import json
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -86,8 +87,9 @@ _RESULTS_CACHE: dict[str, dict] = {}
 _check_results: list[dict] = []
 
 
-def _process_one(case_id: str, source: dict) -> tuple[str, dict]:
+def _process_one(case_id: str, source: dict) -> tuple[str, dict, float]:
     """Process a single fixture/variant. Thread-safe — each call is independent."""
+    t0 = time.perf_counter()
     if source["type"] == "image":
         from receipt_parser.pipeline import process_document
         result = process_document(source["path"], passes=3, apply_user_rules=False)
@@ -95,12 +97,13 @@ def _process_one(case_id: str, source: dict) -> tuple[str, dict]:
         from receipt_parser.pipeline import process_ocr_text
         ocr_text = source["path"].read_text(encoding="utf-8")
         result = process_ocr_text(ocr_text, passes=3, apply_user_rules=False)
-    return case_id, result
+    elapsed = time.perf_counter() - t0
+    return case_id, result, elapsed
 
 
 def _get_result(case_id: str, source: dict) -> dict:
     if case_id not in _RESULTS_CACHE:
-        _, result = _process_one(case_id, source)
+        _, result, _ = _process_one(case_id, source)
         _RESULTS_CACHE[case_id] = result
     return _RESULTS_CACHE[case_id]
 
@@ -109,25 +112,37 @@ def _get_result(case_id: str, source: dict) -> dict:
 def preprocess_fixtures(request):
     """Pre-process all fixtures concurrently before tests run."""
     workers = request.config.getoption("--workers", default=4)
-    if workers <= 1 or not _CASES:
+    if not _CASES:
         return
 
-    from receipt_parser.ocr import init_cloud_vision
-    # Warm up Cloud Vision client (shared across threads)
-    try:
-        init_cloud_vision()
-    except Exception:
+    if _cv_available:
+        from receipt_parser.ocr import init_cloud_vision
+        try:
+            init_cloud_vision()
+        except Exception:
+            return
+
+    n = len(_CASES)
+    if workers <= 1:
+        print(f"\nProcessing {n} fixtures sequentially...")
+        for name, source, _truth in _CASES:
+            _, result, elapsed = _process_one(name, source)
+            _RESULTS_CACHE[name] = result
+            print(f"  {name:25s} {elapsed:5.1f}s")
         return
 
-    print(f"\nPre-processing {len(_CASES)} fixtures with {workers} workers...")
+    print(f"\nProcessing {n} fixtures with {workers} workers...")
+    done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(_process_one, name, source): name
             for name, source, _truth in _CASES
         }
         for future in as_completed(futures):
-            case_id, result = future.result()
+            case_id, result, elapsed = future.result()
             _RESULTS_CACHE[case_id] = result
+            done += 1
+            print(f"  [{done:2d}/{n}] {case_id:25s} {elapsed:5.1f}s")
 
 
 # ---------------------------------------------------------------------------

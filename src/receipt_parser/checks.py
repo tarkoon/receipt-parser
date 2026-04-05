@@ -171,6 +171,60 @@ def check_tax_amount(result: dict, truth: dict) -> dict:
             "detail": f"got {got}, expected {exp} (tol +-5)"}
 
 
+def check_tax_rates(result: dict, truth: dict) -> dict:
+    exp_taxes = truth.get("taxes", [])
+    if not exp_taxes:
+        return {"pass": True, "detail": "no taxes in truth, skipped"}
+    exp = sorted(t.get("rate", "unknown") for t in exp_taxes)
+    got = sorted(t.get("rate", "unknown") for t in result.get("taxes", []))
+    ok = got == exp
+    return {"pass": ok, "expected": exp, "got": got,
+            "detail": f"got {got}, expected {exp}"}
+
+
+def check_tax_labels(result: dict, truth: dict) -> dict:
+    exp_taxes = truth.get("taxes", [])
+    if not exp_taxes:
+        return {"pass": True, "detail": "no taxes in truth, skipped"}
+    exp = sorted(t.get("label", "") or "" for t in exp_taxes)
+    got = sorted(t.get("label", "") or "" for t in result.get("taxes", []))
+    ok = got == exp
+    return {"pass": ok, "expected": exp, "got": got,
+            "detail": f"got {got}, expected {exp}"}
+
+
+def check_points_used(result: dict, truth: dict) -> dict:
+    exp = truth.get("points_used")
+    if exp is None:
+        return {"pass": True, "detail": "no points_used in truth, skipped"}
+    got = result.get("points_used")
+    ok = got is not None and abs(got - exp) < 2
+    return {"pass": ok, "expected": exp, "got": got,
+            "detail": f"got {got}, expected {exp}"}
+
+
+def check_line_items_qty(result: dict, truth: dict) -> dict:
+    true_items = truth.get("line_items", [])
+    if not true_items:
+        return {"pass": True, "detail": "no line items in truth, skipped"}
+    exp = sorted((i.get("qty") or 1) for i in true_items)
+    got = sorted((i.get("qty") or 1) for i in result.get("line_items", []))
+    ok = got == exp
+    return {"pass": ok, "expected": exp, "got": got,
+            "detail": f"got {got}, expected {exp}"}
+
+
+def check_line_items_unit_price(result: dict, truth: dict) -> dict:
+    true_items = truth.get("line_items", [])
+    if not true_items:
+        return {"pass": True, "detail": "no line items in truth, skipped"}
+    exp = sorted((i.get("unit_price") or 0) for i in true_items)
+    got = sorted((i.get("unit_price") or 0) for i in result.get("line_items", []))
+    ok = got == exp
+    return {"pass": ok, "expected": exp, "got": got,
+            "detail": f"got {got}, expected {exp}"}
+
+
 def check_tax_categories(result: dict, truth: dict) -> dict:
     true_cats = sorted(
         i.get("tax_category", "0%") for i in truth.get("line_items", [])
@@ -217,9 +271,14 @@ RECEIPT_CHECKS = {
     "subtotal": check_subtotal,
     "line_items_count": check_line_items_count,
     "line_items_totals": check_line_items_totals,
+    "line_items_qty": check_line_items_qty,
+    "line_items_unit_price": check_line_items_unit_price,
     "tax_amount": check_tax_amount,
+    "tax_rates": check_tax_rates,
+    "tax_labels": check_tax_labels,
     "tax_categories": check_tax_categories,
     "item_descriptions": check_item_descriptions,
+    "points_used": check_points_used,
 }
 
 
@@ -268,8 +327,30 @@ def check_payer(result: dict, truth: dict) -> dict:
             "detail": f"'{got}' vs '{exp}' ({ratio:.0%})"}
 
 
+def check_account_number(result: dict, truth: dict) -> dict:
+    exp = truth.get("account_number")
+    if exp is None:
+        return {"pass": True, "detail": "no account_number in truth, skipped"}
+    got = result.get("account_number")
+    ok = got == exp
+    return {"pass": ok, "expected": exp, "got": got,
+            "detail": f"got {got}, expected {exp}"}
+
+
+def check_payment_reference(result: dict, truth: dict) -> dict:
+    exp = truth.get("payment_reference")
+    if exp is None:
+        return {"pass": True, "detail": "no payment_reference in truth, skipped"}
+    got = result.get("payment_reference")
+    ok = got == exp
+    return {"pass": ok, "expected": exp, "got": got,
+            "detail": f"got {got}, expected {exp}"}
+
+
 SLIP_CHECKS = {
     "payer": check_payer,
+    "account_number": check_account_number,
+    "payment_reference": check_payment_reference,
 }
 
 

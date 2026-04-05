@@ -26,14 +26,41 @@ def try_extract_text_layer(pdf_path: str) -> str | None:
     return full_text.strip() if len(full_text.strip()) > 50 else None
 
 
+def compute_image_quality(gray: np.ndarray) -> dict:
+    """Compute image quality metrics for adaptive preprocessing.
+
+    Returns dict with:
+      - sharpness: Laplacian variance (higher = sharper)
+      - contrast: pixel std dev (higher = more contrast)
+      - min_dimension: smaller of height/width in pixels
+    """
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    contrast = float(gray.std())
+    h, w = gray.shape[:2]
+    return {"sharpness": sharpness, "contrast": contrast, "min_dimension": min(h, w)}
+
+
 def preprocess_receipt(image: np.ndarray) -> np.ndarray:
-    """Enhancement pipeline: grayscale → deskew → denoise.
+    """Enhancement pipeline: grayscale → upscale → background norm → deskew → denoise → CLAHE.
     Returns grayscale (NOT binary/thresholded).
     """
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
         gray = image.copy()
+
+    # Resolution upscaling for low-res images (phone photos, thumbnails)
+    h, w = gray.shape[:2]
+    if min(h, w) < 1500:
+        scale = 1500 / min(h, w)
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    # Adaptive background normalization for low-contrast images
+    quality = compute_image_quality(gray)
+    if quality["contrast"] < 40:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 30))
+        bg = cv2.morphologyEx(gray, cv2.MORPH_DILATE, kernel)
+        gray = cv2.divide(gray, bg, scale=255)
 
     # Deskew via Hough line detection on text baselines
     edges = cv2.Canny(gray, 50, 150, apertureSize=3)
@@ -52,6 +79,11 @@ def preprocess_receipt(image: np.ndarray) -> np.ndarray:
 
     # Denoise — preserve grayscale, do NOT threshold
     denoised = cv2.fastNlMeansDenoising(gray, h=10)
+
+    # CLAHE contrast enhancement (improves faded thermal receipts)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    denoised = clahe.apply(denoised)
+
     return denoised
 
 

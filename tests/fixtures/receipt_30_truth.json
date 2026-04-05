@@ -33,12 +33,12 @@
 	"taxes": [
 		{
 			"rate": "8%",
-			"label": "軽減税率 R",
+			"label": "外税",
 			"amount": 160
 		},
 		{
 			"rate": "10%",
-			"label": "標準税率",
+			"label": "外税",
 			"amount": 2
 		}
 	],

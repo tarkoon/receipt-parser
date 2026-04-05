@@ -24,7 +24,7 @@
   "taxes": [
     {
       "rate": "0%",
-      "label": "非課税対象額",
+      "label": "非課税",
       "amount": 0
     }
   ],

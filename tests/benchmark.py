@@ -102,11 +102,15 @@ def _attribute_failure(failed_field: str, failed_run: dict, ref_run: dict) -> st
         "total": "total", "date": "date", "currency": "currency",
         "subtotal": "subtotal", "payment_method": "payment_method",
         "line_items_count": "line_items", "line_items_totals": "line_items",
-        "tax_amount": "taxes", "merchant_similarity": "merchant",
+        "line_items_qty": "line_items", "line_items_unit_price": "line_items",
+        "tax_amount": "taxes", "tax_rates": "taxes", "tax_labels": "taxes",
+        "merchant_similarity": "merchant",
         "tax_categories": "line_items", "document_type": "document_type",
         "amount_paid": "amount_paid", "item_descriptions": "line_items",
+        "points_used": "points_used",
         "service_type": "service_type", "usage_amount": "usage",
-        "payer": "payer",
+        "payer": "payer", "account_number": "account_number",
+        "payment_reference": "payment_reference",
     }
 
     key = field_key_map.get(failed_field, failed_field)

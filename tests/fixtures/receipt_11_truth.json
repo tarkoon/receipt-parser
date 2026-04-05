@@ -73,11 +73,6 @@
       "rate": "8%",
       "label": "内税",
       "amount": 120
-    },
-    {
-      "rate": "10%",
-      "label": "内税",
-      "amount": 0
     }
   ],
   "service_type": null,

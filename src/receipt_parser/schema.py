@@ -6,7 +6,7 @@ EXTENDING THE SCHEMA section in the build plan.
 """
 
 from __future__ import annotations
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, PrivateAttr, field_validator, model_validator
 from typing import Literal, Optional
 import json
 import re
@@ -309,6 +309,9 @@ class Document(BaseModel):
 
     raw_text_summary: Optional[str] = None
 
+    # Soft validation warnings collected during model construction (non-raising)
+    _soft_warnings: list[str] = PrivateAttr(default_factory=list)
+
     @field_validator("total", "subtotal", "points_used", "amount_paid", mode="before")
     @classmethod
     def coerce_financial_fields(cls, v):
@@ -380,6 +383,55 @@ class Document(BaseModel):
                         data["date"] = f"{2018 + era_year:04d}-{m.group(2)}-{m.group(3)}"
 
         return data
+
+    @model_validator(mode="after")
+    def check_arithmetic(self) -> "Document":
+        """Soft arithmetic validation — collects warnings without raising.
+
+        Mirrors the checks in validation.py but stores them as _soft_warnings
+        on the model instance for integration with instructor and pipeline.
+        """
+        warnings = self._soft_warnings
+
+        # Line item math: qty * unit_price - discount ≈ total (±1)
+        for i, item in enumerate(self.line_items):
+            if item.unit_price is not None and item.qty:
+                expected = item.qty * item.unit_price - item.discount
+                if abs(expected - item.total) > 1:
+                    warnings.append(
+                        f"Line {i+1}: qty*price-discount={expected}, total={item.total}"
+                    )
+
+        # Sum of items ≈ subtotal (±2)
+        if self.subtotal is not None and self.line_items:
+            items_sum = sum(item.total for item in self.line_items)
+            if abs(items_sum - self.subtotal) > 2:
+                warnings.append(
+                    f"Items sum {items_sum} != subtotal {self.subtotal}"
+                )
+
+        # Total ≈ subtotal + taxes (±2, both inclusive/exclusive models)
+        if self.total is not None and self.subtotal is not None and self.taxes:
+            tax_sum = sum(t.amount for t in self.taxes)
+            is_excl = abs((self.subtotal + tax_sum) - self.total) <= 2
+            is_incl = abs(self.subtotal - self.total) <= 2
+            if not (is_excl or is_incl):
+                warnings.append(
+                    f"Total {self.total} != subtotal {self.subtotal} +/- taxes {tax_sum}"
+                )
+
+        # Tax rate membership
+        for tax in self.taxes:
+            rate_str = tax.rate.replace('%', '').strip()
+            try:
+                rate_val = float(rate_str)
+                valid_rate_values = {float(r.replace('%', '')) for r in VALID_TAX_RATES}
+                if rate_val not in valid_rate_values and rate_str != "unknown":
+                    warnings.append(f"Unusual tax rate: {tax.rate}")
+            except ValueError:
+                pass
+
+        return self
 
 
 # Backward compatibility
@@ -466,8 +518,11 @@ RULES:
 """
 
 
-def generate_extraction_prompt(ocr_text: str, doc_type: str = "receipt") -> str:
-    """Build the full LLM extraction prompt from the field registry."""
+def generate_extraction_prompt(ocr_text: str, doc_type: str = "receipt") -> tuple[str, str]:
+    """Build the full LLM extraction prompt from the field registry.
+
+    Returns (system_prompt, user_prompt) for system/user message separation.
+    """
     if doc_type == "utility_bill":
         rules = UTILITY_BILL_RULES
     elif doc_type == "payment_slip":
@@ -475,16 +530,16 @@ def generate_extraction_prompt(ocr_text: str, doc_type: str = "receipt") -> str:
     else:
         rules = BASE_EXTRACTION_RULES
 
-    prompt = f"""{rules}
+    system_prompt = f"""{rules}
 FIELD-SPECIFIC RULES:
 {_build_field_hints(doc_type)}
 
-OCR TEXT:
-{ocr_text}
+Respond with a single JSON object containing all extracted fields. Return only JSON with no additional text or explanation."""
 
-Respond with a single JSON object containing all extracted fields.
-"""
-    return prompt
+    user_prompt = f"""OCR TEXT:
+{ocr_text}"""
+
+    return system_prompt, user_prompt
 
 
 _VERIFICATION_SYSTEM_PROMPT = """You are a receipt/invoice data extraction engine performing a VERIFICATION PASS.
@@ -504,8 +559,11 @@ def generate_verification_prompt(
     ocr_text: str,
     previous_extraction: dict,
     validation_warnings: list[str],
-) -> str:
-    """Build the verification pass prompt."""
+) -> tuple[str, str]:
+    """Build the verification pass prompt.
+
+    Returns (system_prompt, user_prompt) for system/user message separation.
+    """
     warnings_block = "\n".join(f"- {w}" for w in validation_warnings) if validation_warnings else "None"
 
     doc_type = previous_extraction.get("document_type", "receipt")
@@ -514,20 +572,20 @@ def generate_verification_prompt(
         if f.prompt_hint and doc_type in f.doc_types
     )
 
-    prompt = f"""{_VERIFICATION_SYSTEM_PROMPT}
+    system_prompt = f"""{_VERIFICATION_SYSTEM_PROMPT}
 
 FIELD-SPECIFIC RULES:
 {field_hints}
 
-PREVIOUS EXTRACTION:
+Respond with a single JSON object containing all extracted fields. Return only JSON with no additional text or explanation."""
+
+    user_prompt = f"""PREVIOUS EXTRACTION:
 {json.dumps(previous_extraction, ensure_ascii=False, indent=2)}
 
 VALIDATION WARNINGS:
 {warnings_block}
 
 ORIGINAL OCR TEXT:
-{ocr_text}
+{ocr_text}"""
 
-Respond with a single JSON object containing all extracted fields.
-"""
-    return prompt
+    return system_prompt, user_prompt

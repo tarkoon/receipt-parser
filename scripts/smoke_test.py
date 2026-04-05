@@ -25,9 +25,12 @@ print('  [OK] Schema models')
 
 # 4. Prompt generation per type
 from receipt_parser.schema import generate_extraction_prompt, generate_verification_prompt
-prompt_r = generate_extraction_prompt('test text', doc_type='receipt')
-prompt_u = generate_extraction_prompt('test text', doc_type='utility_bill')
-prompt_p = generate_extraction_prompt('test text', doc_type='payment_slip')
+sys_r, usr_r = generate_extraction_prompt('test text', doc_type='receipt')
+sys_u, usr_u = generate_extraction_prompt('test text', doc_type='utility_bill')
+sys_p, usr_p = generate_extraction_prompt('test text', doc_type='payment_slip')
+prompt_r = sys_r + usr_r
+prompt_u = sys_u + usr_u
+prompt_p = sys_p + usr_p
 assert 'DISCOUNTS' in prompt_r
 assert 'meter' in prompt_u.lower()
 assert 'payment_slip' in prompt_p

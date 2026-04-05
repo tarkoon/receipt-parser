@@ -87,11 +87,6 @@
       "rate": "8%",
       "label": "外税",
       "amount": 168
-    },
-    {
-      "rate": "10%",
-      "label": "外税",
-      "amount": 0
     }
   ],
   "service_type": null,

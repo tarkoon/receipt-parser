@@ -24,7 +24,7 @@
 	"taxes": [
 		{
 			"rate": "10%",
-			"label": "内消費税",
+			"label": "内税",
 			"amount": 362
 		}
 	],

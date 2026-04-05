@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest tests/test_unit.py tests/test_validation.py -v
+        env:
+          PYTHONIOENCODING: utf-8
+
+  accuracy-ci:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: python tests/benchmark.py --ci
+        env:
+          PYTHONIOENCODING: utf-8
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}

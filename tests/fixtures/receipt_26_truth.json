@@ -78,12 +78,12 @@
 	"taxes": [
 		{
 			"rate": "8%",
-			"label": "8%内税",
+			"label": "内税",
 			"amount": 180
 		},
 		{
 			"rate": "10%",
-			"label": "10%内税",
+			"label": "内税",
 			"amount": 144
 		}
 	],

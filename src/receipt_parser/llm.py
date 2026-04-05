@@ -219,7 +219,10 @@ def _get_instructor_client():
         try:
             import instructor
             base_client = _get_api_client()
-            _instructor_client = instructor.from_openai(base_client)
+            _instructor_client = instructor.from_openai(
+                base_client,
+                mode=instructor.Mode.JSON,
+            )
         except ImportError:
             return None
     return _instructor_client
@@ -229,7 +232,7 @@ def _openrouter_chat(
     model: str,
     messages: list,
     temperature: float = 0.0,
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
 ) -> LLMResult:
     """Call DeepSeek/OpenRouter API and return structured result."""
     client = _get_api_client()
@@ -258,19 +261,20 @@ def _instructor_extract(
     model: str,
     messages: list,
     temperature: float = 0.0,
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
     max_retries: int = 2,
-) -> Receipt | None:
+) -> tuple[Receipt | None, LLMResult | None]:
     """Use instructor for Pydantic-native structured output with automatic retry.
 
-    Returns a validated Receipt object directly, or None if instructor is unavailable.
-    Falls back to manual parsing if instructor extraction fails.
+    Returns (Receipt, LLMResult) tuple. Receipt is None if instructor is unavailable
+    or extraction fails. LLMResult captures timing metadata.
     """
     client = _get_instructor_client()
     if client is None:
-        return None
+        return None, None
     try:
-        return client.chat.completions.create(
+        t0 = time.perf_counter()
+        receipt = client.chat.completions.create(
             model=model,
             messages=messages,
             response_model=Receipt,
@@ -279,8 +283,16 @@ def _instructor_extract(
             seed=_LLM_SEED,
             max_retries=max_retries,
         )
+        elapsed_ns = int((time.perf_counter() - t0) * 1e9)
+        llm_result = LLMResult(
+            content="(instructor)",
+            eval_duration_ns=elapsed_ns,
+            total_duration_ns=elapsed_ns,
+            backend="api",
+        )
+        return receipt, llm_result
     except Exception:
-        return None
+        return None, None
 
 
 # ── Ollama backend ───────────────────────────────────────────────────
@@ -346,7 +358,7 @@ def _llm_chat(
     messages: list,
     schema: dict,
     temperature: float = 0.0,
-    max_tokens: int = 4096,
+    max_tokens: int = 8192,
 ) -> LLMResult:
     """Unified LLM chat — dispatches to Ollama or OpenRouter."""
     if _is_ollama_model(model):
@@ -377,31 +389,39 @@ def extract_with_llm(
     ocr_text: str,
     model: str = DEFAULT_MODEL,
     doc_type: str = "receipt",
-    use_instructor: bool = False,
+    use_instructor: bool = True,
 ) -> tuple[dict, LLMResult | None]:
     """Single-pass extraction with structured output enforcement.
 
     Returns (parsed_dict, llm_result) where llm_result contains timing metadata.
 
-    Args:
-        use_instructor: If True and available, use instructor for Pydantic-native
-            structured output. Default False — JSON mode is more deterministic.
+    Strategy: normal JSON extraction first (proven deterministic), then
+    instructor as a fallback if JSON parsing fails. This preserves the
+    proven extraction behavior while gaining instructor's auto-retry for
+    malformed responses.
     """
-    prompt = generate_extraction_prompt(ocr_text, doc_type=doc_type)
-    messages = [{"role": "user", "content": prompt}]
+    system_prompt, user_prompt = generate_extraction_prompt(ocr_text, doc_type=doc_type)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
-    if use_instructor and not _is_ollama_model(model):
-        receipt = _instructor_extract(model=model, messages=messages)
-        if receipt is not None:
-            return receipt.model_dump(), None
-
+    # Primary path: normal JSON extraction (deterministic with seed=42)
     llm_result = _llm_chat(
         model=model,
         messages=messages,
         schema=get_ollama_schema(),
     )
 
-    return _parse_llm_json(sanitize_llm_response(llm_result.content)), llm_result
+    parsed = _parse_llm_json(sanitize_llm_response(llm_result.content))
+
+    # Fallback: if JSON parsing failed, try instructor for auto-retry
+    if "error" in parsed and use_instructor and not _is_ollama_model(model):
+        receipt, instructor_result = _instructor_extract(model=model, messages=messages)
+        if receipt is not None:
+            return receipt.model_dump(), instructor_result or llm_result
+
+    return parsed, llm_result
 
 
 def _llm_result_to_timing(result: LLMResult | None) -> dict | None:
@@ -447,7 +467,7 @@ def extract_with_verification(
         if not warnings:
             break
 
-        verification_prompt = generate_verification_prompt(
+        v_system, v_user = generate_verification_prompt(
             ocr_text=ocr_text,
             previous_extraction=extracted,
             validation_warnings=warnings,
@@ -455,7 +475,10 @@ def extract_with_verification(
 
         llm_result = _llm_chat(
             model=model,
-            messages=[{"role": "user", "content": verification_prompt}],
+            messages=[
+                {"role": "system", "content": v_system},
+                {"role": "user", "content": v_user},
+            ],
             schema=get_ollama_schema(),
         )
 
