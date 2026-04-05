@@ -1,5 +1,7 @@
 """validation.py — Schema-driven arithmetic & consistency checks."""
 
+import re
+
 from .schema import Receipt, VALID_TAX_RATES
 
 
@@ -40,8 +42,22 @@ def _validate_receipt_fields(receipt: Receipt) -> list[str]:
                 warnings.append(
                     f"Line {i+1} ({item.description}): qty ({item.qty}) × "
                     f"unit_price ({item.unit_price}) - discount ({item.discount}) "
-                    f"= {expected}, but total is {item.total}"
+                    f"= {expected}, but total is {item.total}. "
+                    f"Suggested: set total to {expected} or adjust qty/unit_price."
                 )
+
+        # Discount rate consistency: if discount_rate is set, verify discount matches
+        if item.discount_rate and item.discount > 0 and item.unit_price is not None and item.qty:
+            rate_match = re.match(r'(\d+(?:\.\d+)?)', item.discount_rate)
+            if rate_match:
+                rate_pct = float(rate_match.group(1)) / 100.0
+                expected_discount = round(item.unit_price * item.qty * rate_pct)
+                if abs(expected_discount - item.discount) > 2:
+                    warnings.append(
+                        f"Line {i+1} ({item.description}): discount_rate "
+                        f"{item.discount_rate} implies discount ~{expected_discount}, "
+                        f"but discount is {item.discount}."
+                    )
 
     # Check sum of line item totals ~ subtotal (+-2 tolerance)
     if receipt.subtotal is not None and receipt.line_items:
@@ -67,6 +83,9 @@ def _validate_receipt_fields(receipt: Receipt) -> list[str]:
                 f"+/- taxes ({tax_sum}) under either inclusive or exclusive tax model."
             )
 
+    # Tax ratio cross-check: does subtotal * (1 + rate) ≈ total?
+    warnings.extend(_check_tax_ratio(receipt))
+
     # Check JP tax rates are plausible
     valid_rate_values = set()
     for r in VALID_TAX_RATES:
@@ -85,6 +104,32 @@ def _validate_receipt_fields(receipt: Receipt) -> list[str]:
         except ValueError:
             pass
 
+    return warnings
+
+
+def _check_tax_ratio(receipt: "Receipt") -> list[str]:
+    """Check if subtotal * known tax rate ≈ total (within ±2 yen tolerance).
+
+    Catches gross total/subtotal extraction errors before subset-sum matching.
+    Skips if subtotal, total, or taxes are missing.
+    """
+    warnings = []
+    if receipt.subtotal is None or receipt.total is None or not receipt.taxes:
+        return warnings
+
+    known_rates = [0.08, 0.10]
+    for rate in known_rates:
+        if abs(receipt.subtotal * (1 + rate) - receipt.total) <= 2:
+            return warnings  # Matches a known rate, no warning
+
+    # Also check tax-inclusive model (subtotal == total)
+    if abs(receipt.subtotal - receipt.total) <= 2:
+        return warnings
+
+    warnings.append(
+        f"Tax ratio check: subtotal ({receipt.subtotal}) × known rate "
+        f"does not produce total ({receipt.total}). Verify subtotal and total."
+    )
     return warnings
 
 

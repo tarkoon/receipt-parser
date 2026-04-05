@@ -503,6 +503,13 @@ def process_ocr_text(
     elif doc_type == "payment_slip" and "error" not in extracted:
         extracted = postprocess_payment_slip(extracted, unified_text, raw_text=ocr_text)
 
+    # ── Common post-processing ──
+    if "error" not in extracted:
+        total = extracted.get("total")
+        points = extracted.get("points_used")
+        if total is not None:
+            extracted["amount_paid"] = total - points if points else total
+
     # Strip _confidence if present
     extracted.pop("_confidence", None)
 

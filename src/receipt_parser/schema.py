@@ -399,8 +399,21 @@ class Document(BaseModel):
                 expected = item.qty * item.unit_price - item.discount
                 if abs(expected - item.total) > 1:
                     warnings.append(
-                        f"Line {i+1}: qty*price-discount={expected}, total={item.total}"
+                        f"Line {i+1}: qty*price-discount={expected}, total={item.total}. "
+                        f"Suggested: set total to {expected} or adjust qty/unit_price."
                     )
+
+            # Discount rate consistency
+            if item.discount_rate and item.discount > 0 and item.unit_price is not None and item.qty:
+                rate_match = re.match(r'(\d+(?:\.\d+)?)', item.discount_rate)
+                if rate_match:
+                    rate_pct = float(rate_match.group(1)) / 100.0
+                    expected_discount = round(item.unit_price * item.qty * rate_pct)
+                    if abs(expected_discount - item.discount) > 2:
+                        warnings.append(
+                            f"Line {i+1}: discount_rate {item.discount_rate} "
+                            f"implies ~{expected_discount}, but discount={item.discount}"
+                        )
 
         # Sum of items ≈ subtotal (±2)
         if self.subtotal is not None and self.line_items:
@@ -418,6 +431,18 @@ class Document(BaseModel):
             if not (is_excl or is_incl):
                 warnings.append(
                     f"Total {self.total} != subtotal {self.subtotal} +/- taxes {tax_sum}"
+                )
+
+        # Tax ratio cross-check: subtotal * known rate ≈ total?
+        if self.total is not None and self.subtotal is not None and self.taxes:
+            known_rates = [0.08, 0.10]
+            ratio_ok = any(
+                abs(self.subtotal * (1 + r) - self.total) <= 2 for r in known_rates
+            ) or abs(self.subtotal - self.total) <= 2
+            if not ratio_ok:
+                warnings.append(
+                    f"Tax ratio: subtotal {self.subtotal} × known rate "
+                    f"!= total {self.total}"
                 )
 
         # Tax rate membership
