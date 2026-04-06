@@ -223,7 +223,8 @@ def clean_handwritten_ocr(text: str, ocr_confidence: float | None = None) -> str
     # Handwritten receipt detection:
     # Primary: low OCR confidence (< 0.7) suggests handwritten content
     # Fallback: short text (< 35 lines), no printed receipt markers
-    is_printed = any('小計' in l or '合計' in l for l in lines)
+    _printed_markers = ('小計', '合計', 'レジ', 'TEL', '税', '円', '%対象', 'お預り', '釣銭')
+    is_printed = any(m in l for l in lines for m in _printed_markers)
     if ocr_confidence is not None:
         is_handwritten = ocr_confidence < 0.7 and not is_printed
     else:
@@ -269,13 +270,18 @@ def clean_handwritten_ocr(text: str, ocr_confidence: float | None = None) -> str
     # Fix absorbed ¥: if a line near "金額" is just a number starting with 1,
     # the leading 1 is likely the ¥ sign misread as a digit.
     # e.g. "金額\n13000" → "金額\n金額:3000" (the 1 was ¥)
+    # Guards: only apply when the number is 3-5 digits after the leading 1
+    # (i.e., 1,000–99,999 range), the context marker is on the immediately
+    # preceding line (not 2 lines away), and the amount hasn't already been
+    # tagged with 金額: by the earlier ¥ replacement pass.
     result_lines = result.split('\n')
     for i in range(len(result_lines)):
         curr = result_lines[i].strip()
-        if re.match(r'^1\d{3,5}$', curr):
-            # Check if nearby lines contain 金額 or 但 (amount/purpose markers)
-            context = ' '.join(result_lines[max(0, i-2):i])
-            if '金額' in context or '但' in context:
+        if re.match(r'^1\d{3,4}$', curr):  # 1,000–19,999 range only
+            # Only check immediately preceding line (not 2 lines back)
+            prev = result_lines[i-1].strip() if i > 0 else ''
+            # Context marker must be a label-only line (no digits = not an amount)
+            if ('金額' in prev or '但' in prev) and not re.search(r'\d{2,}', prev):
                 result_lines[i] = f'金額:{curr[1:]}'
     result = '\n'.join(result_lines)
 

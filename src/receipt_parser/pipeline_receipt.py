@@ -202,12 +202,12 @@ def extract_financial_totals(text: str) -> dict:
 
         if '現計' in line:
             val = _extract_yen_nearby(lines, i)
-            if val is not None:
+            if val is not None and 'total' not in result:
                 result['total'] = val
 
         if '現金支払' in line:
             val = _extract_yen_nearby(lines, i)
-            if val is not None:
+            if val is not None and 'total' not in result:
                 result['total'] = val
 
         if re.search(r'外税\s*\d+%', line) and '対象' not in line:

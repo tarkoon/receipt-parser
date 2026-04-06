@@ -32,6 +32,8 @@ from .pipeline_receipt import (
 from .pipeline_bill import postprocess_utility_bill
 from .pipeline_slip import postprocess_payment_slip
 
+_PIPELINE_VERSION = "3.0.0"
+
 
 # ── Document Type Detection ──────────────────────────────────────────
 
@@ -43,7 +45,7 @@ def detect_document_type(text: str) -> str:
 
     if utility_score >= 2 and utility_score > receipt_score:
         return "utility_bill"
-    if slip_score >= 1 and slip_score >= receipt_score:
+    if slip_score >= 2 and slip_score > receipt_score:
         return "payment_slip"
     return "receipt"
 
@@ -91,15 +93,23 @@ def _location_needs_resolution(location: str | None, ocr_text: str = "") -> bool
 
 
 def _location_has_ocr_evidence(location: str, ocr_text: str) -> bool:
-    """Check if at least part of the location string has evidence in the OCR text."""
+    """Check if at least part of the location string has evidence in the OCR text.
+
+    Normalizes whitespace before comparison since Japanese OCR frequently
+    inserts spaces between characters (e.g., "宗像市 赤間" vs "宗像市赤間").
+    """
     if not location or not ocr_text:
         return False
-    if location in ocr_text:
+    # Normalize whitespace in both strings for comparison
+    loc_norm = re.sub(r'\s+', '', location)
+    ocr_norm = re.sub(r'\s+', '', ocr_text)
+    if loc_norm in ocr_norm:
         return True
+    # Check individual admin-level segments
     parts = re.split(r'[市区町村郡県都道府]', location)
     for part in parts:
         part = part.strip()
-        if len(part) >= 2 and part in ocr_text:
+        if len(part) >= 2 and part in ocr_norm:
             return True
     return False
 
@@ -149,16 +159,42 @@ Respond with a JSON object: {{"location": "..."}} or {{"location": null}} if you
 # ── Confidence ──────────────────────────────────────────────────────
 
 def _compute_posthoc_confidence(extracted: dict, warnings: list[str]) -> dict:
-    """Compute per-field confidence from validation results (post-hoc)."""
-    conf = {}
-    warning_text = " ".join(warnings)
+    """Compute per-field confidence from validation results (post-hoc).
 
+    Maps warning text to fields using keyword matching that avoids false
+    positives from field names appearing in unrelated warning context
+    (e.g., "Line 1: total is X" should affect line_items, not total).
+    """
+    # Map warning keywords to the field they actually pertain to
+    _WARNING_FIELD_MAP = {
+        "Line ": "line_items",
+        "Sum of line items": "line_items",
+        "discount_rate": "line_items",
+        "Total (": "total",
+        "Total does not match": "total",
+        "subtotal (": "subtotal",
+        "Tax ratio": "subtotal",
+        "tax rate": "taxes",
+        "Unusual tax rate": "taxes",
+        "amount_paid": "points_used",
+        "usage.": "usage",
+        "billing_period": "billing_period",
+        "merchant": "merchant",
+    }
+
+    affected_fields: set[str] = set()
+    for w in warnings:
+        for keyword, field in _WARNING_FIELD_MAP.items():
+            if keyword in w:
+                affected_fields.add(field)
+
+    conf = {}
     for field in ("merchant", "date", "total", "subtotal", "taxes",
                    "payment_method", "line_items", "points_used"):
         val = extracted.get(field)
         if val is None or (isinstance(val, list) and len(val) == 0):
             conf[field] = 0.0
-        elif field in warning_text.lower():
+        elif field in affected_fields:
             conf[field] = 0.4
         else:
             conf[field] = 0.9
@@ -177,7 +213,7 @@ def _build_result(receipt, final_warnings, pass_history, model, debug=False, tra
     result["_pass_count"] = len(pass_history)
     result["_pass_history"] = pass_history
     result["_model"] = model
-    result["_pipeline_version"] = "3.0.0"
+    result["_pipeline_version"] = _PIPELINE_VERSION
     line_item_warnings = [w for w in final_warnings if "Line " in w]
     result["_line_items_reliable"] = len(line_item_warnings) == 0
     if ocr_confidence is not None:
@@ -332,7 +368,7 @@ def process_document(
         return {
             "_error": "OCR produced no text.",
             "_warnings": [], "_pass_count": 0, "_model": model,
-            "_pipeline_version": "2.0.0", "_line_items_reliable": False,
+            "_pipeline_version": _PIPELINE_VERSION, "_line_items_reliable": False,
         }
 
     trace.log_step("ocr_grouped", data=unified_text)
@@ -376,10 +412,17 @@ def process_document(
             extracted["payment_method"] = "cash"
 
     # ── Final cash fallback: tender + change labels present but payment still unset ──
+    # Skip if electronic payment markers are present (split/card payments can
+    # also show tender+change text).
+    _ELECTRONIC_PAY_RE = re.compile(
+        r'クレジット|カード|PayPay|電子マネー|iD|QUICPay|Suica|WAON|nanaco|'
+        r'PASMO|楽天Edy|LINE\s*Pay|au\s*PAY|d払い|メルペイ|交通系'
+    )
     if "error" not in extracted and not extracted.get("payment_method"):
         has_tender_label = bool(re.search(r'お預り', unified_text))
         has_change_label_final = bool(re.search(r'釣', unified_text))
-        if has_tender_label and has_change_label_final:
+        has_electronic = bool(_ELECTRONIC_PAY_RE.search(unified_text))
+        if has_tender_label and has_change_label_final and not has_electronic:
             extracted["payment_method"] = "cash"
 
     # ── Location: clear for utility bills and payment slips ──
@@ -477,7 +520,7 @@ def process_ocr_text(
         return {
             "_error": "OCR text is empty.",
             "_warnings": [], "_pass_count": 0, "_model": model,
-            "_pipeline_version": "3.0.0", "_line_items_reliable": False,
+            "_pipeline_version": _PIPELINE_VERSION, "_line_items_reliable": False,
         }
 
     # LLM extraction with verification
@@ -500,6 +543,8 @@ def process_ocr_text(
     llm_conf_ocr = extracted.get("_confidence")
     if doc_type == "receipt" and "error" not in extracted:
         extracted = postprocess_receipt(extracted, unified_text, ocr_conf, ocr_totals, llm_conf_ocr, model)
+    elif doc_type == "utility_bill" and "error" not in extracted:
+        extracted = postprocess_utility_bill(extracted, unified_text)
     elif doc_type == "payment_slip" and "error" not in extracted:
         extracted = postprocess_payment_slip(extracted, unified_text, raw_text=ocr_text)
 

@@ -49,6 +49,7 @@ LOCATION_CLUE_RE = re.compile(
 ERA_TABLE = {
     "令和": 2018,   # 令和1年 = 2019
     "平成": 1988,   # 平成1年 = 1989
+    "昭和": 1925,   # 昭和1年 = 1926
 }
 DEFAULT_ERA_BASE = 2018  # Assume 令和 when era name is not found
 
@@ -62,11 +63,25 @@ def era_to_western_year(era_year: int, era_name: str | None = None) -> int | Non
 
     Returns:
         Western year (e.g. 2026) or None if era_year is invalid.
+
+    When no era name is provided, uses a plausibility heuristic:
+    - era_year <= 8: assume 令和 (produces 2019-2026, current era)
+    - era_year > 8: assume 平成 if result is within last 30 years
     """
     if era_year < 1 or era_year > 99:
         return None
-    base = ERA_TABLE.get(era_name, DEFAULT_ERA_BASE) if era_name else DEFAULT_ERA_BASE
-    return base + era_year
+    if era_name:
+        base = ERA_TABLE.get(era_name, DEFAULT_ERA_BASE)
+        return base + era_year
+    # No era name — disambiguate using plausibility
+    reiwa_year = 2018 + era_year
+    if reiwa_year <= 2026:
+        return reiwa_year  # Plausible 令和 date (current era, not in the future)
+    # era_year > 8: 令和 would be future; try 平成
+    heisei_year = 1988 + era_year
+    if 1996 <= heisei_year <= 2019:
+        return heisei_year  # Plausible 平成 date (within last ~30 years)
+    return reiwa_year  # Fall back to 令和
 
 
 # ── Confidence Router ──────────────────────────────────────────────

@@ -112,9 +112,14 @@ def _check_tax_ratio(receipt: "Receipt") -> list[str]:
 
     Catches gross total/subtotal extraction errors before subset-sum matching.
     Skips if subtotal, total, or taxes are missing.
+    Handles multi-rate receipts by computing the blended effective rate.
     """
     warnings = []
     if receipt.subtotal is None or receipt.total is None or not receipt.taxes:
+        return warnings
+
+    # Also check tax-inclusive model (subtotal == total)
+    if abs(receipt.subtotal - receipt.total) <= 2:
         return warnings
 
     known_rates = [0.08, 0.10]
@@ -122,9 +127,14 @@ def _check_tax_ratio(receipt: "Receipt") -> list[str]:
         if abs(receipt.subtotal * (1 + rate) - receipt.total) <= 2:
             return warnings  # Matches a known rate, no warning
 
-    # Also check tax-inclusive model (subtotal == total)
-    if abs(receipt.subtotal - receipt.total) <= 2:
-        return warnings
+    # Multi-rate check: if multiple tax entries exist, compute blended rate
+    if len(receipt.taxes) > 1 and receipt.subtotal > 0:
+        tax_sum = sum(t.amount for t in receipt.taxes)
+        if abs(receipt.subtotal + tax_sum - receipt.total) <= 2:
+            return warnings  # Subtotal + sum of per-rate taxes ≈ total
+        effective_rate = tax_sum / receipt.subtotal
+        if abs(receipt.subtotal * (1 + effective_rate) - receipt.total) <= 2:
+            return warnings  # Blended rate matches
 
     warnings.append(
         f"Tax ratio check: subtotal ({receipt.subtotal}) × known rate "
