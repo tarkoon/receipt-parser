@@ -115,19 +115,6 @@ def sanitize_llm_response(raw: str) -> str:
     return cleaned
 
 
-def _coerce_llm_output(data: dict) -> dict:
-    """Legacy coercion — now mostly handled by Pydantic model_validator.
-
-    Kept as a thin pass-through for the fallback JSON parsing path.
-    The Document model's handle_llm_aliases model_validator handles:
-    - quantity → qty, name → description aliases
-    - Numeric field coercion
-    - Tax format normalization
-    - Era date fixes
-    """
-    return data
-
-
 def _extract_confidence(data: dict) -> dict | None:
     """Extract and validate the _confidence field from LLM output."""
     conf = data.pop("_confidence", None)
@@ -145,9 +132,10 @@ def _extract_confidence(data: dict) -> dict | None:
 
 
 def _parse_llm_json(raw: str) -> dict:
-    """Parse LLM JSON output with Pydantic validation, coercion fallback.
+    """Parse LLM JSON output with Pydantic validation, raw dict fallback.
 
     Extracts _confidence before Pydantic validation (not part of schema).
+    Coercion is handled by Pydantic's model_validator in schema.py.
     """
     confidence = None
     try:
@@ -158,18 +146,8 @@ def _parse_llm_json(raw: str) -> dict:
         if confidence:
             result["_confidence"] = confidence
         return result
-    except Exception:
-        pass
-    try:
-        data = json.loads(raw)
-        confidence = _extract_confidence(data)
-        data = _coerce_llm_output(data)
-        receipt = Receipt(**data)
-        result = receipt.model_dump()
-        if confidence:
-            result["_confidence"] = confidence
-        return result
-    except Exception as e2:
+    except Exception as e:
+        # Pydantic validation failed — fall back to raw dict
         try:
             data = json.loads(raw)
             confidence = _extract_confidence(data)
@@ -177,7 +155,7 @@ def _parse_llm_json(raw: str) -> dict:
                 data["_confidence"] = confidence
             return data
         except json.JSONDecodeError:
-            return {"error": f"LLM output failed validation: {e2}", "raw": raw}
+            return {"error": f"LLM output failed validation: {e}", "raw": raw}
 
 
 # ── OpenRouter backend ───────────────────────────────────────────────

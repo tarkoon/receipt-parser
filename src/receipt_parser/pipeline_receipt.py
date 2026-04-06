@@ -157,7 +157,26 @@ def _extract_yen_min_nearby(lines: list[str], idx: int, look_ahead: int = 3):
 # ── Financial Totals ───────────────────────────────────────────────
 
 def extract_financial_totals(text: str) -> dict:
-    """Extract subtotal, total, and per-rate taxes directly from OCR text."""
+    """Extract subtotal, total, and per-rate taxes directly from OCR text.
+
+    Multi-page aware: when --- PAGE N --- markers are present, prefers
+    financial totals from the last page (where receipt totals appear).
+    """
+    # For multi-page documents, extract from the last page only for totals
+    page_marker = re.search(r'--- PAGE \d+ ---', text)
+    if page_marker:
+        # Find the last page marker and extract from there
+        last_page_start = text.rfind('--- PAGE ')
+        last_page_text = text[last_page_start:]
+        # Run extraction on last page; fall back to full text if nothing found
+        last_page_result = _extract_financial_totals_impl(last_page_text)
+        if last_page_result.get('total') is not None:
+            return last_page_result
+    return _extract_financial_totals_impl(text)
+
+
+def _extract_financial_totals_impl(text: str) -> dict:
+    """Core implementation of financial totals extraction from OCR text."""
     lines = text.split('\n')
     result: dict = {}
     taxes: list[dict] = []

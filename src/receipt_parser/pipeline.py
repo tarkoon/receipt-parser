@@ -114,8 +114,12 @@ def _location_has_ocr_evidence(location: str, ocr_text: str) -> bool:
     return False
 
 
-def _resolve_location(extracted: dict, ocr_text: str, model: str) -> str | None:
-    """Use a focused LLM call to resolve a partial location to city/ward level."""
+def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str | None, str | None]:
+    """Use a focused LLM call to resolve a partial location to city/ward level.
+
+    Returns (resolved_location, warning_or_none). The warning is set when
+    resolution was attempted but failed, so the caller can log it.
+    """
     from .llm import _llm_chat, sanitize_llm_response
 
     merchant = extracted.get("merchant") or ""
@@ -150,10 +154,10 @@ Respond with a JSON object: {{"location": "..."}} or {{"location": null}} if you
         data = _json.loads(sanitize_llm_response(result.content))
         resolved = data.get("location")
         if resolved and ADMIN_SUFFIX_RE.search(resolved):
-            return resolved
+            return resolved, None
     except Exception:
-        pass
-    return None
+        return None, "Location resolution failed: LLM call error"
+    return None, "Location resolution: could not determine city/ward from available clues"
 
 
 # ── Confidence ──────────────────────────────────────────────────────
@@ -290,7 +294,7 @@ def process_document(
 
             # Location resolution for PDF path
             if "error" not in extracted and _location_needs_resolution(extracted.get("location"), digital_text):
-                resolved = _resolve_location(extracted, digital_text, model)
+                resolved, _loc_warn = _resolve_location(extracted, digital_text, model)
                 if resolved:
                     extracted["location"] = resolved
 
@@ -329,10 +333,20 @@ def process_document(
         blocks = ocr_result.blocks
 
         if len(blocks) < 3:
-            rotated = cv2.rotate(page_img, cv2.ROTATE_90_CLOCKWISE)
-            rotated_result = run_cloud_vision(rotated, ocr_engine, skip_cache=skip_ocr_cache)
-            if len(rotated_result.blocks) > len(blocks):
-                ocr_result = rotated_result
+            # Try all rotations (90°, 180°, 270°), pick best by confidence
+            best_result = ocr_result
+            best_conf = compute_ocr_confidence(blocks) if blocks else 0.0
+            for rotation in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE):
+                rotated = cv2.rotate(page_img, rotation)
+                rot_result = run_cloud_vision(rotated, ocr_engine, skip_cache=skip_ocr_cache)
+                rot_conf = compute_ocr_confidence(rot_result.blocks) if rot_result.blocks else 0.0
+                if len(rot_result.blocks) > len(best_result.blocks) or rot_conf > best_conf:
+                    best_result = rot_result
+                    best_conf = rot_conf
+                if best_conf >= 0.85:
+                    break  # Good enough, stop early
+            if len(best_result.blocks) > len(blocks):
+                ocr_result = best_result
                 blocks = ocr_result.blocks
                 all_ocr_results[-1] = ocr_result
 
@@ -357,13 +371,6 @@ def process_document(
     # Detect document type
     doc_type = detect_document_type(unified_text)
 
-    # Receipt-specific pre-processing
-    ocr_totals = {}
-    if doc_type == "receipt":
-        ocr_totals = extract_financial_totals(unified_text)
-        unified_text = rejoin_price_lines(unified_text)
-        unified_text = clean_handwritten_ocr(unified_text, ocr_confidence=ocr_conf)
-
     if not unified_text.strip():
         return {
             "_error": "OCR produced no text.",
@@ -373,11 +380,17 @@ def process_document(
 
     trace.log_step("ocr_grouped", data=unified_text)
 
-    # Step 4: LLM extraction
-    extracted, pass_history = extract_with_verification(
-        unified_text, model=model, passes=passes,
-        validate_fn=validate_receipt, doc_type=doc_type,
+    # Step 4–5: LLM extraction → post-processing → validation (shared path)
+    extracted, pass_history, final_warnings = _run_extraction_pipeline(
+        unified_text=unified_text, raw_text=raw_text,
+        ocr_conf=ocr_conf, doc_type=doc_type,
+        model=model, passes=passes,
     )
+
+    if "_error" in extracted:
+        extracted.update({"_warnings": [], "_pass_count": 0, "_model": model,
+                          "_pipeline_version": _PIPELINE_VERSION, "_line_items_reliable": False})
+        return extracted
 
     if debug:
         for entry in pass_history:
@@ -386,9 +399,72 @@ def process_document(
             if entry["warnings"]:
                 trace.log_step(f"pass{n}_warnings", data="\n".join(entry["warnings"]))
 
+    # Compute post-hoc confidence from validation results
+    posthoc_conf = _compute_posthoc_confidence(extracted, final_warnings)
+
+    if debug and images:
+        assert debug_dir is not None
+        draw_field_overlay(images[0], all_ocr_results[0].blocks, extracted, debug_dir / "10_field_overlay.png")
+        (debug_dir / "pipeline_trace.txt").write_text(trace.summary())
+
+    # Aggregate OCR metadata from first page result
+    try:
+        receipt = Receipt(**extracted)
+    except Exception:
+        receipt = Receipt()
+    primary_ocr = all_ocr_results[0] if all_ocr_results else None
+    result = _build_result(
+        receipt, final_warnings, pass_history, model, debug=debug, trace=trace,
+        ocr_confidence=ocr_conf, llm_confidence=posthoc_conf,
+        ocr_source=primary_ocr.source if primary_ocr else None,
+        ocr_retried=primary_ocr.retried if primary_ocr else None,
+        ocr_retry_reason=primary_ocr.retry_reason if primary_ocr else None,
+        ocr_text=primary_ocr.chosen_text if primary_ocr else None,
+    )
+    if apply_user_rules:
+        result = _apply_merchant_mapping(result)
+    return result
+
+
+# ── Shared Extraction Pipeline ───────────────────────────────────────
+
+def _run_extraction_pipeline(
+    unified_text: str,
+    raw_text: str,
+    ocr_conf: float,
+    doc_type: str,
+    model: str,
+    passes: int,
+) -> tuple[dict, list[dict], list[str]]:
+    """Shared extraction logic: LLM extraction → post-processing → location → validation.
+
+    Used by both process_document() and process_ocr_text() to avoid code
+    duplication and ensure fixes are applied consistently.
+
+    Returns (extracted_dict, pass_history, final_warnings).
+    """
+    # Receipt-specific pre-processing
+    ocr_totals = {}
+    if doc_type == "receipt":
+        ocr_totals = extract_financial_totals(unified_text)
+        unified_text = rejoin_price_lines(unified_text)
+        unified_text = clean_handwritten_ocr(unified_text, ocr_confidence=ocr_conf)
+
+    if not unified_text.strip():
+        return (
+            {"_error": "OCR text is empty."},
+            [],
+            [],
+        )
+
+    # LLM extraction with verification
+    extracted, pass_history = extract_with_verification(
+        unified_text, model=model, passes=passes,
+        validate_fn=validate_receipt, doc_type=doc_type,
+    )
+
     if "error" not in extracted:
         extracted["document_type"] = doc_type
-        # Type safety: ensure financial values are numeric
         for fkey in ("total", "subtotal"):
             v = extracted.get(fkey)
             if v is not None:
@@ -411,9 +487,7 @@ def process_document(
         if re.search(r'領収証|領収書', unified_text) and not re.search(r'小計|合計|対象|税率', unified_text):
             extracted["payment_method"] = "cash"
 
-    # ── Final cash fallback: tender + change labels present but payment still unset ──
-    # Skip if electronic payment markers are present (split/card payments can
-    # also show tender+change text).
+    # ── Final cash fallback ──
     _ELECTRONIC_PAY_RE = re.compile(
         r'クレジット|カード|PayPay|電子マネー|iD|QUICPay|Suica|WAON|nanaco|'
         r'PASMO|楽天Edy|LINE\s*Pay|au\s*PAY|d払い|メルペイ|交通系'
@@ -440,48 +514,37 @@ def process_document(
     extracted.pop("_confidence", None)
 
     # ── Location resolution (confidence-gated, receipts only) ──
+    location_warnings: list[str] = []
     if "error" not in extracted and doc_type == "receipt" and _location_needs_resolution(extracted.get("location"), unified_text):
-        resolved = _resolve_location(extracted, unified_text, model)
-        if resolved:
-            extracted["location"] = resolved
+        # Check OCR evidence first — skip expensive LLM call if no evidence
+        has_evidence = _location_has_ocr_evidence(
+            extracted.get("location", ""), unified_text
+        )
+        has_clues = bool(LOCATION_CLUE_RE.search(unified_text))
+        if has_evidence or has_clues:
+            resolved, loc_warning = _resolve_location(extracted, unified_text, model)
+            if resolved:
+                extracted["location"] = resolved
+            elif loc_warning:
+                location_warnings.append(loc_warning)
 
     # ── Location validation: clear if no OCR evidence supports it ──
     if "error" not in extracted and doc_type == "receipt" and extracted.get("location"):
         if not _location_has_ocr_evidence(extracted["location"], unified_text):
             extracted["location"] = None
 
-    # Step 5: Final validation
+    # Final validation
     try:
         receipt = Receipt(**extracted)
     except Exception:
         receipt = Receipt()
     final_warnings = validate_receipt(receipt)
-    # Merge Pydantic soft warnings (deduplicated)
     for w in receipt._soft_warnings:
         if w not in final_warnings:
             final_warnings.append(w)
+    final_warnings.extend(location_warnings)
 
-    # Compute post-hoc confidence from validation results
-    posthoc_conf = _compute_posthoc_confidence(extracted, final_warnings)
-
-    if debug and images:
-        assert debug_dir is not None
-        draw_field_overlay(images[0], all_ocr_results[0].blocks, extracted, debug_dir / "10_field_overlay.png")
-        (debug_dir / "pipeline_trace.txt").write_text(trace.summary())
-
-    # Aggregate OCR metadata from first page result
-    primary_ocr = all_ocr_results[0] if all_ocr_results else None
-    result = _build_result(
-        receipt, final_warnings, pass_history, model, debug=debug, trace=trace,
-        ocr_confidence=ocr_conf, llm_confidence=posthoc_conf,
-        ocr_source=primary_ocr.source if primary_ocr else None,
-        ocr_retried=primary_ocr.retried if primary_ocr else None,
-        ocr_retry_reason=primary_ocr.retry_reason if primary_ocr else None,
-        ocr_text=primary_ocr.chosen_text if primary_ocr else None,
-    )
-    if apply_user_rules:
-        result = _apply_merchant_mapping(result)
-    return result
+    return extracted, pass_history, final_warnings
 
 
 # ── OCR Text Entry Point ──────────────────────────────────────────────
@@ -504,17 +567,8 @@ def process_ocr_text(
     # Normalize text
     unified_text = normalize_fullwidth(ocr_text)
     unified_text = strip_barcode_lines(unified_text)
-
-    # Detect document type
     doc_type = detect_document_type(unified_text)
-
-    # Receipt-specific pre-processing
     ocr_conf = 0.9  # default confidence for injected text
-    ocr_totals = {}
-    if doc_type == "receipt":
-        ocr_totals = extract_financial_totals(unified_text)
-        unified_text = rejoin_price_lines(unified_text)
-        unified_text = clean_handwritten_ocr(unified_text, ocr_confidence=ocr_conf)
 
     if not unified_text.strip():
         return {
@@ -523,64 +577,20 @@ def process_ocr_text(
             "_pipeline_version": _PIPELINE_VERSION, "_line_items_reliable": False,
         }
 
-    # LLM extraction with verification
-    extracted, pass_history = extract_with_verification(
-        unified_text, model=model, passes=passes,
-        validate_fn=validate_receipt, doc_type=doc_type,
+    extracted, pass_history, final_warnings = _run_extraction_pipeline(
+        unified_text=unified_text, raw_text=ocr_text,
+        ocr_conf=ocr_conf, doc_type=doc_type,
+        model=model, passes=passes,
     )
 
-    if "error" not in extracted:
-        extracted["document_type"] = doc_type
-        for fkey in ("total", "subtotal"):
-            v = extracted.get(fkey)
-            if v is not None:
-                try:
-                    extracted[fkey] = float(v)
-                except (TypeError, ValueError):
-                    extracted[fkey] = None
-
-    # ── Document-type-specific post-processing ──
-    llm_conf_ocr = extracted.get("_confidence")
-    if doc_type == "receipt" and "error" not in extracted:
-        extracted = postprocess_receipt(extracted, unified_text, ocr_conf, ocr_totals, llm_conf_ocr, model)
-    elif doc_type == "utility_bill" and "error" not in extracted:
-        extracted = postprocess_utility_bill(extracted, unified_text)
-    elif doc_type == "payment_slip" and "error" not in extracted:
-        extracted = postprocess_payment_slip(extracted, unified_text, raw_text=ocr_text)
-
-    # ── Common post-processing ──
-    if "error" not in extracted:
-        total = extracted.get("total")
-        points = extracted.get("points_used")
-        if total is not None:
-            extracted["amount_paid"] = total - points if points else total
-
-    # Strip _confidence if present
-    extracted.pop("_confidence", None)
-
-    # ── Location resolution (confidence-gated, receipts only) ──
-    if "error" not in extracted and doc_type == "receipt" and _location_needs_resolution(extracted.get("location"), unified_text):
-        resolved = _resolve_location(extracted, unified_text, model)
-        if resolved:
-            extracted["location"] = resolved
-
-    # ── Location validation: clear if no OCR evidence supports it ──
-    if "error" not in extracted and doc_type == "receipt" and extracted.get("location"):
-        if not _location_has_ocr_evidence(extracted["location"], unified_text):
-            extracted["location"] = None
-
-    # Final validation
-    try:
-        receipt = Receipt(**extracted)
-    except Exception:
-        receipt = Receipt()
-    final_warnings = validate_receipt(receipt)
-    for w in receipt._soft_warnings:
-        if w not in final_warnings:
-            final_warnings.append(w)
+    if "_error" in extracted:
+        extracted.update({"_warnings": [], "_pass_count": 0, "_model": model,
+                          "_pipeline_version": _PIPELINE_VERSION, "_line_items_reliable": False})
+        return extracted
 
     result = _build_result(
-        receipt, final_warnings, pass_history, model,
+        Receipt(**extracted) if "error" not in extracted else Receipt(),
+        final_warnings, pass_history, model,
         ocr_confidence=ocr_conf, ocr_source="injected",
         ocr_text=ocr_text,
     )

@@ -1,6 +1,7 @@
 """validation.py — Schema-driven arithmetic & consistency checks."""
 
 import re
+from datetime import date, timedelta
 
 from .schema import Receipt, VALID_TAX_RATES
 
@@ -10,6 +11,10 @@ def validate_receipt(receipt: Receipt) -> list[str]:
     warnings = []
 
     doc_type = receipt.document_type
+
+    # Common: date reasonableness check
+    if receipt.date:
+        warnings.extend(_check_date_reasonableness(receipt.date))
 
     # Common: points/amount_paid consistency
     if receipt.points_used and receipt.total:
@@ -36,6 +41,13 @@ def _validate_receipt_fields(receipt: Receipt) -> list[str]:
 
     # Check line item math: qty x unit_price - discount ~ total (+-1 tolerance)
     for i, item in enumerate(receipt.line_items):
+        # Negative total after discount is always wrong
+        if item.total < 0:
+            warnings.append(
+                f"Line {i+1} ({item.description}): total is negative ({item.total}). "
+                f"Likely OCR error in discount ({item.discount}) or unit_price."
+            )
+
         if item.unit_price is not None and item.qty:
             expected = item.qty * item.unit_price - item.discount
             if abs(expected - item.total) > 1:
@@ -182,4 +194,25 @@ def _validate_payment_slip(receipt: Receipt) -> list[str]:
     if not receipt.merchant:
         warnings.append("Payment slip has no merchant (who receives the money?)")
 
+    return warnings
+
+
+def _check_date_reasonableness(date_str: str) -> list[str]:
+    """Warn if the extracted date is implausibly far in the future or past."""
+    warnings = []
+    try:
+        parsed = date.fromisoformat(date_str)
+        today = date.today()
+        if parsed > today + timedelta(days=365):
+            warnings.append(
+                f"Date ({date_str}) is more than 1 year in the future. "
+                f"Possible era conversion or OCR error."
+            )
+        elif parsed < today - timedelta(days=5 * 365):
+            warnings.append(
+                f"Date ({date_str}) is more than 5 years in the past. "
+                f"Possible era conversion or OCR error."
+            )
+    except (ValueError, TypeError):
+        pass  # Malformed date strings are handled elsewhere
     return warnings

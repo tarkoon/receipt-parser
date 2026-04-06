@@ -54,6 +54,7 @@ FIELD_REGISTRY: list[FieldMeta] = [
         debug_color_bgr=(200, 200, 0),
         prompt_hint="The geographic location of the store/business at minimum the city (市) or ward (区) level. Use clues from the receipt: branch name (e.g. '赤間店' → 赤間 is in 宗像市), standalone location names near the top of the receipt (e.g. '赤間' appearing near the store name means the store is in 赤間, which is in 宗像市), explicit address lines, or shopping complex name. Resolve to the actual administrative location using your knowledge of Japanese geography. Output format examples: '宗像市赤間', '福岡市博多区', '北九州市八幡区', '宗像市'. Always include at least the 市 or 区. If the receipt has a full address, extract just the city/ward and neighborhood (not the full street address). A phone number ALONE is NOT sufficient to determine location — only use phone area codes as a supplementary hint when other location clues are also present. If no branch name, standalone location name, address, or complex name exists, output null.",
         extraction_aliases=["住所", "address"],
+        doc_types=["receipt"],
     ),
     FieldMeta(
         name="currency",
@@ -592,12 +593,18 @@ def generate_verification_prompt(
     warnings_block = "\n".join(f"- {w}" for w in validation_warnings) if validation_warnings else "None"
 
     doc_type = previous_extraction.get("document_type", "receipt")
-    field_hints = chr(10).join(
+    doc_type_label = {"receipt": "receipt/store purchase",
+                      "utility_bill": "utility bill (gas/water/electric)",
+                      "payment_slip": "bank transfer or convenience store payment slip"
+                      }.get(doc_type, doc_type)
+    field_hints = "\n".join(
         f"- {f.name}: {f.prompt_hint}" for f in FIELD_REGISTRY
         if f.prompt_hint and doc_type in f.doc_types
     )
 
     system_prompt = f"""{_VERIFICATION_SYSTEM_PROMPT}
+
+Document type: {doc_type_label}. Apply rules specific to this document type.
 
 FIELD-SPECIFIC RULES:
 {field_hints}

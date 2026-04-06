@@ -369,15 +369,22 @@ def blocks_to_structured_text(blocks: list[dict]) -> str:
     lines = []
     current_line = []
     current_y = None
+    _y_sum = 0.0
+    _y_count = 0
 
     for block in blocks:
         if current_y is None or abs(block["y"] - current_y) < y_tolerance:
             current_line.append(block["text"])
-            current_y = block["y"] if current_y is None else current_y
+            _y_sum += block["y"]
+            _y_count += 1
+            # Use running average to track line position through gradual drift
+            current_y = _y_sum / _y_count
         else:
             lines.append("  ".join(current_line))
             current_line = [block["text"]]
             current_y = block["y"]
+            _y_sum = block["y"]
+            _y_count = 1
 
     if current_line:
         lines.append("  ".join(current_line))
