@@ -330,11 +330,12 @@ def test_pipeline_blank_image_returns_error(mock_check, mock_init_cv, mock_ocr):
 
 def test_api_usage_tracking():
     from receipt_parser.usage import (
-        _save, _empty_month, get_usage, sync_usage,
-        _USAGE_FILE, _HISTORY_FILE, _compute_costs,
+        _save, _empty_month, get_usage, sync_usage, _billing_period_month_key,
+        _USAGE_FILE, _HISTORY_FILE, _SETTINGS_FILE,
     )
     from receipt_parser.ocr import get_api_usage
-    _save(_empty_month("2099-01"))
+    month_key = _billing_period_month_key()
+    _save(_empty_month(month_key))
     # Unified tracker
     stats = get_usage()
     assert stats["cloud_vision"]["calls"] == 0
@@ -357,10 +358,11 @@ def test_api_usage_tracking():
     assert stats["deepseek"]["cache_hit_tokens"] == 18_507_008
     assert stats["deepseek"]["cache_miss_tokens"] == 1_019_604
     assert stats["deepseek"]["output_tokens"] == 2_662_239
-    # Verify cost calculation: hit*0.07/1M + miss*0.27/1M + out*1.10/1M
     assert stats["deepseek"]["est_cost_usd"] > 0
     # Cleanup
     if _USAGE_FILE.exists():
         _USAGE_FILE.unlink()
     if _HISTORY_FILE.exists():
         _HISTORY_FILE.unlink()
+    if _SETTINGS_FILE.exists():
+        _SETTINGS_FILE.unlink()

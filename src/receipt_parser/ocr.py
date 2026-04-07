@@ -49,7 +49,7 @@ def get_api_usage() -> dict:
     full = _get_unified_usage()
     cv = full["cloud_vision"]
     return {
-        "month": full["month"],
+        "month": full.get("billing_period_label", ""),
         "calls": cv["calls"],
         "free_limit": cv["free_limit"],
         "remaining": cv["remaining_free"],

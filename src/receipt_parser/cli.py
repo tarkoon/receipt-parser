@@ -199,18 +199,31 @@ def parse(
 @app.command()
 def usage(
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
-    reset: bool = typer.Option(False, "--reset", help="Reset all counters for current month"),
+    reset: bool = typer.Option(False, "--reset", help="Reset all counters for current period"),
     history: bool = typer.Option(False, "--history", "-H", help="Show historical usage log"),
     page: int = typer.Option(1, "--page", help="Page number for history view"),
     sync: bool = typer.Option(False, "--sync", help="Set counters from online dashboard values"),
-    set_cv: int = typer.Option(None, "--set-cv", help="Set Cloud Vision call count"),
     set_ds_hit: int = typer.Option(None, "--set-ds-hit", help="Set DeepSeek cache hit token count"),
     set_ds_miss: int = typer.Option(None, "--set-ds-miss", help="Set DeepSeek cache miss token count"),
     set_ds_out: int = typer.Option(None, "--set-ds-out", help="Set DeepSeek output token count"),
     set_ds_calls: int = typer.Option(None, "--set-ds-calls", help="Set DeepSeek API call count"),
+    billing_day: int = typer.Option(None, "--billing-day", min=1, max=28,
+                                     help="Set billing period start day (1-28, persisted)"),
+    no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip Cloud Vision API auto-fetch"),
 ):
     """Show API usage and estimated costs for the current billing period."""
-    from .usage import get_usage, reset_usage, sync_usage, get_history
+    from .usage import (
+        get_usage, reset_usage, sync_usage, get_history,
+        set_billing_start_day, get_billing_period_label,
+    )
+
+    # ── Billing day config ──
+    if billing_day is not None:
+        set_billing_start_day(billing_day)
+        typer.echo(f"Billing period start day set to {billing_day}.")
+        if not any([reset, history, sync, json_output,
+                     set_ds_hit, set_ds_miss, set_ds_out, set_ds_calls]):
+            return
 
     if reset:
         reset_usage()
@@ -222,8 +235,8 @@ def usage(
         _run_sync_interactive()
         return
 
-    if any(v is not None for v in (set_cv, set_ds_hit, set_ds_miss, set_ds_out, set_ds_calls)):
-        sync_usage(cv_calls=set_cv, ds_cache_hit=set_ds_hit, ds_cache_miss=set_ds_miss,
+    if any(v is not None for v in (set_ds_hit, set_ds_miss, set_ds_out, set_ds_calls)):
+        sync_usage(ds_cache_hit=set_ds_hit, ds_cache_miss=set_ds_miss,
                    ds_output=set_ds_out, ds_calls=set_ds_calls)
         typer.echo("Usage counters updated.")
         # Fall through to display updated stats
@@ -233,8 +246,12 @@ def usage(
         _show_history(page, json_output)
         return
 
-    # ── Current month view ──
-    stats = get_usage()
+    # ── Current period view (auto-fetches Cloud Vision from GCP) ──
+    should_fetch = not no_fetch
+    if should_fetch and not json_output:
+        typer.echo("Fetching Cloud Vision usage from GCP...", err=True)
+
+    stats = get_usage(auto_fetch_cv=should_fetch)
 
     if json_output:
         typer.echo(json.dumps(stats, indent=2))
@@ -244,8 +261,8 @@ def usage(
     ds = stats["deepseek"]
     docs = stats["documents"]
 
-    typer.echo(f"API Usage — {stats['month']}  ({stats['days_until_reset']} days until reset)")
-    typer.echo("─" * 52)
+    typer.echo(f"API Usage — {stats['billing_period_label']}  ({stats['days_until_reset']} days left)")
+    typer.echo("─" * 56)
 
     # Documents
     typer.echo(f"\n  Documents")
@@ -253,7 +270,8 @@ def usage(
     typer.echo(f"    Unique files:     {docs['unique_processed']:,}")
 
     # Cloud Vision
-    typer.echo(f"\n  Google Cloud Vision")
+    cv_source = "live" if should_fetch and "_cv_fetch_error" not in stats else "local"
+    typer.echo(f"\n  Google Cloud Vision  ({cv_source})")
     typer.echo(f"    Calls:          {cv['calls']:,}")
     typer.echo(f"    Free tier:      {cv['remaining_free']:,} / {cv['free_limit']:,} remaining")
     if cv["billable_calls"] > 0:
@@ -261,6 +279,8 @@ def usage(
         typer.echo(f"    Est. cost:      ${cv['est_cost_usd']:.4f}")
     else:
         typer.echo(f"    Est. cost:      $0.00 (within free tier)")
+    if "_cv_fetch_error" in stats:
+        typer.echo(f"    (fetch failed: {stats['_cv_fetch_error']})", err=True)
 
     # DeepSeek
     typer.echo(f"\n  DeepSeek API")
@@ -271,29 +291,27 @@ def usage(
     typer.echo(f"    Est. cost:        ${ds['est_cost_usd']:.4f}")
 
     # Total
-    typer.echo(f"\n{'─' * 52}")
+    typer.echo(f"\n{'─' * 56}")
     typer.echo(f"  Total est. cost:  ${stats['total_est_cost_usd']:.4f}")
 
 
 def _run_sync_interactive():
-    """Interactive sync: prompt user for dashboard values."""
+    """Interactive sync: prompt user for DeepSeek dashboard values.
+
+    Cloud Vision is auto-fetched from GCP, so only DeepSeek needs manual sync.
+    """
     from .usage import sync_usage, get_usage
 
     current = get_usage()
 
-    typer.echo("Sync usage counters with your online dashboard values.")
+    typer.echo("Sync DeepSeek usage from your dashboard.")
+    typer.echo("(Cloud Vision is auto-fetched from GCP — no manual sync needed.)")
     typer.echo("Press Enter to keep current value, or type a new number.\n")
 
-    cv_cur = current["cloud_vision"]["calls"]
     ds_calls_cur = current["deepseek"]["calls"]
     ds_hit_cur = current["deepseek"]["cache_hit_tokens"]
     ds_miss_cur = current["deepseek"]["cache_miss_tokens"]
     ds_out_cur = current["deepseek"]["output_tokens"]
-
-    cv_input = typer.prompt(
-        f"  Cloud Vision calls [{cv_cur:,}]",
-        default="", show_default=False,
-    ).strip()
 
     ds_calls_input = typer.prompt(
         f"  DeepSeek API calls [{ds_calls_cur:,}]",
@@ -315,17 +333,16 @@ def _run_sync_interactive():
         default="", show_default=False,
     ).strip()
 
-    cv_val = int(cv_input) if cv_input else None
     ds_calls_val = int(ds_calls_input) if ds_calls_input else None
     ds_hit_val = int(ds_hit_input) if ds_hit_input else None
     ds_miss_val = int(ds_miss_input) if ds_miss_input else None
     ds_out_val = int(ds_out_input) if ds_out_input else None
 
-    if all(v is None for v in (cv_val, ds_calls_val, ds_hit_val, ds_miss_val, ds_out_val)):
+    if all(v is None for v in (ds_calls_val, ds_hit_val, ds_miss_val, ds_out_val)):
         typer.echo("\nNo changes made.")
         return
 
-    sync_usage(cv_calls=cv_val, ds_calls=ds_calls_val,
+    sync_usage(ds_calls=ds_calls_val,
                ds_cache_hit=ds_hit_val, ds_cache_miss=ds_miss_val, ds_output=ds_out_val)
     typer.echo("\nUsage counters synced.")
 

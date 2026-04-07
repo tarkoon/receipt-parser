@@ -6,6 +6,7 @@ local/*
 __pycache__/
 *.pyc
 .cloud_vision_usage.json
+.api_usage*.json
 tmp*.png
 tmp*.jpg
 .ocr_cache/
