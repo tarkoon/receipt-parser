@@ -22,11 +22,11 @@ _lock = threading.Lock()
 CLOUD_VISION_FREE_TIER = 1000
 CLOUD_VISION_COST_PER_1K = 1.50  # USD per 1000 calls beyond free tier
 
-# DeepSeek V3: per-million-token pricing (as of 2026-04)
+# DeepSeek V3.2 (deepseek-chat): per-million-token pricing (as of 2026-04)
 # Input tokens are split into cache hit (discounted) and cache miss (full price)
-DEEPSEEK_CACHE_HIT_COST_PER_M = 0.07   # USD per 1M cached input tokens
-DEEPSEEK_CACHE_MISS_COST_PER_M = 0.27  # USD per 1M non-cached input tokens
-DEEPSEEK_OUTPUT_COST_PER_M = 1.10      # USD per 1M output tokens
+DEEPSEEK_CACHE_HIT_COST_PER_M = 0.028  # USD per 1M cached input tokens
+DEEPSEEK_CACHE_MISS_COST_PER_M = 0.28  # USD per 1M non-cached input tokens
+DEEPSEEK_OUTPUT_COST_PER_M = 0.42      # USD per 1M output tokens
 
 
 # ── Data model ───────────────────────────────────────────────────────

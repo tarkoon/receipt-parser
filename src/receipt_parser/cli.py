@@ -265,9 +265,9 @@ def usage(
     # DeepSeek
     typer.echo(f"\n  DeepSeek API")
     typer.echo(f"    Calls:            {ds['calls']:,}")
-    typer.echo(f"    Cache hit tokens: {ds['cache_hit_tokens']:,}  (@ $0.07/1M)")
-    typer.echo(f"    Cache miss tokens:{ds['cache_miss_tokens']:>11,}  (@ $0.27/1M)")
-    typer.echo(f"    Output tokens:    {ds['output_tokens']:,}  (@ $1.10/1M)")
+    typer.echo(f"    Cache hit tokens: {ds['cache_hit_tokens']:,}  (@ $0.028/1M)")
+    typer.echo(f"    Cache miss tokens:{ds['cache_miss_tokens']:>11,}  (@ $0.28/1M)")
+    typer.echo(f"    Output tokens:    {ds['output_tokens']:,}  (@ $0.42/1M)")
     typer.echo(f"    Est. cost:        ${ds['est_cost_usd']:.4f}")
 
     # Total
