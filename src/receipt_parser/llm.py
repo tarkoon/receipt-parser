@@ -49,9 +49,12 @@ def check_model_available(model: str = DEFAULT_MODEL) -> None:
     else:
         if not os.environ.get("DEEPSEEK_API_KEY") and not os.environ.get("OPENROUTER_API_KEY"):
             raise RuntimeError(
-                "No API key set. Add DEEPSEEK_API_KEY or OPENROUTER_API_KEY to .env.\n"
-                "DeepSeek: https://platform.deepseek.com/api_keys\n"
-                "OpenRouter: https://openrouter.ai/keys"
+                "No API key configured.\n\n"
+                "Quick fix:\n"
+                "  1. Copy .env.example to .env:  cp .env.example .env\n"
+                "  2. Add your DeepSeek API key:   DEEPSEEK_API_KEY=sk-...\n"
+                "     Get one at: https://platform.deepseek.com/api_keys\n\n"
+                "Or run the setup wizard:  receipt-parser setup"
             )
 
 

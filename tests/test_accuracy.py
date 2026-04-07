@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures"
-VARIANTS = Path(__file__).parent / "ocr_variants"
+VARIANTS = Path(__file__).resolve().parent.parent / ".data" / "ocr_cache" / "variants"
 
 # Skip if Cloud Vision is not configured (needed for image fixtures)
 _cv_available = True

@@ -371,7 +371,8 @@ def _show_history(page: int, json_output: bool):
         cv = entry.get("cloud_vision", {})
         ds = entry.get("deepseek", {})
         docs = entry.get("documents", {})
-        total_tokens = ds.get("input_tokens", 0) + ds.get("output_tokens", 0)
+        total_tokens = (ds.get("cache_hit_tokens", 0) + ds.get("cache_miss_tokens", 0)
+                        + ds.get("output_tokens", 0))
         cost = entry.get("est_cost_usd", 0)
         doc_count = docs.get("total_processed", 0)
 
@@ -383,6 +384,213 @@ def _show_history(page: int, json_output: bool):
 
     if result["total_pages"] > 1:
         typer.echo(f"\n  Use --page N to navigate (1-{result['total_pages']})")
+
+
+@app.command()
+def setup():
+    """Interactive first-run setup wizard."""
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+    env_path = _PROJECT_ROOT / ".env"
+    env_example = _PROJECT_ROOT / ".env.example"
+
+    typer.echo("Receipt Parser — Setup Wizard")
+    typer.echo("=" * 40)
+
+    # Step 0: Ensure merchant_rules.json exists
+    _merchant_rules = Path(__file__).resolve().parent / "merchant_rules.json"
+    if not _merchant_rules.exists():
+        _merchant_rules.write_text(
+            '{\n  "merchant_map": {}\n}\n', encoding="utf-8"
+        )
+        typer.echo("Created merchant_rules.json (empty — see README to customize).")
+
+    # Step 1: .env file
+    typer.echo("\n[1/4] Environment file")
+    if env_path.exists():
+        typer.echo("  .env file found.")
+    elif env_example.exists():
+        typer.echo("  No .env file found. Creating from .env.example...")
+        import shutil
+        shutil.copy(env_example, env_path)
+        typer.echo("  Created .env — you'll fill in the values next.")
+    else:
+        typer.echo("  No .env or .env.example found. Creating .env...")
+        env_path.write_text("# Receipt Parser config\n", encoding="utf-8")
+
+    # Step 2: DeepSeek API key
+    typer.echo("\n[2/4] DeepSeek API key")
+    import os
+    # Reload .env to pick up existing values
+    from dotenv import dotenv_values
+    env_vals = dotenv_values(env_path)
+    existing_ds_key = env_vals.get("DEEPSEEK_API_KEY", "") or os.environ.get("DEEPSEEK_API_KEY", "")
+
+    if existing_ds_key and existing_ds_key != "your-deepseek-api-key-here":
+        masked = existing_ds_key[:8] + "..." + existing_ds_key[-4:]
+        typer.echo(f"  Key found: {masked}")
+        change = typer.prompt("  Replace it? [y/N]", default="n", show_default=False).strip().lower()
+        if change != "y":
+            ds_key = existing_ds_key
+        else:
+            ds_key = typer.prompt("  Enter DeepSeek API key").strip()
+    else:
+        typer.echo("  Get your key at: https://platform.deepseek.com/api_keys")
+        ds_key = typer.prompt("  Enter DeepSeek API key").strip()
+
+    if ds_key:
+        _update_env_var(env_path, "DEEPSEEK_API_KEY", ds_key)
+        # Validate with a test call
+        typer.echo("  Testing connection...", nl=False)
+        os.environ["DEEPSEEK_API_KEY"] = ds_key
+        try:
+            from openai import OpenAI
+            client = OpenAI(base_url="https://api.deepseek.com", api_key=ds_key, timeout=10)
+            client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+            )
+            typer.echo(" OK")
+        except Exception as e:
+            typer.echo(f" FAILED: {e}")
+            typer.echo("  You can fix this later in .env and re-run setup.")
+
+    # Step 3: GCP / Cloud Vision
+    typer.echo("\n[3/4] Google Cloud Vision")
+    existing_project = env_vals.get("GOOGLE_CLOUD_PROJECT", "") or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+
+    if existing_project and existing_project != "your-gcp-project-id":
+        typer.echo(f"  Project: {existing_project}")
+        change = typer.prompt("  Replace it? [y/N]", default="n", show_default=False).strip().lower()
+        if change != "y":
+            gcp_project = existing_project
+        else:
+            gcp_project = typer.prompt("  Enter GCP project ID").strip()
+    else:
+        typer.echo("  You need a GCP project with Cloud Vision API enabled.")
+        typer.echo("  Enable at: https://console.cloud.google.com/apis/library/vision.googleapis.com")
+        typer.echo("  Then authenticate: gcloud auth application-default login")
+        gcp_project = typer.prompt("  Enter GCP project ID (or press Enter to skip)", default="",
+                                    show_default=False).strip()
+
+    if gcp_project:
+        _update_env_var(env_path, "GOOGLE_CLOUD_PROJECT", gcp_project)
+        os.environ["GOOGLE_CLOUD_PROJECT"] = gcp_project
+        typer.echo("  Testing Cloud Vision...", nl=False)
+        try:
+            from .ocr import init_cloud_vision
+            init_cloud_vision()
+            typer.echo(" OK")
+        except Exception as e:
+            typer.echo(f" FAILED: {e}")
+            typer.echo("  Make sure you've run: gcloud auth application-default login")
+
+    # Step 4: Verify end-to-end
+    typer.echo("\n[4/4] End-to-end test")
+    run_test = typer.prompt("  Run a quick test with a sample receipt? [Y/n]",
+                             default="y", show_default=False).strip().lower()
+    if run_test != "n":
+        fixtures_dir = _PROJECT_ROOT / "tests" / "fixtures"
+        sample = next(fixtures_dir.glob("receipt_1.*"), None) if fixtures_dir.exists() else None
+        if sample:
+            typer.echo(f"  Processing {sample.name}...")
+            try:
+                # Reload env
+                load_dotenv(env_path, override=True)
+                result = process_document(sample, passes=1)
+                merchant = result.get("merchant", "?")
+                total = result.get("total", "?")
+                typer.echo(f"  Result: {merchant} — total {total}")
+                typer.echo("  Pipeline is working!")
+            except Exception as e:
+                typer.echo(f"  Test failed: {e}")
+        else:
+            typer.echo("  No test fixtures found, skipping.")
+
+    typer.echo("\n" + "=" * 40)
+    typer.echo("Setup complete! Run 'receipt-parser parse <image>' to get started.")
+
+
+def _update_env_var(env_path: Path, key: str, value: str):
+    """Update or add an env var in a .env file."""
+    if not env_path.exists():
+        env_path.write_text(f"{key}={value}\n", encoding="utf-8")
+        return
+
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    found = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(f"{key}=") or stripped.startswith(f"# {key}="):
+            lines[i] = f"{key}={value}"
+            found = True
+            break
+    if not found:
+        lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+@app.command()
+def clean(
+    cache: bool = typer.Option(False, "--cache", help="Also clear OCR cache"),
+    all_data: bool = typer.Option(False, "--all", help="Clear all data (cache + usage history)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+):
+    """Clean up debug artifacts and optionally cached data."""
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+    targets = []
+
+    # Always: debug directories
+    debug_dir = _PROJECT_ROOT / "debug"
+    if debug_dir.exists():
+        size = sum(f.stat().st_size for f in debug_dir.rglob("*") if f.is_file())
+        targets.append(("Debug artifacts", debug_dir, size))
+
+    # --cache or --all: OCR cache
+    if cache or all_data:
+        from .usage import _DATA_DIR
+        cache_dir = _DATA_DIR / "ocr_cache"
+        # Also check old location
+        old_cache = Path(__file__).resolve().parent / ".ocr_cache"
+        for cd in [cache_dir, old_cache]:
+            if cd.exists():
+                size = sum(f.stat().st_size for f in cd.rglob("*") if f.is_file())
+                targets.append(("OCR cache", cd, size))
+
+    # --all: usage data
+    if all_data:
+        from .usage import _DATA_DIR
+        if _DATA_DIR.exists():
+            for f in _DATA_DIR.glob("*.json"):
+                targets.append(("Usage data", f, f.stat().st_size))
+
+    if not targets:
+        typer.echo("Nothing to clean.")
+        return
+
+    typer.echo("Will remove:")
+    total_size = 0
+    for label, path, size in targets:
+        total_size += size
+        size_str = f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / 1024 / 1024:.1f} MB"
+        typer.echo(f"  {label}: {path} ({size_str})")
+
+    if not yes:
+        confirm = typer.prompt("Proceed? [y/N]", default="n", show_default=False).strip().lower()
+        if confirm != "y":
+            typer.echo("Cancelled.")
+            return
+
+    import shutil
+    for label, path, _ in targets:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        typer.echo(f"  Removed: {path}")
+
+    typer.echo("Done.")
 
 
 if __name__ == "__main__":

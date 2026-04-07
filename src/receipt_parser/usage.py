@@ -17,9 +17,13 @@ import warnings
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
-_USAGE_FILE = Path(__file__).parent / ".api_usage.json"
-_HISTORY_FILE = Path(__file__).parent / ".api_usage_history.json"
-_SETTINGS_FILE = Path(__file__).parent / ".api_usage_settings.json"
+# Data directory: .data/ at project root (sibling of src/)
+_DATA_DIR = Path(__file__).resolve().parent.parent.parent / ".data"
+_DATA_DIR.mkdir(exist_ok=True)
+
+_USAGE_FILE = _DATA_DIR / "api_usage.json"
+_HISTORY_FILE = _DATA_DIR / "api_usage_history.json"
+_SETTINGS_FILE = _DATA_DIR / "api_usage_settings.json"
 _lock = threading.Lock()
 
 # ── Pricing constants ────────────────────────────────────────────────

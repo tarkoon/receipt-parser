@@ -101,13 +101,20 @@ def init_cloud_vision():
         from google.api_core.client_options import ClientOptions
 
         project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-        kwargs = {}
-        if project:
-            kwargs["client_options"] = ClientOptions(quota_project_id=project)
+        if not project:
+            raise RuntimeError(
+                "GOOGLE_CLOUD_PROJECT environment variable is not set.\n\n"
+                "Quick fix:\n"
+                "  1. Add to your .env file:  GOOGLE_CLOUD_PROJECT=your-project-id\n"
+                "  2. Enable Cloud Vision API: https://console.cloud.google.com/apis/library/vision.googleapis.com\n"
+                "  3. Authenticate: gcloud auth application-default login\n\n"
+                "Or run the setup wizard:  receipt-parser setup"
+            )
+        kwargs = {"client_options": ClientOptions(quota_project_id=project)}
         return vision.ImageAnnotatorClient(**kwargs)
     except ImportError:
         raise ImportError(
-            "google-cloud-vision is not installed. "
+            "google-cloud-vision is not installed.\n"
             "Run: pip install google-cloud-vision"
         )
 
@@ -196,7 +203,8 @@ def _extract_fulltext_from_response(response) -> str | None:
     return response.text_annotations[0].description
 
 
-_OCR_CACHE_DIR = Path(__file__).parent / ".ocr_cache"
+# Cache in .data/ at project root (sibling of src/)
+_OCR_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / ".data" / "ocr_cache"
 
 
 def _ocr_cache_key(image: np.ndarray) -> str:

@@ -5,8 +5,17 @@ local/*
 .claude
 __pycache__/
 *.pyc
+.data/
 .cloud_vision_usage.json
 .api_usage*.json
+tmp/
+tmp*.py
+scripts/
+docs/
+CLAUDE.md
+tests/fixtures/
+!tests/fixtures/_truth_template.json
+src/receipt_parser/merchant_rules.json
 tmp*.png
 tmp*.jpg
 .ocr_cache/

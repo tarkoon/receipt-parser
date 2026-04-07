@@ -39,14 +39,20 @@ from receipt_parser.pipeline import process_document
 # ---------------------------------------------------------------------------
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
-VARIANTS_DIR = Path(__file__).resolve().parent / "ocr_variants"
+VARIANTS_DIR = Path(__file__).resolve().parent.parent / ".data" / "ocr_cache" / "variants"
 RESULTS_DIR = Path(__file__).resolve().parent / "results" / "benchmark"
 DEFAULT_OUTPUT = RESULTS_DIR / "latest.json"
 DEFAULT_BUDGET_LIMIT = 200
 
-# DeepSeek pricing (per million tokens)
-_DEEPSEEK_INPUT_COST_PER_M = 0.27
-_DEEPSEEK_OUTPUT_COST_PER_M = 1.10
+# DeepSeek pricing — imported from the canonical source
+from receipt_parser.usage import (
+    DEEPSEEK_CACHE_HIT_COST_PER_M,
+    DEEPSEEK_CACHE_MISS_COST_PER_M,
+    DEEPSEEK_OUTPUT_COST_PER_M,
+)
+# Backwards-compat alias (benchmark uses aggregate input cost estimate)
+_DEEPSEEK_INPUT_COST_PER_M = DEEPSEEK_CACHE_MISS_COST_PER_M
+_DEEPSEEK_OUTPUT_COST_PER_M = DEEPSEEK_OUTPUT_COST_PER_M
 
 
 # ---------------------------------------------------------------------------
