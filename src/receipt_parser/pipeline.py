@@ -254,6 +254,10 @@ def process_document(
     file_path = Path(file_path)
     check_model_available(model)
 
+    # Track document processing
+    from .usage import track_document
+    track_document(file_path)
+
     trace = PipelineTrace()
     debug_dir: Path | None = None
     if debug:

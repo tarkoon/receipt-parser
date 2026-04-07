@@ -225,10 +225,25 @@ def _openrouter_chat(
     )
     elapsed_ns = int((time.perf_counter() - t0) * 1e9)
     usage = response.usage
+    input_toks = usage.prompt_tokens if usage else None
+    output_toks = usage.completion_tokens if usage else None
+
+    # DeepSeek returns cache hit/miss breakdown in usage
+    cache_hit = getattr(usage, "prompt_cache_hit_tokens", None) if usage else None
+    cache_miss = getattr(usage, "prompt_cache_miss_tokens", None) if usage else None
+    # Fallback: if cache fields not available, treat all input as cache miss
+    if cache_hit is None and cache_miss is None and input_toks:
+        cache_hit = 0
+        cache_miss = input_toks
+
+    # Track DeepSeek token usage
+    from .usage import track_deepseek_call
+    track_deepseek_call(cache_hit, cache_miss, output_toks)
+
     return LLMResult(
         content=response.choices[0].message.content,
-        input_tokens=usage.prompt_tokens if usage else None,
-        output_tokens=usage.completion_tokens if usage else None,
+        input_tokens=input_toks,
+        output_tokens=output_toks,
         eval_duration_ns=elapsed_ns,
         total_duration_ns=elapsed_ns,
         backend="api",

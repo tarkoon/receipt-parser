@@ -7,9 +7,7 @@ Returns blocks in the format:
 import json
 import os
 import re
-import threading
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -29,59 +27,32 @@ class OCRResult:
 
 
 # ── API call tracking ─────────────────────────────────────────────────
+# Delegates to the unified usage tracker in usage.py.
 
-_USAGE_FILE = Path(__file__).parent / ".cloud_vision_usage.json"
-_FREE_TIER_LIMIT = 1000
-_WARNING_THRESHOLD = 100  # Warn when within this many of the limit
-_usage_lock = threading.Lock()
-
-
-def _load_usage() -> dict:
-    """Load monthly API call count from disk."""
-    if _USAGE_FILE.exists():
-        try:
-            data = json.loads(_USAGE_FILE.read_text())
-            if data.get("month") == datetime.now().strftime("%Y-%m"):
-                return data
-        except (json.JSONDecodeError, KeyError):
-            pass
-    return {"month": datetime.now().strftime("%Y-%m"), "calls": 0}
-
-
-def _save_usage(data: dict):
-    """Save monthly API call count to disk."""
-    _USAGE_FILE.write_text(json.dumps(data))
+from .usage import (
+    track_cloud_vision_call as _track_api_call_impl,
+    get_usage as _get_unified_usage,
+    CLOUD_VISION_FREE_TIER as _FREE_TIER_LIMIT,
+)
 
 
 def _track_api_call():
-    """Increment the API call counter and warn if approaching the free tier limit."""
-    with _usage_lock:
-        usage = _load_usage()
-        usage["calls"] += 1
-        _save_usage(usage)
-
-    remaining = _FREE_TIER_LIMIT - usage["calls"]
-    if remaining <= _WARNING_THRESHOLD and remaining > 0:
-        import sys
-        print(f"WARNING: Cloud Vision API usage: {usage['calls']}/{_FREE_TIER_LIMIT} "
-              f"this month ({remaining} remaining before paid tier)",
-              file=sys.stderr)
-    elif remaining <= 0:
-        import sys
-        print(f"WARNING: Cloud Vision API free tier exceeded! "
-              f"{usage['calls']} calls this month (limit: {_FREE_TIER_LIMIT}). "
-              f"Additional calls will be billed.",
-              file=sys.stderr)
+    """Increment the Cloud Vision API call counter."""
+    _track_api_call_impl()
 
 
 def get_api_usage() -> dict:
-    """Return current month's API usage stats."""
-    usage = _load_usage()
+    """Return current month's Cloud Vision API usage stats.
+
+    Legacy interface — use usage.get_usage() for full stats including DeepSeek.
+    """
+    full = _get_unified_usage()
+    cv = full["cloud_vision"]
     return {
-        "month": usage["month"],
-        "calls": usage["calls"],
-        "free_limit": _FREE_TIER_LIMIT,
-        "remaining": max(0, _FREE_TIER_LIMIT - usage["calls"]),
+        "month": full["month"],
+        "calls": cv["calls"],
+        "free_limit": cv["free_limit"],
+        "remaining": cv["remaining_free"],
     }
 
 

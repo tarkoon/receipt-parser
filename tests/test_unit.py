@@ -329,10 +329,38 @@ def test_pipeline_blank_image_returns_error(mock_check, mock_init_cv, mock_ocr):
 # --- API usage tracking tests ---
 
 def test_api_usage_tracking():
-    from receipt_parser.ocr import _load_usage, _save_usage, get_api_usage, _USAGE_FILE
-    _save_usage({"month": "2099-01", "calls": 0})
-    stats = get_api_usage()
-    assert stats["calls"] == 0
-    assert stats["remaining"] == 1000
+    from receipt_parser.usage import (
+        _save, _empty_month, get_usage, sync_usage,
+        _USAGE_FILE, _HISTORY_FILE, _compute_costs,
+    )
+    from receipt_parser.ocr import get_api_usage
+    _save(_empty_month("2099-01"))
+    # Unified tracker
+    stats = get_usage()
+    assert stats["cloud_vision"]["calls"] == 0
+    assert stats["cloud_vision"]["remaining_free"] == 1000
+    assert stats["deepseek"]["calls"] == 0
+    assert stats["deepseek"]["cache_hit_tokens"] == 0
+    assert stats["deepseek"]["cache_miss_tokens"] == 0
+    assert stats["documents"]["total_processed"] == 0
+    assert stats["documents"]["unique_processed"] == 0
+    # Legacy interface
+    legacy = get_api_usage()
+    assert legacy["calls"] == 0
+    assert legacy["remaining"] == 1000
+    # Sync with cache hit/miss breakdown
+    sync_usage(cv_calls=42, ds_cache_hit=18_507_008, ds_cache_miss=1_019_604,
+               ds_output=2_662_239, ds_calls=6959)
+    stats = get_usage()
+    assert stats["cloud_vision"]["calls"] == 42
+    assert stats["deepseek"]["calls"] == 6959
+    assert stats["deepseek"]["cache_hit_tokens"] == 18_507_008
+    assert stats["deepseek"]["cache_miss_tokens"] == 1_019_604
+    assert stats["deepseek"]["output_tokens"] == 2_662_239
+    # Verify cost calculation: hit*0.07/1M + miss*0.27/1M + out*1.10/1M
+    assert stats["deepseek"]["est_cost_usd"] > 0
+    # Cleanup
     if _USAGE_FILE.exists():
         _USAGE_FILE.unlink()
+    if _HISTORY_FILE.exists():
+        _HISTORY_FILE.unlink()
