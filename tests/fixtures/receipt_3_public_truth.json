@@ -1,0 +1,20 @@
+{
+  "document_type": "receipt",
+  "merchant": "さくら助産院",
+  "date": "2025-12-22",
+  "location": "宗像市赤間3-4-6",
+  "currency": "JPY",
+  "total": 3000,
+  "payment_method": "cash",
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 3000,
+  "line_items": [],
+  "subtotal": null,
+  "taxes": [],
+  "service_type": null,
+  "billing_period": null,
+  "usage": null,
+  "payer": "ヤマダ ハナコ",
+  "payment_reference": null
+}

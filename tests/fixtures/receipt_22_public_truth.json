@@ -1,0 +1,90 @@
+{
+  "document_type": "receipt",
+  "merchant": "Mister Donut",
+  "date": "2026-03-05",
+  "location": "福津市",
+  "currency": "JPY",
+  "total": 1260,
+  "payment_method": "cash",
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 1260,
+  "line_items": [
+    {
+      "description": "ミスドアイスコーヒー",
+      "qty": 1,
+      "unit_price": 237,
+      "total": 237,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "ポン・デ・黒糖",
+      "qty": 1,
+      "unit_price": 172,
+      "total": 172,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "ハニーチュロ",
+      "qty": 1,
+      "unit_price": 172,
+      "total": 172,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "ドーナツポップS",
+      "qty": 1,
+      "unit_price": 313,
+      "total": 313,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "塩キャラメルフレンチ",
+      "qty": 1,
+      "unit_price": 194,
+      "total": 194,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    },
+    {
+      "description": "ハニーディップ",
+      "qty": 1,
+      "unit_price": 172,
+      "total": 172,
+      "tax_category": "8%",
+      "discount": null,
+      "discount_rate": null
+    }
+  ],
+  "subtotal": 1260,
+  "taxes": [
+    {
+      "rate": "8%",
+      "label": "内税",
+      "amount": 93
+    }
+  ],
+  "service_type": null,
+  "billing_period": {
+    "start": null,
+    "end": null
+  },
+  "usage": {
+    "amount": null,
+    "unit": null,
+    "cost_per": null,
+    "meter_previous": null,
+    "meter_current": null
+  },
+  "payer": null,
+  "payment_reference": null
+}

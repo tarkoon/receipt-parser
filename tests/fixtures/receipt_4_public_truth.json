@@ -1,0 +1,97 @@
+{
+  "document_type": "receipt",
+  "merchant": "業務スーパー",
+  "date": "2026-03-22",
+  "location": "新宗像市",
+  "currency": "JPY",
+  "total": 2279,
+  "payment_method": "cash",
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 2279,
+  "line_items": [
+    {
+      "description": "アマンディ ホイ",
+      "qty": 1,
+      "unit_price": 328,
+      "total": 328,
+      "tax_category": "8%"
+    },
+    {
+      "description": "トーラクホイップ",
+      "qty": 1,
+      "unit_price": 368,
+      "total": 368,
+      "tax_category": "8%"
+    },
+    {
+      "description": "サニーレタス",
+      "qty": 1,
+      "unit_price": 129,
+      "total": 129,
+      "tax_category": "8%"
+    },
+    {
+      "description": "みかん缶詰",
+      "qty": 1,
+      "unit_price": 115,
+      "total": 115,
+      "tax_category": "8%"
+    },
+    {
+      "description": "レジ袋",
+      "qty": 1,
+      "unit_price": 5,
+      "total": 5,
+      "tax_category": "10%"
+    },
+    {
+      "description": "いちご",
+      "qty": 1,
+      "unit_price": 399,
+      "total": 399,
+      "tax_category": "8%"
+    },
+    {
+      "description": "業務スーパー 強力",
+      "qty": 1,
+      "unit_price": 184,
+      "total": 184,
+      "tax_category": "8%"
+    },
+    {
+      "description": "三井製糖 上白糖",
+      "qty": 1,
+      "unit_price": 225,
+      "total": 225,
+      "tax_category": "8%"
+    },
+    {
+      "description": "じゃが芋",
+      "qty": 1,
+      "unit_price": 199,
+      "total": 199,
+      "tax_category": "8%"
+    },
+    {
+      "description": "人参",
+      "qty": 1,
+      "unit_price": 159,
+      "total": 159,
+      "tax_category": "8%"
+    }
+  ],
+  "subtotal": 2111,
+  "taxes": [
+    {
+      "rate": "8%",
+      "label": "外税",
+      "amount": 168
+    }
+  ],
+  "service_type": null,
+  "billing_period": null,
+  "usage": null,
+  "payer": null,
+  "payment_reference": null
+}

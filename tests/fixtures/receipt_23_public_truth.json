@@ -1,0 +1,45 @@
+{
+  "document_type": "receipt",
+  "merchant": "ファミリーマート",
+  "date": "2026-03-18",
+  "location": "兵庫県神戸市中央区御幸通5丁目",
+  "currency": "JPY",
+  "total": 948,
+  "payment_method": "cash",
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 948,
+  "line_items": [
+    {
+      "description": "耐風ビニール傘70",
+      "qty": 1,
+      "unit_price": 948,
+      "total": 948,
+      "tax_category": "10%",
+      "discount": null,
+      "discount_rate": null
+    }
+  ],
+  "subtotal": 948,
+  "taxes": [
+    {
+      "rate": "10%",
+      "label": "内税",
+      "amount": 86
+    }
+  ],
+  "service_type": null,
+  "billing_period": {
+    "start": null,
+    "end": null
+  },
+  "usage": {
+    "amount": null,
+    "unit": null,
+    "cost_per": null,
+    "meter_previous": null,
+    "meter_current": null
+  },
+  "payer": null,
+  "payment_reference": null
+}

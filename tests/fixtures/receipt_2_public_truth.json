@@ -1,0 +1,55 @@
+{
+	"document_type": "receipt",
+	"merchant": "マックスバリュ",
+	"date": "2026-03-11",
+	"location": "宗像市",
+	"currency": "JPY",
+	"total": 903,
+	"payment_method": "WAON",
+	"account_number": null,
+	"points_used": null,
+	"amount_paid": 903,
+	"line_items": [
+		{
+			"description": "たまご三昧",
+			"qty": 1,
+			"unit_price": 278,
+			"total": 278,
+			"tax_category": "8%"
+		},
+		{
+			"description": "食品ポリ袋L",
+			"qty": 1,
+			"unit_price": 3,
+			"total": 3,
+			"tax_category": "10%"
+		},
+		{
+			"description": "日清密封チャック付フラ",
+			"qty": 1,
+			"unit_price": 328,
+			"total": 328,
+			"tax_category": "8%"
+		},
+		{
+			"description": "ベーコン",
+			"qty": 1,
+			"unit_price": 228,
+			"total": 228,
+			"tax_category": "8%"
+		}
+	],
+	"subtotal": 837,
+	"taxes": [
+		{
+			"rate": "8%",
+			"label": "外税",
+			"amount": 66
+		}
+	],
+	"service_type": null,
+	"billing_period": null,
+	"usage": null,
+	"payer": null,
+	"payment_reference": null
+}

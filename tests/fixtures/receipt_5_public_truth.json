@@ -1,0 +1,85 @@
+{
+	"document_type": "receipt",
+	"merchant": "マックスバリュ",
+	"date": "2026-03-23",
+	"location": "宗像市",
+	"currency": "JPY",
+	"total": 2514,
+	"payment_method": "credit",
+	"account_number": null,
+	"points_used": null,
+	"amount_paid": 2514,
+	"line_items": [
+		{
+			"description": "銀さけ切身",
+			"qty": 1,
+			"unit_price": 467,
+			"total": 373,
+			"tax_category": "8%",
+			"discount": 94,
+			"discount_rate": "20%"
+		},
+		{
+			"description": "ギュウコマギレ",
+			"qty": 1,
+			"unit_price": 497,
+			"total": 497,
+			"tax_category": "8%"
+		},
+		{
+			"description": "糸島のたまご",
+			"qty": 1,
+			"unit_price": 328,
+			"total": 328,
+			"tax_category": "8%"
+		},
+		{
+			"description": "熟成デミグラハッシュド",
+			"qty": 1,
+			"unit_price": 338,
+			"total": 338,
+			"tax_category": "8%"
+		},
+		{
+			"description": "TVBP低脂肪",
+			"qty": 1,
+			"unit_price": 148,
+			"total": 148,
+			"tax_category": "8%"
+		},
+		{
+			"description": "TVえのき茸 小",
+			"qty": 1,
+			"unit_price": 78,
+			"total": 78,
+			"tax_category": "8%"
+		},
+		{
+			"description": "シャウエッセン",
+			"qty": 1,
+			"unit_price": 398,
+			"total": 398,
+			"tax_category": "8%"
+		},
+		{
+			"description": "本仕込食パン(8)",
+			"qty": 1,
+			"unit_price": 168,
+			"total": 168,
+			"tax_category": "8%"
+		}
+	],
+	"subtotal": 2328,
+	"taxes": [
+		{
+			"rate": "8%",
+			"label": "外税",
+			"amount": 186
+		}
+	],
+	"service_type": null,
+	"billing_period": null,
+	"usage": null,
+	"payer": null,
+	"payment_reference": null
+}

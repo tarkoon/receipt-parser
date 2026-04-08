@@ -1,0 +1,29 @@
+{
+  "document_type": "utility_bill",
+  "merchant": null,
+  "date": "2026-02-05",
+  "location": null,
+  "currency": "JPY",
+  "total": 15946,
+  "payment_method": "bank_payment",
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 15946,
+  "line_items": [],
+  "subtotal": null,
+  "taxes": [],
+  "service_type": "gas",
+  "billing_period": {
+    "start": "2026-01-06",
+    "end": "2026-02-05"
+  },
+  "usage": {
+    "amount": 19.0,
+    "unit": "m3",
+    "cost_per": null,
+    "meter_previous": 569.4,
+    "meter_current": 588.4
+  },
+  "payer": "ヤマダ タロウ ケンジ",
+  "payment_reference": null
+}

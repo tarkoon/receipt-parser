@@ -13,12 +13,9 @@ tmp*.py
 scripts/
 docs/
 CLAUDE.md
-tests/fixtures/*.jpg
-tests/fixtures/*.jpeg
-tests/fixtures/*.png
-tests/fixtures/*.pdf
-tests/fixtures/*.tiff
-tests/fixtures/*.bmp
+tests/fixtures/*
+!tests/fixtures/_truth_template.json
+!tests/fixtures/*_public_truth.json
 src/receipt_parser/user_rules.json
 tmp*.png
 tmp*.jpg

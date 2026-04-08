@@ -1,8 +1,13 @@
 """Accuracy tests — field checks against cached pipeline results and OCR variants.
 
 Auto-discovers:
-1. Image fixtures: tests/fixtures/receipt_N.jpg + receipt_N_truth.json (cached OCR)
-2. OCR variants: tests/ocr_variants/receipt_N_vM.txt (injected text, skips OCR)
+1. Image fixtures: tests/fixtures/receipt_N.jpg + receipt_N_truth.json (full pipeline)
+2. Public fixtures: tests/fixtures/receipt_N_public_truth.json + .data/ocr_cache/named/receipt_N.txt
+   (anonymized, committed to git, skips Cloud Vision OCR)
+3. OCR variants: .data/ocr_cache/variants/receipt_N_vM.txt (injected text, skips OCR)
+
+When images are available, uses process_document() with the original truth file.
+When only public fixtures exist, falls back to process_ocr_text() with anonymized data.
 
 Run with:
     python -m pytest tests/test_accuracy.py -v
@@ -19,6 +24,7 @@ from pathlib import Path
 import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures"
+OCR_FIXTURES = Path(__file__).parent / "ocr_fixtures"
 VARIANTS = Path(__file__).resolve().parent.parent / ".data" / "ocr_cache" / "variants"
 
 # Skip if Cloud Vision is not configured (needed for image fixtures)
@@ -52,11 +58,14 @@ def _extract_base_name(variant_stem: str) -> str:
 
 def _discover_test_cases():
     cases = []
+    discovered_bases = set()
 
-    # Image fixtures (process_document with cached OCR)
+    # Image fixtures (process_document with original truth, full pipeline)
     if _cv_available:
         for truth_file in sorted(FIXTURES.glob("*_truth.json")):
             if truth_file.name == "_truth_template.json":
+                continue
+            if "_public_truth" in truth_file.name:
                 continue
             base = truth_file.stem.replace("_truth", "")
             image = _find_image(base)
@@ -64,6 +73,19 @@ def _discover_test_cases():
                 continue
             truth = json.loads(truth_file.read_text(encoding="utf-8"))
             cases.append((base, {"type": "image", "path": image}, truth))
+            discovered_bases.add(base)
+
+    # Public fixtures (anonymized truth + named OCR text, no images needed)
+    for truth_file in sorted(FIXTURES.glob("*_public_truth.json")):
+        base = truth_file.stem.replace("_public_truth", "")
+        if base in discovered_bases:
+            continue  # already discovered as image fixture
+        ocr_file = OCR_FIXTURES / f"{base}.txt"
+        if not ocr_file.exists():
+            continue
+        truth = json.loads(truth_file.read_text(encoding="utf-8"))
+        cases.append((base, {"type": "ocr_text", "path": ocr_file}, truth))
+        discovered_bases.add(base)
 
     # OCR variant fixtures (process_ocr_text, skip OCR)
     if VARIANTS.exists():
@@ -71,6 +93,8 @@ def _discover_test_cases():
             stem = variant_file.stem
             base = _extract_base_name(stem)
             truth_file = FIXTURES / f"{base}_truth.json"
+            if not truth_file.exists():
+                truth_file = FIXTURES / f"{base}_public_truth.json"
             if not truth_file.exists():
                 continue
             truth = json.loads(truth_file.read_text(encoding="utf-8"))

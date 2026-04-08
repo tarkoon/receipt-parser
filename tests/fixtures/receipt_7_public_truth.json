@@ -1,0 +1,41 @@
+{
+	"document_type": "receipt",
+	"merchant": "スーパービバホーム",
+	"date": "2026-03-24",
+	"location": "宗像市赤間",
+	"currency": "JPY",
+	"total": 105,
+	"payment_method": "cash",
+	"account_number": null,
+	"points_used": null,
+	"amount_paid": 105,
+	"line_items": [
+		{
+			"description": "三共 紙やすり #400",
+			"qty": 1,
+			"unit_price": 48,
+			"total": 48,
+			"tax_category": "10%"
+		},
+		{
+			"description": "三共 紙やすり #320",
+			"qty": 1,
+			"unit_price": 48,
+			"total": 48,
+			"tax_category": "10%"
+		}
+	],
+	"subtotal": 96,
+	"taxes": [
+		{
+			"rate": "10%",
+			"label": "外税",
+			"amount": 9
+		}
+	],
+	"service_type": null,
+	"billing_period": null,
+	"usage": null,
+	"payer": null,
+	"payment_reference": null
+}

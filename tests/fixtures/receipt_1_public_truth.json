@@ -1,0 +1,41 @@
+{
+	"document_type": "receipt",
+	"merchant": "サンリブ",
+	"date": "2026-03-04",
+	"location": "宗像市",
+	"currency": "JPY",
+	"total": 725,
+	"payment_method": "cash",
+	"account_number": null,
+	"points_used": null,
+	"amount_paid": 725,
+	"line_items": [
+		{
+			"description": "スコットフラワー",
+			"qty": 2,
+			"unit_price": 328,
+			"total": 656,
+			"tax_category": "10%"
+		},
+		{
+			"description": "レジ袋",
+			"qty": 1,
+			"unit_price": 4,
+			"total": 4,
+			"tax_category": "10%"
+		}
+	],
+	"subtotal": 660,
+	"taxes": [
+		{
+			"rate": "10%",
+			"label": "内税",
+			"amount": 65
+		}
+	],
+	"service_type": null,
+	"billing_period": null,
+	"usage": null,
+	"payer": null,
+	"payment_reference": null
+}

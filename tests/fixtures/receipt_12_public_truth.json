@@ -1,0 +1,60 @@
+{
+	"document_type": "receipt",
+	"merchant": "カルディ",
+	"date": "2026-03-24",
+	"location": "宗像市",
+	"currency": "JPY",
+	"total": 2044,
+	"payment_method": "cash",
+	"account_number": null,
+	"points_used": null,
+	"amount_paid": 2044,
+	"line_items": [
+		{
+			"description": "KAL紙袋M",
+			"qty": 1,
+			"unit_price": 30,
+			"total": 30,
+			"tax_category": "10%"
+		},
+		{
+			"description": "プレッツィオーザ ウズラマメ",
+			"qty": 2,
+			"unit_price": 235,
+			"total": 470,
+			"tax_category": "8%"
+		},
+		{
+			"description": "ラ・プレッツィ 白インゲン",
+			"qty": 2,
+			"unit_price": 235,
+			"total": 470,
+			"tax_category": "8%"
+		},
+		{
+			"description": "S&Wクロインゲンソマメ",
+			"qty": 2,
+			"unit_price": 537,
+			"total": 1074,
+			"tax_category": "8%"
+		}
+	],
+	"subtotal": 2044,
+	"taxes": [
+		{
+			"rate": "8%",
+			"label": "内税",
+			"amount": 149
+		},
+		{
+			"rate": "10%",
+			"label": "内税",
+			"amount": 2
+		}
+	],
+	"service_type": null,
+	"billing_period": null,
+	"usage": null,
+	"payer": null,
+	"payment_reference": null
+}

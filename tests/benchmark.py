@@ -32,13 +32,14 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from receipt_parser.checks import get_checks_for, ALL_CHECKS
 from receipt_parser.llm import check_model_available, DEFAULT_MODEL
 from receipt_parser.ocr import init_cloud_vision, get_api_usage, get_ollama_gpu_status
-from receipt_parser.pipeline import process_document
+from receipt_parser.pipeline import process_document, process_ocr_text
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+OCR_FIXTURES_DIR = Path(__file__).resolve().parent / "ocr_fixtures"
 VARIANTS_DIR = Path(__file__).resolve().parent.parent / ".data" / "ocr_cache" / "variants"
 RESULTS_DIR = Path(__file__).resolve().parent / "results" / "benchmark"
 DEFAULT_OUTPUT = RESULTS_DIR / "latest.json"
@@ -60,9 +61,15 @@ _DEEPSEEK_OUTPUT_COST_PER_M = DEEPSEEK_OUTPUT_COST_PER_M
 # ---------------------------------------------------------------------------
 
 def discover_fixtures(names: list[str] | None = None) -> list[tuple[str, Path, dict]]:
+    """Discover test fixtures. Prefers images + original truth; falls back to named OCR + public truth."""
     fixtures = []
+    discovered = set()
+
+    # Image fixtures (original truth, full pipeline)
     for truth_file in sorted(FIXTURES_DIR.glob("*_truth.json")):
         if truth_file.name == "_truth_template.json":
+            continue
+        if "_public_truth" in truth_file.name:
             continue
         base = truth_file.stem.replace("_truth", "")
         if names and base not in names:
@@ -77,6 +84,22 @@ def discover_fixtures(names: list[str] | None = None) -> list[tuple[str, Path, d
             continue
         truth = json.loads(truth_file.read_text(encoding="utf-8"))
         fixtures.append((base, image, truth))
+        discovered.add(base)
+
+    # Public fixtures (anonymized truth + named OCR text, no images needed)
+    for truth_file in sorted(FIXTURES_DIR.glob("*_public_truth.json")):
+        base = truth_file.stem.replace("_public_truth", "")
+        if base in discovered:
+            continue
+        if names and base not in names:
+            continue
+        ocr_file = OCR_FIXTURES_DIR / f"{base}.txt"
+        if not ocr_file.exists():
+            continue
+        truth = json.loads(truth_file.read_text(encoding="utf-8"))
+        fixtures.append((base, ocr_file, truth))
+        discovered.add(base)
+
     return fixtures
 
 
@@ -193,7 +216,7 @@ def _check_budget(estimated_calls: int, budget_limit: int, force: bool) -> bool:
 
 def _run_fixture(
     fixture_name: str,
-    fixture_image: Path,
+    fixture_source: Path,
     fixture_truth: dict,
     runs: int,
     model: str,
@@ -201,6 +224,7 @@ def _run_fixture(
     cv_client,
 ) -> tuple[str, dict]:
     """Run all iterations for a single fixture. Returns (name, fixture_data)."""
+    is_ocr_text = fixture_source.suffix == ".txt"
     checks = get_checks_for(fixture_truth)
     fixture_runs = []
 
@@ -209,11 +233,18 @@ def _run_fixture(
         error = None
         result = {}
         try:
-            result = process_document(
-                fixture_image, model=model, passes=passes,
-                apply_user_rules=False, skip_ocr_cache=True,
-                ocr_engine=cv_client,
-            )
+            if is_ocr_text:
+                ocr_text = fixture_source.read_text(encoding="utf-8")
+                result = process_ocr_text(
+                    ocr_text, model=model, passes=passes,
+                    apply_user_rules=False,
+                )
+            else:
+                result = process_document(
+                    fixture_source, model=model, passes=passes,
+                    apply_user_rules=False, skip_ocr_cache=True,
+                    ocr_engine=cv_client,
+                )
         except Exception as e:
             error = str(e)
         wall_time = time.perf_counter() - wall_start
@@ -449,8 +480,11 @@ def _print_summary(summary: dict, metadata: dict):
     if summary["variants_saved"]:
         print(f"\nOCR variants saved: {summary['variants_saved']} (in {VARIANTS_DIR})")
 
-    usage = get_api_usage()
-    print(f"\nAPI Budget: {usage['remaining']} calls remaining")
+    try:
+        usage = get_api_usage()
+        print(f"\nAPI Budget: {usage['remaining']} calls remaining")
+    except Exception:
+        pass
     print(f"Results saved: {metadata.get('output_path', '?')}")
 
 
@@ -593,17 +627,25 @@ def run_benchmark(
 
     # Preflight
     check_model_available(model)
-    try:
-        cv_client = init_cloud_vision()
-    except Exception as e:
-        print(f"ERROR: Cloud Vision init failed: {e}")
-        sys.exit(1)
 
-    # Budget check (skip in CI mode — uses cached OCR)
-    if not ci:
-        estimated = _estimate_api_calls(n_fixtures, runs)
-        if not _check_budget(estimated, budget_limit, force):
+    # Check if any fixtures need Cloud Vision (image sources)
+    has_image_fixtures = any(f[1].suffix != ".txt" for f in fixtures)
+    cv_client = None
+    if has_image_fixtures:
+        try:
+            cv_client = init_cloud_vision()
+        except Exception as e:
+            print(f"ERROR: Cloud Vision init failed: {e}")
             sys.exit(1)
+
+        # Budget check (skip in CI mode — uses cached OCR)
+        if not ci:
+            image_count = sum(1 for f in fixtures if f[1].suffix != ".txt")
+            estimated = _estimate_api_calls(image_count, runs)
+            if not _check_budget(estimated, budget_limit, force):
+                sys.exit(1)
+    else:
+        print("All fixtures use OCR text — no Cloud Vision needed.")
 
     git_sha = _get_git_sha()
     metadata = {
@@ -625,19 +667,19 @@ def run_benchmark(
         print(f"\nRunning {n_fixtures} fixtures with {workers} workers...")
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(_run_fixture, name, image, truth, runs, model, passes, cv_client): name
-                for name, image, truth in fixtures
+                pool.submit(_run_fixture, name, source, truth, runs, model, passes, cv_client): name
+                for name, source, truth in fixtures
             }
             for future in as_completed(futures):
                 fname, fdata = future.result()
                 per_fixture[fname] = fdata
     else:
         # Sequential
-        for fix_idx, (name, image, truth) in enumerate(fixtures):
+        for fix_idx, (name, source, truth) in enumerate(fixtures):
             print(f"\n[{fix_idx + 1}/{n_fixtures}] {name}")
             skip_cache = not ci  # CI mode uses cached OCR
             _, fdata = _run_fixture_sequential(
-                name, image, truth, runs, model, passes, cv_client, skip_cache,
+                name, source, truth, runs, model, passes, cv_client, skip_cache,
             )
             per_fixture[name] = fdata
 
@@ -657,9 +699,10 @@ def run_benchmark(
 
 
 def _run_fixture_sequential(
-    fixture_name, fixture_image, fixture_truth, runs, model, passes, cv_client, skip_cache,
+    fixture_name, fixture_source, fixture_truth, runs, model, passes, cv_client, skip_cache,
 ):
     """Sequential fixture runner with progress printing."""
+    is_ocr_text = fixture_source.suffix == ".txt"
     checks = get_checks_for(fixture_truth)
     fixture_runs = []
 
@@ -668,11 +711,18 @@ def _run_fixture_sequential(
         error = None
         result = {}
         try:
-            result = process_document(
-                fixture_image, model=model, passes=passes,
-                apply_user_rules=False, skip_ocr_cache=skip_cache,
-                ocr_engine=cv_client,
-            )
+            if is_ocr_text:
+                ocr_text = fixture_source.read_text(encoding="utf-8")
+                result = process_ocr_text(
+                    ocr_text, model=model, passes=passes,
+                    apply_user_rules=False,
+                )
+            else:
+                result = process_document(
+                    fixture_source, model=model, passes=passes,
+                    apply_user_rules=False, skip_ocr_cache=skip_cache,
+                    ocr_engine=cv_client,
+                )
         except Exception as e:
             error = str(e)
         wall_time = time.perf_counter() - wall_start

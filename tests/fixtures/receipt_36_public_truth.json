@@ -1,0 +1,45 @@
+{
+  "document_type": "receipt",
+  "merchant": "ENEOS",
+  "date": "2026-03-22",
+  "location": "福岡県北九州市小倉北区片野3-14-13",
+  "currency": "JPY",
+  "total": 4820,
+  "payment_method": "cash",
+  "account_number": null,
+  "points_used": null,
+  "amount_paid": 4820,
+  "line_items": [
+    {
+      "description": "レギュラーガソリン",
+      "qty": 1,
+      "unit_price": 4820,
+      "total": 4820,
+      "tax_category": "10%",
+      "discount": null,
+      "discount_rate": null
+    }
+  ],
+  "subtotal": 4820,
+  "taxes": [
+    {
+      "rate": "10%",
+      "label": "内税",
+      "amount": 438
+    }
+  ],
+  "service_type": null,
+  "billing_period": {
+    "start": null,
+    "end": null
+  },
+  "usage": {
+    "amount": 26.63,
+    "unit": "L",
+    "cost_per": 181.0,
+    "meter_previous": null,
+    "meter_current": null
+  },
+  "payer": null,
+  "payment_reference": null
+}

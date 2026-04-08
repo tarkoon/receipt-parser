@@ -1,0 +1,41 @@
+{
+	"document_type": "receipt",
+	"merchant": "スーパービバホーム",
+	"date": "2026-03-22",
+	"location": "宗像市赤間",
+	"currency": "JPY",
+	"total": 1570,
+	"payment_method": "cash",
+	"account_number": null,
+	"points_used": null,
+	"amount_paid": 1570,
+	"line_items": [
+		{
+			"description": "アカシア集成材10",
+			"qty": 1,
+			"unit_price": 980,
+			"total": 980,
+			"tax_category": "10%"
+		},
+		{
+			"description": "アロンアルファー 木工用",
+			"qty": 1,
+			"unit_price": 448,
+			"total": 448,
+			"tax_category": "10%"
+		}
+	],
+	"subtotal": 1428,
+	"taxes": [
+		{
+			"rate": "10%",
+			"label": "外税",
+			"amount": 142
+		}
+	],
+	"service_type": null,
+	"billing_period": null,
+	"usage": null,
+	"payer": null,
+	"payment_reference": null
+}
