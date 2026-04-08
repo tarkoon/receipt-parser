@@ -282,7 +282,8 @@ def fetch_cloud_vision_usage() -> tuple[int | None, str | None]:
         }
 
         total = 0
-        while True:
+        max_pages = 100
+        for _ in range(max_pages):
             response = requests.get(url, headers=headers, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()
@@ -324,8 +325,8 @@ def track_cloud_vision_call():
         data = _load()
         data["cloud_vision"]["calls"] += 1
         _save(data)
+        calls = data["cloud_vision"]["calls"]
 
-    calls = data["cloud_vision"]["calls"]
     remaining = CLOUD_VISION_FREE_TIER - calls
     if 0 < remaining <= 100:
         import sys

@@ -5,6 +5,8 @@ description = "Extract structured data from receipts and invoices"
 requires-python = ">=3.10"
 dependencies = [
     "google-cloud-vision",
+    "google-auth>=2.0",
+    "requests>=2.28",
     "opencv-python-headless",
     "pdf2image",
     "pdfplumber",

@@ -165,47 +165,51 @@ def _parse_llm_json(raw: str) -> dict:
 
 _api_client = None
 _instructor_client = None
+_client_lock = threading.Lock()
 
 
 def _get_api_client():
     """Get or create the API client (DeepSeek direct or OpenRouter fallback)."""
     global _api_client
-    if _api_client is None:
-        from openai import OpenAI
-        deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
-        openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-        if deepseek_key:
-            _api_client = OpenAI(
-                base_url="https://api.deepseek.com",
-                api_key=deepseek_key,
-                timeout=OLLAMA_TIMEOUT_SECONDS,
-            )
-        elif openrouter_key:
-            _api_client = OpenAI(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=openrouter_key,
-                timeout=OLLAMA_TIMEOUT_SECONDS,
-            )
-        else:
-            raise RuntimeError(
-                "No API key set. Add DEEPSEEK_API_KEY or OPENROUTER_API_KEY to .env."
-            )
+    if _api_client is not None:
+        return _api_client
+    with _client_lock:
+        if _api_client is None:
+            from openai import OpenAI
+            deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
+            openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+            if deepseek_key:
+                _api_client = OpenAI(
+                    base_url="https://api.deepseek.com",
+                    api_key=deepseek_key,
+                    timeout=OLLAMA_TIMEOUT_SECONDS,
+                )
+            elif openrouter_key:
+                _api_client = OpenAI(
+                    base_url="https://openrouter.ai/api/v1",
+                    api_key=openrouter_key,
+                    timeout=OLLAMA_TIMEOUT_SECONDS,
+                )
+            else:
+                raise RuntimeError(
+                    "No API key set. Add DEEPSEEK_API_KEY or OPENROUTER_API_KEY to .env."
+                )
     return _api_client
 
 
 def _get_instructor_client():
     """Get or create an instructor-patched client for Pydantic-native structured output."""
     global _instructor_client
-    if _instructor_client is None:
-        try:
+    if _instructor_client is not None:
+        return _instructor_client
+    with _client_lock:
+        if _instructor_client is None:
             import instructor
             base_client = _get_api_client()
             _instructor_client = instructor.from_openai(
                 base_client,
                 mode=instructor.Mode.JSON,
             )
-        except ImportError:
-            return None
     return _instructor_client
 
 

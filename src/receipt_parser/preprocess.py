@@ -90,9 +90,9 @@ def preprocess_receipt(image: np.ndarray) -> np.ndarray:
 def _fix_exif_orientation(image: np.ndarray, file_path: Path) -> np.ndarray:
     """Rotate image based on EXIF orientation tag. Critical for phone photos."""
     try:
-        pil_img = Image.open(file_path)
-        exif = pil_img.getexif()
-        orientation = exif.get(0x0112)  # Orientation tag
+        with Image.open(file_path) as pil_img:
+            exif = pil_img.getexif()
+            orientation = exif.get(0x0112)  # Orientation tag
         if orientation == 3:
             image = cv2.rotate(image, cv2.ROTATE_180)
         elif orientation == 6:

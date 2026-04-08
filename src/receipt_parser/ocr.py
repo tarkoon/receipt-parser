@@ -67,8 +67,8 @@ def get_ollama_gpu_status() -> dict | None:
     """
     try:
         import urllib.request
-        resp = urllib.request.urlopen("http://localhost:11434/api/ps", timeout=5)
-        data = json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen("http://localhost:11434/api/ps", timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
         models = data.get("models", [])
         if not models:
             return None
