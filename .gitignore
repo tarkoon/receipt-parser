@@ -13,9 +13,13 @@ tmp*.py
 scripts/
 docs/
 CLAUDE.md
-tests/fixtures/
-!tests/fixtures/_truth_template.json
-src/receipt_parser/merchant_rules.json
+tests/fixtures/*.jpg
+tests/fixtures/*.jpeg
+tests/fixtures/*.png
+tests/fixtures/*.pdf
+tests/fixtures/*.tiff
+tests/fixtures/*.bmp
+src/receipt_parser/user_rules.json
 tmp*.png
 tmp*.jpg
 .ocr_cache/

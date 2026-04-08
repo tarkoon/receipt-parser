@@ -396,13 +396,13 @@ def setup():
     typer.echo("Receipt Parser — Setup Wizard")
     typer.echo("=" * 40)
 
-    # Step 0: Ensure merchant_rules.json exists
-    _merchant_rules = Path(__file__).resolve().parent / "merchant_rules.json"
-    if not _merchant_rules.exists():
-        _merchant_rules.write_text(
+    # Step 0: Ensure user_rules.json exists
+    _user_rules = Path(__file__).resolve().parent / "user_rules.json"
+    if not _user_rules.exists():
+        _user_rules.write_text(
             '{\n  "merchant_map": {}\n}\n', encoding="utf-8"
         )
-        typer.echo("Created merchant_rules.json (empty — see README to customize).")
+        typer.echo("Created user_rules.json (empty — see README to customize).")
 
     # Step 1: .env file
     typer.echo("\n[1/4] Environment file")

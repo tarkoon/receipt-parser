@@ -52,15 +52,15 @@ def detect_document_type(text: str) -> str:
 
 # ── Merchant Mapping ─────────────────────────────────────────────────
 
-_MERCHANT_RULES_PATH = Path(__file__).parent / "merchant_rules.json"
+_USER_RULES_PATH = Path(__file__).parent / "user_rules.json"
 
 
-def _apply_merchant_mapping(result: dict) -> dict:
-    """Apply merchant_rules.json merchant alias mapping."""
-    if not _MERCHANT_RULES_PATH.exists():
+def _apply_user_rules(result: dict) -> dict:
+    """Apply user_rules.json merchant alias mapping."""
+    if not _USER_RULES_PATH.exists():
         return result
     try:
-        rules = json.loads(_MERCHANT_RULES_PATH.read_text(encoding="utf-8"))
+        rules = json.loads(_USER_RULES_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return result
 
@@ -320,7 +320,7 @@ def process_document(
             result = _build_result(receipt, final_warnings, pass_history, model, debug=debug, trace=trace,
                                    ocr_confidence=1.0, llm_confidence=llm_conf_pdf)
             if apply_user_rules:
-                result = _apply_merchant_mapping(result)
+                result = _apply_user_rules(result)
             return result
 
     # Step 2: Init OCR engine
@@ -426,7 +426,7 @@ def process_document(
         ocr_text=primary_ocr.chosen_text if primary_ocr else None,
     )
     if apply_user_rules:
-        result = _apply_merchant_mapping(result)
+        result = _apply_user_rules(result)
     return result
 
 
@@ -599,7 +599,7 @@ def process_ocr_text(
         ocr_text=ocr_text,
     )
     if apply_user_rules:
-        result = _apply_merchant_mapping(result)
+        result = _apply_user_rules(result)
     return result
 
 

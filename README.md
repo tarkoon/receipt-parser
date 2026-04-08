@@ -127,7 +127,7 @@ financial-aid/
     patterns.py           # Regex patterns + confidence routing
     usage.py              # API usage tracking + cost estimation
     cli.py                # Typer CLI
-    merchant_rules.json   # User-maintained merchant mappings
+    user_rules.json   # User-maintained merchant mappings
   tests/
     fixtures/             # Test images + truth files (local, gitignored)
       _truth_template.json  # Schema template for creating truth files
@@ -142,9 +142,9 @@ financial-aid/
     api_usage_history.json
 ```
 
-## Merchant Rules
+## User Rules
 
-The file `src/receipt_parser/merchant_rules.json` lets you define custom merchant name mappings and categories. The pipeline applies these after LLM extraction. The file is created automatically by `receipt-parser setup` with an empty mapping — add your own entries as needed.
+The file `src/receipt_parser/user_rules.json` lets you define custom merchant name mappings and categories. The pipeline applies these after LLM extraction. The file is created automatically by `receipt-parser setup` with an empty mapping — add your own entries as needed.
 
 ### Format
 
@@ -186,7 +186,7 @@ The pipeline checks if any key in `merchant_map` appears as a substring of the e
 
 ### Adding entries
 
-1. Open `src/receipt_parser/merchant_rules.json`
+1. Open `src/receipt_parser/user_rules.json`
 2. Add your pattern under `merchant_map`
 3. The pattern should be the text that appears in the OCR output (usually Japanese)
 4. The merchant value is what you want in the output
