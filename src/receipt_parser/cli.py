@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", encoding="utf-8")
 
 import typer
 
@@ -217,7 +217,7 @@ def usage(
         set_billing_start_day, get_billing_period_label,
     )
 
-    # ── Billing day config ──
+    # Billing day config
     if billing_day is not None:
         set_billing_start_day(billing_day)
         typer.echo(f"Billing period start day set to {billing_day}.")
@@ -230,7 +230,7 @@ def usage(
         typer.echo("Usage counters reset.")
         return
 
-    # ── Sync: interactive or flag-based ──
+    # Sync: interactive or flag-based
     if sync:
         _run_sync_interactive()
         return
@@ -241,12 +241,12 @@ def usage(
         typer.echo("Usage counters updated.")
         # Fall through to display updated stats
 
-    # ── History view ──
+    # History view
     if history:
         _show_history(page, json_output)
         return
 
-    # ── Current period view (auto-fetches Cloud Vision from GCP) ──
+    # Current period view (auto-fetches Cloud Vision from GCP)
     should_fetch = not no_fetch
     if should_fetch and not json_output:
         typer.echo("Fetching Cloud Vision usage from GCP...", err=True)

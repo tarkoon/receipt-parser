@@ -12,7 +12,6 @@ import json
 import re
 
 
-# ── Field Registry ────────────────────────────────────────────────────
 class FieldMeta:
     """Metadata for a single extractable field."""
     def __init__(
@@ -31,7 +30,7 @@ class FieldMeta:
 
 
 FIELD_REGISTRY: list[FieldMeta] = [
-    # ── Common fields (all types) ──
+    # Common fields (all types)
     FieldMeta(
         name="document_type",
         debug_color_bgr=(255, 255, 255),
@@ -40,7 +39,7 @@ FIELD_REGISTRY: list[FieldMeta] = [
     FieldMeta(
         name="merchant",
         debug_color_bgr=(255, 165, 0),
-        prompt_hint="The store/merchant name is the consumer-facing BRAND name ONLY — do NOT include the branch/store name, shopping complex, or location suffix. Strip everything after the core brand: 'ダイソー' not 'ダイソー ビバモール赤間店', 'カルディ' not 'カルディコーヒーファーム サンリブくりえいと宗像店', 'マックスバリュ' not 'マックスバリュくりえいと宗像店', 'サンリブ' not 'サンリブ宗像' or 'サンリブ くりえいと宗像'. Use the shortest recognizable brand name in its original script. For example: 'HANDS' not 'ハンズ', 'コスモス' not 'コスモス くりえいと宗像店'. If a subtitle describes the business type (e.g. '自家製生パスタの店', 'まちのパン屋さん') but a proper name also appears (e.g. 'チャオ', 'Pain Brié'), use the proper name, not the description. Do NOT use the parent company name (e.g. アークランズ株式会社, 株式会社ハンズ), franchisee/operator name (e.g. 有限会社..., 片野SS), or corporate registration name. For gas stations, use the fuel brand (e.g. 'ENEOS') not the station operator. For handwritten receipts (領収証), the merchant name is near the stamp/seal at the bottom. For payment slips, this is the company receiving the money (受取人). For stores with English+Japanese dual names, use the form that appears most prominently (usually the largest text at the top).",
+        prompt_hint="Consumer-facing BRAND name only (see merchant rules above). If a subtitle describes the business type (e.g. '自家製生パスタの店') but a proper name also appears (e.g. 'チャオ'), use the proper name. For handwritten receipts (領収証), the merchant name is near the stamp/seal at the bottom. For payment slips, this is the 受取人. For dual English+Japanese names, use the most prominent form.",
         extraction_aliases=["店名", "store", "shop", "受取人"],
     ),
     FieldMeta(
@@ -52,7 +51,7 @@ FIELD_REGISTRY: list[FieldMeta] = [
     FieldMeta(
         name="location",
         debug_color_bgr=(200, 200, 0),
-        prompt_hint="The geographic location of the store/business at minimum the city (市) or ward (区) level. Use clues from the receipt: branch name (e.g. '赤間店' → 赤間 is in 宗像市), standalone location names near the top of the receipt (e.g. '赤間' appearing near the store name means the store is in 赤間, which is in 宗像市), explicit address lines, or shopping complex name. Resolve to the actual administrative location using your knowledge of Japanese geography. Output format examples: '宗像市赤間', '福岡市博多区', '北九州市八幡区', '宗像市'. Always include at least the 市 or 区. If the receipt has a full address, extract just the city/ward and neighborhood (not the full street address). A phone number ALONE is NOT sufficient to determine location — only use phone area codes as a supplementary hint when other location clues are also present. If no branch name, standalone location name, address, or complex name exists, output null.",
+        prompt_hint="City/ward level location. Use branch name to infer location (e.g. '赤間店' → 赤間 is in 宗像市, so output '宗像市赤間'; '八幡店' → 八幡 is in 北九州市, so output '北九州市八幡区'). Also use explicit address lines or shopping complex names. Output format: '宗像市赤間', '福岡市博多区', '北九州市八幡区'. Always include at least 市 or 区. Extract city/ward only, not full street address. Phone numbers alone are NOT sufficient — only use as supplementary hint. Output null if no location clues exist.",
         extraction_aliases=["住所", "address"],
         doc_types=["receipt"],
     ),
@@ -93,11 +92,11 @@ FIELD_REGISTRY: list[FieldMeta] = [
         prompt_hint="Actual out-of-pocket cost. Equals total minus points_used. If no points used, equals total.",
     ),
 
-    # ── Receipt-specific fields ──
+    # Receipt-specific fields
     FieldMeta(
         name="line_items",
         debug_color_bgr=(255, 255, 0),
-        prompt_hint="Match description, quantity, unit price, and line total on the same row. If quantity is not shown, assume 1. For tax_category: if the receipt shows '10%内税対象' or '8%対象', set tax_category to the matching rate. Items marked ※, *, or X are reduced 8% tax. Items marked '除' are exempt. OCR may merge multiple items into one line — look for multiple prices (e.g. '食品ポリ袋L3除日清チャック付328※' = two items: ¥3 and ¥328). Lines like '部門 NNN' or '部門NNN' followed by a price are department-coded items (common in small shops/bakeries) — treat them as line items with description '部門NNN'. Common JP receipt items: レジ袋 (plastic bag). DISCOUNTS: If a discount line follows an item (e.g., '割引 20%' with -¥94), do NOT create a separate line item. Instead merge it into the parent item: set total to the price AFTER discount (unit_price - discount), set discount to the discount amount, and set discount_rate to the rate string (e.g., '20%'). The total must always be positive.",
+        prompt_hint="Match description, qty, unit_price, and total per row. Default qty=1. Numbers followed by tax markers at line end ARE prices: 278※ means ¥278 at 8%, 3除 means ¥3 at 10%. Tax markers: ※/*/X → reduced 8%, 除 → standard 10%. A single OCR line may contain multiple items with prices — split them (e.g. '食品ポリ袋L3除日清チャック付328※' = two items: ¥3 and ¥328). '部門NNN' lines are department-coded items. See discount rules above.",
         doc_types=["receipt"],
     ),
     FieldMeta(
@@ -114,7 +113,7 @@ FIELD_REGISTRY: list[FieldMeta] = [
         doc_types=["receipt"],
     ),
 
-    # ── Utility bill-specific fields ──
+    # Utility bill-specific fields
     FieldMeta(
         name="service_type",
         debug_color_bgr=(0, 200, 100),
@@ -137,7 +136,7 @@ FIELD_REGISTRY: list[FieldMeta] = [
         doc_types=["utility_bill"],
     ),
 
-    # ── Payment slip-specific fields ──
+    # Payment slip-specific fields
     FieldMeta(
         name="payer",
         debug_color_bgr=(100, 0, 200),
@@ -168,9 +167,6 @@ def get_debug_color_map() -> dict[str, tuple[int, int, int]]:
     return {f.name: f.debug_color_bgr for f in FIELD_REGISTRY}
 
 
-# ── Pydantic Models ───────────────────────────────────────────────────
-
-# ── Configurable Tax Rates ───────────────────────────────────────────
 VALID_TAX_RATES = ("8%", "10%", "0%")
 REDUCED_RATE = "8%"
 STANDARD_RATE = "10%"
@@ -464,8 +460,6 @@ class Document(BaseModel):
 Receipt = Document
 
 
-# ── Prompt Helpers ────────────────────────────────────────────────────
-
 def _build_field_hints(doc_type: str = "receipt") -> str:
     """Build the FIELD-SPECIFIC RULES block from the registry."""
     hints = []
@@ -481,8 +475,6 @@ def _build_field_hints(doc_type: str = "receipt") -> str:
             hints.append(f"- {f.name}: {' '.join(parts)}")
     return "\n".join(hints)
 
-
-# ── OCR-based Prompt Generation ───────────────────────────────────────
 
 BASE_EXTRACTION_RULES = """You are a receipt/invoice data extraction engine. Extract structured data from the OCR text below.
 

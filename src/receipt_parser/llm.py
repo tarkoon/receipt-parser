@@ -1,6 +1,7 @@
 """llm.py — LLM extraction via DeepSeek API (default), OpenRouter, or Ollama, multi-pass."""
 
 import json
+import logging
 import os
 import re
 import signal
@@ -8,6 +9,8 @@ import platform
 import threading
 import time
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 import ollama as ollama_client
 from .schema import Receipt, generate_extraction_prompt, generate_verification_prompt
@@ -39,8 +42,6 @@ def _ollama_model_name(model: str) -> str:
     """Strip the 'ollama/' prefix to get the actual Ollama model name."""
     return model[len(OLLAMA_PREFIX):]
 
-
-# ── Model availability check ────────────────────────────────────────
 
 def check_model_available(model: str = DEFAULT_MODEL) -> None:
     """Verify the LLM backend is reachable."""
@@ -74,8 +75,6 @@ def _check_ollama_available(model: str) -> None:
         raise
 
 
-# ── JSON schema for structured output ────────────────────────────────
-
 def get_ollama_schema() -> dict:
     """Return a flattened JSON schema with $ref pointers resolved."""
     schema = Receipt.model_json_schema()
@@ -99,8 +98,6 @@ def get_ollama_schema() -> dict:
     result = resolve_refs(schema)
     return result  # type: ignore[return-value]
 
-
-# ── Response parsing ─────────────────────────────────────────────────
 
 def sanitize_llm_response(raw: str) -> str:
     """Strip markdown code fences and extract JSON block from LLM output.
@@ -135,33 +132,27 @@ def _extract_confidence(data: dict) -> dict | None:
 
 
 def _parse_llm_json(raw: str) -> dict:
-    """Parse LLM JSON output with Pydantic validation, raw dict fallback.
+    """Parse LLM JSON output with Pydantic validation.
 
     Extracts _confidence before Pydantic validation (not part of schema).
     Coercion is handled by Pydantic's model_validator in schema.py.
     """
-    confidence = None
     try:
         data = json.loads(raw)
-        confidence = _extract_confidence(data)
+    except json.JSONDecodeError as e:
+        return {"error": f"LLM output is not valid JSON: {e}", "raw": raw}
+
+    confidence = _extract_confidence(data)
+    try:
         receipt = Receipt(**data)
         result = receipt.model_dump()
         if confidence:
             result["_confidence"] = confidence
         return result
     except Exception as e:
-        # Pydantic validation failed — fall back to raw dict
-        try:
-            data = json.loads(raw)
-            confidence = _extract_confidence(data)
-            if confidence:
-                data["_confidence"] = confidence
-            return data
-        except json.JSONDecodeError:
-            return {"error": f"LLM output failed validation: {e}", "raw": raw}
+        logger.warning("Pydantic validation failed: %s", e)
+        return {"error": f"LLM output failed schema validation: {e}", "raw": raw}
 
-
-# ── OpenRouter backend ───────────────────────────────────────────────
 
 _api_client = None
 _instructor_client = None
@@ -291,11 +282,10 @@ def _instructor_extract(
             backend="api",
         )
         return receipt, llm_result
-    except Exception:
+    except Exception as e:
+        logger.warning("Instructor extraction failed: %s", e)
         return None, None
 
-
-# ── Ollama backend ───────────────────────────────────────────────────
 
 _RETRYABLE_ERRORS = ("GGML_ASSERT", "model failed to load", "resource limitations")
 _MAX_RETRIES = 2
@@ -341,7 +331,7 @@ def _ollama_chat_once(timeout: int, **kwargs: object) -> dict:
                 result[0] = ollama_client.chat(**kwargs)  # type: ignore[arg-type]
             except Exception as e:
                 error[0] = e
-        t = threading.Thread(target=_call)
+        t = threading.Thread(target=_call, daemon=True)
         t.start()
         t.join(timeout)
         if t.is_alive():
@@ -350,8 +340,6 @@ def _ollama_chat_once(timeout: int, **kwargs: object) -> dict:
             raise error[0]
         return result[0]  # type: ignore[return-value]
 
-
-# ── Unified LLM chat ────────────────────────────────────────────────
 
 def _llm_chat(
     model: str,
@@ -382,8 +370,6 @@ def _llm_chat(
     else:
         return _openrouter_chat(model, messages, temperature, max_tokens)
 
-
-# ── Extraction functions ─────────────────────────────────────────────
 
 def extract_with_llm(
     ocr_text: str,

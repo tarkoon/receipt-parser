@@ -3,9 +3,9 @@
 import re
 import unicodedata
 
-# Price-only line: ¥-prefixed (¥656, ¥2,279, ¥168)) or number + JP tax marker (278※, 3除)
+# Price-only line: ¥-prefixed (¥656, ¥2,279, ¥168, ¥200外) or number + JP tax marker (278※, 3除)
 _PRICE_LINE_RE = re.compile(
-    r'^[¥￥]\s*[\d,]+\s*[)）軽]?\s*$'
+    r'^[¥￥]\s*[\d,]+\s*[)）軽外内]?\s*$'
     r'|'
     r'^\d[\d,]*\s*[※X除軽]\s*$'
 )
@@ -63,8 +63,27 @@ def rejoin_price_lines(text: str) -> str:
     def _is_price(s: str) -> bool:
         return bool(_PRICE_LINE_RE.match(s.strip()))
 
+    def _price_value(s: str) -> float | None:
+        """Extract numeric value from a price line, or None if not a price."""
+        s = s.strip()
+        m = re.search(r'[\d,]+', s)
+        if m:
+            try:
+                return float(m.group(0).replace(',', ''))
+            except ValueError:
+                pass
+        return None
+
     # Markers that signal the END of the item section
     _SECTION_END = re.compile(r'小計|合計|現計|税率|外税|内税|消費税|WAON|クレジット|お預り|お釣り')
+
+    # Pattern for inline price suffix: digit(s) + tax marker at end of line
+    # e.g. "食品ポリ袋L (バイオマス30 3除" has "3除" = inline price
+    _INLINE_PRICE_SUFFIX = re.compile(r'\d[\d,]*\s*[※X除軽]\s*$')
+
+    def _has_inline_price(s: str) -> bool:
+        """Check if a line already has a price suffix (digit + tax marker)."""
+        return bool(_INLINE_PRICE_SUFFIX.search(s.strip()))
 
     def _is_item_candidate(s: str) -> bool:
         """Line that looks like an item: has Japanese text, no ¥, not a summary."""
@@ -77,22 +96,88 @@ def rejoin_price_lines(text: str) -> str:
             return False
         if _SECTION_END.search(s):
             return False
+        # Qty/price detail lines like "(@100 × 2個)" are not items
+        if re.match(r'^\(.*[×xX].*[個コ点]\s*\)', s):
+            return False
         return True
+
+    def _needs_price(s: str) -> bool:
+        """Item candidate that does NOT already have an inline price."""
+        return _is_item_candidate(s) and not _has_inline_price(s)
 
     # --- Step 1: Find the item section boundaries ---
     # Item section starts at the first line with ¥ or a price-line pattern,
     # and ends at the first summary marker (小計, 合計, etc.)
+    def _count_trailing_priceless(end_idx: int, start_idx: int = 0) -> int:
+        """Count consecutive priceless item candidates ending at end_idx."""
+        count = 0
+        for back in range(end_idx, start_idx - 1, -1):
+            if _needs_price(lines[back].strip()):
+                count += 1
+            else:
+                break
+        return count
+
+    def _collect_prices_after(marker_idx: int, needed: int) -> list[int]:
+        """Scan past a section marker for price line indices.
+
+        Stops early if a price equals the running sum of collected prices
+        (that's the subtotal, not an item price).
+        """
+        found: list[int] = []
+        running_sum = 0.0
+        for j in range(marker_idx + 1, min(marker_idx + needed * 3 + 5, len(lines))):
+            if _is_price(lines[j].strip()):
+                val = _price_value(lines[j].strip())
+                if val is not None and len(found) >= 2 and abs(val - running_sum) < 1:
+                    break  # this price IS the subtotal of items so far
+                found.append(j)
+                running_sum += val or 0
+                if len(found) >= needed:
+                    return found
+        return found
+
     item_start = None
     item_end = len(lines)
     for i, line in enumerate(lines):
         s = line.strip()
         if item_start is None:
-            # Look for the first line that has a price or is a priced item.
             # Look for the first line that has a price or is a priced item
             if '¥' in s or '￥' in s or _is_price(s) or (
                     _is_item_candidate(s) and i + 1 < len(lines) and _is_price(lines[i + 1].strip())):
                 item_start = i
+            elif _SECTION_END.search(s):
+                # Section marker hit before any priced line — OCR may have
+                # read items in one column and prices in another.
+                # Directly join trailing priceless items with post-marker prices.
+                trailing = _count_trailing_priceless(i - 1)
+                if trailing > 0:
+                    price_indices = _collect_prices_after(i, trailing)
+                    if price_indices:
+                        n_pairs = min(trailing, len(price_indices))
+                        for k in range(n_pairs):
+                            item_idx = i - n_pairs + k
+                            price_idx = price_indices[k]
+                            lines[item_idx] += '  ' + lines[price_idx].strip()
+                            lines[price_idx] = ''
+                        # Lines modified in-place; rebuild and return since
+                        # item_start was never set (no normal section to process)
+                        return '\n'.join(l for l in lines if l)
         elif _SECTION_END.search(s):
+            # Edge case: OCR may place a section marker (小計/合計) between
+            # items and their prices when it reads a two-column layout.
+            # Directly join trailing priceless items with post-marker prices.
+            trailing = _count_trailing_priceless(i - 1, item_start)
+            if trailing > 0:
+                price_indices = _collect_prices_after(i, trailing)
+                if price_indices:
+                    n_pairs = min(trailing, len(price_indices))
+                    for k in range(n_pairs):
+                        item_idx = i - n_pairs + k
+                        price_idx = price_indices[k]
+                        lines[item_idx] += '  ' + lines[price_idx].strip()
+                        lines[price_idx] = ''
+
             item_end = i
             break
 
@@ -128,19 +213,25 @@ def rejoin_price_lines(text: str) -> str:
         else:
             break
 
-    # Block matching: find runs of priceless items followed by price lines
+    # Block matching: find runs of priceless items followed by price lines.
+    # Items that already have an inline price (e.g. "食品ポリ袋L 3除") are
+    # skipped so they don't consume prices meant for subsequent items.
     resolved = list(section)
     i = 0
     while i < len(resolved):
-        if not _is_item_candidate(resolved[i].strip()):
+        if not _needs_price(resolved[i].strip()):
             i += 1
             continue
 
-        # Count consecutive item-candidate lines
+        # Count consecutive priceless item-candidate lines
         istart = i
-        while i < len(resolved) and _is_item_candidate(resolved[i].strip()):
+        while i < len(resolved) and _needs_price(resolved[i].strip()):
             i += 1
         iend = i
+
+        # Skip over items that already have inline prices (they don't need pairing)
+        while i < len(resolved) and _is_item_candidate(resolved[i].strip()) and _has_inline_price(resolved[i].strip()):
+            i += 1
 
         # Count consecutive price lines immediately after
         pstart = i

@@ -7,8 +7,6 @@ plus confidence threshold constants and routing functions.
 import re
 
 
-# ── Document Type Detection ────────────────────────────────────────
-
 UTILITY_BILL_KEYWORDS = re.compile(
     r'検針|使用量|m3|kWh|ガス料金|水道料金|電気料金|'
     r'ご請求額|引落予定|メーター|基本料金|下水道使用料'
@@ -22,16 +20,12 @@ PAYMENT_SLIP_KEYWORDS = re.compile(
 RECEIPT_KEYWORDS = re.compile(r'小計|合計|レジ')
 
 
-# ── Yen Extraction ─────────────────────────────────────────────────
-
 # Match ¥ or ￥ prefix, or 円 suffix amounts
 YEN_INLINE = re.compile(r'[¥￥]\s*([\d,]+)|(?<!\d)([\d,]+)\s*円')
 
 # Suffix chars allowed after ¥ amounts: closing parens + JP tax rate markers
 YEN_SUFFIX = r'[)）軽※X除]'
 
-
-# ── Location ───────────────────────────────────────────────────────
 
 ADMIN_SUFFIX_RE = re.compile(r'[市区町村]')
 
@@ -40,10 +34,10 @@ LOCATION_CLUE_RE = re.compile(
     r'|[\w\u3000-\u9fff]+モール'       # Xモール (mall)
     r'|[都道府県市区町村郡]'             # Address text with admin units
     r'|〒\d{3}'                        # Postal code
-)
+    r'|(?:TEL|電話|☎)\s*[:\s]?\s*0\d'  # Labeled phone number
+    r'|^0\d{1,4}-\d{1,4}-\d{2,4}$'    # Bare phone number on its own line
+, re.MULTILINE)
 
-
-# ── Japanese Era Constants ─────────────────────────────────────────
 
 # Era name → base year (era year 1 = base + 1)
 ERA_TABLE = {
@@ -83,8 +77,6 @@ def era_to_western_year(era_year: int, era_name: str | None = None) -> int | Non
         return heisei_year  # Plausible 平成 date (within last ~30 years)
     return reiwa_year  # Fall back to 令和
 
-
-# ── Confidence Router ──────────────────────────────────────────────
 
 HIGH_OCR_CONFIDENCE = 0.85
 HIGH_LLM_CONFIDENCE = 0.7

@@ -5,6 +5,7 @@ Returns blocks in the format:
 """
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -13,7 +14,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# ── OCR result dataclass ──────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class OCRResult:
@@ -26,7 +28,6 @@ class OCRResult:
     chosen_text: str = ""
 
 
-# ── API call tracking ─────────────────────────────────────────────────
 # Delegates to the unified usage tracker in usage.py.
 
 from .usage import (
@@ -56,8 +57,6 @@ def get_api_usage() -> dict:
     }
 
 
-# ── Ollama GPU status ─────────────────────────────────────────────────
-
 def get_ollama_gpu_status() -> dict | None:
     """Query Ollama for current model GPU/VRAM status.
 
@@ -85,11 +84,9 @@ def get_ollama_gpu_status() -> dict | None:
             "gpu_percent": round(gpu_pct, 1),
             "full_gpu": size_vram == size and size > 0,
         }
-    except Exception:
+    except (OSError, ValueError) as e:
+        logger.debug("Ollama GPU status unavailable: %s", e)
         return None
-
-
-# ── Google Cloud Vision backend ───────────────────────────────────────
 
 def init_cloud_vision():
     """Initialize Google Cloud Vision client. Returns the client for reuse.
@@ -176,7 +173,7 @@ def _extract_blocks_from_response(response) -> list[dict]:
                 )
                 confidence = paragraph.confidence
 
-                if confidence < 0.5 or not text.strip():
+                if confidence < 0.5 or not text.strip():  # drop very low-confidence noise
                     continue
 
                 vertices = paragraph.bounding_box.vertices
@@ -235,7 +232,7 @@ def _fulltext_to_blocks(fulltext: str) -> list[dict]:
     } for i, line in enumerate(lines)]
 
 
-_OCR_CONFIDENCE_RETRY_THRESHOLD = 0.75
+_OCR_CONFIDENCE_RETRY_THRESHOLD = 0.75  # below this, make a second API call for better text
 
 
 def _pick_better_fulltext(ft1: str, ft2: str) -> str:
@@ -323,8 +320,6 @@ def run_cloud_vision(image: np.ndarray, client=None, *, skip_cache: bool = False
     )
 
 
-# ── Shared text grouping ──────────────────────────────────────────────
-
 def blocks_to_structured_text(blocks: list[dict]) -> str:
     """Convert spatial blocks to line-grouped text for the LLM.
     y_tolerance is calculated dynamically from the median bounding box height.
@@ -341,7 +336,7 @@ def blocks_to_structured_text(blocks: list[dict]) -> str:
 
     if heights:
         median_height = sorted(heights)[len(heights) // 2]
-        y_tolerance = max(10, int(median_height * 0.4))
+        y_tolerance = max(10, int(median_height * 0.4))  # 40% of char height groups same-line blocks
     else:
         y_tolerance = 15
 

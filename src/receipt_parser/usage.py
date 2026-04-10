@@ -11,11 +11,14 @@ Thread-safe for concurrent pipeline use (process_batch).
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import warnings
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Data directory: .data/ at project root (sibling of src/)
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent / ".data"
@@ -26,7 +29,6 @@ _HISTORY_FILE = _DATA_DIR / "api_usage_history.json"
 _SETTINGS_FILE = _DATA_DIR / "api_usage_settings.json"
 _lock = threading.Lock()
 
-# ── Pricing constants ────────────────────────────────────────────────
 
 # Google Cloud Vision: 1000 free calls/month, then $1.50/1000
 CLOUD_VISION_FREE_TIER = 1000
@@ -37,8 +39,6 @@ DEEPSEEK_CACHE_HIT_COST_PER_M = 0.028  # USD per 1M cached input tokens
 DEEPSEEK_CACHE_MISS_COST_PER_M = 0.28  # USD per 1M non-cached input tokens
 DEEPSEEK_OUTPUT_COST_PER_M = 0.42      # USD per 1M output tokens
 
-
-# ── Settings (billing period config) ─────────────────────────────────
 
 def _load_settings() -> dict:
     """Load user settings (billing start day, etc.)."""
@@ -65,8 +65,6 @@ def set_billing_start_day(day: int):
     settings["billing_start_day"] = day
     _save_settings(settings)
 
-
-# ── Billing period helpers ───────────────────────────────────────────
 
 def get_billing_period(ref_date: date | None = None) -> tuple[date, date]:
     """Return (start, end) of the current billing period.
@@ -108,8 +106,6 @@ def _billing_period_month_key() -> str:
     start, _ = get_billing_period()
     return start.strftime("%Y-%m")
 
-
-# ── Data model ───────────────────────────────────────────────────────
 
 def _empty_month(month: str) -> dict:
     """Return a fresh usage record for a given month."""
@@ -165,8 +161,6 @@ def _compute_costs(data: dict) -> dict:
         "total_cost": round(cv_cost + ds_cost, 4),
     }
 
-
-# ── Persistence ──────────────────────────────────────────────────────
 
 def _load() -> dict:
     """Load usage data, archiving and resetting if the billing period has rolled over."""
@@ -238,8 +232,6 @@ def _save_history(history: list[dict]):
     _HISTORY_FILE.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
 
-# ── Cloud Vision auto-fetch from GCP Monitoring API ──────────────────
-
 def fetch_cloud_vision_usage() -> tuple[int | None, str | None]:
     """Fetch Cloud Vision API call count from GCP Monitoring API.
 
@@ -300,7 +292,8 @@ def fetch_cloud_vision_usage() -> tuple[int | None, str | None]:
         return total, None
 
     except Exception as e:
-        return None, str(e)
+        logger.warning("Cloud Vision usage fetch failed: %s", e)
+        return None, "Cloud Vision usage fetch failed (check logs for details)"
 
 
 def refresh_cloud_vision():
@@ -316,8 +309,6 @@ def refresh_cloud_vision():
             _save(data)
     return count, error
 
-
-# ── Tracking functions (called by ocr.py, llm.py, pipeline.py) ──────
 
 def track_cloud_vision_call():
     """Record one Cloud Vision API call (local counter, supplemented by auto-fetch)."""
@@ -373,8 +364,6 @@ def track_document(file_path: str | Path):
         _save(data)
 
 
-# ── Sync function (set counters from dashboard values) ───────────────
-
 def sync_usage(
     cv_calls: int | None = None,
     ds_cache_hit: int | None = None,
@@ -397,8 +386,6 @@ def sync_usage(
             data["deepseek"]["output_tokens"] = ds_output
         _save(data)
 
-
-# ── Query functions (called by CLI and benchmark) ────────────────────
 
 def get_usage(auto_fetch_cv: bool = False) -> dict:
     """Return full usage stats with cost estimates.

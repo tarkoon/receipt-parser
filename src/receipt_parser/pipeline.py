@@ -5,6 +5,7 @@ Supports batch processing with concurrent API calls via process_batch().
 """
 
 import json
+import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,6 +13,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from .schema import Receipt
 from .preprocess import load_image, try_extract_text_layer
@@ -35,8 +38,6 @@ from .pipeline_slip import postprocess_payment_slip
 _PIPELINE_VERSION = "3.0.0"
 
 
-# ── Document Type Detection ──────────────────────────────────────────
-
 def detect_document_type(text: str) -> str:
     """Classify document type from OCR text using keyword matching."""
     utility_score = len(UTILITY_BILL_KEYWORDS.findall(text))
@@ -49,8 +50,6 @@ def detect_document_type(text: str) -> str:
         return "payment_slip"
     return "receipt"
 
-
-# ── Merchant Mapping ─────────────────────────────────────────────────
 
 _USER_RULES_PATH = Path(__file__).parent / "user_rules.json"
 
@@ -76,9 +75,6 @@ def _apply_user_rules(result: dict) -> dict:
             break
 
     return result
-
-
-# ── Location Resolver ───────────────────────────────────────────────
 
 
 def _location_needs_resolution(location: str | None, ocr_text: str = "") -> bool:
@@ -126,21 +122,91 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
     raw_location = extracted.get("location") or ""
 
     phone_match = re.search(r'(?:TEL|電話|☎)\s*[:\s]?\s*(0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{2,4})', ocr_text)
+    if not phone_match:
+        # Bare phone number on its own line
+        phone_match = re.search(r'^(0\d{1,4}-\d{1,4}-\d{2,4})\s*$', ocr_text, re.MULTILINE)
     phone_hint = phone_match.group(1) if phone_match else ""
+
+    # Extract branch/store name (e.g., "赤間店" → "赤間", "八幡店" → "八幡")
+    branch_match = re.search(r'([\u3000-\u9fff]{2,})\s*店', ocr_text)
+    branch_hint = branch_match.group(1) if branch_match else ""
+
+    # Also extract short standalone Japanese text from the first few lines
+    # (often branch/location names like "赤間" above the brand name)
+    header_lines = []
+    for line in ocr_text.split('\n')[:6]:
+        s = line.strip()
+        if s and 2 <= len(s) <= 8 and re.match(r'^[\u3000-\u9fff]+$', s):
+            header_lines.append(s)
+    header_hint = ", ".join(header_lines) if header_lines else ""
+
+    # Phone area code → region hint
+    _AREA_CODES = {
+        "0940": ("宗像市", "宗像市/福津市 area (Fukuoka pref.)"),
+        "093": ("北九州市", "北九州市 area (Fukuoka pref.)"),
+        "092": ("福岡市", "福岡市 area (Fukuoka pref.)"),
+        "0942": ("久留米市", "久留米市 area (Fukuoka pref.)"),
+        "0948": ("飯塚市", "飯塚市 area (Fukuoka pref.)"),
+    }
+    area_hint = ""
+    area_city = ""
+    if phone_hint:
+        area_code = re.match(r'(0\d{1,4})', phone_hint.replace('-', '').replace(' ', ''))
+        if area_code:
+            code = area_code.group(1)
+            for prefix, (city, desc) in _AREA_CODES.items():
+                if code.startswith(prefix):
+                    area_hint = f"Phone area code {prefix} = {desc}"
+                    area_city = city
+                    break
 
     addr_lines = []
     for line in ocr_text.split('\n'):
         if re.search(r'[都道府県市区町村郡]|〒\d{3}', line):
             addr_lines.append(line.strip())
 
+    clues = [f"- Merchant/brand: {merchant}"]
+    if branch_hint:
+        clues.append(f"- Branch/store name: {branch_hint}店 (the branch name often indicates the neighborhood)")
+    if header_hint and header_hint != branch_hint:
+        clues.append(f"- Receipt header text: {header_hint} (may contain location or branch name)")
+    clues.append(f"- Current location value: {raw_location or 'unknown'}")
+    clues.append(f"- Phone number: {phone_hint or 'not found'}")
+    if area_hint:
+        clues.append(f"- {area_hint}")
+    clues.append(f"- Address fragments from receipt: {'; '.join(addr_lines) if addr_lines else 'none found'}")
+
+    # Deterministic resolution: if area code gives us a city and we have a
+    # neighborhood name (from branch or header), combine them directly.
+    neighborhood = ""
+    if branch_hint:
+        # Strip common prefixes from branch name to get neighborhood
+        # e.g., "ビバモール赤間" → take last 2-3 chars as neighborhood
+        for suffix_len in (3, 2):
+            candidate = branch_hint[-suffix_len:]
+            if re.match(r'^[\u3000-\u9fff]+$', candidate):
+                neighborhood = candidate
+                break
+        if not neighborhood:
+            neighborhood = branch_hint
+    elif header_lines:
+        # Use the first short header line as neighborhood
+        for h in header_lines:
+            if 2 <= len(h) <= 4 and re.match(r'^[\u3000-\u9fff]+$', h):
+                neighborhood = h
+                break
+
+    if area_city and neighborhood:
+        candidate = f"{area_city}{neighborhood}"
+        if ADMIN_SUFFIX_RE.search(candidate):
+            return candidate, None
+
     prompt = f"""Given these clues from a Japanese receipt, determine the city (市) or ward (区) where this store is located.
 Output ONLY a JSON object with a single "location" field. The location should be at the 市区町村 level, e.g. "宗像市赤間", "福岡市博多区", "北九州市八幡区".
+The branch name (e.g. 赤間店 → 赤間 is a neighborhood in 宗像市) is the strongest clue for location.
 
 Clues:
-- Merchant/brand: {merchant}
-- Current location value: {raw_location or 'unknown'}
-- Phone number: {phone_hint or 'not found'}
-- Address fragments from receipt: {'; '.join(addr_lines) if addr_lines else 'none found'}
+{chr(10).join(clues)}
 
 Respond with a JSON object: {{"location": "..."}} or {{"location": null}} if you cannot determine it."""
 
@@ -155,12 +221,11 @@ Respond with a JSON object: {{"location": "..."}} or {{"location": null}} if you
         resolved = data.get("location")
         if resolved and ADMIN_SUFFIX_RE.search(resolved):
             return resolved, None
-    except Exception:
+    except Exception as e:
+        logger.warning("Location resolution failed: %s", e)
         return None, "Location resolution failed: LLM call error"
     return None, "Location resolution: could not determine city/ward from available clues"
 
-
-# ── Confidence ──────────────────────────────────────────────────────
 
 def _compute_posthoc_confidence(extracted: dict, warnings: list[str]) -> dict:
     """Compute per-field confidence from validation results (post-hoc).
@@ -169,28 +234,33 @@ def _compute_posthoc_confidence(extracted: dict, warnings: list[str]) -> dict:
     positives from field names appearing in unrelated warning context
     (e.g., "Line 1: total is X" should affect line_items, not total).
     """
-    # Map warning keywords to the field they actually pertain to
-    _WARNING_FIELD_MAP = {
-        "Line ": "line_items",
-        "Sum of line items": "line_items",
-        "discount_rate": "line_items",
-        "Total (": "total",
-        "Total does not match": "total",
-        "subtotal (": "subtotal",
-        "Tax ratio": "subtotal",
-        "tax rate": "taxes",
-        "Unusual tax rate": "taxes",
-        "amount_paid": "points_used",
-        "usage.": "usage",
-        "billing_period": "billing_period",
-        "merchant": "merchant",
-    }
+    # Map warning prefixes/keywords to the field they pertain to.
+    # Checked in order; first match wins per warning to avoid double-assignment.
+    _WARNING_FIELD_RULES: list[tuple[str, str, bool]] = [
+        # (pattern, field, prefix_only)
+        ("Line ", "line_items", True),
+        ("Sum of line items", "line_items", True),
+        ("Items sum", "line_items", True),
+        ("discount_rate", "line_items", False),
+        ("Total (", "total", True),
+        ("Total does not match", "total", True),
+        ("subtotal (", "subtotal", False),
+        ("Tax ratio", "taxes", True),
+        ("tax rate", "taxes", False),
+        ("Unusual tax rate", "taxes", True),
+        ("amount_paid", "points_used", False),
+        ("usage.", "usage", False),
+        ("billing_period", "billing_period", False),
+        ("merchant", "merchant", False),
+    ]
 
     affected_fields: set[str] = set()
     for w in warnings:
-        for keyword, field in _WARNING_FIELD_MAP.items():
-            if keyword in w:
+        for pattern, field, prefix_only in _WARNING_FIELD_RULES:
+            matched = w.startswith(pattern) if prefix_only else (pattern in w)
+            if matched:
                 affected_fields.add(field)
+                break
 
     conf = {}
     for field in ("merchant", "date", "total", "subtotal", "taxes",
@@ -205,8 +275,6 @@ def _compute_posthoc_confidence(extracted: dict, warnings: list[str]) -> dict:
 
     return conf
 
-
-# ── Result Builder ───────────────────────────────────────────────────
 
 def _build_result(receipt, final_warnings, pass_history, model, debug=False, trace=None,
                    ocr_confidence=None, llm_confidence=None,
@@ -237,8 +305,6 @@ def _build_result(receipt, final_warnings, pass_history, model, debug=False, tra
         result["_trace"] = trace.summary()
     return result
 
-
-# ── Main Pipeline ────────────────────────────────────────────────────
 
 def process_document(
     file_path: Path,
@@ -430,8 +496,6 @@ def process_document(
     return result
 
 
-# ── Shared Extraction Pipeline ───────────────────────────────────────
-
 def _run_extraction_pipeline(
     unified_text: str,
     raw_text: str,
@@ -477,7 +541,7 @@ def _run_extraction_pipeline(
                 except (TypeError, ValueError):
                     extracted[fkey] = None
 
-    # ── Document-type-specific post-processing ──
+    # Document-type-specific post-processing
     llm_conf = extracted.get("_confidence")
     if doc_type == "receipt" and "error" not in extracted:
         extracted = postprocess_receipt(extracted, unified_text, ocr_conf, ocr_totals, llm_conf, model)
@@ -486,12 +550,12 @@ def _run_extraction_pipeline(
     elif doc_type == "payment_slip" and "error" not in extracted:
         extracted = postprocess_payment_slip(extracted, unified_text, raw_text=raw_text)
 
-    # ── Universal cash detection (all document types) ──
+    # Universal cash detection (all document types)
     if "error" not in extracted and not extracted.get("payment_method"):
         if re.search(r'領収証|領収書', unified_text) and not re.search(r'小計|合計|対象|税率', unified_text):
             extracted["payment_method"] = "cash"
 
-    # ── Final cash fallback ──
+    # Final cash fallback
     _ELECTRONIC_PAY_RE = re.compile(
         r'クレジット|カード|PayPay|電子マネー|iD|QUICPay|Suica|WAON|nanaco|'
         r'PASMO|楽天Edy|LINE\s*Pay|au\s*PAY|d払い|メルペイ|交通系'
@@ -503,11 +567,11 @@ def _run_extraction_pipeline(
         if has_tender_label and has_change_label_final and not has_electronic:
             extracted["payment_method"] = "cash"
 
-    # ── Location: clear for utility bills and payment slips ──
+    # Location: clear for utility bills and payment slips
     if "error" not in extracted and doc_type in ("utility_bill", "payment_slip"):
         extracted["location"] = None
 
-    # ── Common post-processing ──
+    # Common post-processing
     if "error" not in extracted:
         total = extracted.get("total")
         points = extracted.get("points_used")
@@ -517,7 +581,7 @@ def _run_extraction_pipeline(
     # Strip _confidence if present
     extracted.pop("_confidence", None)
 
-    # ── Location resolution (confidence-gated, receipts only) ──
+    # Location resolution (confidence-gated, receipts only)
     location_warnings: list[str] = []
     if "error" not in extracted and doc_type == "receipt" and _location_needs_resolution(extracted.get("location"), unified_text):
         # Check OCR evidence first — skip expensive LLM call if no evidence
@@ -532,7 +596,7 @@ def _run_extraction_pipeline(
             elif loc_warning:
                 location_warnings.append(loc_warning)
 
-    # ── Location validation: clear if no OCR evidence supports it ──
+    # Location validation: clear if no OCR evidence supports it
     if "error" not in extracted and doc_type == "receipt" and extracted.get("location"):
         if not _location_has_ocr_evidence(extracted["location"], unified_text):
             extracted["location"] = None
@@ -550,8 +614,6 @@ def _run_extraction_pipeline(
 
     return extracted, pass_history, final_warnings
 
-
-# ── OCR Text Entry Point ──────────────────────────────────────────────
 
 def process_ocr_text(
     ocr_text: str,
@@ -602,8 +664,6 @@ def process_ocr_text(
         result = _apply_user_rules(result)
     return result
 
-
-# ── Batch Processing ────────────────────────────────────────────────
 
 def process_batch(
     file_paths: list[Path],

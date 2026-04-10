@@ -2,22 +2,22 @@
 name = "receipt-parser"
 version = "3.0.0"
 description = "Extract structured data from receipts and invoices"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    "google-cloud-vision",
+    "google-cloud-vision>=3.7",
     "google-auth>=2.0",
     "requests>=2.28",
-    "opencv-python-headless",
-    "pdf2image",
-    "pdfplumber",
+    "opencv-python-headless>=4.8",
+    "pdf2image>=1.16",
+    "pdfplumber>=0.10",
     "pydantic>=2.0,<3.0",
     "typer[all]",
     "ollama>=0.4.0",
     "openai>=1.0",
     "instructor>=1.0",
     "Pillow>=9.0",
-    "numpy",
-    "python-dotenv",
+    "numpy>=1.24",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]

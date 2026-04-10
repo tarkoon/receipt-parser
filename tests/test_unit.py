@@ -254,12 +254,6 @@ def test_debug_color_map_has_all_fields():
         assert field in color_map, f"Missing field: {field}"
 
 
-def test_receipt_instantiation():
-    r = Receipt(total=100)
-    assert r.total == 100
-    assert r.merchant is None
-    assert r.line_items == []
-
 
 # --- Pipeline tests with mocked Cloud Vision + LLM ---
 

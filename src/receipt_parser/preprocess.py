@@ -51,13 +51,13 @@ def preprocess_receipt(image: np.ndarray) -> np.ndarray:
 
     # Resolution upscaling for low-res images (phone photos, thumbnails)
     h, w = gray.shape[:2]
-    if min(h, w) < 1500:
+    if min(h, w) < 1500:  # Cloud Vision needs ~1500px min for reliable Japanese OCR
         scale = 1500 / min(h, w)
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
     # Adaptive background normalization for low-contrast images
     quality = compute_image_quality(gray)
-    if quality["contrast"] < 40:
+    if quality["contrast"] < 40:  # low-contrast threshold (0-255 range)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 30))
         bg = cv2.morphologyEx(gray, cv2.MORPH_DILATE, kernel)
         gray = cv2.divide(gray, bg, scale=255)
