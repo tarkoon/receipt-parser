@@ -360,3 +360,63 @@ def test_api_usage_tracking():
         _HISTORY_FILE.unlink()
     if _SETTINGS_FILE.exists():
         _SETTINGS_FILE.unlink()
+
+
+# --- Stage callback tests ---
+
+def test_stage_callback_fires_in_order():
+    """on_stage callback should fire with monotonically increasing progress."""
+    from receipt_parser.pipeline import process_ocr_text
+
+    calls = []
+
+    def on_stage(stage, detail, progress):
+        calls.append((stage, detail, progress))
+
+    # Use a minimal OCR text that will produce a result
+    ocr_text = "マクドナルド\n2025-01-15\n合計 ¥500\nビッグマック ¥500"
+
+    with patch("receipt_parser.pipeline.extract_with_verification") as mock_extract:
+        mock_extract.return_value = (
+            {"merchant": "マクドナルド", "date": "2025-01-15", "total": 500,
+             "line_items": [{"description": "ビッグマック", "total": 500}],
+             "currency": "JPY", "_confidence": {"overall": "high"}},
+            [{"pass": 1, "extraction": {}, "warnings": []}],
+        )
+        process_ocr_text(ocr_text, on_stage=on_stage)
+
+    # Should have received calls
+    assert len(calls) >= 3, f"Expected at least 3 stage calls, got {len(calls)}"
+
+    # All values should be correct types
+    for stage, detail, progress in calls:
+        assert isinstance(stage, str)
+        assert isinstance(detail, str)
+        assert isinstance(progress, float) or isinstance(progress, int)
+
+    # Progress should be monotonically non-decreasing
+    progress_values = [c[2] for c in calls]
+    for i in range(1, len(progress_values)):
+        assert progress_values[i] >= progress_values[i - 1], \
+            f"Progress not monotonic: {progress_values}"
+
+    # Should end with "done" at 1.0
+    assert calls[-1][0] == "done"
+    assert calls[-1][2] == 1.0
+
+
+def test_stage_callback_none_default():
+    """on_stage=None (default) should not break anything."""
+    from receipt_parser.pipeline import process_ocr_text
+
+    ocr_text = "マクドナルド\n2025-01-15\n合計 ¥500"
+
+    with patch("receipt_parser.pipeline.extract_with_verification") as mock_extract:
+        mock_extract.return_value = (
+            {"merchant": "マクドナルド", "date": "2025-01-15", "total": 500,
+             "currency": "JPY", "_confidence": {"overall": "high"}},
+            [{"pass": 1, "extraction": {}, "warnings": []}],
+        )
+        # Should not raise — on_stage defaults to None
+        result = process_ocr_text(ocr_text)
+        assert "merchant" in result

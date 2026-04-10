@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", encoding="utf-8")
 
 import typer
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 
 from .pipeline import process_document, process_batch
 from .llm import DEFAULT_MODEL
@@ -109,43 +110,59 @@ def parse(
     # Use batch processing for multiple files with workers > 1
     if is_batch and workers > 1:
         effective_workers = min(workers, len(files))
+
         if verbose:
             typer.echo(f"Batch processing {len(files)} files with {effective_workers} workers", err=True)
+            batch_start = time.perf_counter()
 
-        batch_start = time.perf_counter()
-
-        def _on_progress(file_path, result, completed, total):
-            if verbose:
+            def _on_progress(file_path, result, completed, total):
                 status = "OK" if "_error" not in result else f"ERROR: {result['_error']}"
                 typer.echo(f"  [{completed}/{total}] {file_path.name}: {status}", err=True)
 
-        results = process_batch(
-            files, model=model, debug=debug, passes=passes,
-            ocr_engine=engine, max_workers=effective_workers,
-            on_progress=_on_progress if verbose else None,
-        )
+            results = process_batch(
+                files, model=model, debug=debug, passes=passes,
+                ocr_engine=engine, max_workers=effective_workers,
+                on_progress=_on_progress,
+            )
 
-        if verbose:
             elapsed = time.perf_counter() - batch_start
             per_file = elapsed / len(files)
             typer.echo(f"  Batch complete: {elapsed:.1f}s total, "
                        f"{per_file:.1f}s/file avg ({len(files)/elapsed:.1f} files/min)",
                        err=True)
+        else:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total} files"),
+                TimeElapsedColumn(),
+                transient=True,
+            ) as progress:
+                task = progress.add_task("Processing", total=len(files))
+
+                def _on_progress_bar(file_path, result, completed, total):
+                    progress.update(task, completed=completed)
+
+                results = process_batch(
+                    files, model=model, debug=debug, passes=passes,
+                    ocr_engine=engine, max_workers=effective_workers,
+                    on_progress=_on_progress_bar,
+                )
     else:
         # Sequential processing
         results = []
-        for file in files:
-            if verbose:
+
+        if verbose:
+            for file in files:
                 typer.echo(f"Processing: {file.name}", err=True)
+                try:
+                    result = process_document(
+                        file, model=model, debug=debug,
+                        passes=passes, ocr_engine=engine,
+                    )
+                    result["_file"] = str(file)
 
-            try:
-                result = process_document(
-                    file, model=model, debug=debug,
-                    passes=passes, ocr_engine=engine,
-                )
-                result["_file"] = str(file)
-
-                if verbose:
                     warnings = result.get("_warnings", [])
                     history = result.get("_pass_history", [])
                     for entry in history:
@@ -163,12 +180,43 @@ def parse(
                         if trace:
                             typer.echo(f"\n{trace}", err=True)
 
-            except Exception as e:
-                result = {"_file": str(file), "_error": str(e)}
-                if verbose:
+                except Exception as e:
+                    result = {"_file": str(file), "_error": str(e)}
                     typer.echo(f"  Error: {e}", err=True)
 
-            results.append(result)
+                results.append(result)
+        else:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                transient=True,
+            ) as progress:
+                if is_batch:
+                    overall = progress.add_task("Files", total=len(files))
+                file_task = progress.add_task("Starting", total=100)
+
+                for i, file in enumerate(files):
+                    def _on_stage(stage, detail, pct, _task=file_task):
+                        progress.update(_task, completed=int(pct * 100), description=detail)
+
+                    try:
+                        result = process_document(
+                            file, model=model, debug=debug,
+                            passes=passes, ocr_engine=engine,
+                            on_stage=_on_stage,
+                        )
+                        result["_file"] = str(file)
+                    except Exception as e:
+                        result = {"_file": str(file), "_error": str(e)}
+
+                    results.append(result)
+
+                    if is_batch:
+                        progress.update(overall, completed=i + 1)
+                        progress.update(file_task, completed=0, description="Starting")
 
     final_output = results if is_batch else results[0]
 

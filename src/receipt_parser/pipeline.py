@@ -35,6 +35,17 @@ from .pipeline_receipt import (
 from .pipeline_bill import postprocess_utility_bill
 from .pipeline_slip import postprocess_payment_slip
 
+from typing import Callable
+
+StageCallback = Callable[[str, str, float], None] | None
+
+
+def _notify(on_stage: StageCallback, stage: str, detail: str, progress: float) -> None:
+    """Fire a progress callback if one is registered."""
+    if on_stage is not None:
+        on_stage(stage, detail, progress)
+
+
 _PIPELINE_VERSION = "3.0.0"
 
 
@@ -319,6 +330,7 @@ def process_document(
     """Main pipeline. Uses Cloud Vision OCR + LLM extraction (OpenRouter or Ollama)."""
     file_path = Path(file_path)
     check_model_available(model)
+    on_stage: StageCallback = kwargs.get("on_stage")
 
     # Track document processing
     from .usage import track_document
@@ -332,11 +344,13 @@ def process_document(
         trace.debug_dir = debug_dir
 
     # Step 1: Load
+    _notify(on_stage, "load", "Loading image", 0.0)
     images = load_image(file_path)
     trace.log_step("original", image=images[0])
 
     # Digital PDF fast path
     if file_path.suffix.lower() == ".pdf":
+        _notify(on_stage, "ocr", "Checking for digital text", 0.05)
         digital_text = try_extract_text_layer(str(file_path))
         if digital_text:
             digital_text = normalize_fullwidth(digital_text)
@@ -348,6 +362,7 @@ def process_document(
                 (debug_dir / "03_ocr_bboxes.txt").write_text(
                     "SKIPPED: Digital PDF fast path — no OCR performed.")
 
+            _notify(on_stage, "extract", "LLM extraction (digital PDF)", 0.40)
             extracted, pass_history = extract_with_verification(
                 digital_text, model=model, passes=passes,
                 validate_fn=validate_receipt, doc_type=doc_type,
@@ -387,6 +402,7 @@ def process_document(
                                    ocr_confidence=1.0, llm_confidence=llm_conf_pdf)
             if apply_user_rules:
                 result = _apply_user_rules(result)
+            _notify(on_stage, "done", "Complete", 1.0)
             return result
 
     # Step 2: Init OCR engine
@@ -394,6 +410,7 @@ def process_document(
         ocr_engine = init_cloud_vision()
 
     # Step 3: OCR per page, concatenate
+    _notify(on_stage, "ocr", "Running OCR", 0.05)
     all_ocr_results: list[OCRResult] = []
     text_parts = []
 
@@ -435,6 +452,7 @@ def process_document(
     unified_text = strip_barcode_lines(unified_text)
 
     # Compute aggregate OCR confidence
+    _notify(on_stage, "normalize", "Processing OCR text", 0.30)
     all_blocks_flat = [b for r in all_ocr_results for b in r.blocks]
     ocr_conf = compute_ocr_confidence(all_blocks_flat)
 
@@ -451,10 +469,12 @@ def process_document(
     trace.log_step("ocr_grouped", data=unified_text)
 
     # Step 4–5: LLM extraction → post-processing → validation (shared path)
+    _notify(on_stage, "extract", "LLM extraction", 0.40)
     extracted, pass_history, final_warnings = _run_extraction_pipeline(
         unified_text=unified_text, raw_text=raw_text,
         ocr_conf=ocr_conf, doc_type=doc_type,
         model=model, passes=passes,
+        on_stage=on_stage,
     )
 
     if "_error" in extracted:
@@ -493,6 +513,7 @@ def process_document(
     )
     if apply_user_rules:
         result = _apply_user_rules(result)
+    _notify(on_stage, "done", "Complete", 1.0)
     return result
 
 
@@ -503,6 +524,7 @@ def _run_extraction_pipeline(
     doc_type: str,
     model: str,
     passes: int,
+    on_stage: StageCallback = None,
 ) -> tuple[dict, list[dict], list[str]]:
     """Shared extraction logic: LLM extraction → post-processing → location → validation.
 
@@ -526,6 +548,7 @@ def _run_extraction_pipeline(
         )
 
     # LLM extraction with verification
+    _notify(on_stage, "extract", f"LLM pass 1 of {passes}", 0.45)
     extracted, pass_history = extract_with_verification(
         unified_text, model=model, passes=passes,
         validate_fn=validate_receipt, doc_type=doc_type,
@@ -542,6 +565,7 @@ def _run_extraction_pipeline(
                     extracted[fkey] = None
 
     # Document-type-specific post-processing
+    _notify(on_stage, "postprocess", "Post-processing", 0.70)
     llm_conf = extracted.get("_confidence")
     if doc_type == "receipt" and "error" not in extracted:
         extracted = postprocess_receipt(extracted, unified_text, ocr_conf, ocr_totals, llm_conf, model)
@@ -582,6 +606,7 @@ def _run_extraction_pipeline(
     extracted.pop("_confidence", None)
 
     # Location resolution (confidence-gated, receipts only)
+    _notify(on_stage, "resolve_location", "Resolving location", 0.85)
     location_warnings: list[str] = []
     if "error" not in extracted and doc_type == "receipt" and _location_needs_resolution(extracted.get("location"), unified_text):
         # Check OCR evidence first — skip expensive LLM call if no evidence
@@ -602,6 +627,7 @@ def _run_extraction_pipeline(
             extracted["location"] = None
 
     # Final validation
+    _notify(on_stage, "validate", "Validating", 0.95)
     try:
         receipt = Receipt(**extracted)
     except Exception:
@@ -620,6 +646,7 @@ def process_ocr_text(
     model: str = DEFAULT_MODEL,
     passes: int = 1,
     apply_user_rules: bool = True,
+    on_stage: StageCallback = None,
 ) -> dict:
     """Run the pipeline from OCR text onwards (skip image loading + OCR).
 
@@ -643,10 +670,12 @@ def process_ocr_text(
             "_pipeline_version": _PIPELINE_VERSION, "_line_items_reliable": False,
         }
 
+    _notify(on_stage, "extract", "LLM extraction", 0.40)
     extracted, pass_history, final_warnings = _run_extraction_pipeline(
         unified_text=unified_text, raw_text=ocr_text,
         ocr_conf=ocr_conf, doc_type=doc_type,
         model=model, passes=passes,
+        on_stage=on_stage,
     )
 
     if "_error" in extracted:
@@ -654,6 +683,7 @@ def process_ocr_text(
                           "_pipeline_version": _PIPELINE_VERSION, "_line_items_reliable": False})
         return extracted
 
+    _notify(on_stage, "done", "Complete", 1.0)
     result = _build_result(
         Receipt(**extracted) if "error" not in extracted else Receipt(),
         final_warnings, pass_history, model,
@@ -674,6 +704,7 @@ def process_batch(
     apply_user_rules: bool = True,
     max_workers: int = 4,
     on_progress=None,
+    on_stage: StageCallback = None,
 ) -> list[dict]:
     """Process multiple documents concurrently.
 
@@ -697,6 +728,7 @@ def process_batch(
                 file_path, model=model, debug=debug,
                 passes=passes, ocr_engine=ocr_engine,
                 apply_user_rules=apply_user_rules,
+                on_stage=on_stage,
             )
             result["_file"] = str(file_path)
         except Exception as e:
