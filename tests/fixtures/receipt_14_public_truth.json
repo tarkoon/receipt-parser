@@ -2,6 +2,7 @@
   "document_type": "payment_slip",
   "merchant": "スマートビリングサービス株式会社",
   "date": null,
+  "time": null,
   "location": null,
   "currency": "JPY",
   "total": 6270,

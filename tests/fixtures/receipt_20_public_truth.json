@@ -2,6 +2,7 @@
   "document_type": "utility_bill",
   "merchant": null,
   "date": "2026-03-05",
+  "time": null,
   "location": null,
   "currency": "JPY",
   "total": 13120,

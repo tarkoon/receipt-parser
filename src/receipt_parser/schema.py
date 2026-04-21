@@ -49,6 +49,13 @@ FIELD_REGISTRY: list[FieldMeta] = [
         extraction_aliases=["日付", "日時", "date", "支払期限"],
     ),
     FieldMeta(
+        name="time",
+        debug_color_bgr=(0, 220, 60),
+        prompt_hint="Transaction time of day, 24-hour H:MM (no leading zero on hour, two-digit minute). Look immediately after the date — receipts usually print it as '2026年3月15日 (水) 17:05', '2026/3/15 17:05', or '13時30分'. Drop seconds (17:05:42 → 17:05). Convert 13時30分 → 13:30. Convert 09:32 → 9:32 (strip leading zero on the hour). Output null if no time appears, or if the only time-looking text is a business-hours range (営業時間 9:00~21:00) or a phone number. Do NOT use the time portion of a printer/issued timestamp on utility bills or payment slips unless it clearly marks the transaction.",
+        extraction_aliases=["時刻", "time"],
+        doc_types=["receipt"],
+    ),
+    FieldMeta(
         name="location",
         debug_color_bgr=(200, 200, 0),
         prompt_hint="City/ward level location. Use branch name to infer location (e.g. '赤間店' → 赤間 is in 宗像市, so output '宗像市赤間'; '八幡店' → 八幡 is in 北九州市, so output '北九州市八幡区'). Also use explicit address lines or shopping complex names. Output format: '宗像市赤間', '福岡市博多区', '北九州市八幡区'. Always include at least 市 or 区. Extract city/ward only, not full street address. Phone numbers alone are NOT sufficient — only use as supplementary hint. Output null if no location clues exist.",
@@ -175,6 +182,38 @@ EXEMPT_RATE = "0%"
 TaxCategoryType = Literal["8%", "10%", "0%"]
 
 
+_TIME_RE_COLON = re.compile(r'^\s*(\d{1,2})\s*[:：]\s*(\d{1,2})(?:\s*[:：]\s*\d{1,2})?\s*$')
+_TIME_RE_JP = re.compile(r'^\s*(\d{1,2})\s*時\s*(\d{1,2})\s*分?\s*$')
+_TIME_RE_AMPM = re.compile(r'^\s*(午前|午後|AM|PM|am|pm)\s*(\d{1,2})\s*[:：時]\s*(\d{1,2})')
+
+
+def _normalize_time(v) -> str | None:
+    """Normalize a time string to 24-hour HH:MM. Return None if unparseable."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s or s.lower() in ("null", "none"):
+        return None
+
+    ampm = _TIME_RE_AMPM.match(s)
+    if ampm:
+        marker, hh, mm = ampm.group(1), int(ampm.group(2)), int(ampm.group(3))
+        if marker in ("午後", "PM", "pm") and hh < 12:
+            hh += 12
+        elif marker in ("午前", "AM", "am") and hh == 12:
+            hh = 0
+    else:
+        m = _TIME_RE_COLON.match(s) or _TIME_RE_JP.match(s)
+        if not m:
+            return None
+        hh, mm = int(m.group(1)), int(m.group(2))
+
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    # Hour: no leading zero ('9:32', not '09:32'). Minute: always two digits.
+    return f"{hh}:{mm:02d}"
+
+
 def _coerce_numeric(v) -> float | None:
     """Coerce a value to float, handling strings with commas."""
     if v is None:
@@ -282,6 +321,7 @@ class Document(BaseModel):
     document_type: Literal["receipt", "utility_bill", "payment_slip"] = "receipt"
     merchant: Optional[str] = None
     date: Optional[str] = None
+    time: Optional[str] = None
     location: Optional[str] = None
     currency: Optional[str] = None
     total: Optional[float] = None
@@ -319,7 +359,7 @@ class Document(BaseModel):
         except (TypeError, ValueError):
             return None
 
-    @field_validator("merchant", "date", "location", "currency", "payment_method",
+    @field_validator("merchant", "date", "time", "location", "currency", "payment_method",
                      "account_number", "payer", "payment_reference",
                      "service_type", "raw_text_summary", mode="before")
     @classmethod
@@ -353,6 +393,14 @@ class Document(BaseModel):
                     continue
                 if "total" not in item or item["total"] is None:
                     continue
+                # Drop negative-total items: usually a discount line the LLM
+                # mis-extracted as a standalone item. Keeping it would trigger
+                # LineItem.total_must_be_positive and reject the whole receipt.
+                try:
+                    if float(str(item["total"]).replace(',', '')) < 0:
+                        continue
+                except (TypeError, ValueError):
+                    pass
                 fixed.append(item)
             data["line_items"] = fixed
 
@@ -364,6 +412,13 @@ class Document(BaseModel):
             data["taxes"] = [taxes]
         elif taxes is None:
             data["taxes"] = []
+
+        # Normalize time to 24-hour HH:MM (drop seconds, parse 13時30分)
+        time_val = data.get("time")
+        if time_val is not None and time_val != "":
+            time_str = str(time_val).strip()
+            normalized = _normalize_time(time_str)
+            data["time"] = normalized  # may be None if unparseable
 
         # Fix Japanese era dates in LLM output
         date_val = data.get("date")

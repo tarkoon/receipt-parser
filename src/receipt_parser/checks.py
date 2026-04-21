@@ -62,6 +62,16 @@ def check_date(result: dict, truth: dict) -> dict:
             "detail": f"got {got}, expected {exp}"}
 
 
+def check_time(result: dict, truth: dict) -> dict:
+    exp = truth.get("time")
+    if exp is None:
+        return {"pass": True, "detail": "no time in truth, skipped"}
+    got = result.get("time")
+    ok = got == exp
+    return {"pass": ok, "expected": exp, "got": got,
+            "detail": f"got {got}, expected {exp}"}
+
+
 def check_currency(result: dict, truth: dict) -> dict:
     got, exp = result.get("currency"), truth.get("currency")
     ok = got == exp
@@ -122,6 +132,7 @@ def check_location(result: dict, truth: dict) -> dict:
 COMMON_CHECKS = {
     "total": check_total,
     "date": check_date,
+    "time": check_time,
     "currency": check_currency,
     "payment_method": check_payment_method,
     "document_type": check_document_type,

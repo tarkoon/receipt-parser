@@ -2,6 +2,7 @@
   "document_type": "receipt",
   "merchant": "Mister Donut",
   "date": "2026-03-05",
+  "time": "13:00",
   "location": "福津市",
   "currency": "JPY",
   "total": 1260,
