@@ -91,6 +91,22 @@ def _apply_user_rules(result: dict) -> dict:
 def _location_needs_resolution(location: str | None, ocr_text: str = "") -> bool:
     """Check if the location needs resolution via a focused LLM call."""
     if location and ADMIN_SUFFIX_RE.search(location):
+        # Force resolution if the location comes from a corporate HQ address line
+        # AND there's a facility indicator (toll gate, branch office) suggesting
+        # the transaction occurred elsewhere
+        loc_norm = re.sub(r'\s+', '', location)
+        is_hq_address = False
+        for line in ocr_text.split('\n'):
+            line_norm = re.sub(r'\s+', '', line)
+            if (loc_norm in line_norm
+                    and re.search(r'\d+-\d+', line_norm)
+                    and re.match(r'.+[都道府県]', line_norm)):
+                is_hq_address = True
+                break
+        if is_hq_address:
+            has_facility = bool(re.search(
+                r'(?:料金所|営業所|支店|出張所)\s*\n?\s*[\u3000-\u9fff]{2,}', ocr_text))
+            return has_facility
         return False
     if location:
         return True
@@ -140,14 +156,18 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
 
     # Extract branch/store name (e.g., "赤間店" → "赤間", "八幡店" → "八幡")
     branch_match = re.search(r'([\u3000-\u9fff]{2,})\s*店', ocr_text)
+    if not branch_match:
+        # Location-type indicators: toll gate, station, branch office
+        branch_match = re.search(r'(?:料金所|営業所|支店|出張所)\s*\n?\s*([\u3000-\u9fff]{2,})', ocr_text)
     branch_hint = branch_match.group(1) if branch_match else ""
 
     # Also extract short standalone Japanese text from the first few lines
     # (often branch/location names like "赤間" above the brand name)
+    _FINANCIAL_KEYWORDS = {'合計', '小計', '税込', '税抜', '総額', '釣銭', '預金', '現計', '点数'}
     header_lines = []
-    for line in ocr_text.split('\n')[:6]:
+    for line in ocr_text.split('\n')[:8]:
         s = line.strip()
-        if s and 2 <= len(s) <= 8 and re.match(r'^[\u3000-\u9fff]+$', s):
+        if s and 2 <= len(s) <= 8 and re.match(r'^[\u3000-\u9fff]+$', s) and s not in _FINANCIAL_KEYWORDS:
             header_lines.append(s)
     header_hint = ", ".join(header_lines) if header_lines else ""
 

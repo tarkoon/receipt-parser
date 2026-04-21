@@ -24,8 +24,11 @@
   "subtotal": null,
   "taxes": [
     {
+      "_comment_rate": "String: '8%', '10%', or '0%' (non-taxable)",
       "rate": "10%",
+      "_comment_label": "Canonical labels only: '内税' (tax-inclusive), '外税' (tax-exclusive), or '非課税' (tax-exempt). Do NOT use raw receipt text like '内消費税額'.",
       "label": null,
+      "_comment_zero_amount": "Omit tax entries where amount=0. Only include rates with non-zero tax amounts. Exception: rate '0%' (non-taxable) may have amount=0.",
       "amount": 0
     }
   ],

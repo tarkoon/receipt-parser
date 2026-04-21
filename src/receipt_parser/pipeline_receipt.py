@@ -205,7 +205,7 @@ def _extract_financial_totals_impl(text: str) -> dict:
             prev_context = ' '.join(l.strip() for l in lines[max(0, i - 3):i])
             if '合' in prev_context or '税' in prev_context or '対象' in prev_context:
                 is_total_line = True
-        if is_total_line and not re.search(r'税\s*合\s*計', line) and '対象' not in line:
+        if is_total_line and not re.search(r'税\s*合\s*計', line) and '対象' not in line and 'お預' not in line:
             val_max = _extract_yen_max_nearby(lines, i, look_ahead=5)
             val_first = _extract_yen_nearby(lines, i, look_ahead=3)
             if val_max is not None:
@@ -214,8 +214,8 @@ def _extract_financial_totals_impl(text: str) -> dict:
                 result['total_first'] = val_first
 
         if '現計' in line:
-            val = _extract_yen_nearby(lines, i)
-            if val is not None and 'total' not in result:
+            val = _extract_yen_max_nearby(lines, i, look_ahead=7)
+            if val is not None and val > result.get('total', 0):
                 result['total'] = val
 
         if '現金支払' in line:
@@ -477,6 +477,16 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
             detected_rates.add(r)
 
     if not detected_rates:
+        # No explicit tax evidence — default "0%" (unknown) to standard 10%
+        # Exception: department-coded items (部門NNN) stay unknown, and
+        # receipts with non-taxable markers (非課税, etc.)
+        has_nontaxable = bool(re.search(r'非課税|不課税|免税', unified_text))
+        if not has_nontaxable:
+            for item in items:
+                if item.get("tax_category") == "0%":
+                    desc = item.get("description", "")
+                    if not re.match(r'^部門\s*\d', desc):
+                        item["tax_category"] = STANDARD_RATE
         return
     if len(detected_rates) == 1:
         rate = next(iter(detected_rates))
@@ -670,7 +680,15 @@ def _fix_date(extracted, unified_text):
             if name in unified_text:
                 era_name = name
                 break
-        w_year = era_to_western_year(int(era.group(1)), era_name)
+        era_year_val = int(era.group(1))
+        # 2-digit western year abbreviation (e.g. "26年" = 2026)
+        # Prefer this when no era name is present and 20XX is plausible
+        if not era_name and 20 <= era_year_val <= 99:
+            western_candidate = 2000 + era_year_val
+            if 2020 <= western_candidate <= 2030:
+                extracted["date"] = f"{western_candidate:04d}-{int(era.group(2)):02d}-{int(era.group(3)):02d}"
+                return
+        w_year = era_to_western_year(era_year_val, era_name)
         if w_year and 1989 <= w_year <= 2100:
             extracted["date"] = f"{w_year:04d}-{int(era.group(2)):02d}-{int(era.group(3)):02d}"
 
@@ -726,6 +744,30 @@ def _fix_line_items(extracted, unified_text):
                 "discount": 0, "discount_rate": "",
             }]
 
+    # Fallback: single-service receipt (toll, parking, single-item)
+    _AMOUNT_LABELS_RE = re.compile(
+        r'^(金額|合計|小計|税込|税抜|総額|請求額|お会計|お預り|釣銭|No\.?|様)$'
+    )
+    if not extracted.get("line_items") and extracted.get("total"):
+        total = extracted["total"]
+        for m in re.finditer(r'[¥￥]\s*([\d,]+)', unified_text):
+            price = int(m.group(1).replace(',', ''))
+            if abs(price - total) < 1:
+                pos = m.start()
+                before = unified_text[:pos].rstrip()
+                lines_before = before.split('\n')
+                desc = lines_before[-1].strip() if lines_before else ""
+                if (desc and len(desc) >= 2
+                        and not re.match(r'^[\d,¥￥\s\-]+$', desc)
+                        and not _AMOUNT_LABELS_RE.match(desc)):
+                    extracted["line_items"] = [{
+                        "description": desc,
+                        "qty": 1, "unit_price": total,
+                        "total": total, "tax_category": "10%",
+                        "discount": None, "discount_rate": None,
+                    }]
+                    break
+
     # Remove zero-total items
     if extracted.get("line_items"):
         extracted["line_items"] = [
@@ -737,12 +779,16 @@ def _fix_line_items(extracted, unified_text):
         ]
 
     # Handwritten receipt guard: remove single line item that just duplicates total
+    # Keep items with distinct descriptions (e.g. "通行料金" for toll receipts)
     is_handwritten = not any(kw in unified_text for kw in ['小計', '合計', '対象', '税率'])
     if is_handwritten and extracted.get("line_items") and extracted.get("total"):
         items = extracted["line_items"]
         if len(items) == 1 and isinstance(items[0], dict):
             if abs(items[0].get("total", 0) - extracted["total"]) < 1:
-                extracted["line_items"] = []
+                desc = (items[0].get("description") or "").strip()
+                merchant = (extracted.get("merchant") or "").strip()
+                if not desc or desc == merchant:
+                    extracted["line_items"] = []
 
     if not extracted.get("line_items"):
         return
@@ -1027,6 +1073,20 @@ def _normalize_taxes(extracted, unified_text, ocr_totals):
     tax_sum = sum(t.get("amount", 0) for t in extracted["taxes"])
     for t in extracted["taxes"]:
         t["rate"] = normalize_tax_rate(t.get("rate", "unknown"))
+        # Resolve "unknown" rate by searching OCR text for tax-context rate patterns
+        if t["rate"] == "unknown":
+            ocr_rates = set()
+            for pattern in (
+                r'外税\s*(\d+(?:\.\d+)?)\s*%',
+                r'内税\s*(\d+(?:\.\d+)?)\s*%',
+                r'(\d+(?:\.\d+)?)\s*%\s*(?:対象|消費税)',
+            ):
+                for m in re.finditer(pattern, unified_text):
+                    candidate = normalize_tax_rate(m.group(1) + '%')
+                    if candidate in VALID_TAX_RATES:
+                        ocr_rates.add(candidate)
+            if len(ocr_rates) == 1:
+                t["rate"] = ocr_rates.pop()
         t["label"] = normalize_tax_label(
             t.get("label"), unified_text,
             subtotal=subtotal, total=total, tax_sum=tax_sum,
@@ -1050,6 +1110,11 @@ def postprocess_receipt(
     _fix_date(extracted, unified_text)
     _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
     _fix_line_items(extracted, unified_text)
+
+    # Clear account_number when it's a masked card number suffix, not a real account
+    acct = extracted.get("account_number")
+    if acct and re.search(r'\*{2,}' + re.escape(str(acct)), unified_text):
+        extracted["account_number"] = None
 
     # Tax categories
     if extracted.get("line_items"):
@@ -1076,7 +1141,10 @@ def postprocess_receipt(
         item_sum = sum(i.get("total", 0) for i in extracted["line_items"] if isinstance(i, dict))
         receipt_total = extracted["total"]
         items_fixed = False
-        if len(extracted["line_items"]) == 1 and abs(item_sum - receipt_total) > 1:
+        # Skip adjustment when taxes account for the difference (exclusive tax)
+        tax_total = sum(t.get("amount", 0) for t in extracted.get("taxes", []))
+        items_are_pretax = tax_total > 0 and abs(item_sum + tax_total - receipt_total) < 2
+        if len(extracted["line_items"]) == 1 and abs(item_sum - receipt_total) > 1 and not items_are_pretax:
             item = extracted["line_items"][0]
             if isinstance(item, dict) and abs(item_sum * 1.10 - receipt_total) < 2:
                 item["total"] = receipt_total
