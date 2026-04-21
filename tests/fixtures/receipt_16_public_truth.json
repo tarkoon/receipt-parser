@@ -2,6 +2,7 @@
   "document_type": "utility_bill",
   "merchant": "宗像地区事務組合",
   "date": "2026-02-23",
+  "time": null,
   "location": null,
   "currency": "JPY",
   "total": 6824,

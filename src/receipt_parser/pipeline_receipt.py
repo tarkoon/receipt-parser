@@ -693,6 +693,92 @@ def _fix_date(extracted, unified_text):
             extracted["date"] = f"{w_year:04d}-{int(era.group(2)):02d}-{int(era.group(3)):02d}"
 
 
+_DATE_LINE_RE = re.compile(
+    r'(?:'
+    r'20\d{2}\s*[年/-]\s*0?\d{1,2}\s*[月/-]\s*0?\d{1,2}\s*日?'
+    r'|'
+    r'(?:令和|平成)?\s*\d{1,2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日'
+    r')'
+)
+_TIME_HHMM_RE = re.compile(r'(?<!\d)([0-2]?\d)\s*[:：]\s*([0-5]\d)(?:\s*[:：]\s*[0-5]\d)?(?!\d)')
+_TIME_JP_RE = re.compile(r'(?<!\d)([0-2]?\d)\s*時\s*([0-5]\d)\s*分?')
+_BUSINESS_HOURS_RE = re.compile(r'営業時間|営業中|定休|OPEN|CLOSE|TEL|電話|☎')
+
+
+def _parse_time_from_segment(segment: str) -> str | None:
+    """Find the first valid HH:MM (or HH時MM分) in a text segment, or None."""
+    for pattern in (_TIME_HHMM_RE, _TIME_JP_RE):
+        for m in pattern.finditer(segment):
+            hh, mm = int(m.group(1)), int(m.group(2))
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                return f"{hh}:{mm:02d}"
+    return None
+
+
+def _fix_time(extracted, unified_text):
+    """Extract receipt transaction time from OCR text, anchored to the date line.
+
+    Scans the date line + next 2 lines for HH:MM or HH時MM分.
+    Skips lines that look like business hours / phone numbers to avoid false positives.
+
+    Sets extracted['time'] only when:
+      - The LLM didn't already produce a valid time, OR
+      - The OCR-anchored time disagrees with the LLM and we have strong evidence.
+    Leaves extracted['time'] as None if no time appears on the receipt.
+    """
+    lines = unified_text.split('\n')
+
+    candidate: str | None = None
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if not _DATE_LINE_RE.search(line):
+            continue
+        # Skip the part of the date line that contains the date itself,
+        # so we don't match digits inside e.g. "2026年03月04日" or "12月03日"
+        date_match = _DATE_LINE_RE.search(line)
+        tail = line[date_match.end():] if date_match else line
+
+        # Look in the date-line tail and the next two lines (but not into
+        # business-hours context).
+        segments = [tail]
+        for j in range(i + 1, min(i + 3, len(lines))):
+            nxt = lines[j].strip()
+            if _BUSINESS_HOURS_RE.search(nxt):
+                break
+            segments.append(nxt)
+
+        for seg in segments:
+            if _BUSINESS_HOURS_RE.search(seg):
+                continue
+            t = _parse_time_from_segment(seg)
+            if t:
+                candidate = t
+                break
+        if candidate:
+            break
+
+    if candidate is None:
+        # Fallback: ISO date already in extracted['date'] but OCR may have it
+        # joined together as "2025/12/23/13:49" — pull time off the join.
+        joined = re.search(r'20\d{2}[/-]\d{1,2}[/-]\d{1,2}[/\s-]+(\d{1,2})[:：](\d{2})', unified_text)
+        if joined:
+            hh, mm = int(joined.group(1)), int(joined.group(2))
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                candidate = f"{hh}:{mm:02d}"
+
+    existing = extracted.get("time")
+    if not existing:
+        # Pydantic may have left it as None — set if we found one
+        if candidate:
+            extracted["time"] = candidate
+        return
+
+    # LLM gave a value. Trust the OCR-anchored candidate when both exist
+    # and they disagree (OCR is closer to ground truth here).
+    if candidate and candidate != existing:
+        extracted["time"] = candidate
+
+
 def _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf):
     """Detect cash payment from OCR evidence (tendered amount, change, etc.)."""
     has_cash = '現計' in unified_text
@@ -1108,6 +1194,7 @@ def postprocess_receipt(
     """Apply all receipt-specific post-processing to the LLM extraction."""
     _apply_financial_overrides(extracted, ocr_totals, ocr_conf, llm_conf)
     _fix_date(extracted, unified_text)
+    _fix_time(extracted, unified_text)
     _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
     _fix_line_items(extracted, unified_text)
 
