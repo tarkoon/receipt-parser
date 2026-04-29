@@ -646,6 +646,17 @@ def _run_extraction_pipeline(
         if not _location_has_ocr_evidence(extracted["location"], unified_text):
             extracted["location"] = None
 
+    # Expand truncated location when OCR has a more detailed address
+    if "error" not in extracted and doc_type == "receipt" and extracted.get("location"):
+        loc = extracted["location"]
+        loc_norm = re.sub(r'\s+', '', loc)
+        for line in unified_text.split('\n'):
+            line_norm = re.sub(r'\s+', '', line.strip())
+            if (len(line_norm) > len(loc_norm) and loc_norm in line_norm
+                    and re.search(r'\d+-\d+|丁目|番地', line_norm)):
+                extracted["location"] = line_norm
+                break
+
     # Final validation
     _notify(on_stage, "validate", "Validating", 0.95)
     try:

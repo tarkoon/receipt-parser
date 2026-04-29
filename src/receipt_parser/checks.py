@@ -322,6 +322,9 @@ UTILITY_CHECKS = {
     "usage_amount": check_usage_amount,
 }
 
+# usage_amount is also relevant for fuel receipts (volume/cost_per data)
+RECEIPT_CHECKS["usage_amount"] = check_usage_amount
+
 
 # ---------------------------------------------------------------------------
 # Payment slip-specific checks

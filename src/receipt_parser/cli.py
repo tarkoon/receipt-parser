@@ -73,7 +73,7 @@ CSV_FIELDNAMES = [
 
 @app.command()
 def parse(
-    input_path: Path = typer.Argument(..., help="Image, PDF, or directory to process"),
+    input_paths: list[Path] = typer.Argument(..., help="One or more images, PDFs, or directories to process"),
     output: Path = typer.Option(None, "--output", "-o", help="Output file (default: stdout)"),
     model: str = typer.Option(DEFAULT_MODEL, "--model", "-m",
                               help="LLM model (default: DeepSeek; prefix 'ollama/' for Ollama)"),
@@ -88,19 +88,23 @@ def parse(
                                  is_eager=True, help="Show version"),
 ):
     """Parse receipts and invoices into structured data."""
-    if not input_path.exists():
-        typer.echo(f"Error: {input_path} does not exist", err=True)
-        raise typer.Exit(1)
-
-    if input_path.is_dir():
-        extensions = {".jpg", ".jpeg", ".png", ".pdf", ".tiff", ".tif", ".bmp"}
-        files = sorted([f for f in input_path.iterdir()
-                        if f.suffix.lower() in extensions])
-        if not files:
-            typer.echo(f"No supported files found in {input_path}", err=True)
+    for p in input_paths:
+        if not p.exists():
+            typer.echo(f"Error: {p} does not exist", err=True)
             raise typer.Exit(1)
-    else:
-        files = [input_path]
+
+    extensions = {".jpg", ".jpeg", ".png", ".pdf", ".tiff", ".tif", ".bmp"}
+    files: list[Path] = []
+    for p in input_paths:
+        if p.is_dir():
+            dir_files = sorted([f for f in p.iterdir()
+                                if f.suffix.lower() in extensions])
+            if not dir_files:
+                typer.echo(f"No supported files found in {p}", err=True)
+                raise typer.Exit(1)
+            files.extend(dir_files)
+        else:
+            files.append(p)
 
     is_batch = len(files) > 1
 
@@ -494,7 +498,7 @@ def setup():
             from openai import OpenAI
             client = OpenAI(base_url="https://api.deepseek.com", api_key=ds_key, timeout=10)
             client.chat.completions.create(
-                model="deepseek-chat",
+                model=DEFAULT_MODEL,
                 messages=[{"role": "user", "content": "hi"}],
                 max_tokens=1,
             )

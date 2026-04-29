@@ -16,7 +16,7 @@ import ollama as ollama_client
 from .schema import Receipt, generate_extraction_prompt, generate_verification_prompt
 
 OLLAMA_TIMEOUT_SECONDS = 180
-DEFAULT_MODEL = "deepseek-chat"
+DEFAULT_MODEL = "deepseek-v4-flash"
 OLLAMA_PREFIX = "ollama/"
 _LLM_SEED = 42  # Fixed seed for deterministic output
 
@@ -220,6 +220,7 @@ def _openrouter_chat(
         temperature=temperature,
         max_tokens=max_tokens,
         seed=_LLM_SEED,
+        extra_body={"thinking": {"type": "disabled"}},
     )
     elapsed_ns = int((time.perf_counter() - t0) * 1e9)
     usage = response.usage
@@ -273,6 +274,7 @@ def _instructor_extract(
             max_tokens=max_tokens,
             seed=_LLM_SEED,
             max_retries=max_retries,
+            extra_body={"thinking": {"type": "disabled"}},
         )
         elapsed_ns = int((time.perf_counter() - t0) * 1e9)
         llm_result = LLMResult(
@@ -407,7 +409,34 @@ def extract_with_llm(
         if receipt is not None:
             return receipt.model_dump(), instructor_result or llm_result
 
+    # Content quality retry: re-extract when items grossly exceed total
+    if "error" not in parsed and _extraction_is_low_quality(parsed):
+        logger.info("Low-quality extraction detected, retrying with seed=%d", _LLM_SEED + 1)
+        retry_result = _llm_chat(
+            model=model,
+            messages=messages,
+            schema=get_ollama_schema(),
+            temperature=0.3,
+        )
+        retry_parsed = _parse_llm_json(sanitize_llm_response(retry_result.content))
+        if "error" not in retry_parsed and not _extraction_is_low_quality(retry_parsed):
+            return retry_parsed, retry_result
+
     return parsed, llm_result
+
+
+def _extraction_is_low_quality(parsed: dict) -> bool:
+    """Detect structurally valid but content-broken extractions."""
+    items = parsed.get("line_items", [])
+    total = parsed.get("total")
+    if not items or not total or total <= 0:
+        return False
+    item_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+    if item_sum > total * 1.3:
+        return True
+    if len(items) >= 3 and all(i.get("unit_price", 0) == 0 for i in items if isinstance(i, dict)):
+        return True
+    return False
 
 
 def _llm_result_to_timing(result: LLMResult | None) -> dict | None:
