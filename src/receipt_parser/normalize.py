@@ -47,6 +47,34 @@ def strip_barcode_lines(text: str) -> str:
     return '\n'.join(cleaned)
 
 
+# Lines that are pure loyalty-point / bonus-point indicators in the item zone.
+# Japanese supermarket receipts (Aeon, Maxvalu, etc.) print bonus points
+# inline between items, often as standalone fragments like "(ボーナスポイント"
+# / "10P)" or one-line "(ボーナスポイント 10P)". They are NOT items, but they
+# appear in the price column and break per-row item↔price matching during
+# rejoin_price_lines, scrambling subsequent items' prices.
+_BONUS_POINT_LINE_RE = re.compile(
+    r'^\(?\s*(?:'
+    r'ボーナスポイント[\s\d]*\)?'        # "(ボーナスポイント" or "(ボーナスポイント 10P)"
+    r'|\d+\s*P\)?'                        # "(10P)", "10P)", "40P"
+    r')\s*$'
+)
+
+
+def strip_bonus_point_lines(text: str) -> str:
+    """Remove standalone bonus/loyalty-point indicator lines.
+
+    Generic for Japanese receipts: any line that is exclusively a loyalty
+    point fragment is dropped. Real product lines that mention "P" or
+    "ポイント" alongside a description are preserved (the regex requires
+    the entire line to match).
+    """
+    return '\n'.join(
+        line for line in text.split('\n')
+        if not _BONUS_POINT_LINE_RE.match(line.strip())
+    )
+
+
 def rejoin_price_lines(text: str) -> str:
     """Join orphan price lines with their corresponding item lines.
 

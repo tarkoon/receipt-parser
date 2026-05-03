@@ -31,40 +31,72 @@ def normalize_tax_label(
     label: str | None, text: str = "",
     subtotal: float | None = None, total: float | None = None,
     tax_sum: float | None = None,
+    items_sum: float | None = None,
 ) -> str:
-    """Normalize a tax label to canonical set: 内税, 外税, 非課税."""
+    """Normalize a tax label to canonical set: 内税, 外税, 非課税.
+
+    Priority order:
+      1. 非課税 in label (always definitive)
+      2. Explicit OCR text keywords (外税 / 内税)
+      3. 対象 pattern without 外税 keyword → 内税 (most JP receipts that
+         break out per-rate base in '(N%対象 …)' form are tax-inclusive)
+      4. Items-sum signal: items add to total → 内税; items add to subtotal → 外税
+      5. LLM-supplied label as last resort
+      6. Default 内税 (most common in JP receipts)
+
+    Under the canonical 'subtotal = total - tax' convention, the math
+    'subtotal+tax=total' holds for both 内税 and 外税 — so it can't
+    distinguish them. The trustworthy signals are OCR keywords and
+    items_sum vs total/subtotal.
+    """
     label = label or ""
 
-    # 0. Definitive math check: subtotal ≈ total with tax > 0 is always 内税
-    if subtotal is not None and total is not None and tax_sum is not None and tax_sum > 0:
-        if abs(subtotal - total) <= 5:
-            return '内税'
-
-    # 1. Unambiguous label keywords
     if '非課税' in label:
         return '非課税'
-    if '外税' in label or '税抜' in label:
+
+    # Explicit OCR keywords. "外税" and "税抜N%" / "税抜対象" are strong
+    # exclusive markers; "内税" is a strong inclusive marker. Plain "税抜額"
+    # (informational pre-tax total on a 内税 receipt) and "(内消費税等"
+    # (informational tax breakdown on either kind) are not strong enough
+    # alone — handled below.
+    has_strong_exclusive = bool(re.search(r'外税|税抜\s*\d+%|税抜対象', text))
+    has_strong_inclusive = bool(re.search(r'内税', text))
+    # "(内消費税…" / "内消費税等" wording — appears on 内税 receipts as a
+    # tax breakdown but is NOT a definitive marker (also appears on 外税
+    # receipts as informational text).
+    has_weak_inclusive = bool(re.search(r'内\s*消費税', text))
+    # "\d+%税(額)?" not followed by a kanji is a separate-line tax amount,
+    # which only appears on 外税 receipts. ("8%内税対象額" is a 内税 phrase
+    # but matches `内` between % and 税, so it's excluded by \s* requirement.)
+    has_pct_tax_marker = bool(re.search(r'\d+%\s*税(?:額)?(?![一-鿿])', text))
+
+    if has_strong_exclusive and not has_strong_inclusive:
         return '外税'
-    if label == '内税':
+    if has_strong_inclusive and not has_strong_exclusive:
         return '内税'
-
-    # 2. OCR text keyword check (more reliable than math for 内/外)
-    has_exclusive = bool(re.search(r'外税|外\d+%|税抜対象|\d+%\s*税\s*[¥￥\n]', text))
-    has_inclusive = bool(re.search(r'内税', text))
-
-    if has_exclusive and not has_inclusive:
+    if has_strong_inclusive and has_strong_exclusive:
+        return '内税'
+    # Strong exclusive marker via separate %-tax line
+    if has_pct_tax_marker:
         return '外税'
-    if has_inclusive and not has_exclusive:
-        return '内税'
-    if has_inclusive and has_exclusive:
+    # Weak inclusive only fires when no strong exclusive marker is present
+    if has_weak_inclusive:
         return '内税'
 
-    # 3. Math fallback: only when no OCR keywords found
-    if subtotal is not None and total is not None and tax_sum is not None and tax_sum > 0:
-        if abs(subtotal + tax_sum - total) <= 5 and subtotal < total - 1:
+    # Items-sum signal: items add to total → 内税 (post-tax line items);
+    # items add to subtotal → 外税 (pre-tax line items).
+    if (items_sum is not None and total is not None and subtotal is not None
+            and tax_sum is not None and tax_sum > 0):
+        if abs(items_sum - total) <= 2 and abs(items_sum - subtotal) > 2:
+            return '内税'
+        if abs(items_sum - subtotal) <= 2 and abs(items_sum - total) > 2:
             return '外税'
 
-    # 4. Default to 内税 (most common in Japanese receipts)
+    if label == '内税':
+        return '内税'
+    if '外税' in label or '税抜' in label:
+        return '外税'
+
     return '内税'
 
 
@@ -197,6 +229,20 @@ def _extract_financial_totals_impl(text: str) -> dict:
                 if val is not None:
                     taxes.append({'rate': effective_rate, 'label': '消費税等', 'amount': val})
             _rate_context = None
+
+        # Inline 内税/外税 with rate context: "10%対象 ¥19,118 内消費税 ¥1,738".
+        # Captures 内/外 prefix on 消費税 paired with a ¥amount on the same line.
+        if not _has_specific_taxes:
+            m_combo = re.search(
+                r'(\d+(?:\.\d+)?)\s*%\s*対象.*?(内|外)消費税[等額]?\s*[¥￥]\s*([\d,]+)',
+                line,
+            )
+            if m_combo:
+                rate_combo = normalize_tax_rate(m_combo.group(1) + '%')
+                label_combo = '内税' if m_combo.group(2) == '内' else '外税'
+                amt_combo = float(m_combo.group(3).replace(',', ''))
+                taxes.append({'rate': rate_combo, 'label': label_combo, 'amount': amt_combo})
+                _has_specific_taxes = True
 
         if (re.search(r'小\s*計', line) or 'お買上高' in line) and '税' not in line:
             val = _extract_yen_nearby(lines, i)
@@ -390,6 +436,21 @@ def _extract_financial_totals_impl(text: str) -> dict:
     if taxes and total:
         taxes = [t for t in taxes if t['amount'] < total]
 
+    # Dedup: a receipt may print the same tax in multiple places (e.g., a 外税
+    # receipt that also shows the inclusive breakdown in parens, "(内消費税等
+    # 8% ¥203)"). Both lines match our extraction patterns, producing duplicate
+    # entries that downstream code then sums into bogus 2x tax totals.
+    if taxes:
+        seen: set[tuple] = set()
+        deduped = []
+        for t in taxes:
+            key = (t.get('rate'), t.get('label'), t.get('amount'))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(t)
+        taxes = deduped
+
     if taxes:
         result['taxes'] = taxes
 
@@ -432,6 +493,8 @@ def extract_rate_bases(text: str) -> dict[str, float | None]:
                     bases[rate_str] = float(yen_ahead.group(1).replace(',', ''))
                     found = True
                     break
+                if re.match(r'^\d+\s*[\u500b\u70b9]\s*$', js):
+                    continue
                 if re.search(r'[\u3000-\u9fff]', js):
                     break
                 if plain_candidate is None:
@@ -471,6 +534,18 @@ def extract_points_used(text: str) -> float | None:
 
 
 def _find_subset_sum(items, target, max_k=3, tolerance=5.0):
+    # Prefer near-exact (≤2) matches at small k (k ≤ 2) before accepting a
+    # fuzzy match. Stops a loose 1-item match from shadowing a real 2-item
+    # exact match (e.g. fuzzy {138}≈131 vs. exact {3, 128}=131).
+    # Restricted to k ≤ 2: a k=3 exact can be a coincidence (any wrong target
+    # near a sum is exactly hit by some 3-tuple), so we don't let large-k exact
+    # override a smaller-k fuzzy candidate.
+    if tolerance > 2:
+        for k in range(1, min(3, max_k + 1, len(items) + 1)):
+            for combo in combinations(items, k):
+                total = sum(t for _, t in combo)
+                if abs(total - target) <= 2:
+                    return [i for i, _ in combo]
     for k in range(1, min(max_k + 1, len(items) + 1)):
         for combo in combinations(items, k):
             total = sum(t for _, t in combo)
@@ -567,10 +642,23 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
     tax_amounts = {t["rate"]: t.get("amount", 0) for t in ocr_totals.get("taxes", [])}
     if not tax_amounts and extracted_taxes:
         tax_amounts = {t["rate"]: t.get("amount", 0) for t in extracted_taxes if isinstance(t, dict)}
-    majority_rate = max(
-        detected_rates,
-        key=lambda r: (assigned_counts.get(r, 0), tax_amounts.get(r, 0), rate_bases.get(r, 0) or 0),
-    )
+    # Choose the dominant rate. When most items have OCR tax markers,
+    # the marked counts are reliable. When markers are sparse (e.g. only
+    # 1 of 18 items has a 除 tag), counts mislead — fall back to
+    # rate_bases (sum of items per rate from OCR), which reflects the
+    # actual transaction proportions regardless of how many items got
+    # tagged.
+    marked_total = sum(assigned_counts.values())
+    if marked_total >= len(items) * 0.5:
+        majority_rate = max(
+            detected_rates,
+            key=lambda r: (assigned_counts.get(r, 0), tax_amounts.get(r, 0), rate_bases.get(r, 0) or 0),
+        )
+    else:
+        majority_rate = max(
+            detected_rates,
+            key=lambda r: (rate_bases.get(r, 0) or 0, tax_amounts.get(r, 0), assigned_counts.get(r, 0)),
+        )
     minority_rates = [r for r in detected_rates if r != majority_rate]
     minority_rate = minority_rates[0] if minority_rates else None
 
@@ -993,6 +1081,193 @@ def _fix_zero_prices_from_ocr(items, unified_text):
 
 _SKIP_PRICE_LINE = re.compile(r'対象|内税|外税|合計|小計|消費税|お預り|お釣|お預かり')
 
+# Descriptions that are clearly NOT product names — generic category markers
+# (used in HANDS-style receipts above the actual item) or contact info.
+_GENERIC_DESC_MARKERS = frozenset({
+    '消耗', '食料品', '飲料', '雑貨', '文具', '日配', '冷蔵', '冷凍',
+    '青果', '惣菜', '加工', '生活', '化粧品', '医薬', 'お菓子', '酒類',
+    '日用品', '特', '軽',
+})
+
+_JUNK_DESC_RE = re.compile(
+    r'^(?:電話|TEL|☎)\s*[:：]?\s*0?\d'  # phone numbers ('電話: 078-...')
+    r'|^〒\s*\d{3}'                       # postal code
+    r'|^\d{8,}'                            # bare digit run (barcode)
+    r'|^\d+\s*[xX×]\s*[#＃]?\s*\d+$'      # unit-rate notation '23 X #199'
+)
+
+# Lines that look like receipt-header metadata (phone, address, date,
+# register/cashier numbers) — never use as a product description.
+_HEADER_LINE_RE = re.compile(
+    r'(?:電話|TEL|☎)|登録番号|担当|レシートNo|レジ\s*\d|キャッシャ|'
+    r'店舗|発行|取引(?:コード|No)|POS\s*No|〒\s*\d{3}|'
+    r'(?:\d{2,4}\s*)?年\s*\d{1,2}\s*月\s*\d{1,2}\s*日|'  # date (year optional)
+    r'\(\s*[月火水木金土日]\s*\)|'                          # day-of-week marker
+    r'\d{1,2}\s*[:時]\s*\d{2}\s*分?(?!\d)|'                # HH:MM or HH時MM分
+    r'\d+\s*番\s*\d+\s*号|'
+    r'[県府][　-鿿]+[市区町村]|'                            # address
+    r'^[一-鿿]{2,8}店$|'                                      # branch name
+    r'\bNo\.?\s*\d{2,}|'                                      # No. 012
+    r'領\s*収\s*証'                                           # 領収証
+)
+
+
+def _fix_junk_descriptions(items, unified_text):
+    """Replace 'junk' item descriptions (category markers, phone numbers,
+    barcode digits) with the nearest product-like line above the price in OCR.
+
+    Generic-purpose: any item whose description is on the marker list or
+    matches a junk pattern, regardless of receipt source.
+    """
+    lines = unified_text.split('\n')
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        desc = (item.get("description") or "").strip()
+        total = item.get("total", 0)
+        if not total or total <= 0:
+            continue
+
+        # Mixed-script OCR fragments with very few Japanese chars and an
+        # ASCII word separated by whitespace (e.g. "TV くりえ") are usually
+        # garbage. Brand-prefix product names like "KAL紙袋M" or "S&W..."
+        # have ASCII directly adjacent to Japanese (no space) — those are
+        # valid and must not be flagged.
+        japanese_chars = re.findall(r'[ぁ-んァ-ン一-龥]', desc)
+        ascii_chars = re.findall(r'[A-Za-z]', desc)
+        has_separating_space = bool(re.search(
+            r'[A-Za-z]\s+[ぁ-んァ-ン一-龥]|[ぁ-んァ-ン一-龥]\s+[A-Za-z]', desc
+        ))
+        is_short_mixed_garbage = (
+            japanese_chars and ascii_chars
+            and len(japanese_chars) < 5
+            and len(desc) < 9
+            and has_separating_space
+        )
+
+        # Unit-price × quantity notation like "単235×2個" — never a product name
+        is_unit_price_notation = bool(
+            re.match(r'^単?\s*\d', desc)
+            and ('×' in desc or 'x' in desc or 'X' in desc)
+            and ('個' in desc or '点' in desc or 'コ' in desc)
+        )
+
+        # Length-based junk: only flag empty / 1-char, or short non-Japanese
+        # strings. Pure-Japanese 2-char descs like "部品", "牛肉" are valid.
+        is_pure_japanese = bool(desc) and bool(re.fullmatch(r'[ぁ-んァ-ンー一-龥]+', desc))
+        is_short_junk = len(desc) < 2 or (len(desc) == 2 and not is_pure_japanese)
+
+        is_junk = (
+            desc in _GENERIC_DESC_MARKERS
+            or is_short_junk
+            or _JUNK_DESC_RE.search(desc) is not None
+            or _HEADER_LINE_RE.search(desc) is not None
+            or is_short_mixed_garbage
+            or is_unit_price_notation
+        )
+        if not is_junk:
+            continue
+
+        # Find the OCR line containing this item's price
+        price_line_idx = None
+        for i, line in enumerate(lines):
+            if _SKIP_PRICE_LINE.search(line):
+                continue
+            for m in re.finditer(r'[¥￥]\s*([\d,]+)', line):
+                val_str = m.group(1)
+                if not val_str:
+                    continue
+                try:
+                    price = float(val_str.replace(',', ''))
+                except ValueError:
+                    continue
+                if abs(price - total) < 1:
+                    price_line_idx = i
+                    break
+            if price_line_idx is not None:
+                break
+
+        if price_line_idx is None:
+            continue
+
+        # Build a list of nearby line indices ordered by proximity to the
+        # price line — start with the price line itself (rejoin_price_lines
+        # often merges item name + price on one line, e.g. "KAL紙袋M ¥30"),
+        # then alternate below/above. Range ±15 handles receipts with
+        # garbled OCR between the description and price.
+        candidates_idx: list[int] = [price_line_idx]
+        for offset in range(1, 16):
+            for direction in (1, -1):
+                j = price_line_idx + direction * offset
+                if 0 <= j < len(lines):
+                    candidates_idx.append(j)
+
+        def _process_candidate(cand_raw: str) -> str | None:
+            m_yen = re.search(r'[¥￥]', cand_raw)
+            cand = cand_raw[:m_yen.start()].strip() if m_yen else cand_raw
+            cand = re.sub(r'\s+[\d,]+\s*[点個コ]\s*$', '', cand).strip()
+            cand = re.sub(r'\s*[※\*非外]\s*$', '', cand).strip()
+            # Strip leading product/department code if remainder has Japanese
+            m_code = re.match(r'^\d{4,}[A-Za-z]{0,3}\)?\s?(.+)$', cand)
+            if m_code and re.search(r'[ぁ-んァ-ン一-龥]', m_code.group(1)):
+                cand = m_code.group(1).strip()
+            if not cand or len(cand) <= 2:
+                return None
+            if cand in _GENERIC_DESC_MARKERS:
+                return None
+            if _SKIP_PRICE_LINE.search(cand):
+                return None
+            if re.match(r'^[\d,\s\-\(\)\.\*※軽除]+$', cand):
+                return None
+            if _JUNK_DESC_RE.search(cand):
+                return None
+            if _HEADER_LINE_RE.search(cand):
+                return None
+            # Reject unit-price × qty notation (e.g. "単235×2個") — this is
+            # itself a junk pattern when picked from OCR as a description.
+            if (re.match(r'^単?\s*\d', cand)
+                    and ('×' in cand or 'x' in cand or 'X' in cand)
+                    and ('個' in cand or '点' in cand or 'コ' in cand)):
+                return None
+            if not re.search(r'[ぁ-んァ-ン一-龥]', cand):
+                return None
+            jp = re.findall(r'[ぁ-んァ-ン一-龥]', cand)
+            asc = re.findall(r'[A-Za-z]', cand)
+            cand_has_separating_space = bool(re.search(
+                r'[A-Za-z]\s+[ぁ-んァ-ン一-龥]|[ぁ-んァ-ン一-龥]\s+[A-Za-z]', cand
+            ))
+            if (jp and asc and len(jp) < 5 and len(cand) < 9
+                    and cand_has_separating_space):
+                return None
+            if any(
+                isinstance(o, dict) and o is not item
+                and (o.get("description") or "").strip() == cand
+                for o in items
+            ):
+                return None
+            return cand
+
+        # First pass: prefer lines with a product-code prefix (raw check).
+        chosen = None
+        for j in candidates_idx:
+            raw = lines[j].strip()
+            if not re.match(r'^\d{4,}', raw):
+                continue
+            cand = _process_candidate(raw)
+            if cand:
+                chosen = cand
+                break
+        # Second pass: any valid candidate
+        if not chosen:
+            for j in candidates_idx:
+                cand = _process_candidate(lines[j].strip())
+                if cand:
+                    chosen = cand
+                    break
+        if chosen:
+            item["description"] = chosen
+
 
 def _fix_item_desc_from_ocr_price_line(items, unified_text):
     """Fix item descriptions when LLM picked up non-item text (e.g. promotional banners)."""
@@ -1031,6 +1306,12 @@ def _fix_item_desc_from_ocr_price_line(items, unified_text):
                 break
 
         if price_line_idx is None or price_desc is None:
+            continue
+
+        # Don't replace with a generic category marker — that's a downgrade.
+        # The junk-description fixer will handle these cases by searching
+        # backward from the price line.
+        if price_desc in _GENERIC_DESC_MARKERS:
             continue
 
         near_price = any(abs(dl - price_line_idx) <= 3 for dl in desc_lines)
@@ -1101,11 +1382,24 @@ def _fix_line_items(extracted, unified_text):
         return
 
     _fix_item_desc_from_ocr_price_line(extracted["line_items"], unified_text)
+    _merge_qty_detail_into_previous(extracted["line_items"], unified_text)
+    _fix_junk_descriptions(extracted["line_items"], unified_text)
+    _remove_unit_rate_phantom_items(extracted)
     _fix_qty_hallucinations(extracted["line_items"], unified_text)
+    _replace_duplicate_desc_from_ocr(extracted["line_items"], unified_text)
+    _fix_item_totals_from_ocr_neighborhood(
+        extracted["line_items"], unified_text,
+        extracted.get("subtotal"), extracted.get("total"),
+    )
+    _replace_hallucinated_dup_with_ocr_item(
+        extracted["line_items"], unified_text,
+        extracted.get("subtotal"), extracted.get("total"),
+    )
+    _apply_qty_notation_from_ocr(extracted["line_items"], unified_text)
     _dedup_same_total_items(extracted)
     _fix_qty_from_ocr_patterns(extracted["line_items"], unified_text)
     _fix_fuel_volume_qty(extracted["line_items"], unified_text,
-                         subtotal=extracted.get("subtotal") or extracted.get("total"))
+                         receipt_total=extracted.get("total") or extracted.get("subtotal"))
     _expand_collapsed_items(extracted, unified_text)
     _fix_hallucinated_prices(extracted["line_items"], unified_text)
     _fix_zero_prices_from_ocr(extracted["line_items"], unified_text)
@@ -1114,29 +1408,491 @@ def _fix_line_items(extracted, unified_text):
     _detect_ocr_discounts(extracted["line_items"], unified_text)
 
 
-def _dedup_same_total_items(extracted):
-    """Remove duplicate items with identical description and total, keeping qty>1 version."""
-    items = extracted.get("line_items", [])
+# Matches qty-detail OCR fragments like "(2個 X 単70)", "2個 X70)", "(@100 × 2個)".
+# These are not products — they are qty/unit-price annotations for the
+# preceding item, but the LLM sometimes extracts them as standalone items.
+_QTY_DETAIL_DESC_RE = re.compile(
+    r'^\(?\s*'
+    r'(?:'
+    r'\d+\s*[コ個点]\s*[xX×]\s*(?:単|@)?\s*\d[\d,]*'   # "2個 X70", "2個 X 単70"
+    r'|(?:単|@)\s*\d[\d,]*\s*[xX×]\s*\d+\s*[コ個点]'    # "単70 × 2個", "@70x2個"
+    r')'
+    r'\)?\s*$'
+)
+
+
+def _merge_qty_detail_into_previous(items, unified_text):
+    """Collapse qty-detail phantom items into the preceding product.
+
+    When the LLM extracts a qty-detail OCR fragment (e.g. "(2個 X 単70)") as
+    a standalone item, the receipt's preceding product is actually priced
+    at qty × unit. Use the OCR text (not the LLM's possibly-wrong qty) to
+    extract qty/unit, apply them to the previous item, then drop the
+    phantom.
+
+    Safety: only merges when (a) the phantom's description matches the
+    qty-detail regex AND the OCR text near a qty-detail fragment yields a
+    consistent (qty, unit) pair (qty ≥ 2, unit > 0); and (b) a previous
+    item exists with qty == 1.
+    """
     if len(items) < 2:
         return
-    subtotal = extracted.get("subtotal") or extracted.get("total")
-    seen = {}
+    ocr_lines = unified_text.split('\n')
+    to_drop: set[int] = set()
+    for i, item in enumerate(items):
+        if i == 0 or not isinstance(item, dict):
+            continue
+        desc = (item.get("description") or "").strip()
+        if not desc or not _QTY_DETAIL_DESC_RE.match(desc):
+            continue
+        # Extract qty/unit from OCR (more reliable than the LLM's parse).
+        ocr_qty: float | None = None
+        ocr_unit: float | None = None
+        for ocr_line in ocr_lines:
+            if not _QTY_DETAIL_DESC_RE.match(ocr_line.strip()):
+                continue
+            m = re.search(
+                r'(\d+)\s*[コ個点]\s*[xX×]\s*(?:単|@)?\s*(\d[\d,]*)',
+                ocr_line,
+            )
+            if not m:
+                m = re.search(
+                    r'(?:単|@)\s*(\d[\d,]*)\s*[xX×]\s*(\d+)\s*[コ個点]',
+                    ocr_line,
+                )
+                if m:
+                    ocr_unit = float(m.group(1).replace(',', ''))
+                    ocr_qty = float(m.group(2))
+                    break
+            else:
+                ocr_qty = float(m.group(1))
+                ocr_unit = float(m.group(2).replace(',', ''))
+                break
+        if ocr_qty is None or ocr_unit is None or ocr_qty < 2 or ocr_unit <= 0:
+            continue
+        prev = items[i - 1]
+        if not isinstance(prev, dict):
+            continue
+        if prev.get("qty", 1) and float(prev.get("qty", 1)) > 1:
+            continue
+        prev["qty"] = ocr_qty
+        prev["unit_price"] = ocr_unit
+        prev["total"] = ocr_qty * ocr_unit
+        to_drop.add(i)
+    if to_drop:
+        items[:] = [it for j, it in enumerate(items) if j not in to_drop]
+
+
+def _fix_item_totals_from_ocr_neighborhood(items, unified_text, target_subtotal, target_total):
+    """When items_sum is off-target, re-anchor each item's total to the price
+    immediately following its description in OCR text.
+
+    Generic-purpose: handles 2-column receipts where rejoin_price_lines didn't
+    fully resolve, so the LLM mis-attributes prices across adjacent items.
+    Conservative — only fires when:
+      - items_sum is off both subtotal and total by > 2 yen
+      - The OCR shows a clear desc → price chain (no other Japanese line between)
+      - The OCR-grounded price differs from the LLM total by > 1 yen
+      - Applying the fix brings items_sum strictly closer to a target
+    """
+    if not items:
+        return
+    items_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+    targets = [t for t in (target_subtotal, target_total) if t]
+    if not targets:
+        return
+    if any(abs(items_sum - t) <= 2 for t in targets):
+        return
+
+    lines = unified_text.split('\n')
+
+    def _ocr_price_after(li: int) -> float | None:
+        # Look for a clean ¥-bearing or plain numeric line within next 6 lines.
+        # Stop on another item-like line (Japanese text, no ¥).
+        for j in range(li + 1, min(li + 7, len(lines))):
+            s = lines[j].strip()
+            if not s:
+                continue
+            if _SKIP_PRICE_LINE.search(s):
+                return None
+            m = re.match(r'^[¥￥]?\s*([\d,]+)\s*[※\*除]?\s*$', s)
+            if m:
+                try:
+                    return float(m.group(1).replace(',', ''))
+                except ValueError:
+                    return None
+            if re.search(r'[ぁ-んァ-ン一-龥]{2,}', s):
+                return None  # next item starts before any price
+        return None
+
+    def _ocr_price_inline(line: str) -> float | None:
+        m = re.search(r'[¥￥]\s*([\d,]+)', line)
+        if m:
+            try:
+                return float(m.group(1).replace(',', ''))
+            except ValueError:
+                return None
+        return None
+
+    # Apply candidate fixes one at a time, verifying each improves items_sum
+    # toward a target. Stop when items_sum is within 2 yen of a target.
+    progress = True
+    while progress:
+        progress = False
+        items_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+        if any(abs(items_sum - t) <= 2 for t in targets):
+            break
+        candidates: list[tuple[float, int, float]] = []
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            desc = (item.get("description") or "").strip()
+            total = item.get("total")
+            if not desc or len(desc) < 5 or total is None:
+                continue
+            desc_prefix = desc[:5]
+            for li, line in enumerate(lines):
+                if desc_prefix not in line:
+                    continue
+                ocr_total = _ocr_price_inline(line)
+                if ocr_total is None:
+                    ocr_total = _ocr_price_after(li)
+                if ocr_total is None:
+                    continue
+                if abs(ocr_total - total) <= 1:
+                    break  # already aligned
+                # Score this candidate by the improvement it brings
+                new_sum = items_sum - total + ocr_total
+                cur_diff = min(abs(items_sum - t) for t in targets)
+                new_diff = min(abs(new_sum - t) for t in targets)
+                if new_diff < cur_diff:
+                    candidates.append((cur_diff - new_diff, idx, ocr_total))
+                break  # first matching OCR line for this item
+        if not candidates:
+            break
+        candidates.sort(reverse=True)  # largest improvement first
+        improvement, idx, new_total = candidates[0]
+        items[idx]["total"] = new_total
+        if items[idx].get("qty", 1) == 1 and items[idx].get("unit_price") is not None:
+            items[idx]["unit_price"] = new_total
+        progress = True
+
+
+def _replace_hallucinated_dup_with_ocr_item(items, unified_text, target_subtotal, target_total):
+    """When LLM has duplicate items AND items_sum is off-target, look for an
+    OCR-grounded item whose substitution closes the gap.
+
+    Generic: handles any LLM hallucination where it copy-pastes a nearby
+    item's price+description onto a different item, masking the right
+    one. Only applies when:
+      - items_sum doesn't match subtotal or total (within ±2 yen)
+      - LLM has ≥ 2 items with the same (description, total)
+      - Exactly one unaccounted OCR ¥amount equals dup_total + gap
+    """
+    if not items or len(items) < 2:
+        return
+    items_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+    targets = [t for t in (target_subtotal, target_total) if t]
+    if not targets:
+        return
+    if any(abs(items_sum - t) <= 2 for t in targets):
+        return  # items already balance
+
+    groups: dict[tuple[str, float], list[int]] = {}
+    for i, it in enumerate(items):
+        if not isinstance(it, dict):
+            continue
+        desc = (it.get("description") or "").strip()
+        total = it.get("total")
+        if not desc or total is None:
+            continue
+        groups.setdefault((desc, float(total)), []).append(i)
+    duplicates = {k: v for k, v in groups.items() if len(v) >= 2}
+    if not duplicates:
+        return
+
+    lines = unified_text.split('\n')
+    ocr_prices: list[tuple[int, float]] = []
+    for li, line in enumerate(lines):
+        if _SKIP_PRICE_LINE.search(line):
+            continue
+        for m in re.finditer(r'[¥￥]\s*([\d,]+)', line):
+            try:
+                amt = float(m.group(1).replace(',', ''))
+            except ValueError:
+                continue
+            if amt > 0:
+                ocr_prices.append((li, amt))
+
+    # Multiset diff: remove one OCR entry per LLM item amount
+    item_amounts = [i.get("total", 0) for i in items if isinstance(i, dict)]
+    unmatched = list(ocr_prices)
+    for amt in item_amounts:
+        for j, (_, oa) in enumerate(unmatched):
+            if abs(oa - amt) < 1:
+                unmatched.pop(j)
+                break
+
+    if not unmatched:
+        return
+
+    # For each duplicate × target combo, search for an OCR price that closes
+    # the gap when substituted.
+    candidates: list[tuple[float, int, int, float, str]] = []
+    for target in targets:
+        gap = target - items_sum
+        for dup_key, dup_idxs in duplicates.items():
+            dup_total = dup_key[1]
+            wanted = dup_total + gap
+            matches = [(li, oa) for li, oa in unmatched if abs(oa - wanted) <= 2]
+            if len(matches) != 1:
+                continue
+            li, oa = matches[0]
+            new_sum = items_sum - dup_total + oa
+            diff = abs(new_sum - target)
+            candidates.append((diff, dup_idxs[-1], li, oa, dup_key[0]))
+
+    if not candidates:
+        return
+    candidates.sort()
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        return  # ambiguous tie — refuse
+
+    diff, replace_idx, price_line_idx, new_total, _ = candidates[0]
+    if diff > 2:
+        return
+
+    new_desc = _find_ocr_item_desc(lines, price_line_idx, items)
+    if not new_desc:
+        return
+
+    items[replace_idx]["description"] = new_desc
+    items[replace_idx]["total"] = new_total
+    items[replace_idx]["unit_price"] = new_total
+    items[replace_idx]["qty"] = 1
+
+
+def _find_ocr_item_desc(lines, price_line_idx, existing_items):
+    """Find a plausible item description for an OCR price line."""
+    existing_descs = {
+        (it.get("description") or "").strip()
+        for it in existing_items if isinstance(it, dict)
+    }
+
+    def _clean(text: str) -> str:
+        text = text.strip()
+        m = re.search(r'[¥￥]', text)
+        if m:
+            text = text[:m.start()].strip()
+        text = re.sub(r'\s+[\d,]+\s*[点個コ]\s*$', '', text).strip()
+        text = re.sub(r'\s*[※\*非外内]\s*$', '', text).strip()
+        mc = re.match(r'^\d{4,}[A-Za-z]{0,3}\)?\s?(.+)$', text)
+        if mc and re.search(r'[ぁ-んァ-ン一-龥]', mc.group(1)):
+            text = mc.group(1).strip()
+        return text
+
+    def _is_valid(text: str) -> bool:
+        if not text or len(text) < 3:
+            return False
+        if text in _GENERIC_DESC_MARKERS:
+            return False
+        if _SKIP_PRICE_LINE.search(text):
+            return False
+        if re.match(r'^[\d,\s\-\(\)\.\*※軽除外]+$', text):
+            return False
+        if not re.search(r'[ぁ-んァ-ン一-龥]', text):
+            return False
+        return True
+
+    # Same-line first (rejoin merged item+price)
+    cand = _clean(lines[price_line_idx])
+    if _is_valid(cand) and cand not in existing_descs:
+        return cand
+    # Search backward up to 15 lines, then forward up to 5
+    for j in list(range(price_line_idx - 1, max(price_line_idx - 16, -1), -1)) + \
+             list(range(price_line_idx + 1, min(price_line_idx + 6, len(lines)))):
+        cand = _clean(lines[j])
+        if _is_valid(cand) and cand not in existing_descs:
+            return cand
+    return None
+
+
+def _remove_unit_rate_phantom_items(extracted):
+    """Remove items whose description is a unit-rate notation (e.g. '23 X #199')
+    with no Japanese characters. These appear when the LLM extracts a per-unit
+    annotation as a standalone product. Conservative: only fires when the
+    description has zero Japanese chars AND matches a unit-rate-like pattern.
+    """
+    items = extracted.get("line_items") or []
+    if not items:
+        return
+    keep = []
+    for it in items:
+        if not isinstance(it, dict):
+            keep.append(it)
+            continue
+        desc = (it.get("description") or "").strip()
+        if not desc:
+            keep.append(it)
+            continue
+        if re.search(r'[ぁ-んァ-ン一-龥]', desc):
+            keep.append(it)
+            continue
+        # Pure-ASCII/digit unit-rate notation like "23 X #199" or "2X@99"
+        if re.match(r'^[\d,]+\s*[xX×]\s*[#＃@]?\s*[\d,]+\s*[#＃]?\s*$', desc):
+            continue
+        keep.append(it)
+    extracted["line_items"] = keep
+
+
+def _replace_duplicate_desc_from_ocr(items, unified_text):
+    """When the LLM extracts duplicate (description, total) items but OCR
+    shows distinct items at that total, swap a duplicate's description for
+    the unmatched OCR description.
+
+    Generic-purpose: addresses LLM hallucinations where it copy-pastes a
+    nearby item's name onto a different item with the same price.
+    Conservative — only fires when:
+      - LLM has ≥ 2 items with the same (description, total)
+      - OCR text contains a distinct, valid item-like description with that
+        same total (within ±2 yen) that doesn't match any current LLM
+        description
+      - The replacement description appears nearby a matching ¥amount in OCR
+    """
+    if not items or len(items) < 2:
+        return
+
+    # Group LLM items by (description, total)
+    groups: dict[tuple[str, float], list[int]] = {}
+    for i, it in enumerate(items):
+        if not isinstance(it, dict):
+            continue
+        desc = (it.get("description") or "").strip()
+        total = it.get("total")
+        if not desc or total is None:
+            continue
+        groups.setdefault((desc, float(total)), []).append(i)
+
+    duplicates = {key: idxs for key, idxs in groups.items() if len(idxs) >= 2}
+    if not duplicates:
+        return
+
+    # Existing descriptions, lowered for matching
+    existing_descs = {
+        (it.get("description") or "").strip()
+        for it in items if isinstance(it, dict)
+    }
+
+    lines = unified_text.split('\n')
+
+    # For each price line in OCR, locate a nearby description (same logic
+    # used by _recover_missing_items_from_gap, but inline since this fires
+    # earlier in the pipeline).
+    def _candidate_desc_for_price(price_idx: int, target_amt: float) -> str | None:
+        # Check the price line itself first (rejoin_price_lines may have
+        # merged item + price on one line).
+        line_text = lines[price_idx]
+        for raw in [line_text] + [lines[j] for j in range(price_idx - 1, max(price_idx - 6, -1), -1)]:
+            cand = raw.strip()
+            # Strip price suffix
+            m = re.search(r'[¥￥]', cand)
+            if m:
+                cand = cand[:m.start()].strip()
+            # Strip trailing count markers and tax markers
+            cand = re.sub(r'\s+[\d,]+\s*[点個コ]\s*$', '', cand).strip()
+            cand = re.sub(r'\s*[※\*非外内]\s*$', '', cand).strip()
+            # Strip leading product code
+            mc = re.match(r'^\d{4,}[A-Za-z]{0,3}\)?\s?(.+)$', cand)
+            if mc and re.search(r'[ぁ-んァ-ン一-龥]', mc.group(1)):
+                cand = mc.group(1).strip()
+            # Validate
+            if not cand or len(cand) < 3:
+                continue
+            if cand in _GENERIC_DESC_MARKERS:
+                continue
+            if re.match(r'^[\d,\s\-\(\)\.\*※軽除外]+$', cand):
+                continue
+            if not re.search(r'[ぁ-んァ-ン一-龥]', cand):
+                continue
+            if _SKIP_PRICE_LINE.search(cand):
+                continue
+            return cand
+        return None
+
+    for (dup_desc, dup_total), dup_idxs in duplicates.items():
+        # Collect OCR descriptions associated with prices ≈ dup_total
+        ocr_descs: list[str] = []
+        for li, line in enumerate(lines):
+            if _SKIP_PRICE_LINE.search(line):
+                continue
+            for m in re.finditer(r'[¥￥]\s*([\d,]+)', line):
+                try:
+                    amt = float(m.group(1).replace(',', ''))
+                except ValueError:
+                    continue
+                if abs(amt - dup_total) <= 2:
+                    cand = _candidate_desc_for_price(li, amt)
+                    if cand and cand not in ocr_descs:
+                        ocr_descs.append(cand)
+
+        # OCR-distinct descriptions not currently in LLM extraction
+        unmatched_ocr_descs = [
+            d for d in ocr_descs
+            if d not in existing_descs and d != dup_desc
+        ]
+        if not unmatched_ocr_descs:
+            continue
+
+        # Need at least as many distinct OCR descs as duplicates − 1, since
+        # one duplicate is real (matches the dup_desc). Keep one duplicate;
+        # replace the rest with OCR-derived descriptions.
+        replacements = unmatched_ocr_descs[: len(dup_idxs) - 1]
+        for repl_desc, idx in zip(replacements, dup_idxs[1:]):
+            items[idx]["description"] = repl_desc
+            existing_descs.add(repl_desc)
+
+
+def _dedup_same_total_items(extracted):
+    """Remove duplicate items with identical description and total, keeping qty>1 version.
+
+    Only applies when the deduped sum is strictly closer to its expected target
+    than the original sum. The target is whichever of subtotal/total the
+    original sum is closer to — items match subtotal on 外税 receipts and total
+    on 内税 receipts, so the LLM's extraction style picks the right anchor.
+    Without this, legitimate duplicates (e.g. two hot-dog meals at the same
+    price) get wrongly removed on 内税 receipts where subtotal < items_sum.
+    """
+    items = list(extracted.get("line_items", []) or [])
+    if len(items) < 2:
+        return
+    original_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+    subtotal = extracted.get("subtotal")
+    total = extracted.get("total")
+    candidates = [v for v in (subtotal, total) if v]
+    if not candidates:
+        return
+    target = min(candidates, key=lambda v: abs(v - original_sum))
+
+    keep_mask = [True] * len(items)
+    seen: dict[tuple, int] = {}
     for i, item in enumerate(items):
         if not isinstance(item, dict):
             continue
         key = (item.get("description", ""), item.get("total", 0))
         if key in seen:
             prev_idx = seen[key]
-            prev = items[prev_idx]
-            prev_qty = prev.get("qty", 1)
+            prev_qty = items[prev_idx].get("qty", 1)
             cur_qty = item.get("qty", 1)
             remove_idx = prev_idx if cur_qty > prev_qty else i
-            items[remove_idx] = None
+            keep_mask[remove_idx] = False
+            if remove_idx == prev_idx:
+                seen[key] = i
         else:
             seen[key] = i
-    new_items = [item for item in items if item is not None]
-    if subtotal and abs(sum(i.get("total", 0) for i in new_items) - subtotal) <= \
-                   abs(sum(i.get("total", 0) for i in extracted["line_items"] if i) - subtotal):
+
+    new_items = [item for item, keep in zip(items, keep_mask) if keep]
+    new_sum = sum(i.get("total", 0) for i in new_items if isinstance(i, dict))
+    if abs(new_sum - target) < abs(original_sum - target):
         extracted["line_items"] = new_items
 
 
@@ -1171,6 +1927,54 @@ def _fix_qty_hallucinations(items, unified_text):
             item["qty"] = 1
             item["unit_price"] = total
             item["total"] = total - (item.get("discount") or 0)
+
+
+def _apply_qty_notation_from_ocr(items, unified_text):
+    """When OCR has '(N個 X unit)' notation immediately after an item line
+    AND the LLM didn't apply it (qty=1 with anomalously low total), update
+    qty/unit/total from the OCR pattern.
+
+    Generic-purpose: handles receipts where the LLM ignores explicit qty/unit
+    annotations and instead picks up a stray weight/quantity number as the
+    total. Conservative — only fires when OCR shows a clear qty notation
+    near the item AND applying it strictly increases the total (so we don't
+    overwrite an already-correct qty=N item).
+    """
+    ocr_lines = unified_text.split('\n')
+    qty_re = re.compile(r'\(?\s*(\d+)\s*[コ個点]\s*[xX×]\s*(?:単|@)?\s*(\d[\d,]*)\s*\)?')
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        desc = (item.get("description") or "").strip()
+        if not desc or len(desc) < 4:
+            continue
+        cur_total = item.get("total", 0)
+        desc_prefix = desc[:4]
+        for li, line in enumerate(ocr_lines):
+            if desc_prefix not in line:
+                continue
+            for offset in range(1, 5):
+                if li + offset >= len(ocr_lines):
+                    break
+                nearby = ocr_lines[li + offset].strip()
+                if not nearby:
+                    continue
+                m = qty_re.search(nearby)
+                if m:
+                    qty = float(m.group(1))
+                    try:
+                        unit = float(m.group(2).replace(',', ''))
+                    except ValueError:
+                        break
+                    if qty >= 2 and unit > 0 and qty * unit > cur_total + 1:
+                        item["qty"] = qty
+                        item["unit_price"] = unit
+                        item["total"] = qty * unit
+                    break
+                # Stop on next item desc (Japanese without qty notation)
+                if re.search(r'[ぁ-んァ-ン一-龥]{2,}', nearby) and not re.search(r'\d+\s*[コ個点]', nearby):
+                    break
+            break
 
 
 def _fix_qty_from_ocr_patterns(items, unified_text):
@@ -1292,6 +2096,22 @@ def _fix_qty_from_ocr_patterns(items, unified_text):
                 float(found_price_str.replace(',', '')),
                 float(found_qty_str) * float(found_price_str.replace(',', '')),
             ))
+
+    # OCR-mangled "<unit_price>\n<qty>個" pattern: a pure-digits line followed by
+    # "<digits>個" on the next line. Common when an inline "unit qty個 total"
+    # line gets split (e.g. Lawson tofu where "212軽" was lost from the total).
+    for li in range(len(ocr_lines) - 1):
+        m_price = re.match(r'^\s*(\d[\d,]*)\s*$', ocr_lines[li])
+        m_qty = re.match(r'^\s*(\d+)\s*個\s*$', ocr_lines[li + 1])
+        if not (m_price and m_qty):
+            continue
+        qty = float(m_qty.group(1))
+        if qty <= 1 or qty > 99:
+            continue
+        price = float(m_price.group(1).replace(',', ''))
+        if price <= 0:
+            continue
+        ocr_qty_prices.append((qty, price, qty * price))
 
     for li, ocr_line in enumerate(ocr_lines):
         m_ten = re.match(r'^\s*(\d+)\s*点\s*$', ocr_line)
@@ -1427,8 +2247,14 @@ def _extract_fuel_usage(extracted, unified_text):
     }
 
 
-def _fix_fuel_volume_qty(items, unified_text, subtotal=None):
-    """Normalize fuel receipt volumes (fractional qty) to qty=1."""
+def _fix_fuel_volume_qty(items, unified_text, receipt_total=None):
+    """Normalize fuel receipt volumes (fractional qty) to qty=1.
+
+    The reference for a single-item receipt is receipt.total (printed 合計),
+    which equals the item's post-tax price for 内税 receipts and pre-tax + tax
+    for 外税. Using receipt.total avoids misfires under the canonical
+    pre-tax subtotal convention.
+    """
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -1444,10 +2270,11 @@ def _fix_fuel_volume_qty(items, unified_text, subtotal=None):
             item["unit_price"] = total
             break
         # Case 2: qty=1, single item, but unit_price is per-unit (e.g., yen/liter)
-        # and doesn't match receipt subtotal — correct to subtotal
-        if qty == 1 and len(items) == 1 and subtotal and total > 0 and abs(total - subtotal) > 5:
-            item["unit_price"] = subtotal
-            item["total"] = subtotal
+        # and doesn't match receipt total — correct to receipt total.
+        if (qty == 1 and len(items) == 1 and receipt_total
+                and total > 0 and abs(total - receipt_total) > 5):
+            item["unit_price"] = receipt_total
+            item["total"] = receipt_total
             break
 
 
@@ -1597,21 +2424,40 @@ def _detect_ocr_discounts(items, unified_text):
         for li, ocr_line in enumerate(ocr_lines):
             if desc_prefix not in ocr_line:
                 continue
-            for offset in range(1, 4):
+            for offset in range(1, 6):
                 if li + offset >= len(ocr_lines):
                     break
                 next_line = ocr_lines[li + offset].strip()
+                # Continuation lines (qty/multiplier info) are NOT a new item.
+                is_qty_continuation = (
+                    next_line.startswith('(')
+                    or re.search(r'\d+\s*[個点]', next_line) is not None
+                    or '単' in next_line
+                )
+                # Reached the next item: a CJK description line with no
+                # price/discount/qty-info markers.
+                if (re.search(r'[　-鿿]', next_line)
+                        and '割引' not in next_line
+                        and '値引' not in next_line
+                        and '%' not in next_line
+                        and '¥' not in next_line
+                        and '￥' not in next_line
+                        and not next_line.startswith('-')
+                        and not is_qty_continuation):
+                    break
                 if '¥' in next_line and re.search(r'[\u3000-\u9fff]', next_line):
                     break
-                if '割引' in next_line:
+                if '割引' in next_line or '値引' in next_line:
                     rate_str = ""
                     discount_amount = 0
                     for k in range(li + offset, min(li + offset + 4, len(ocr_lines))):
                         kline = ocr_lines[k].strip()
-                        rate_match = re.match(r'^(\d+)%$', kline)
+                        # Rate may appear inline ("割引: 20%") or alone ("10%").
+                        rate_match = re.search(r'(\d+)\s*%', kline)
                         if rate_match:
-                            rate_str = rate_match.group(0)
-                        amt_match = re.match(r'^-(\d[\d,.]*)$', kline)
+                            rate_str = rate_match.group(1) + '%'
+                        # Amount line: accept "-38", "-¥24", "-￥24" with optional yen sign.
+                        amt_match = re.match(r'^-\s*[¥￥]?\s*(\d[\d,.]*)\s*$', kline)
                         if amt_match:
                             amt_str = amt_match.group(1).replace(',', '')
                             if '.' in amt_str and float(amt_str) < 10:
@@ -1633,6 +2479,10 @@ def _normalize_taxes(extracted, unified_text, ocr_totals):
     subtotal = extracted.get("subtotal")
     total = extracted.get("total")
     tax_sum = sum(t.get("amount", 0) for t in extracted["taxes"])
+    items_sum = sum(
+        i.get("total", 0) for i in (extracted.get("line_items") or [])
+        if isinstance(i, dict)
+    ) or None
     for t in extracted["taxes"]:
         t["rate"] = normalize_tax_rate(t.get("rate", "unknown"))
         # Resolve "unknown" rate by searching OCR text for tax-context rate patterns
@@ -1652,11 +2502,252 @@ def _normalize_taxes(extracted, unified_text, ocr_totals):
         t["label"] = normalize_tax_label(
             t.get("label"), unified_text,
             subtotal=subtotal, total=total, tax_sum=tax_sum,
+            items_sum=items_sum,
         )
     extracted["taxes"] = [
         t for t in extracted["taxes"]
         if t.get("amount", 0) != 0 or t.get("rate") == "0%"
     ]
+    seen: set[tuple] = set()
+    deduped = []
+    for t in extracted["taxes"]:
+        key = (t.get("rate"), t.get("label"), t.get("amount"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(t)
+    extracted["taxes"] = deduped
+
+
+def _recover_missing_items_from_gap(extracted, unified_text):
+    """Add a missing line_item when the items_sum gap matches exactly one
+    unaccounted ¥amount in the OCR text.
+
+    Generic-purpose: applies to any receipt whose extracted items sum is
+    short by a single OCR-visible price. Conservative: only fires when
+    exactly one unmatched OCR price equals the gap (±2 yen) and a
+    plausible description appears within 12 lines above it.
+    """
+    items = extracted.get("line_items") or []
+    total = extracted.get("total")
+    subtotal = extracted.get("subtotal")
+    taxes = extracted.get("taxes") or []
+    tax_sum = sum(t.get("amount", 0) for t in taxes)
+
+    if not total or not items:
+        return
+
+    items_sum = sum(
+        i.get("total", 0) for i in items if isinstance(i, dict)
+    )
+
+    # Skip when items already balance against either target — no missing item.
+    items_match_total = abs(items_sum - total) <= 2
+    items_match_subtotal = subtotal is not None and abs(items_sum - subtotal) <= 2
+    if items_match_total or items_match_subtotal:
+        return
+
+    lines = unified_text.split('\n')
+
+    # Collect OCR ¥amounts excluding summary lines
+    ocr_prices: list[tuple[int, float]] = []
+    for i, line in enumerate(lines):
+        if _SKIP_PRICE_LINE.search(line):
+            continue
+        for m in re.finditer(r'[¥￥]\s*([\d,]+)', line):
+            try:
+                amt = float(m.group(1).replace(',', ''))
+            except ValueError:
+                continue
+            if amt > 0:
+                ocr_prices.append((i, amt))
+
+    # Multiset diff: remove one OCR entry per extracted item amount
+    item_amounts = [
+        i.get("total", 0) for i in items if isinstance(i, dict)
+    ]
+    unmatched = list(ocr_prices)
+    for amt in item_amounts:
+        for j, (_idx, oa) in enumerate(unmatched):
+            if abs(oa - amt) < 1:
+                unmatched.pop(j)
+                break
+
+    # Try both targets: items add to total (内税) or to subtotal (外税).
+    # Pre-normalize, the LLM-supplied tax label is unreliable, so test both
+    # and only fire if exactly one yields a single matching unaccounted ¥.
+    successful = []
+    for try_target in (total, subtotal):
+        if try_target is None:
+            continue
+        g = try_target - items_sum
+        if g <= 0 or g > total:
+            continue
+        matches = [(idx, amt) for idx, amt in unmatched if abs(amt - g) <= 2]
+        if len(matches) == 1:
+            successful.append((try_target, matches[0]))
+
+    if len(successful) != 1:
+        return
+
+    target, (price_line_idx, price) = successful[0]
+
+    def _clean_candidate(text: str) -> str:
+        """Strip price suffix, count markers, tax markers, and leading product
+        codes from a description candidate."""
+        text = text.strip()
+        # Drop everything from the first ¥ onward (item-and-price merged lines)
+        m = re.search(r'[¥￥]', text)
+        if m:
+            text = text[:m.start()].strip()
+        # Drop trailing count markers like "1点", "2個", "3コ"
+        text = re.sub(r'\s+[\d,]+\s*[点個コ]\s*$', '', text).strip()
+        # Drop trailing tax markers
+        text = re.sub(r'\s*[※\*非外]\s*$', '', text).strip()
+        # Strip leading product/department code: 4+ digits, optional letters,
+        # optional ')'. Only when the remainder still has Japanese content.
+        m = re.match(r'^\d{4,}[A-Za-z]{0,3}\)?\s?(.+)$', text)
+        if m and re.search(r'[ぁ-んァ-ン一-龥]', m.group(1)):
+            text = m.group(1).strip()
+        return text
+
+    def _is_existing_desc(text: str) -> bool:
+        return any(
+            isinstance(o, dict)
+            and (o.get("description") or "").strip() == text
+            for o in items
+        )
+
+    def _is_valid_desc(text: str) -> bool:
+        if not text or len(text) < 3:
+            return False
+        if text in _GENERIC_DESC_MARKERS:
+            return False
+        if _SKIP_PRICE_LINE.search(text):
+            return False
+        if re.match(r'^\d{12,}$', text):
+            return False
+        if re.match(r'^[\d,\s\-\(\)\.\*※軽除外]+$', text):
+            return False
+        if _JUNK_DESC_RE.search(text):
+            return False
+        if _HEADER_LINE_RE.search(text):
+            return False
+        # Skip lines without any Japanese (logos, store names, English-only)
+        if not re.search(r'[ぁ-んァ-ン一-龥]', text):
+            return False
+        # Short fragments (<5 chars) are usually OCR garbage when adding a new
+        # item — unless they start with a product code (e.g., "0011W) X").
+        if len(text) < 5 and not re.match(r'^\d{3,}', text):
+            return False
+        if re.match(r'^単?\s*\d', text) and ('×' in text or 'x' in text or '個' in text):
+            return False
+        return True
+
+    desc = None
+
+    # First check the price line itself — rejoin_price_lines often merges
+    # the item name with its price on a single line.
+    line_text = lines[price_line_idx]
+    cand = _clean_candidate(line_text)
+    if _is_valid_desc(cand) and not _is_existing_desc(cand):
+        desc = cand
+
+    # Else search backward up to 15 lines, then forward up to 5 lines.
+    # Prefer product-code-prefixed lines (e.g. "20060SAミタメスッキリ ロック")
+    # since they're unambiguous item starts even when surrounded by OCR garbage.
+    if not desc:
+        candidates_idx = list(range(price_line_idx - 1, max(price_line_idx - 16, -1), -1))
+        candidates_idx += list(range(price_line_idx + 1, min(price_line_idx + 6, len(lines))))
+
+        # First pass: lines with a leading product code (e.g. "20060SA…").
+        # Check the prefix on the raw line, then clean it for the description.
+        for j in candidates_idx:
+            raw = lines[j].strip()
+            if not re.match(r'^\d{4,}', raw):
+                continue
+            cand = _clean_candidate(raw)
+            if _is_valid_desc(cand) and not _is_existing_desc(cand):
+                desc = cand
+                break
+        # Second pass: any valid candidate
+        if not desc:
+            for j in candidates_idx:
+                cand = _clean_candidate(lines[j])
+                if _is_valid_desc(cand) and not _is_existing_desc(cand):
+                    desc = cand
+                    break
+
+    if not desc:
+        return
+
+    # Decide qty/unit_price: if the line above the price has "単X×N個" form,
+    # use it for qty/unit_price; else default qty=1, unit_price=price.
+    qty = 1
+    unit_price = price
+    for j in range(price_line_idx - 1, max(price_line_idx - 4, -1), -1):
+        line = lines[j].strip()
+        m = re.match(r'単?\s*(\d+)\s*[×x]\s*(\d+)\s*個?', line)
+        if m:
+            up = float(m.group(1))
+            q = float(m.group(2))
+            if abs(up * q - price) < 2:
+                qty = int(q)
+                unit_price = up
+            break
+
+    # Tax category: use majority rate from existing items, falling back to
+    # the receipt's tax rates.
+    tax_category = "0%"
+    if items:
+        from collections import Counter
+        cats = Counter(
+            i.get("tax_category") for i in items
+            if isinstance(i, dict) and i.get("tax_category")
+        )
+        if cats:
+            tax_category = cats.most_common(1)[0][0]
+    elif taxes:
+        tax_category = taxes[0].get("rate", "0%")
+
+    new_item = {
+        "description": desc,
+        "qty": qty,
+        "unit_price": unit_price,
+        "total": price,
+        "tax_category": tax_category,
+        "discount": 0,
+        "discount_rate": "",
+    }
+
+    # Insert at the OCR-order position: find the existing item whose price
+    # appears after this one in the OCR text, and insert before it.
+    insert_pos = len(extracted["line_items"])
+    for idx, existing in enumerate(extracted["line_items"]):
+        if not isinstance(existing, dict):
+            continue
+        e_total = existing.get("total", 0)
+        if not e_total:
+            continue
+        existing_price_line = None
+        for li, line in enumerate(lines):
+            if _SKIP_PRICE_LINE.search(line):
+                continue
+            for m in re.finditer(r'[¥￥]\s*([\d,]+)', line):
+                try:
+                    amt = float(m.group(1).replace(',', ''))
+                except ValueError:
+                    continue
+                if abs(amt - e_total) < 1:
+                    existing_price_line = li
+                    break
+            if existing_price_line is not None:
+                break
+        if existing_price_line is not None and existing_price_line > price_line_idx:
+            insert_pos = idx
+            break
+
+    extracted["line_items"].insert(insert_pos, new_item)
 
 
 def _fix_items_from_subtotal(extracted, unified_text, ocr_totals):
@@ -1721,6 +2812,7 @@ def postprocess_receipt(
     _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
     _fix_line_items(extracted, unified_text)
     _fix_items_from_subtotal(extracted, unified_text, ocr_totals)
+    _recover_missing_items_from_gap(extracted, unified_text)
 
     # Clear account_number when it's a masked card number suffix, not a real account
     acct = extracted.get("account_number")
@@ -1793,38 +2885,6 @@ def postprocess_receipt(
                 if item.get("unit_price") and abs(item["unit_price"] - item_sum) < 1:
                     item["unit_price"] = receipt_total
                 items_fixed = True
-        if items_fixed:
-            extracted["subtotal"] = sum(
-                i.get("total", 0) for i in extracted["line_items"] if isinstance(i, dict)
-            )
-
-    # Fix subtotal = rate_base confusion: when items sum to total, subtotal should = total
-    if (extracted.get("subtotal") and extracted.get("total")
-            and abs(extracted["subtotal"] - extracted["total"]) > 1
-            and "subtotal" not in ocr_totals):
-        item_sum = sum(i.get("total", 0) for i in extracted.get("line_items", [])
-                       if isinstance(i, dict))
-        if item_sum > 0 and abs(item_sum - extracted["total"]) < 5:
-            extracted["subtotal"] = extracted["total"]
-
-    # Inclusive tax subtotal fix
-    if extracted.get("subtotal") and extracted.get("total") and extracted.get("taxes"):
-        ocr_tax_labels = [t.get("label", "") for t in ocr_totals.get("taxes", [])]
-        if not ocr_tax_labels:
-            ocr_tax_labels = [t.get("label", "") for t in extracted.get("taxes", [])]
-        all_inclusive = ocr_tax_labels and all(
-            (lbl or '') in ('内税', '消費税等') or (lbl or '').startswith('内')
-            for lbl in ocr_tax_labels
-        )
-        if all_inclusive and re.search(r'外税|外\d+%|税抜対象', unified_text):
-            all_inclusive = False
-        if all_inclusive and "subtotal" not in ocr_totals:
-            tax_sum = sum(t.get("amount", 0) for t in extracted["taxes"])
-            if extracted["subtotal"] and abs(extracted["subtotal"] + tax_sum - extracted["total"]) < 2:
-                extracted["subtotal"] = extracted["total"]
-            elif extracted["subtotal"] != extracted["total"]:
-                extracted["subtotal"] = extracted["total"]
-
     _normalize_taxes(extracted, unified_text, ocr_totals)
 
     # Fix tax amounts when OCR taxes are missing
@@ -1874,8 +2934,33 @@ def postprocess_receipt(
                 if abs(t.get("amount", 0) - computed) > 2:
                     t["amount"] = computed
 
-    if extracted.get("subtotal") is None and extracted.get("total") is not None:
-        extracted["subtotal"] = extracted["total"]
+    # Universal subtotal rule: subtotal = total - sum(taxes), regardless of
+    # 内税 / 外税. Pre-tax base is the canonical definition; for 内税 receipts
+    # this means subtotal != sum(line_items) (line items are post-tax) which is
+    # expected and validated.
+    #
+    # Preserve an existing subtotal when it's close to the computed value —
+    # this guards against 1-2 yen rounding flips when the tax was extracted
+    # with a small rounding error. The printed subtotal is authoritative for
+    # the receipt's own internal rounding choice.
+    if extracted.get("total") is not None:
+        tax_sum = sum(t.get("amount", 0) for t in extracted.get("taxes") or [])
+        computed_sub = extracted["total"] - tax_sum
+        if computed_sub >= 0:
+            existing_sub = extracted.get("subtotal")
+            close_to_computed = (
+                existing_sub is not None
+                and abs(existing_sub - computed_sub) <= 5
+            )
+            close_to_pretax_via_tax_only = (
+                existing_sub is not None
+                and tax_sum > 0
+                and abs(existing_sub + tax_sum - extracted["total"]) <= 5
+            )
+            if close_to_computed or close_to_pretax_via_tax_only:
+                pass  # keep the printed/extracted value
+            else:
+                extracted["subtotal"] = computed_sub
 
     _extract_fuel_usage(extracted, unified_text)
 
