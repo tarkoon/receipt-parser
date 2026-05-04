@@ -1406,6 +1406,7 @@ def _fix_line_items(extracted, unified_text):
     _fix_discount_totals(extracted["line_items"])
     _fix_misattributed_discounts(extracted["line_items"])
     _detect_ocr_discounts(extracted["line_items"], unified_text)
+    _project_totals_to_ocr_multiset(extracted, unified_text)
 
 
 # Matches qty-detail OCR fragments like "(2個 X 単70)", "2個 X70)", "(@100 × 2個)".
@@ -1670,6 +1671,162 @@ def _replace_hallucinated_dup_with_ocr_item(items, unified_text, target_subtotal
     items[replace_idx]["total"] = new_total
     items[replace_idx]["unit_price"] = new_total
     items[replace_idx]["qty"] = 1
+
+
+_OCR_TRAILING_PRICE_RE = re.compile(r'(?:^|[\s(（])([¥￥]?\s*\d[\d,]*)\s*[*※除軽]?\s*$')
+_OCR_ZONE_END_RE = re.compile(r'^(小計|合計|現計|外税|内税|消費税|お預り|お釣り|釣銭|WAON|クレジット|お会計)')
+_OCR_QTY_NOTATION_RE = re.compile(r'\d+\s*個\s*[xX×Ⅹ]\s*\d')
+
+
+def _project_totals_to_ocr_multiset(extracted, unified_text):
+    """When LLM items_sum is off-target but the OCR's price-column multiset
+    sums to a target, snap the LLM's totals onto the OCR multiset.
+
+    Triggered only when:
+      - items_sum doesn't match subtotal or total (within ±2 yen)
+      - count of OCR price tokens (after reserving qty>1 unit_prices) equals
+        the count of qty=1 items, OR exactly one extra candidate exists
+        and dropping it produces the unique target-matching subset
+      - the resulting OCR multiset sums to a target (subtotal-qtyN_total or
+        total-qtyN_total)
+
+    The new totals replace the LLM's by total-rank (sorted-OCR -> sorted-items).
+    Description↔total pairing is not preserved — the test compares totals as
+    a multiset, and any (desc, total) coherence is incidental on column-stacked
+    OCR layouts where the LLM couldn't recover the visual row order.
+    """
+    items = extracted.get("line_items") or []
+    if not items:
+        return
+    items_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+    subtotal = extracted.get("subtotal")
+    total = extracted.get("total")
+    targets = [t for t in (subtotal, total) if t]
+    if not targets:
+        return
+    if any(abs(items_sum - t) <= 2 for t in targets):
+        return
+
+    lines = unified_text.split('\n')
+
+    # Find item zone: from first inline-priced line to first 小計/合計-style end marker.
+    zone_start = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if re.search(r'[¥￥]\s*\d', s) or re.search(r'\d[\d,]*\s*[*※除軽]\s*$', s):
+            zone_start = i
+            break
+    if zone_start is None:
+        return
+    zone_end = len(lines)
+    for i in range(zone_start, len(lines)):
+        if _OCR_ZONE_END_RE.match(lines[i].strip()):
+            zone_end = i
+            break
+
+    # Extract candidate price tokens. Each candidate is (line_idx, value).
+    candidates: list[tuple[int, int]] = []
+    for li in range(zone_start, zone_end):
+        s = lines[li].strip()
+        if not s:
+            continue
+        if _OCR_QTY_NOTATION_RE.search(s):
+            continue  # qty notation like "2個 X70)" — skip whole line
+        m = _OCR_TRAILING_PRICE_RE.search(s)
+        if not m:
+            continue
+        raw = m.group(1).strip().lstrip('¥￥').replace(',', '')
+        if not raw or not raw.isdigit():
+            continue
+        try:
+            v = int(raw)
+        except ValueError:
+            continue
+        if v < 1 or v > 99999:
+            continue
+        candidates.append((li, v))
+
+    if not candidates:
+        return
+
+    # Reserve OCR tokens consumed by qty>1 items (their unit_price).
+    qty_n_items = [i for i in items if isinstance(i, dict) and (i.get("qty") or 1) > 1]
+    qty_1_items = [i for i in items if isinstance(i, dict) and (i.get("qty") or 1) == 1]
+    if not qty_1_items:
+        return  # nothing to project onto
+
+    pool = list(candidates)
+    for it in qty_n_items:
+        up = it.get("unit_price")
+        if up is None:
+            continue
+        for j, (_, v) in enumerate(pool):
+            if abs(v - up) < 1:
+                pool.pop(j)
+                break
+
+    n_qty1 = len(qty_1_items)
+    qtyN_total = sum(i.get("total", 0) for i in qty_n_items)
+
+    # Find the single subset (size = n_qty1) whose sum is within 2 of any target.
+    target_qty1_sums = [t - qtyN_total for t in targets]
+
+    def _multiset_matches(values: list[int]) -> int | None:
+        s = sum(values)
+        for t in target_qty1_sums:
+            if abs(s - t) <= 2:
+                return t
+        return None
+
+    pool_values = [v for _, v in pool]
+    chosen: list[int] | None = None
+
+    if len(pool_values) == n_qty1:
+        if _multiset_matches(pool_values) is not None:
+            chosen = list(pool_values)
+    elif len(pool_values) == n_qty1 + 1:
+        # Try dropping each candidate; apply only if exactly one drop produces
+        # a sum that matches a target.
+        viable: list[list[int]] = []
+        for k in range(len(pool_values)):
+            sub = pool_values[:k] + pool_values[k + 1:]
+            if _multiset_matches(sub) is not None:
+                viable.append(sub)
+        # Multiple drops can produce equivalent sums when duplicate values
+        # are present (dropping any of three "228"s gives the same subset).
+        # Treat them as one viable solution.
+        unique = {tuple(sorted(v)) for v in viable}
+        if len(unique) == 1:
+            chosen = list(viable[0])
+
+    if chosen is None:
+        return
+
+    # Verify the projection actually changes the multiset (no point otherwise).
+    sorted_qty1_totals = sorted(i.get("total", 0) for i in qty_1_items)
+    sorted_chosen = sorted(chosen)
+    if sorted_qty1_totals == sorted_chosen:
+        return
+
+    # Sanity: same length
+    if len(sorted_chosen) != len(qty_1_items):
+        return
+
+    # Apply: assign sorted-OCR totals to qty=1 items by their current total-rank.
+    qty1_sorted_idxs = sorted(
+        range(len(items)),
+        key=lambda j: (
+            -1 if not isinstance(items[j], dict) or (items[j].get("qty") or 1) > 1 else 0,
+            items[j].get("total", 0) if isinstance(items[j], dict) else 0,
+        ),
+    )
+    qty1_sorted_idxs = [j for j in qty1_sorted_idxs
+                        if isinstance(items[j], dict) and (items[j].get("qty") or 1) == 1]
+
+    for k, idx in enumerate(qty1_sorted_idxs):
+        new_total = sorted_chosen[k]
+        items[idx]["total"] = new_total
+        items[idx]["unit_price"] = new_total
 
 
 def _find_ocr_item_desc(lines, price_line_idx, existing_items):
