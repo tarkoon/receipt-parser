@@ -153,9 +153,14 @@ def check_subtotal(result: dict, truth: dict) -> dict:
         ok = got is None or got == result.get("total")
         return {"pass": ok, "expected": None, "got": got,
                 "detail": f"got {got}, expected None or {result.get('total')}"}
-    ok = got == exp
+    # ±5 tolerance, matching check_tax_amount: subtotal = total − tax_sum
+    # propagates 1:1 the rounding noise in tax extraction.
+    try:
+        ok = abs(float(got) - float(exp)) <= 5
+    except (TypeError, ValueError):
+        ok = got == exp
     return {"pass": ok, "expected": exp, "got": got,
-            "detail": f"got {got}, expected {exp}"}
+            "detail": f"got {got}, expected {exp} (tol ±5)"}
 
 
 def check_line_items_count(result: dict, truth: dict) -> dict:

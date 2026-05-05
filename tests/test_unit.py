@@ -108,9 +108,10 @@ def test_bad_subtotal_plus_tax():
 
 
 def test_tax_inclusive_no_false_warning():
+    """内税 (tax-inclusive): subtotal is pre-tax base (total - tax)."""
     receipt = Receipt(
-        total=324, subtotal=324,
-        taxes=[{"rate": "8%", "amount": 24}],
+        total=324, subtotal=300,
+        taxes=[{"rate": "8%", "label": "内税", "amount": 24}],
     )
     assert validate_receipt(receipt) == []
 
@@ -420,3 +421,172 @@ def test_stage_callback_none_default():
         # Should not raise — on_stage defaults to None
         result = process_ocr_text(ocr_text)
         assert "merchant" in result
+
+
+def test_stage_callback_emits_classify_and_plan():
+    """Phase 2 contract: a 4-arg callback (param named `payload`) receives the
+    structured plan and classify payloads."""
+    from receipt_parser.pipeline import process_ocr_text
+
+    events: list[tuple[str, str, float, dict | None]] = []
+
+    def on_stage(stage, detail, progress, payload=None):
+        events.append((stage, detail, progress, payload))
+
+    with patch("receipt_parser.pipeline.extract_with_verification") as mock_extract:
+        mock_extract.return_value = (
+            {"merchant": "マクドナルド", "date": "2025-01-15", "total": 500,
+             "currency": "JPY", "line_items": [
+                 {"description": "ビッグマック", "total": 500}]},
+            [{"pass": 1, "extraction": {}, "warnings": []}],
+        )
+        process_ocr_text(
+            "マクドナルド\n2025-01-15\n合計 ¥500\nビッグマック ¥500",
+            on_stage=on_stage,
+        )
+
+    stages = [e[0] for e in events]
+    assert "plan" in stages
+    assert "classify" in stages
+    assert "validate" in stages
+    assert stages[-1] == "done"
+
+    plan = next(e for e in events if e[0] == "plan")
+    assert plan[3] is not None and plan[3]["page_count"] == 1
+    assert plan[3]["pass_budget"] >= 1
+    assert plan[3]["path"] in ("receipt", "tbd", "utility_bill", "payment_slip")
+
+    classify = next(e for e in events if e[0] == "classify")
+    assert classify[3] is not None
+    assert classify[3].get("document_type") in ("receipt", "utility_bill", "payment_slip")
+    # Classify payload must let the consumer finalize the step list without
+    # memorizing the path table.
+    assert "expected_stages" in classify[3]
+    assert classify[3]["expected_stages"][-1] == "done"
+    assert "will_resolve_location" in classify[3]
+    assert isinstance(classify[3]["will_resolve_location"], bool)
+
+    # Validate-stage detail should include the result preview ("N items · ¥M").
+    validate_event = next(e for e in events if e[0] == "validate")
+    assert "item" in validate_event[1]
+    assert "500" in validate_event[1]
+
+
+def test_stage_callback_legacy_three_arg_still_works():
+    """3-arg callbacks must keep working; payload must NOT be passed positionally."""
+    from receipt_parser.pipeline import process_ocr_text
+
+    events: list[tuple] = []
+
+    def on_stage(stage, detail, progress):
+        events.append((stage, detail, progress))
+
+    with patch("receipt_parser.pipeline.extract_with_verification") as mock_extract:
+        mock_extract.return_value = (
+            {"merchant": "マクドナルド", "total": 500, "currency": "JPY",
+             "line_items": []},
+            [{"pass": 1, "extraction": {}, "warnings": []}],
+        )
+        process_ocr_text("マクドナルド\n合計 ¥500", on_stage=on_stage)
+
+    assert events[-1][0] == "done"
+    # Legacy callback must never receive a 4th element.
+    assert all(len(e) == 3 for e in events)
+
+
+def test_stage_callback_default_arg_closure_pattern_preserved():
+    """The CLI-style closure-capture-via-default trick (`def cb(s,d,p,_task=t)`)
+    must not be misclassified as a 4-arg payload-receiving callback. The
+    default-bound 4th arg is closure state, not an output channel."""
+    from receipt_parser.pipeline import _callback_accepts_payload
+
+    sentinel = object()
+
+    def cb(stage, detail, pct, _task=sentinel):
+        return _task  # would expose accidental override
+
+    # Conservative: only the explicit `payload` name (or **kwargs) opts in.
+    assert _callback_accepts_payload(cb) is False
+
+    def cb_payload(stage, detail, progress, payload=None):
+        return payload
+
+    assert _callback_accepts_payload(cb_payload) is True
+
+    def cb_kwargs(*args, **kwargs):
+        return kwargs
+
+    assert _callback_accepts_payload(cb_kwargs) is True
+
+
+def test_stage_callback_cancellation_raises():
+    """A callback returning False must abort the pipeline with PipelineCancelled."""
+    from receipt_parser.pipeline import process_ocr_text, PipelineCancelled
+
+    def on_stage(stage, detail, progress):
+        if stage == "extract":
+            return False  # request cancellation
+        return None
+
+    with patch("receipt_parser.pipeline.extract_with_verification") as mock_extract:
+        mock_extract.return_value = (
+            {"merchant": "X", "total": 1, "currency": "JPY", "line_items": []},
+            [{"pass": 1, "extraction": {}, "warnings": []}],
+        )
+        try:
+            process_ocr_text("X\n合計 ¥1", on_stage=on_stage)
+        except PipelineCancelled as e:
+            assert e.stage == "extract"
+        else:
+            raise AssertionError("Expected PipelineCancelled to be raised")
+
+
+def test_stage_callback_warn_fires_on_low_block_retry():
+    """The warn stage should be emitted when OCR returns <3 blocks and rotation
+    retry kicks in. Verifies the engineer's example: 'OCR returned <3 blocks,
+    retrying'."""
+    from receipt_parser.pipeline import process_document
+    from receipt_parser.ocr import OCRResult
+
+    events: list[tuple] = []
+
+    def on_stage(stage, detail, progress, payload=None):
+        events.append((stage, detail, progress, payload))
+
+    # Two blocks → triggers retry. Subsequent rotations also return weak results
+    # (so the loop runs but doesn't early-stop).
+    weak_blocks = [
+        {"text": "a", "confidence": 0.5, "x": 0, "y": 0,
+         "bbox": [[0, 0], [10, 0], [10, 10], [0, 10]]},
+        {"text": "b", "confidence": 0.5, "x": 0, "y": 12,
+         "bbox": [[0, 12], [10, 12], [10, 22], [0, 22]]},
+    ]
+
+    def fake_ocr(*_args, **_kwargs):
+        return OCRResult(blocks=list(weak_blocks),
+                         source="cloud_vision", retried=False)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        img_path = Path(tmp) / "tiny.png"
+        img = np.full((50, 50, 3), 255, dtype=np.uint8)
+        cv2.imwrite(str(img_path), img)
+
+        with patch("receipt_parser.pipeline.run_cloud_vision",
+                   side_effect=fake_ocr), \
+             patch("receipt_parser.pipeline.init_cloud_vision",
+                   return_value=MagicMock()), \
+             patch("receipt_parser.pipeline.extract_with_verification") as mock_extract:
+            mock_extract.return_value = (
+                {"merchant": "X", "total": 1, "currency": "JPY",
+                 "line_items": []},
+                [{"pass": 1, "extraction": {}, "warnings": []}],
+            )
+            process_document(img_path, on_stage=on_stage)
+
+    warn_events = [e for e in events if e[0] == "warn"]
+    assert warn_events, f"Expected at least one 'warn' event; got {[e[0] for e in events]}"
+    # Payload should describe the reason and page index.
+    payload = warn_events[0][3]
+    assert payload is not None
+    assert payload.get("reason") == "low_block_count"
+    assert payload.get("page") == 1

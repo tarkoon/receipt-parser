@@ -22,7 +22,8 @@ from .ocr import init_cloud_vision, run_cloud_vision, blocks_to_structured_text,
 from .llm import check_model_available, extract_with_verification, DEFAULT_MODEL
 from .validation import validate_receipt
 from .normalize import (normalize_fullwidth, clean_handwritten_ocr, strip_barcode_lines,
-                        rejoin_price_lines)
+                        rejoin_price_lines, strip_bonus_point_lines,
+                        rejoin_totals_label_value_columns)
 from .tracing import PipelineTrace, draw_ocr_bboxes, draw_field_overlay
 from .patterns import (
     UTILITY_BILL_KEYWORDS, PAYMENT_SLIP_KEYWORDS, RECEIPT_KEYWORDS,
@@ -35,18 +36,80 @@ from .pipeline_receipt import (
 from .pipeline_bill import postprocess_utility_bill
 from .pipeline_slip import postprocess_payment_slip
 
-from typing import Callable
+import inspect
+from typing import Any, Callable, Literal
 
-StageCallback = Callable[[str, str, float], None] | None
+# Public progress contract — these stage names are stable across pipeline versions.
+# Consumers may switch on these strings safely.
+StageName = Literal[
+    "load",
+    "ocr",
+    "classify",
+    "normalize",
+    "extract",
+    "postprocess",
+    "resolve_location",
+    "validate",
+    "warn",
+    "plan",
+    "done",
+]
+
+# Callback may be 3-arg (stage, detail, progress) — original contract — or
+# 4-arg by naming the extra parameter `payload` (or accepting **kwargs).
+# Returning False from any call requests cooperative cancellation.
+StageCallback = Callable[..., Any] | None
 
 
-def _notify(on_stage: StageCallback, stage: str, detail: str, progress: float) -> None:
-    """Fire a progress callback if one is registered."""
-    if on_stage is not None:
-        on_stage(stage, detail, progress)
+class PipelineCancelled(Exception):
+    """Raised when an on_stage callback returns False to abort the pipeline."""
+    def __init__(self, stage: str):
+        super().__init__(f"Pipeline cancelled at stage: {stage}")
+        self.stage = stage
 
 
-_PIPELINE_VERSION = "3.0.0"
+def _callback_accepts_payload(cb) -> bool:
+    """Decide whether to pass the structured payload as a keyword argument.
+
+    A callback opts in to the 4-arg contract by naming a parameter `payload`
+    or accepting **kwargs. Counting positional slots is unreliable: callers
+    sometimes use a 4th defaulted positional (e.g. ``def cb(s, d, p, _task=t)``)
+    as a closure-capture idiom, and we must NOT pass our payload there.
+    """
+    try:
+        sig = inspect.signature(cb)
+    except (ValueError, TypeError):
+        return False
+    params = sig.parameters
+    if "payload" in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _notify(
+    on_stage: StageCallback,
+    stage: str,
+    detail: str,
+    progress: float,
+    payload: dict | None = None,
+) -> None:
+    """Fire a progress callback if one is registered.
+
+    Backwards compatible with 3-arg callbacks. The structured payload is only
+    passed when the callback's signature opts in (param named `payload` or
+    accepts **kwargs). If the callback returns False, raises PipelineCancelled.
+    """
+    if on_stage is None:
+        return
+    if _callback_accepts_payload(on_stage):
+        result = on_stage(stage, detail, progress, payload=payload)
+    else:
+        result = on_stage(stage, detail, progress)
+    if result is False:
+        raise PipelineCancelled(stage)
+
+
+_PIPELINE_VERSION = "3.1.0"
 
 
 def detect_document_type(text: str) -> str:
@@ -128,8 +191,10 @@ def _location_has_ocr_evidence(location: str, ocr_text: str) -> bool:
     ocr_norm = re.sub(r'\s+', '', ocr_text)
     if loc_norm in ocr_norm:
         return True
-    # Check individual admin-level segments
-    parts = re.split(r'[市区町村郡県都道府]', location)
+    # Check individual admin-level segments. Also split on facility suffixes
+    # (IC/インターチェンジ) so a toll-gate name like "若宮IC" is matched against
+    # the bare "若宮" that appears in OCR after 料金所.
+    parts = re.split(r'[市区町村郡県都道府]|IC$|インターチェンジ$', location)
     for part in parts:
         part = part.strip()
         if len(part) >= 2 and part in ocr_norm:
@@ -232,6 +297,33 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
         if ADMIN_SUFFIX_RE.search(candidate):
             return candidate, None
 
+    # Toll-receipt deterministic path: NEXCO/expressway receipts print 料金所
+    # alone on its own line, followed by the toll-gate name on the next non-
+    # empty line (e.g. "若宮", "小倉南"). Without a phone area code (toll-free
+    # 0120) the LLM otherwise falls back to the corporate HQ address — the
+    # geographically wrong place. Use the toll-gate name with an "IC" suffix
+    # as the location instead. Skip the noise line "料金所では一旦停車…".
+    is_toll = bool(re.search(r'料金所|高速道路|NEXCO', ocr_text))
+    if is_toll:
+        toll_lines = ocr_text.split('\n')
+        toll_name = ""
+        for idx, raw in enumerate(toll_lines):
+            line = raw.strip()
+            # Exact "料金所" on a line by itself (not "料金所では一旦…")
+            if line == "料金所":
+                for nxt in toll_lines[idx + 1:idx + 4]:
+                    cand = nxt.strip()
+                    # 2-4 char Japanese name (kanji + kana), no punctuation
+                    if cand and re.match(r'^[　-鿿]{2,8}$', cand) and 'です' not in cand:
+                        toll_name = cand
+                        break
+                if toll_name:
+                    break
+        if toll_name:
+            if not re.search(r'(?:IC|インターチェンジ|料金所)$', toll_name):
+                return f"{toll_name}IC", None
+            return toll_name, None
+
     prompt = f"""Given these clues from a Japanese receipt, determine the city (市) or ward (区) where this store is located.
 Output ONLY a JSON object with a single "location" field. The location should be at the 市区町村 level, e.g. "宗像市赤間", "福岡市博多区", "北九州市八幡区".
 The branch name (e.g. 赤間店 → 赤間 is a neighborhood in 宗像市) is the strongest clue for location.
@@ -307,6 +399,90 @@ def _compute_posthoc_confidence(extracted: dict, warnings: list[str]) -> dict:
     return conf
 
 
+def _build_validate_detail(extracted: dict) -> str:
+    """Format a short receipt preview string for the validate-stage callback."""
+    if "error" in extracted or "_error" in extracted:
+        return "Validating"
+
+    parts: list[str] = []
+    doc_type = extracted.get("document_type") or "receipt"
+
+    if doc_type == "receipt":
+        n = len(extracted.get("line_items") or [])
+        if n:
+            parts.append(f"{n} item{'s' if n != 1 else ''}")
+    elif doc_type == "utility_bill":
+        st = extracted.get("service_type")
+        if st:
+            parts.append(str(st))
+    elif doc_type == "payment_slip":
+        parts.append("payment slip")
+
+    total = extracted.get("total")
+    if total is not None:
+        currency = extracted.get("currency") or ""
+        symbol = "¥" if currency in ("JPY", "") else ""
+        try:
+            parts.append(f"{symbol}{int(round(float(total))):,}")
+        except (TypeError, ValueError):
+            pass
+
+    return " · ".join(parts) if parts else "Validating"
+
+
+def _build_plan_payload(
+    page_count: int,
+    pass_budget: int,
+    doc_type: str | None = None,
+) -> dict:
+    """Build the structured payload for a 'plan' stage event."""
+    if doc_type is None:
+        path = "tbd"
+        will_resolve_location = True  # unknown until classify; assume yes
+    else:
+        path = doc_type
+        will_resolve_location = (doc_type == "receipt")
+    return {
+        "path": path,
+        "page_count": page_count,
+        "pass_budget": pass_budget,
+        "will_resolve_location": will_resolve_location,
+    }
+
+
+def _expected_stages(doc_type: str, source: str) -> list[str]:
+    """The remaining stage keys this document will fire after classify, in order.
+
+    Lets consumers finalize the step list as soon as classify lands, instead of
+    inferring the path from doc_type + source themselves.
+    """
+    if source == "digital_pdf":
+        # Fast path: no OCR-grouping, normalize, postprocess, or resolve_location
+        # stage events. (Location resolution may still run internally for
+        # receipts, but no event is fired for it.)
+        return ["extract", "validate", "done"]
+    stages = ["extract", "postprocess"]
+    if doc_type == "receipt":
+        stages.append("resolve_location")
+    stages.extend(["validate", "done"])
+    return stages
+
+
+def _build_classify_payload(doc_type: str, source: str) -> dict:
+    """Structured payload for the 'classify' event — enough info to finalize the
+    UI step list without needing to memorize the per-doc-type path table."""
+    if source == "digital_pdf":
+        will_resolve = False  # not emitted as a stage even when it runs
+    else:
+        will_resolve = (doc_type == "receipt")
+    return {
+        "document_type": doc_type,
+        "source": source,
+        "will_resolve_location": will_resolve,
+        "expected_stages": _expected_stages(doc_type, source),
+    }
+
+
 def _build_result(receipt, final_warnings, pass_history, model, debug=False, trace=None,
                    ocr_confidence=None, llm_confidence=None,
                    ocr_source=None, ocr_retried=None, ocr_retry_reason=None,
@@ -368,6 +544,14 @@ def process_document(
     images = load_image(file_path)
     trace.log_step("original", image=images[0])
 
+    # Plan event: declare known shape early so consumers can draw the step list.
+    # Doc-type is unknown until classify; path is "tbd" here.
+    _notify(
+        on_stage, "plan", "Pipeline plan",
+        0.02,
+        payload=_build_plan_payload(page_count=len(images), pass_budget=passes),
+    )
+
     # Digital PDF fast path
     if file_path.suffix.lower() == ".pdf":
         _notify(on_stage, "ocr", "Checking for digital text", 0.05)
@@ -376,6 +560,11 @@ def process_document(
             digital_text = normalize_fullwidth(digital_text)
             trace.log_step("digital_text_extracted", data=digital_text)
             doc_type = detect_document_type(digital_text)
+            _notify(
+                on_stage, "classify", f"Detected: {doc_type}",
+                0.35,
+                payload=_build_classify_payload(doc_type, source="digital_pdf"),
+            )
 
             if debug:
                 assert debug_dir is not None
@@ -386,6 +575,7 @@ def process_document(
             extracted, pass_history = extract_with_verification(
                 digital_text, model=model, passes=passes,
                 validate_fn=validate_receipt, doc_type=doc_type,
+                on_stage=on_stage,
             )
 
             if debug:
@@ -407,6 +597,7 @@ def process_document(
                 receipt = Receipt(**extracted)
             except Exception:
                 receipt = Receipt()
+            _notify(on_stage, "validate", _build_validate_detail(extracted), 0.95)
             final_warnings = validate_receipt(receipt)
             for w in receipt._soft_warnings:
                 if w not in final_warnings:
@@ -434,16 +625,47 @@ def process_document(
     all_ocr_results: list[OCRResult] = []
     text_parts = []
 
+    n_pages = max(1, len(images))
+    _OCR_BAND_START, _OCR_BAND_END = 0.05, 0.30
+    _OCR_BAND = _OCR_BAND_END - _OCR_BAND_START
+
+    rotations = (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
     for i, page_img in enumerate(images):
+        page_start = _OCR_BAND_START + (i / n_pages) * _OCR_BAND
+        page_end = _OCR_BAND_START + ((i + 1) / n_pages) * _OCR_BAND
+        if n_pages > 1:
+            _notify(on_stage, "ocr", f"OCR page {i+1} of {n_pages}", page_start)
+        else:
+            _notify(on_stage, "ocr", "Running OCR", page_start)
+
         ocr_result = run_cloud_vision(page_img, ocr_engine, skip_cache=skip_ocr_cache)
         all_ocr_results.append(ocr_result)
         blocks = ocr_result.blocks
 
         if len(blocks) < 3:
-            # Try all rotations (90°, 180°, 270°), pick best by confidence
+            # Try all rotations (90°, 180°, 270°), pick best by confidence.
+            _notify(
+                on_stage, "warn",
+                f"OCR returned {len(blocks)} blocks — retrying with rotations",
+                page_start,
+                payload={
+                    "reason": "low_block_count",
+                    "page": i + 1,
+                    "block_count": len(blocks),
+                },
+            )
             best_result = ocr_result
             best_conf = compute_ocr_confidence(blocks) if blocks else 0.0
-            for rotation in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE):
+            for r_idx, rotation in enumerate(rotations):
+                # Distribute sub-progress within this page's slot, leaving room
+                # for the post-rotation work.
+                sub_progress = page_start + ((r_idx + 1) / (len(rotations) + 1)) * (page_end - page_start)
+                _notify(
+                    on_stage, "ocr",
+                    f"Page {i+1} retry rotation {r_idx+1}/{len(rotations)}",
+                    sub_progress,
+                )
                 rotated = cv2.rotate(page_img, rotation)
                 rot_result = run_cloud_vision(rotated, ocr_engine, skip_cache=skip_ocr_cache)
                 rot_conf = compute_ocr_confidence(rot_result.blocks) if rot_result.blocks else 0.0
@@ -478,6 +700,11 @@ def process_document(
 
     # Detect document type
     doc_type = detect_document_type(unified_text)
+    _notify(
+        on_stage, "classify", f"Detected: {doc_type}",
+        0.35,
+        payload=_build_classify_payload(doc_type, source="ocr"),
+    )
 
     if not unified_text.strip():
         return {
@@ -556,7 +783,14 @@ def _run_extraction_pipeline(
     # Receipt-specific pre-processing
     ocr_totals = {}
     if doc_type == "receipt":
+        # Interleave label-value column splits in the totals zone BEFORE
+        # extracting financial totals — otherwise the line-by-line walk
+        # picks up sibling-label values (お預り) instead of 合計's own value.
+        unified_text = rejoin_totals_label_value_columns(unified_text)
         ocr_totals = extract_financial_totals(unified_text)
+        # Strip bonus-point lines BEFORE rejoin so item↔price column matching
+        # isn't disrupted by stray loyalty-point fragments.
+        unified_text = strip_bonus_point_lines(unified_text)
         unified_text = rejoin_price_lines(unified_text)
         unified_text = clean_handwritten_ocr(unified_text, ocr_confidence=ocr_conf)
 
@@ -567,11 +801,11 @@ def _run_extraction_pipeline(
             [],
         )
 
-    # LLM extraction with verification
-    _notify(on_stage, "extract", f"LLM pass 1 of {passes}", 0.45)
+    # LLM extraction with verification — emits per-pass beats internally.
     extracted, pass_history = extract_with_verification(
         unified_text, model=model, passes=passes,
         validate_fn=validate_receipt, doc_type=doc_type,
+        on_stage=on_stage,
     )
 
     if "error" not in extracted:
@@ -594,16 +828,32 @@ def _run_extraction_pipeline(
     elif doc_type == "payment_slip" and "error" not in extracted:
         extracted = postprocess_payment_slip(extracted, unified_text, raw_text=raw_text)
 
-    # Universal cash detection (all document types)
-    if "error" not in extracted and not extracted.get("payment_method"):
-        if re.search(r'領収証|領収書', unified_text) and not re.search(r'小計|合計|対象|税率', unified_text):
-            extracted["payment_method"] = "cash"
-
-    # Final cash fallback
+    # Universal cash detection (all document types). For handwritten 領収証
+    # forms, accept either explicit tender markers (お預り, 現金, 現計, お釣り)
+    # OR the formal cash-receipt acknowledgement (上記正に領収/受領いたしました)
+    # as long as nothing electronic or transfer-related contradicts it.
+    # The acknowledgement phrase on a small handwritten receipt with no other
+    # tender info is the standard Japanese signal that cash was tendered.
     _ELECTRONIC_PAY_RE = re.compile(
         r'クレジット|カード|PayPay|電子マネー|iD|QUICPay|Suica|WAON|nanaco|'
         r'PASMO|楽天Edy|LINE\s*Pay|au\s*PAY|d払い|メルペイ|交通系'
     )
+    if "error" not in extracted and not extracted.get("payment_method"):
+        is_handwritten = (
+            re.search(r'領収証|領収書', unified_text)
+            and not re.search(r'小計|合計|対象|税率', unified_text)
+        )
+        if is_handwritten:
+            has_tender = bool(re.search(r'お預り|現金|現計|お釣り|釣銭', unified_text))
+            has_acknowledgement = bool(
+                re.search(r'上記正に\s*(?:領収|受領)', unified_text)
+            )
+            has_electronic = bool(_ELECTRONIC_PAY_RE.search(unified_text))
+            has_transfer = bool(re.search(r'振込|振替|送金|口座', unified_text))
+            if has_tender or (has_acknowledgement and not has_electronic and not has_transfer):
+                extracted["payment_method"] = "cash"
+
+    # Final cash fallback
     if "error" not in extracted and not extracted.get("payment_method"):
         has_tender_label = bool(re.search(r'お預り', unified_text))
         has_change_label_final = bool(re.search(r'釣', unified_text))
@@ -657,8 +907,8 @@ def _run_extraction_pipeline(
                 extracted["location"] = line_norm
                 break
 
-    # Final validation
-    _notify(on_stage, "validate", "Validating", 0.95)
+    # Final validation — preview the result so consumers can flash it before "done".
+    _notify(on_stage, "validate", _build_validate_detail(extracted), 0.95)
     try:
         receipt = Receipt(**extracted)
     except Exception:
@@ -701,6 +951,18 @@ def process_ocr_text(
             "_pipeline_version": _PIPELINE_VERSION, "_line_items_reliable": False,
         }
 
+    # process_ocr_text skips image loading and OCR — declare the plan upfront
+    # with the doc_type already known, so consumers see the same event contract.
+    _notify(
+        on_stage, "plan", "Pipeline plan",
+        0.02,
+        payload=_build_plan_payload(page_count=1, pass_budget=passes, doc_type=doc_type),
+    )
+    _notify(
+        on_stage, "classify", f"Detected: {doc_type}",
+        0.35,
+        payload=_build_classify_payload(doc_type, source="ocr_text_input"),
+    )
     _notify(on_stage, "extract", "LLM extraction", 0.40)
     extracted, pass_history, final_warnings = _run_extraction_pipeline(
         unified_text=unified_text, raw_text=ocr_text,

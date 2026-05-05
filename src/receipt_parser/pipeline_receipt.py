@@ -207,6 +207,11 @@ def _extract_financial_totals_impl(text: str) -> dict:
     taxes: list[dict] = []
     _rate_context: str | None = None
     _rate_base: float | None = None
+    # Track all per-rate taxable bases seen so far. When 消費税等 ¥X appears
+    # without an inline rate, picking _rate_context (latest seen) misassigns
+    # the tax to the wrong rate on receipts that print 8% rows then 10% rows
+    # before the summary tax. Use bases × rate_pct to pick the correct rate.
+    _rate_bases_seen: dict[str, float] = {}
 
     for i, raw in enumerate(lines):
         line = raw.strip()
@@ -214,6 +219,28 @@ def _extract_financial_totals_impl(text: str) -> dict:
         rate_ctx_m = re.search(r'(\d+(?:\.\d+)?)%.*対象', line)
         if rate_ctx_m:
             _rate_context = normalize_tax_rate(rate_ctx_m.group(1) + '%')
+            base_val = None
+            yen_in_line = re.search(r'[¥￥]\s*([\d,]+)', line)
+            if yen_in_line:
+                try:
+                    base_val = float(yen_in_line.group(1).replace(',', ''))
+                except ValueError:
+                    pass
+            else:
+                # Yen amount may be on the next line (column-split OCR layout)
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    nb = lines[j].strip()
+                    yen_next = re.match(r'^[¥￥]\s*([\d,]+)\s*[\)）]?\s*$', nb)
+                    if yen_next:
+                        try:
+                            base_val = float(yen_next.group(1).replace(',', ''))
+                        except ValueError:
+                            pass
+                        break
+                    if nb and re.search(r'[　-鿿]', nb):
+                        break
+            if base_val is not None:
+                _rate_bases_seen[_rate_context] = base_val
 
         rate_amt_m = re.match(r'^(\d+(?:\.\d+)?)\s*%\s*[¥￥]\s*([\d,]+)\s*$', line)
         if rate_amt_m and not _rate_context:
@@ -221,9 +248,36 @@ def _extract_financial_totals_impl(text: str) -> dict:
             _rate_base = float(rate_amt_m.group(2).replace(',', ''))
 
         _has_specific_taxes = any(t.get('label') in ('税額', '外税', '内税') for t in taxes)
-        if re.search(r'消費税[等額]', line) and '対象' not in line and not _has_specific_taxes:
+        # Match 消費税 with optional 等/額 suffix. Receipts that print
+        # "(内消費税 ¥151)" inline (McDonald's, some chain stores) need the
+        # bare-消費税 case; '対象' guard still excludes label lines.
+        if re.search(r'消費税[等額]?', line) and '対象' not in line and not _has_specific_taxes:
             inline_rate_m = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
-            effective_rate = normalize_tax_rate(inline_rate_m.group(1) + '%') if inline_rate_m else _rate_context
+            if inline_rate_m:
+                effective_rate = normalize_tax_rate(inline_rate_m.group(1) + '%')
+            else:
+                effective_rate = _rate_context
+                # If multiple rate bases have been seen, pick the rate whose
+                # base × rate_pct best matches the tax amount. This corrects
+                # the case where the latest rate context belongs to a small
+                # 0-tax row (e.g. 10%対象 ¥3 where tax rounds to 0) but the
+                # actual tax (¥258) belongs to the earlier 8% base.
+                if len(_rate_bases_seen) >= 2:
+                    val_lookahead = _extract_yen_min_nearby(lines, i, look_ahead=5)
+                    if val_lookahead is not None:
+                        best_rate = None
+                        best_err = float('inf')
+                        for rate, base in _rate_bases_seen.items():
+                            try:
+                                pct = float(rate.rstrip('%')) / 100.0
+                            except ValueError:
+                                continue
+                            err = abs(base * pct - val_lookahead)
+                            if err < best_err:
+                                best_err = err
+                                best_rate = rate
+                        if best_rate and best_err <= max(2.0, val_lookahead * 0.05):
+                            effective_rate = best_rate
             if effective_rate:
                 val = _extract_yen_min_nearby(lines, i, look_ahead=5)
                 if val is not None:
@@ -261,7 +315,11 @@ def _extract_financial_totals_impl(text: str) -> dict:
         is_total_line = re.search(r'合\s*計', line)
         if not is_total_line and re.match(r'^計$', line) and i > 0:
             prev_context = ' '.join(l.strip() for l in lines[max(0, i - 3):i])
-            if '合' in prev_context or '税' in prev_context or '対象' in prev_context:
+            # Reject ポイント対象金額 (loyalty-points subtotal) etc. — those
+            # have 対象 in the predecessor context but are NOT 合計.
+            if 'ポイント' in prev_context:
+                pass
+            elif '合' in prev_context or '税' in prev_context or '対象' in prev_context:
                 is_total_line = True
         if is_total_line and not re.search(r'税\s*合\s*計', line) and '対象' not in line and 'お預' not in line:
             val_max = _extract_yen_max_nearby(lines, i, look_ahead=5)
@@ -281,9 +339,140 @@ def _extract_financial_totals_impl(text: str) -> dict:
             if val is not None and 'total' not in result:
                 result['total'] = val
 
+        # Inline 内税N%消費税 pattern (gas-station receipts):
+        # "(内税10%消費税" or "(内税分消費税" sits in a label block with the
+        # ¥amount in a separate value block below. The LLM gets the rate
+        # but mis-extracts the amount, so use OCR-derived value to override.
+        m_inclusive_with_rate = re.search(
+            r'\(?\s*内税(?:分|\s*\d+\s*%)?\s*消費税', line,
+        )
+        if m_inclusive_with_rate and '対象' not in line and not _has_specific_taxes:
+            rate_search = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
+            inclusive_rate = (
+                normalize_tax_rate(rate_search.group(1) + '%') if rate_search else None
+            )
+            val_inc = _extract_yen_nearby(lines, i)
+            # Walk forward past labels to collect all ¥amounts in the value
+            # block. Pair-matching (V, B) where V ≈ B × rate/(1+rate) picks
+            # the right tax value even when お預り inflates the magnitude.
+            if val_inc is None:
+                forward_values: list[float] = []
+                for j in range(i + 1, min(i + 22, len(lines))):
+                    js = lines[j].strip()
+                    if not js:
+                        continue
+                    yen_m = re.match(r'^[¥￥]\s*([\d,]+)\s*[\)）]?\s*$', js)
+                    if yen_m:
+                        try:
+                            forward_values.append(float(yen_m.group(1).replace(',', '')))
+                        except ValueError:
+                            pass
+                        continue
+                    if re.match(r'^@?\d+(?:[.,]\d+)?[Ll円]?\s*$', js):
+                        continue
+                    if re.search(r'[　-鿿]', js):
+                        if re.search(r'内税|外税|対象|消費税|合計|小計|現計|現金|お預り|お釣|単価|数量|@|ガソリン税|料金所|残高|支払', js):
+                            continue
+                        break
+                if forward_values:
+                    rate_pct = (float(inclusive_rate.rstrip('%')) / 100.0
+                                if inclusive_rate else 0.10)
+                    if rate_pct > 0:
+                        # Find tax value V such that V = B × rate/(1+rate) for
+                        # some base B also in forward_values. Tax is much
+                        # smaller than its base, so iterate small-to-large.
+                        best = None
+                        best_err = float('inf')
+                        for v in sorted(set(forward_values)):
+                            if v <= 0:
+                                continue
+                            implied_base = v * (1 + rate_pct) / rate_pct
+                            for b in forward_values:
+                                err = abs(b - implied_base)
+                                if err < best_err and err <= max(2.0, implied_base * 0.01):
+                                    best_err = err
+                                    best = v
+                                    break
+                        if best is not None:
+                            val_inc = best
+            if inclusive_rate and val_inc is not None:
+                taxes.append({'rate': inclusive_rate, 'label': '内税', 'amount': val_inc})
+
+        # Plain 内税 with inline ¥ value (e.g. "内税 ※ ¥187"). Requires a
+        # previously-set rate context AND a single rate in play — when the
+        # receipt has multiple rate contexts, the inline value is typically
+        # the SUM of per-rate taxes (e.g. "(内税 ¥780)" where 780 = 632+148),
+        # not a per-rate tax. Triggers after rejoin_totals_label_value_columns
+        # has interleaved labels with their position-paired values.
+        m_inclusive_plain = re.match(
+            r'\(?\s*内税\s*[※\*]?\s*[¥￥]\s*([\d,]+)\s*[\)）]?\s*$', line
+        )
+        if (m_inclusive_plain and not _has_specific_taxes
+                and _rate_context and len(_rate_bases_seen) <= 1):
+            # Require a rate base so we can sanity-check the value. Without a
+            # base we can't tell whether this is the per-rate tax or a sum.
+            # Fall back to _rate_base (single var set by rate_amt_m) when
+            # _rate_bases_seen has no entry — both track rate-context state.
+            rate_base = _rate_bases_seen.get(_rate_context)
+            if rate_base is None and _rate_base is not None and len(_rate_bases_seen) == 0:
+                rate_base = _rate_base
+            if rate_base is not None:
+                try:
+                    val_inc_plain = float(m_inclusive_plain.group(1).replace(',', ''))
+                except ValueError:
+                    val_inc_plain = None
+                if val_inc_plain is not None and val_inc_plain > 0:
+                    try:
+                        rate_pct = float(_rate_context.rstrip('%')) / 100.0
+                    except ValueError:
+                        rate_pct = 0
+                    expected_inc = rate_base * rate_pct / (1 + rate_pct)
+                    expected_excl = rate_base * rate_pct
+                    plausible = (
+                        abs(val_inc_plain - expected_inc) <= max(2, expected_inc * 0.10)
+                        or abs(val_inc_plain - expected_excl) <= max(2, expected_excl * 0.10)
+                    )
+                    if plausible:
+                        taxes.append({'rate': _rate_context, 'label': '内税',
+                                      'amount': val_inc_plain})
+
         if re.search(r'外税\s*\d+%', line) and '対象' not in line:
             rate_m = re.search(r'(\d+)%', line)
             val = _extract_yen_nearby(lines, i)
+            # Column-split layout: amount can appear above the label block.
+            # Sibling labels (外税N%, 対象, 小計, 合計) sit between the current
+            # label and the value block above; skip them when scanning back.
+            if val is None and rate_m:
+                back_values: list[float] = []
+                _SIBLING_TAX_LABEL_RE = re.compile(
+                    r'^(?:[\(（]?[ab]?)?\s*外税|^(?:[\(（]?[ab]?)?\s*内税|'
+                    r'対象(?:額)?|^合\s*計$|^小\s*計$|^\d+\s*%\s*対象|^[\(（]?\s*\d+\s*%'
+                )
+                for back in range(i - 1, max(i - 14, -1), -1):
+                    bs = lines[back].strip()
+                    back_m = re.match(r'^[¥￥]\s*([\d,]+)\s*[)）]?\s*$', bs)
+                    if back_m:
+                        back_values.append(float(back_m.group(1).replace(',', '')))
+                        continue
+                    if not bs:
+                        continue
+                    # Skip sibling labels — they belong to the same tax block
+                    if _SIBLING_TAX_LABEL_RE.search(bs):
+                        continue
+                    # Stop on non-financial content (item descriptions, etc.)
+                    if re.search(r'[　-鿿]', bs):
+                        break
+                if back_values:
+                    rate_pct = float(rate_m.group(1)) / 100.0
+                    if rate_pct > 0:
+                        largest = max(back_values)
+                        expected = largest * rate_pct
+                        if expected > 0:
+                            val = min(back_values, key=lambda v: abs(v - expected))
+                    if val is None:
+                        non_zero = [v for v in back_values if v > 0]
+                        if non_zero:
+                            val = min(non_zero)
             if rate_m and val is not None:
                 taxes.append({'rate': rate_m.group(1) + '%', 'label': '外税', 'amount': val})
 
@@ -493,7 +682,8 @@ def extract_rate_bases(text: str) -> dict[str, float | None]:
                     bases[rate_str] = float(yen_ahead.group(1).replace(',', ''))
                     found = True
                     break
-                if re.match(r'^\d+\s*[\u500b\u70b9]\s*$', js):
+                if re.match(r'^\d*\s*[\u500b\u70b9]\s*$', js):
+                    # Item-count fragment ("3\u500b", "\u500b", "9\u70b9") \u2014 keep scanning
                     continue
                 if re.search(r'[\u3000-\u9fff]', js):
                     break
@@ -620,13 +810,34 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
         if not desc:
             continue
         desc_prefix = desc[:4] if len(desc) >= 4 else desc
-        for line in ocr_lines:
+        for li, line in enumerate(ocr_lines):
             if desc_prefix not in line:
                 continue
+            # Column-split OCR puts the price+marker on the very next line
+            # ("たまご三昧" \n "278*"). Same-line check first (most receipts
+            # interleave price and marker with the description). If neither
+            # matches, peek the immediate next non-empty line — but stop if
+            # that line itself starts with another product description (avoid
+            # bleeding the next item's marker into this one).
+            tax_marker = None
             if '除' in line:
-                item_rates[idx] = STANDARD_RATE
+                tax_marker = STANDARD_RATE
             elif re.search(r'[※\*軽]|(?<![A-Za-z])X(?![A-Za-z])', line):
-                item_rates[idx] = REDUCED_RATE
+                tax_marker = REDUCED_RATE
+            if tax_marker is None and li + 1 < len(ocr_lines):
+                nxt = ocr_lines[li + 1].strip()
+                # Only peek when the next line is a price-with-marker pattern
+                # (digits + tax marker glyph), not a new item description.
+                if nxt and re.match(
+                    r'^[\d,]+\s*[※\*軽除AB]?\s*$|^[\d,]+\s*[¥￥]?[\d,]*\s*[※\*軽除]\s*$',
+                    nxt,
+                ):
+                    if '除' in nxt:
+                        tax_marker = STANDARD_RATE
+                    elif re.search(r'[※\*軽]|(?<![A-Za-z])X(?![A-Za-z])', nxt):
+                        tax_marker = REDUCED_RATE
+            if tax_marker is not None:
+                item_rates[idx] = tax_marker
             break
 
     unassigned = [i for i in range(len(items)) if i not in item_rates]
@@ -640,8 +851,16 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
         assigned_counts[r] = assigned_counts.get(r, 0) + 1
 
     tax_amounts = {t["rate"]: t.get("amount", 0) for t in ocr_totals.get("taxes", [])}
-    if not tax_amounts and extracted_taxes:
-        tax_amounts = {t["rate"]: t.get("amount", 0) for t in extracted_taxes if isinstance(t, dict)}
+    # Merge in LLM-extracted taxes for any rates the OCR pass missed (column-
+    # split layouts often hide one of the per-rate tax lines from the OCR scan
+    # while the LLM still recovers it).
+    if extracted_taxes:
+        for t in extracted_taxes:
+            if not isinstance(t, dict):
+                continue
+            r = t.get("rate", "")
+            if r and r not in tax_amounts:
+                tax_amounts[r] = t.get("amount", 0)
     # Choose the dominant rate. When most items have OCR tax markers,
     # the marked counts are reliable. When markers are sparse (e.g. only
     # 1 of 18 items has a 除 tag), counts mislead — fall back to
@@ -662,6 +881,48 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
     minority_rates = [r for r in detected_rates if r != majority_rate]
     minority_rate = minority_rates[0] if minority_rates else None
 
+    # Some receipts print rate_base as the tax-INCLUSIVE amount (pre_tax + tax)
+    # rather than the pre-tax base. Subset-sum operates on item totals, which
+    # may themselves be pre-tax (items_sum == subtotal) or inclusive (items_sum
+    # == total). When items are pre-tax but the printed rate_base is inclusive
+    # we need to subtract the tax to recover the right subset-sum target.
+    items_sum_total = 0.0
+    item_count = 0
+    for it in items:
+        if isinstance(it, dict):
+            try:
+                items_sum_total += float(it.get("total") or 0)
+                item_count += 1
+            except (TypeError, ValueError):
+                pass
+
+    rate_bases = dict(rate_bases)  # local copy — don't mutate caller's dict
+    sum_rate_bases = sum(v for v in rate_bases.values() if v is not None)
+    sum_taxes = sum(tax_amounts.values()) if tax_amounts else 0
+    # "items_sum is pre-tax" signal: items_sum + sum_of_taxes ≈ sum_of_rate_bases
+    # (rate_bases printed as inclusive). For receipts where items are inclusive
+    # already, items_sum ≈ sum_of_rate_bases without adding tax — no adjustment.
+    items_are_pretax = (
+        item_count > 0 and sum_rate_bases > 0 and sum_taxes > 0
+        and abs(items_sum_total + sum_taxes - sum_rate_bases) < max(5, sum_rate_bases * 0.02)
+    )
+    if items_are_pretax:
+        for rate in list(rate_bases):
+            base = rate_bases.get(rate)
+            tax = tax_amounts.get(rate)
+            if base is None or not tax or base <= 0:
+                continue
+            try:
+                rate_pct = float(rate.rstrip('%')) / 100.0
+            except ValueError:
+                continue
+            if rate_pct <= 0:
+                continue
+            err_pretax = abs(base * rate_pct - tax)
+            err_inclusive = abs((base - tax) * rate_pct - tax)
+            if err_inclusive + 0.5 < err_pretax and base > tax:
+                rate_bases[rate] = base - tax
+
     subset_matched = False
     if minority_rate and unassigned:
         unassigned_items = [(i, items[i].get("total", 0)) for i in unassigned]
@@ -681,10 +942,20 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
             sub_max_k = min(len(unassigned_items), 5)
             match = _find_subset_sum(unassigned_items, try_base, max_k=sub_max_k, tolerance=50.0)
             if match is not None and other_base is not None and len(unassigned_items) > 3:
-                match_err = abs(sum(t for i, t in unassigned_items if i in match) - try_base)
-                compl_err = abs(sum(t for i, t in unassigned_items if i not in match) - other_base)
-                best_err = match_err + compl_err
-                for ext_k in range(4, min(len(unassigned_items), 7)):
+                # Score candidates by (target_err, complement_err) lex tuple — an
+                # exact target hit (e ≤ 2) wins over a fuzzy 2-element match even
+                # if the complement drifts. The unassigned set may be slightly off
+                # from base+other_base because of upstream OCR/LLM noise; in that
+                # case complement error is irreducible noise and shouldn't gate
+                # whether we accept an exact target match.
+                best_e = abs(sum(t for i, t in unassigned_items if i in match) - try_base)
+                best_ce = abs(sum(t for i, t in unassigned_items if i not in match) - other_base)
+                best_score = (best_e, best_ce)
+                # Start at k=3: the inner _find_subset_sum returns at the first
+                # k=2 fuzzy match, so a k=3 exact match (e≈0) is never reached.
+                # The extension is the only path that lets a higher-k candidate
+                # beat a smaller-k fuzzy hit.
+                for ext_k in range(3, min(len(unassigned_items), 7)):
                     for combo in combinations(unassigned_items, ext_k):
                         s = sum(t for _, t in combo)
                         e = abs(s - try_base)
@@ -693,13 +964,13 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
                         c_indices = {i for i, _ in combo}
                         cs = sum(t for i, t in unassigned_items if i not in c_indices)
                         ce = abs(cs - other_base)
-                        total_e = e + ce
-                        if total_e < best_err:
-                            best_err = total_e
+                        score = (e, ce)
+                        if score < best_score:
+                            best_score = score
                             match = [i for i, _ in combo]
-                            if total_e == 0:
+                            if e == 0 and ce == 0:
                                 break
-                    if best_err == 0:
+                    if best_score == (0, 0):
                         break
             if match is not None:
                 other_rate = minority_rate if try_rate == majority_rate else majority_rate
@@ -850,7 +1121,15 @@ def _apply_financial_overrides(extracted, ocr_totals, ocr_conf, llm_conf):
                 elif computed_tax > 0:
                     extracted["taxes"] = [{"rate": "unknown", "label": None, "amount": computed_tax}]
     if ocr_totals.get("taxes") and should_override_field("taxes", ocr_conf, llm_conf):
-        extracted["taxes"] = ocr_totals["taxes"]
+        # Merge: trust OCR for rates it found, but keep LLM's tax entries for
+        # rates the OCR scan missed (column-split layouts often hide one rate's
+        # tax line from the OCR forward-scan while the LLM still recovers it).
+        ocr_rates = {t.get("rate") for t in ocr_totals["taxes"]}
+        llm_extra = [
+            t for t in (extracted.get("taxes") or [])
+            if isinstance(t, dict) and t.get("rate") and t.get("rate") not in ocr_rates
+        ]
+        extracted["taxes"] = list(ocr_totals["taxes"]) + llm_extra
 
     # Fix per-rate subtotal: when subtotal + tax != total, recompute from total - tax
     if "subtotal" in ocr_totals and "total" in ocr_totals and ocr_totals.get("taxes"):
@@ -1031,9 +1310,11 @@ def _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf):
         elif should_override_field("payment_method", ocr_conf, llm_conf) and not existing:
             extracted["payment_method"] = "cash"
     elif extracted.get("payment_method") == "cash":
-        is_printed = any(kw in unified_text for kw in ['小計', '合計', '対象', '税率'])
-        if is_printed:
-            extracted["payment_method"] = None
+        # Hallucinated cash with no OCR evidence — strip it. The original
+        # guard only fires for printed receipts (has 小計/合計) and missed
+        # handwritten 領収証 where the LLM defaults to "cash" because of
+        # the receipt-header phrasing (上記正に領収いたしました).
+        extracted["payment_method"] = None
 
 
 _FUEL_KEYWORDS = ('ガソリン', 'レギュラー', 'ハイオク', '軽油', 'ENEOS', '出光', 'コスモ')
@@ -1094,6 +1375,7 @@ _JUNK_DESC_RE = re.compile(
     r'|^〒\s*\d{3}'                       # postal code
     r'|^\d{8,}'                            # bare digit run (barcode)
     r'|^\d+\s*[xX×]\s*[#＃]?\s*\d+$'      # unit-rate notation '23 X #199'
+    r'|^\*?\s*\d[\d,]*\s*\(\s*\d+\s*[個コ点]\s*\)'  # '*770 (1コ)' price+qty notation
 )
 
 # Lines that look like receipt-header metadata (phone, address, date,
@@ -1367,7 +1649,11 @@ def _fix_line_items(extracted, unified_text):
         ]
 
     # Handwritten receipt guard: remove single line item that just duplicates total
-    # Keep items with distinct descriptions (e.g. "通行料金" for toll receipts)
+    # Keep items with distinct descriptions (e.g. "通行料金" for toll receipts).
+    # Also drop the item if the description is an LLM-confabulated fragment —
+    # a date, disclaimer text, or anything that isn't a recognizable service
+    # term. Handwritten 領収証 lacking item lists per template rule should
+    # produce line_items=[].
     is_handwritten = not any(kw in unified_text for kw in ['小計', '合計', '対象', '税率'])
     if is_handwritten and extracted.get("line_items") and extracted.get("total"):
         items = extracted["line_items"]
@@ -1375,7 +1661,16 @@ def _fix_line_items(extracted, unified_text):
             if abs(items[0].get("total", 0) - extracted["total"]) < 1:
                 desc = (items[0].get("description") or "").strip()
                 merchant = (extracted.get("merchant") or "").strip()
-                if not desc or desc == merchant:
+                _DISCLAIMER_FRAGMENTS = ('含み', '但し', '消費税', '領収', '印紙', '収入')
+                _SERVICE_TERMS = ('通行料金', 'ガソリン', 'レギュラー', 'ハイオク', '軽油',
+                                  '駐車', '入場料', '料金', '施術', '診療')
+                desc_is_disclaimer = any(kw in desc for kw in _DISCLAIMER_FRAGMENTS)
+                desc_looks_like_date = bool(re.match(
+                    r'^\s*(?:20\d{2}|令和|平成)?\s*\d+\s*年', desc
+                ))
+                desc_is_service = any(kw in desc for kw in _SERVICE_TERMS)
+                if (not desc or desc == merchant or desc_is_disclaimer
+                        or (desc_looks_like_date and not desc_is_service)):
                     extracted["line_items"] = []
 
     if not extracted.get("line_items"):
@@ -1391,11 +1686,16 @@ def _fix_line_items(extracted, unified_text):
         extracted["line_items"], unified_text,
         extracted.get("subtotal"), extracted.get("total"),
     )
+    _repair_column_split_items(
+        extracted["line_items"], unified_text,
+        extracted.get("subtotal"), extracted.get("total"),
+    )
     _replace_hallucinated_dup_with_ocr_item(
         extracted["line_items"], unified_text,
         extracted.get("subtotal"), extracted.get("total"),
     )
     _apply_qty_notation_from_ocr(extracted["line_items"], unified_text)
+    _revert_unsupported_qty_inflation(extracted["line_items"], unified_text)
     _dedup_same_total_items(extracted)
     _fix_qty_from_ocr_patterns(extracted["line_items"], unified_text)
     _fix_fuel_volume_qty(extracted["line_items"], unified_text,
@@ -1579,6 +1879,357 @@ def _fix_item_totals_from_ocr_neighborhood(items, unified_text, target_subtotal,
         progress = True
 
 
+def _repair_column_split_items(items, unified_text, target_subtotal, target_total):
+    """Re-pair LLM items to OCR prices when the OCR is column-split.
+
+    Column-split layout: a run of name-only lines (Japanese, no ¥), then a
+    run of price-only lines (¥-prefixed or bare digits). The LLM matches by
+    proximity, which fails when sub-runs are unequal or qty annotations
+    break the price block.
+
+    Strategy:
+      1. Walk OCR up to (and optionally past) the 小計/合計 zone end. Skip
+         qty notations, discount lines, and inline-priced names (those
+         self-pair). Collect remaining name and price tokens in OCR order.
+      2. If global counts of names == prices in the chain, position-pair
+         them: name[i] → price[i] for the chain's full length.
+      3. For each LLM item, if its description prefix appears in the paired
+         dict and the override moves items_sum toward a target, apply.
+
+    Inline-priced detection: a Japanese line ending with " <digits>[marker]"
+    is treated as inline-priced even without a ¥ symbol (handles AEON-style
+    "食品ポリ袋L (バイオマス30 3除" and "千切りキャベツビッグパ 238").
+
+    Zone extension: when names without paired prices remain at the 小計
+    boundary, extend past 小計 to capture stray bare-digit prices that
+    appear before the first ¥-prefixed totals line. (Handles AEON layouts
+    where the right-column item prices land below 小計 in OCR order.)
+
+    Conservative — only fires when items_sum is off-target by > 2 yen and
+    the override strictly reduces the error.
+    """
+    if not items:
+        return
+    items_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+    targets = [t for t in (target_subtotal, target_total) if t]
+    if not targets or any(abs(items_sum - t) <= 2 for t in targets):
+        return
+
+    lines = unified_text.split('\n')
+
+    # Find zone-end at the first totals/tax line.
+    end_idx = len(lines)
+    for i, raw in enumerate(lines):
+        s = raw.strip()
+        if re.search(r'^(小\s*計|合\s*計|外税|内税|消費税|お預り|現計|お釣り|釣銭|総額)', s):
+            end_idx = i
+            break
+
+    # Anchor the item zone to where LLM items actually appear in OCR. This
+    # filters out header NAMEs (campaign text, store info, register #, etc.)
+    # whose presence would break the equal-count check.
+    item_descs = [
+        (it.get("description") or "").strip()
+        for it in items if isinstance(it, dict)
+    ]
+    item_descs = [d for d in item_descs if d and len(d) >= 2]
+    if not item_descs:
+        return
+
+    zone_start: int | None = None
+    zone_last_item: int = 0
+    for li in range(min(end_idx, len(lines))):
+        line = lines[li]
+        for d in item_descs:
+            if d[:5] in line or (len(d) >= 3 and d[:3] in line and re.search(r'[ぁ-んァ-ン一-龥]', d[:3])):
+                if zone_start is None:
+                    zone_start = li
+                zone_last_item = li
+                break
+
+    if zone_start is None:
+        return
+    # Items zone runs from zone_start (first OCR match of any LLM item) to
+    # end_idx (the 小計/合計 line). No slack — the first matched line is
+    # the earliest item, anything before it is header noise.
+    item_zone_end = end_idx
+
+    # Permissive price-line: digits + optional 1-2 trailing marker chars.
+    # Captures `198`, `378+`, `98%`, `265X`, `228*`, `78 A`, `¥1,498`, `1,074`.
+    # Rejects post-item footer noise like `10P)` or `54P` (P is not a marker).
+    _PRICE_MARKER_CLASS = r'[*※軽除＊・X+%A_]'
+    _PRICE_ONLY_RE = re.compile(
+        r'^[¥￥]?\s*(\d[\d,]{0,5})\s*' + _PRICE_MARKER_CLASS + r'?\s*' + _PRICE_MARKER_CLASS + r'?\s*$'
+    )
+    _PRICE_HAS_MARKER_RE = re.compile(r'[*※軽除＊・X+%A]')
+    _QTY_NOTATION_RE = re.compile(
+        r'[\(（<]?\s*\d+\s*[コ個点]\s*[xX×]\s*(?:単|@)?\s*\d[\d,]*\s*[\)）>]?'
+    )
+    # Inline price tail: " <digits>[marker]" at end of a name line.
+    _INLINE_PRICE_TAIL_RE = re.compile(
+        r'\s+(\d[\d,]{0,5})\s*[*※軽除＊・X+%]?\s*$'
+    )
+    # Lines that look like a date or phone — not inline-priced.
+    _DATE_LIKE_RE = re.compile(r'\d{4}[/年-]\d|\d{2}[:時]\d')
+    _PHONE_LIKE_RE = re.compile(r'\d{2,4}-\d{2,4}-\d{3,4}')
+
+    def _parse_price(s: str):
+        m = _PRICE_ONLY_RE.match(s)
+        if not m:
+            return None
+        try:
+            v = float(m.group(1).replace(',', ''))
+        except ValueError:
+            return None
+        if v < 1 or v > 999999:
+            return None
+        return v
+
+    def _is_inline_priced(s: str) -> bool:
+        if not re.search(r'[ぁ-んァ-ン一-龥]', s):
+            return False
+        if _DATE_LIKE_RE.search(s) or _PHONE_LIKE_RE.search(s):
+            return False
+        if re.search(r'[¥￥]\s*\d', s):
+            return True
+        m = _INLINE_PRICE_TAIL_RE.search(s)
+        if not m:
+            return False
+        # Avoid product codes like "L30" mid-string by requiring the digit
+        # group be at the end with whitespace before. _INLINE_PRICE_TAIL_RE
+        # already enforces \s+ before the digit group, so a trailing lone
+        # number after Japanese chars is the signal.
+        return True
+
+    def _is_name_line(s: str) -> bool:
+        if not s or len(s) < 2:
+            return False
+        if re.search(r'[¥￥]', s):
+            return False
+        if not re.search(r'[ぁ-んァ-ン一-龥]', s):
+            return False
+        if _QTY_NOTATION_RE.search(s):
+            return False
+        if re.match(r'^割引', s) or s.startswith('-'):
+            return False
+        # Skip post-item footer markers (point-tracking, account info, etc.)
+        # that share OCR space with the item zone.
+        if re.search(
+            r'(ポイント|残高|累計|獲得|有効期限|内訳|お買上|今回|商品数|'
+            r'WAON|^内\s|^取\s*\d|レジ\s*\d|登録番号|TEL|FAX|http)', s
+        ):
+            return False
+        return True
+
+    # Walk the zone, building name and price token streams. Skip qty
+    # notations, discount lines, and inline-priced names (self-paired).
+    # Discount-rate lines like "20%" or "-18" stand alone; "98%" is a
+    # price-with-marker (the % is OCR noise for *), not a discount rate.
+    # Distinguish: discount lines appear right after a 割引 or item name
+    # without an intervening price; we treat any standalone digit + %
+    # within ~2 lines of a 割引 marker as a discount rate, otherwise as
+    # a price-with-marker.
+    discount_rate_lines: set[int] = set()
+    for i in range(zone_start, item_zone_end):
+        s = lines[i].strip()
+        if re.match(r'^割引', s):
+            # Look ahead for a digit% line within the next 3 lines.
+            for j in range(i + 1, min(i + 4, item_zone_end)):
+                t = lines[j].strip()
+                if re.match(r'^-?\d{1,3}\s*[%％]\s*$', t):
+                    discount_rate_lines.add(j)
+                    break
+
+    # Walk the zone, building OCR-ordered (name, price) pairs.
+    # Inline-priced lines emit a pair directly. Pure-name and pure-price
+    # tokens are stitched into chains; chains where len(names)==len(prices)
+    # contribute pairs by position.
+    ordered_pairs: list[tuple[str, float]] = []
+    pending_names: list[str] = []
+    pending_prices: list[float] = []
+
+    def _flush_chain():
+        nonlocal pending_names, pending_prices
+        if pending_names and pending_prices and len(pending_names) == len(pending_prices):
+            for n, p in zip(pending_names, pending_prices):
+                ordered_pairs.append((n, p))
+        pending_names = []
+        pending_prices = []
+
+    def _flush_chain_with_extension(extension_prices: list[float]):
+        """Try to complete an unfinished chain by appending extension prices."""
+        nonlocal pending_names, pending_prices
+        needed = len(pending_names) - len(pending_prices)
+        if needed > 0 and len(extension_prices) >= needed:
+            pending_prices.extend(extension_prices[:needed])
+        if pending_names and pending_prices and len(pending_names) == len(pending_prices):
+            for n, p in zip(pending_names, pending_prices):
+                ordered_pairs.append((n, p))
+        pending_names = []
+        pending_prices = []
+
+    # Helper: detect a partial qty notation fragment like "(2個 X" (OCR
+    # split this onto two lines so the trailing digits are missing).
+    _PARTIAL_QTY_RE = re.compile(r'^[\(（<]?\s*\d+\s*[コ個点]\s*[xX×]?\s*$')
+
+    for i in range(zone_start, item_zone_end):
+        s = lines[i].strip()
+        if not s:
+            continue
+        if _QTY_NOTATION_RE.search(s) or _PARTIAL_QTY_RE.match(s):
+            continue
+        if re.match(r'^割引', s) or i in discount_rate_lines or re.match(r'^-\d', s):
+            continue
+        # Inline-priced line — emit pair directly, flush any pending chain.
+        if _is_inline_priced(s):
+            # Extract name part and price.
+            m_yen = re.search(r'[¥￥]\s*([\d,]+)', s)
+            if m_yen:
+                pv_str = m_yen.group(1)
+                price_pos = m_yen.start()
+            else:
+                m_tail = _INLINE_PRICE_TAIL_RE.search(s)
+                if not m_tail:
+                    continue
+                pv_str = m_tail.group(1)
+                price_pos = m_tail.start()
+            try:
+                pv = float(pv_str.replace(',', ''))
+            except ValueError:
+                continue
+            name_part = s[:price_pos].strip()
+            if not name_part or not re.search(r'[ぁ-んァ-ン一-龥]', name_part):
+                continue
+            _flush_chain()
+            ordered_pairs.append((name_part, pv))
+            continue
+        v = _parse_price(s)
+        if v is not None:
+            pending_prices.append(v)
+            continue
+        if _is_name_line(s):
+            # Names after prices indicate a new chain — flush.
+            if pending_prices and len(pending_names) == len(pending_prices):
+                _flush_chain()
+            pending_names.append(s)
+
+    # Zone extension: scan past 小計 for stray bare-digit prices (no ¥) that
+    # may complete an unfinished column-split chain. AEON layouts often print
+    # the right-column item prices below 小計 in OCR order.
+    extension_prices: list[float] = []
+    if pending_names and len(pending_prices) < len(pending_names) and item_zone_end < len(lines):
+        for i in range(item_zone_end + 1, len(lines)):
+            s = lines[i].strip()
+            if not s:
+                continue
+            if re.search(r'[¥￥]', s):
+                break  # Hit ¥-prefixed totals zone
+            if re.search(
+                r'^(外税|内税|消費税|対象|お預り|現計|お釣り|釣銭|総額|'
+                r'合\s*計|小\s*計|WAON|現金|クレジット|カード|お会計|電子)',
+                s,
+            ):
+                break
+            if _QTY_NOTATION_RE.search(s) or _PARTIAL_QTY_RE.match(s):
+                continue
+            v = _parse_price(s)
+            if v is not None:
+                extension_prices.append(v)
+                # Stop if we have enough to complete the chain.
+                if len(pending_prices) + len(extension_prices) >= len(pending_names):
+                    break
+
+    if extension_prices:
+        _flush_chain_with_extension(extension_prices)
+    else:
+        _flush_chain()
+
+    if len(ordered_pairs) < 2:
+        return
+
+    # Match LLM items to ordered_pairs by description-prefix overlap, then
+    # greedy-claim by best score. Duplicate-named items (e.g., two
+    # 牛豚ミンチ(解凍) lines) and out-of-order LLM emissions still match.
+    def _match_score(ocr_name: str, llm_desc: str) -> int:
+        clean = re.sub(r'^[\d\s\*\(（]+', '', ocr_name).strip()
+        for prefix_len in (6, 5, 4, 3):
+            if len(clean) >= prefix_len and clean[:prefix_len] in llm_desc[:14]:
+                return prefix_len
+            if len(ocr_name) >= prefix_len and ocr_name[:prefix_len] in llm_desc[:14]:
+                return prefix_len
+        return 0
+
+    eligible_items: list[tuple[int, dict, str, float, int]] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        desc = (item.get("description") or "").strip()
+        total = item.get("total")
+        if not desc or total is None:
+            continue
+        if (item.get("discount") or 0) > 0:
+            continue
+        qty = item.get("qty", 1) or 1
+        eligible_items.append((idx, item, desc, float(total), int(qty)))
+
+    # Score every (item, ocr_pair) combination, then greedy-claim.
+    candidates: list[tuple[int, int, int]] = []  # (score, item_idx_in_eligible, ocr_pair_idx)
+    for ei, (idx, _, desc, _, _) in enumerate(eligible_items):
+        for p in range(len(ordered_pairs)):
+            score = _match_score(ordered_pairs[p][0], desc)
+            if score >= 3:
+                candidates.append((score, ei, p))
+    # Sort by score descending; tie-break by ei (earliest LLM item first).
+    candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
+    claimed_pair: set[int] = set()
+    claimed_item: set[int] = set()
+    matches: dict[int, int] = {}  # eligible idx -> ocr_pair idx
+    for score, ei, p in candidates:
+        if ei in claimed_item or p in claimed_pair:
+            continue
+        matches[ei] = p
+        claimed_item.add(ei)
+        claimed_pair.add(p)
+
+    overrides: list[tuple[int, float, float, int]] = []
+    for ei, p in matches.items():
+        idx, _, _, total, qty = eligible_items[ei]
+        ocr_price = ordered_pairs[p][1]
+        if abs(ocr_price - total) < 1:
+            continue
+        overrides.append((idx, float(ocr_price), float(total), int(qty)))
+
+    if not overrides:
+        return
+
+    # Apply overrides only if the collective effect strictly improves
+    # items_sum's distance to a target. This catches "swap" scenarios
+    # (two items with reversed totals) where a single greedy fix would
+    # regress items_sum, but applying both is neutral or beneficial.
+    items_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+    total_delta = sum(new_total - old_total for _, new_total, old_total, _ in overrides)
+    new_sum = items_sum + total_delta
+    cur_diff = min(abs(items_sum - t) for t in targets)
+    new_diff = min(abs(new_sum - t) for t in targets)
+    if new_diff > cur_diff:
+        return  # Net regression — don't apply
+    if new_diff == cur_diff and total_delta == 0:
+        # Pure swap (no items_sum change). Apply only if it actually
+        # changes the description-total pairing for ≥ 2 items (otherwise
+        # nothing happens).
+        if len(overrides) < 2:
+            return
+    elif new_diff == cur_diff and total_delta != 0:
+        return  # Same gap but in the other direction — don't apply
+
+    for idx, new_total, _, qty in overrides:
+        items[idx]["total"] = new_total
+        if qty == 1 and items[idx].get("unit_price") is not None:
+            items[idx]["unit_price"] = new_total
+        elif qty > 1 and qty != 0 and new_total % qty == 0:
+            items[idx]["unit_price"] = new_total / qty
+
+
 def _replace_hallucinated_dup_with_ocr_item(items, unified_text, target_subtotal, target_total):
     """When LLM has duplicate items AND items_sum is off-target, look for an
     OCR-grounded item whose substitution closes the gap.
@@ -1613,10 +2264,21 @@ def _replace_hallucinated_dup_with_ocr_item(items, unified_text, target_subtotal
         return
 
     lines = unified_text.split('\n')
-    ocr_prices: list[tuple[int, float]] = []
+    # Bound to the item zone: stop at the first 小計/合計 line so we don't
+    # treat tax/total values as item-price candidates.
+    zone_end = len(lines)
     for li, line in enumerate(lines):
+        if re.search(r'^(小\s*計|合\s*計|外税|内税|消費税|お預り|現計|お釣り|釣銭)',
+                     line.strip()):
+            zone_end = li
+            break
+    ocr_prices: list[tuple[int, float]] = []
+    _BARE_PRICE_RE = re.compile(r'^[¥￥]?\s*(\d[\d,]{0,5})\s*[*※軽除＊・X+%A]?\s*$')
+    for li in range(zone_end):
+        line = lines[li]
         if _SKIP_PRICE_LINE.search(line):
             continue
+        # ¥-prefixed amounts (anywhere in the line)
         for m in re.finditer(r'[¥￥]\s*([\d,]+)', line):
             try:
                 amt = float(m.group(1).replace(',', ''))
@@ -1624,6 +2286,19 @@ def _replace_hallucinated_dup_with_ocr_item(items, unified_text, target_subtotal
                 continue
             if amt > 0:
                 ocr_prices.append((li, amt))
+        # Bare-digit price lines (no ¥), with optional trailing marker.
+        # OCR sometimes drops the ¥ but the line is still a price token.
+        if not re.search(r'[¥￥]', line):
+            s = line.strip()
+            if s and not re.search(r'[ぁ-んァ-ン一-龥]', s):
+                m = _BARE_PRICE_RE.match(s)
+                if m:
+                    try:
+                        amt = float(m.group(1).replace(',', ''))
+                    except ValueError:
+                        amt = 0
+                    if amt > 0:
+                        ocr_prices.append((li, amt))
 
     # Multiset diff: remove one OCR entry per LLM item amount
     item_amounts = [i.get("total", 0) for i in items if isinstance(i, dict)]
@@ -2012,8 +2687,10 @@ def _replace_duplicate_desc_from_ocr(items, unified_text):
 def _dedup_same_total_items(extracted):
     """Remove duplicate items with identical description and total, keeping qty>1 version.
 
-    Only applies when the deduped sum is strictly closer to its expected target
-    than the original sum. The target is whichever of subtotal/total the
+    Also removes "phantom-child" duplicates where the LLM produced the
+    unit-price row as a separate qty=1 item alongside the real qty=N×unit_price
+    item. Only applies when the deduped sum is strictly closer to its expected
+    target than the original sum. The target is whichever of subtotal/total the
     original sum is closer to — items match subtotal on 外税 receipts and total
     on 内税 receipts, so the LLM's extraction style picks the right anchor.
     Without this, legitimate duplicates (e.g. two hot-dog meals at the same
@@ -2046,6 +2723,31 @@ def _dedup_same_total_items(extracted):
                 seen[key] = i
         else:
             seen[key] = i
+
+    # Phantom-child pass: same description, same unit_price, one qty>1 with
+    # total=qty*unit_price and another qty=1 with total=unit_price. The qty=1
+    # entry is the unit-price/per-item line read as a separate item; drop it.
+    by_desc_unit: dict[tuple, list[int]] = {}
+    for i, item in enumerate(items):
+        if not isinstance(item, dict) or not keep_mask[i]:
+            continue
+        desc = item.get("description", "")
+        unit = item.get("unit_price")
+        if not desc or unit is None or unit <= 0:
+            continue
+        by_desc_unit.setdefault((desc, unit), []).append(i)
+    for (desc, unit), idxs in by_desc_unit.items():
+        if len(idxs) < 2:
+            continue
+        has_real = any(items[k].get("qty", 1) > 1 for k in idxs)
+        if not has_real:
+            continue
+        for k in idxs:
+            it = items[k]
+            qty_k = it.get("qty", 1)
+            tot_k = it.get("total", 0)
+            if qty_k == 1 and abs(tot_k - unit) < 1:
+                keep_mask[k] = False
 
     new_items = [item for item, keep in zip(items, keep_mask) if keep]
     new_sum = sum(i.get("total", 0) for i in new_items if isinstance(i, dict))
@@ -2086,6 +2788,83 @@ def _fix_qty_hallucinations(items, unified_text):
             item["total"] = total - (item.get("discount") or 0)
 
 
+def _revert_unsupported_qty_inflation(items, unified_text):
+    """Revert qty>1 to qty=1 when the OCR has no qty notation supporting it.
+
+    LLM variance issue: when two items share a prefix (e.g., 'TVBP カットトマト'
+    with `(2個 X 単128)` followed by 'TVBP ジンジャーエー' without a qty
+    notation), the LLM sometimes applies the earlier qty notation to the
+    later same-prefix item, inflating qty=1→2 and total=128→256.
+
+    Detection: for each LLM item with qty≥2, find its OCR name-line by
+    longest-prefix match (last occurrence, since the LLM emits items in
+    OCR order). If no qty notation appears within 3 lines after the
+    matched OCR line AND items_sum is currently off-target by an amount
+    consistent with the inflation, revert to qty=1.
+
+    Conservative — only fires when:
+      - qty ≥ 2 AND total = qty × unit_price (clean qty inflation)
+      - No qty notation in 3-line OCR window after the item's name-line
+      - The match line is unambiguous (using a long-enough prefix)
+    """
+    if not items:
+        return
+    ocr_lines = unified_text.split('\n')
+    qty_re = re.compile(
+        r'[\(（<]?\s*\d+\s*[コ個点]\s*[xX×]\s*(?:単|@)?\s*\d[\d,]*'
+    )
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        qty = item.get("qty", 1) or 1
+        if qty < 2:
+            continue
+        if (item.get("discount") or 0) > 0:
+            continue
+        desc = (item.get("description") or "").strip()
+        if not desc or len(desc) < 5:
+            continue
+        unit = item.get("unit_price")
+        total = item.get("total")
+        if unit is None or total is None:
+            continue
+        # Only consider clean qty=N×unit_price patterns.
+        if abs(unit * qty - total) > 1:
+            continue
+        # Find the OCR name-line. Use a long prefix and take the LAST
+        # occurrence (LLM extracts items in OCR order; for the second of
+        # two same-prefix items, the right line is the later one).
+        prefix = desc[:6] if len(desc) >= 6 else desc
+        match_li = None
+        for li, line in enumerate(ocr_lines):
+            if prefix in line:
+                match_li = li
+        if match_li is None:
+            continue
+        # Look at the next 3 non-empty lines for a qty notation. Stop
+        # early at the next item-name line.
+        has_qty = False
+        for offset in range(1, 5):
+            j = match_li + offset
+            if j >= len(ocr_lines):
+                break
+            nearby = ocr_lines[j].strip()
+            if not nearby:
+                continue
+            if qty_re.search(nearby):
+                has_qty = True
+                break
+            # Stop on next name (≥ 2 Japanese chars) without qty notation.
+            if re.search(r'[ぁ-んァ-ン一-龥]{2,}', nearby):
+                break
+        if has_qty:
+            continue
+        # No qty notation supports this qty>1 — revert to qty=1.
+        item["qty"] = 1
+        item["total"] = unit
+        item["unit_price"] = unit
+
+
 def _apply_qty_notation_from_ocr(items, unified_text):
     """When OCR has '(N個 X unit)' notation immediately after an item line
     AND the LLM didn't apply it (qty=1 with anomalously low total), update
@@ -2098,7 +2877,8 @@ def _apply_qty_notation_from_ocr(items, unified_text):
     overwrite an already-correct qty=N item).
     """
     ocr_lines = unified_text.split('\n')
-    qty_re = re.compile(r'\(?\s*(\d+)\s*[コ個点]\s*[xX×]\s*(?:単|@)?\s*(\d[\d,]*)\s*\)?')
+    # OCR sometimes mis-reads opening parens as "<", so accept either prefix.
+    qty_re = re.compile(r'[\(（<]?\s*(\d+)\s*[コ個点]\s*[xX×]\s*(?:単|@)?\s*(\d[\d,]*)\s*[\)）>]?')
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -2124,9 +2904,13 @@ def _apply_qty_notation_from_ocr(items, unified_text):
                     except ValueError:
                         break
                     if qty >= 2 and unit > 0 and qty * unit > cur_total + 1:
-                        item["qty"] = qty
-                        item["unit_price"] = unit
-                        item["total"] = qty * unit
+                        # Skip discounted items — the LLM already merged the
+                        # discount into total at the original (correct) qty.
+                        # Only override when current item has no discount.
+                        if not (item.get("discount") or 0):
+                            item["qty"] = qty
+                            item["unit_price"] = unit
+                            item["total"] = qty * unit
                     break
                 # Stop on next item desc (Japanese without qty notation)
                 if re.search(r'[ぁ-んァ-ン一-龥]{2,}', nearby) and not re.search(r'\d+\s*[コ個点]', nearby):
@@ -2137,6 +2921,20 @@ def _apply_qty_notation_from_ocr(items, unified_text):
 def _fix_qty_from_ocr_patterns(items, unified_text):
     """Fix quantities using ×N個 patterns and qty×price scanners in OCR text."""
     ocr_lines = unified_text.split('\n')
+
+    # 本体合計(N点) — Starbucks-style summary that names the total item count.
+    # When the receipt has exactly one line_item but the summary says N>1,
+    # the LLM lost the qty (which usually appears as a "NT"/"3T" prefix on
+    # the item line). Apply qty=N and divide unit_price.
+    body_count_m = re.search(r'本体合計\s*\(?\s*(\d+)\s*点\s*\)?', unified_text)
+    if body_count_m and len(items) == 1 and isinstance(items[0], dict):
+        body_qty = int(body_count_m.group(1))
+        item = items[0]
+        cur_qty = item.get("qty", 1) or 1
+        cur_total = item.get("total") or 0
+        if body_qty > 1 and cur_qty == 1 and cur_total > 0 and cur_total % body_qty == 0:
+            item["qty"] = float(body_qty)
+            item["unit_price"] = cur_total / body_qty
 
     # Match by description prefix
     for item in items:
@@ -2998,19 +3796,58 @@ def postprocess_receipt(
         existing_rates = {t.get("rate") for t in extracted["taxes"]}
         existing_labels = [t.get("label", "") for t in extracted["taxes"] if t.get("label")]
         default_label = existing_labels[0] if existing_labels else None
+        is_inclusive = default_label in ('内税', '消費税等') or (default_label or '').startswith('内')
         for cat in sorted(rate_sums):
             if cat not in existing_rates and rate_sums[cat] > 0:
                 rate_pct = float(cat.replace('%', '')) / 100.0
-                is_inclusive = default_label in ('内税', '消費税等') or (default_label or '').startswith('内')
                 if is_inclusive:
                     computed_tax = round(rate_sums[cat] * rate_pct / (1 + rate_pct))
                 else:
                     computed_tax = round(rate_sums[cat] * rate_pct)
-                extracted["taxes"].append({
-                    "rate": cat,
-                    "label": default_label,
-                    "amount": computed_tax,
-                })
+                # Truth-file convention: omit tax entries that round to 0
+                # (e.g., a レジ袋 at 5円 × 10% = 0.5 → 0).
+                if computed_tax > 0:
+                    extracted["taxes"].append({
+                        "rate": cat,
+                        "label": default_label,
+                        "amount": computed_tax,
+                    })
+
+        # Drop tax entries for rates whose items-side computed tax rounds to 0
+        # (e.g., LLM merged a `{rate: 10%, amount: 4}` entry by mis-reading a 4
+        # yen レジ袋 as the tax amount). The truth-file convention omits these.
+        kept = []
+        for t in extracted["taxes"]:
+            if not isinstance(t, dict):
+                kept.append(t)
+                continue
+            r = t.get("rate")
+            if r and r in rate_sums:
+                try:
+                    rate_pct = float(r.replace('%', '')) / 100.0
+                except ValueError:
+                    rate_pct = 0
+                if rate_pct > 0:
+                    if is_inclusive:
+                        expected = round(rate_sums[r] * rate_pct / (1 + rate_pct))
+                    else:
+                        expected = round(rate_sums[r] * rate_pct)
+                    if expected == 0:
+                        continue  # drop — items at this rate produce 0 tax
+            kept.append(t)
+        extracted["taxes"] = kept
+
+    # Drop any remaining tax entries with amount=0 (LLM-supplied unhandled).
+    # Exempt the 0% / 非課税 entry: truth files keep it (rate '0%' may have
+    # amount=0 since there's no tax to record on a non-taxable line).
+    if extracted.get("taxes"):
+        extracted["taxes"] = [
+            t for t in extracted["taxes"]
+            if not isinstance(t, dict)
+            or (t.get("amount") or 0) > 0
+            or t.get("rate") == "0%"
+            or "非課税" in (t.get("label") or "")
+        ]
 
     # Points used
     points = extract_points_used(unified_text)

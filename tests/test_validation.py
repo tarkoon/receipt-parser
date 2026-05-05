@@ -20,10 +20,10 @@ def test_tax_exclusive_correct():
 
 
 def test_tax_inclusive_correct():
-    """内税 (tax-inclusive): subtotal = total (tax is included)."""
+    """内税 (tax-inclusive): subtotal is the pre-tax base (total - tax)."""
     receipt = Receipt(
-        total=324, subtotal=324,
-        taxes=[{"rate": "8%", "amount": 24}],
+        total=324, subtotal=300,
+        taxes=[{"rate": "8%", "label": "内税", "amount": 24}],
     )
     assert validate_receipt(receipt) == []
 

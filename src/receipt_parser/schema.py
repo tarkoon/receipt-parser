@@ -109,6 +109,7 @@ FIELD_REGISTRY: list[FieldMeta] = [
     FieldMeta(
         name="subtotal",
         debug_color_bgr=(0, 255, 255),
+        prompt_hint="ALWAYS the pre-tax base: subtotal = total - sum(taxes). For 内税 (tax-inclusive) receipts where 合計 already includes tax, subtotal is LESS than 合計 — compute subtotal = 合計 - 消費税. For 外税 receipts subtotal equals 小計 (printed pre-tax). Never set subtotal equal to total when there is a non-zero tax amount.",
         extraction_aliases=["小計", "subtotal"],
         doc_types=["receipt"],
     ),
@@ -467,35 +468,39 @@ class Document(BaseModel):
                             f"implies ~{expected_discount}, but discount={item.discount}"
                         )
 
-        # Sum of items ≈ subtotal (±2)
+        # Sum of items matches subtotal (pre-tax items) or total (post-tax items)
         if self.subtotal is not None and self.line_items:
             items_sum = sum(item.total for item in self.line_items)
-            if abs(items_sum - self.subtotal) > 2:
+            items_match_subtotal = abs(items_sum - self.subtotal) <= 2
+            items_match_total = (self.total is not None
+                                 and abs(items_sum - self.total) <= 2)
+            if not (items_match_subtotal or items_match_total):
                 warnings.append(
-                    f"Items sum {items_sum} != subtotal {self.subtotal}"
+                    f"Items sum {items_sum} != subtotal {self.subtotal} "
+                    f"or total {self.total}"
                 )
 
-        # Total ≈ subtotal + taxes (±2, both inclusive/exclusive models)
+        # Universal: subtotal + tax_sum = total
         if self.total is not None and self.subtotal is not None and self.taxes:
             tax_sum = sum(t.amount for t in self.taxes)
-            is_excl = abs((self.subtotal + tax_sum) - self.total) <= 2
-            is_incl = abs(self.subtotal - self.total) <= 2
-            if not (is_excl or is_incl):
+            if abs((self.subtotal + tax_sum) - self.total) > 2:
                 warnings.append(
-                    f"Total {self.total} != subtotal {self.subtotal} +/- taxes {tax_sum}"
+                    f"Total {self.total} != subtotal {self.subtotal} + taxes {tax_sum}"
                 )
 
-        # Tax ratio cross-check: subtotal * known rate ≈ total?
+        # Tax ratio cross-check: subtotal × known rate ≈ total
         if self.total is not None and self.subtotal is not None and self.taxes:
-            known_rates = [0.08, 0.10]
-            ratio_ok = any(
-                abs(self.subtotal * (1 + r) - self.total) <= 2 for r in known_rates
-            ) or abs(self.subtotal - self.total) <= 2
-            if not ratio_ok:
-                warnings.append(
-                    f"Tax ratio: subtotal {self.subtotal} × known rate "
-                    f"!= total {self.total}"
-                )
+            tax_sum = sum(t.amount for t in self.taxes)
+            if tax_sum > 0:
+                known_rates = [0.08, 0.10]
+                ratio_ok = any(
+                    abs(self.subtotal * (1 + r) - self.total) <= 2 for r in known_rates
+                ) or abs(self.subtotal + tax_sum - self.total) <= 2
+                if not ratio_ok:
+                    warnings.append(
+                        f"Tax ratio: subtotal {self.subtotal} × known rate "
+                        f"!= total {self.total}"
+                    )
 
         # Tax rate membership
         for tax in self.taxes:
@@ -550,7 +555,7 @@ RULES:
 9. The merchant name is the consumer-facing BRAND name ONLY — do NOT include the branch name, store location, or shopping complex. Strip everything after the core brand: 'ダイソー' not 'ダイソー ビバモール赤間店', 'カルディ' not 'カルディコーヒーファーム', 'マックスバリュ' not 'マックスバリュくりえいと宗像店'. Do NOT use the parent company (AEON/イオン), corporate entity (株式会社..., 有限会社...), franchisee/operator name, or abbreviation. Short text next to a number code (e.g. 'コウソ 003080') is a cashier/operator identifier, NOT the merchant. If a website domain appears (e.g. 'clickcycle.com'), the brand name is often derived from it (e.g. 'click'). For gas stations, use the fuel brand not the station operator.
 10. If the receipt shows a specific payment method like WAON, クレジット, Suica, PayPay, etc., use that. Only default to "cash" if no electronic payment is named and you see お預り (cash tendered) or 現計 (cash total).
 11. OCR may put item names and their prices on SEPARATE lines. Associate each item with the ¥ amount on the NEXT line. Example: "サニーレタス" followed by "¥129" means サニーレタス costs 129.
-12. The subtotal (小計) is the sum of item prices BEFORE tax. The tax lines (外税8%税額, 消費税 etc.) show the TAX amount, NOT the subtotal. Do NOT confuse 小計 with tax.
+12. The subtotal is ALWAYS the pre-tax base: subtotal = total - sum(taxes). This holds for both 外税 (tax-exclusive) and 内税 (tax-inclusive) receipts. For 内税 receipts where printed item prices already include tax, subtotal is LESS than the printed 合計; do NOT set subtotal equal to total. The tax lines (外税8%税額, 消費税 etc.) show the TAX amount, NOT the subtotal.
 13. 課税対象額 means "taxable amount" (the BASE that tax is calculated on) — this is NOT a tax. Only 税額 (tax amount) entries should be in the taxes list. Example: "税率8%課税対象額 ¥2274" is the taxable base; "税率8%税額 ¥168" is the actual tax of 168.
 14. Labels (合計, 小計, 税額) may appear on a DIFFERENT line from their ¥ values, especially in rotated receipts where all labels are in one block and all values in another. Use arithmetic to match: tax = total − subtotal. If you see many ¥ amounts together (e.g. "¥2,279  ¥2,111  ¥168)"), match them with labels elsewhere in the text.
 15. DISCOUNTS: If a discount line follows an item (e.g., "割引 20%" with "-¥94" after "銀さけ切身 ¥467"), do NOT create a separate line item for the discount. Merge it into the parent item: set total = price AFTER discount (467 - 94 = 373), set discount = 94, set discount_rate = "20%". Every line item total must be positive.

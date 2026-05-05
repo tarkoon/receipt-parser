@@ -7,7 +7,7 @@ import unicodedata
 _PRICE_LINE_RE = re.compile(
     r'^[¥￥]\s*[\d,]+\s*[)）軽外内]?\s*$'
     r'|'
-    r'^\d[\d,]*\s*[※X除軽]\s*$'
+    r'^\d[\d,]*\s*[※\*X除軽]\s*$'
 )
 
 
@@ -17,6 +17,11 @@ def normalize_fullwidth(text: str) -> str:
     Keeps ¥ symbols so the LLM can distinguish prices from codes.
     """
     text = unicodedata.normalize('NFKC', text)
+    # Known OCR-segmentation errors on financial labels. Cloud Vision
+    # occasionally splits 計 (言+十) into 富 + 士, so 小計 reads as 小富士.
+    # The replacement is safe because 小富士 is virtually never a product
+    # name in a Japanese receipt context.
+    text = re.sub(r'(?<!\S)小富士(?!\S)', '小計', text)
     return text
 
 
@@ -124,8 +129,10 @@ def rejoin_price_lines(text: str) -> str:
             return False
         if _SECTION_END.search(s):
             return False
-        # Qty/price detail lines like "(@100 × 2個)" are not items
-        if re.match(r'^\(.*[×xX].*[個コ点]\s*\)', s):
+        # Qty/price detail lines like "(@100 × 2個)" or "<2個 X 単248)" — the
+        # OCR sometimes reads "(" as "<" so accept either as the open bracket,
+        # and the multiplier symbol may appear before or after the count marker.
+        if re.match(r'^[\(\<](?=.*[×xX])(?=.*[個コ点])', s):
             return False
         return True
 
@@ -146,6 +153,11 @@ def rejoin_price_lines(text: str) -> str:
                 break
         return count
 
+    # Bare-digit price line — accepted only inside _collect_prices_after where
+    # we already know we're in the totals zone. Outside the totals zone bare
+    # digits could be quantities, codes, etc.
+    _BARE_DIGIT_PRICE_RE = re.compile(r'^\d{1,3}(?:,\d{3})*$|^\d{1,6}$')
+
     def _collect_prices_after(marker_idx: int, needed: int) -> list[int]:
         """Scan past a section marker for price line indices.
 
@@ -155,8 +167,9 @@ def rejoin_price_lines(text: str) -> str:
         found: list[int] = []
         running_sum = 0.0
         for j in range(marker_idx + 1, min(marker_idx + needed * 3 + 5, len(lines))):
-            if _is_price(lines[j].strip()):
-                val = _price_value(lines[j].strip())
+            stripped = lines[j].strip()
+            if _is_price(stripped) or _BARE_DIGIT_PRICE_RE.match(stripped):
+                val = _price_value(stripped)
                 if val is not None and len(found) >= 2 and abs(val - running_sum) < 1:
                     break  # this price IS the subtotal of items so far
                 found.append(j)
@@ -325,6 +338,135 @@ def rejoin_price_lines(text: str) -> str:
             break
 
     return '\n'.join(before + result + after)
+
+
+_TOTALS_LABEL_RE = re.compile(
+    r'^\(?\s*('
+    r'小\s*計|合\s*計|現計|総額|総合計|お会計|'
+    r'外税(?:\s*\d+\s*%)?(?:\s*対象?額?)?|'
+    r'内税(?:\s*\d+\s*%)?(?:\s*対象?額?)?|'
+    r'\d+\s*%\s*対象(?:額)?|消費税[等額]?(?:\s*\d+\s*%)?(?:\s*対象?額?)?|'
+    r'税率\s*\d+\s*%\s*(?:(?:課税)?対象?額?|税額)|'
+    r'内\s*消費税(?:\s*\d+\s*%)?|内\s*ガソリン税|内\s*石油|内\s*税分|'
+    r'非課税対象|非課税|軽減?税率?|'
+    r'お預り|お預\s*り|お釣り|お釣\s*り|おつり|釣銭|'
+    r'現金|電子マネー|WAON支払|クレジット|カード'
+    r')\s*[\)）]?\s*[※\*]?\s*$'
+)
+_VALUE_LINE_RE = re.compile(r'^[\d\s\)\]コX]*\s*([¥￥])?\s*([\d,]+)\s*[\)）]?\s*$')
+
+
+def rejoin_totals_label_value_columns(text: str) -> str:
+    """Interleave label-block + value-block patterns in the totals zone.
+
+    Some receipts (notably McDonald's) print every totals label on its own
+    line in a left column, then every yen value in a right column:
+
+        小計            ¥2,050
+        (内消費税        ¥151)
+        合計            ¥2,050
+        お預り           ¥5,050
+        おつり           ¥3,000
+
+    OCR reconstructs this column-by-column:
+
+        小計
+        (内消費税
+        合計
+        お預り
+        おつり
+        ¥2,050
+        ¥151)
+        ¥2,050
+        ¥5,050
+        ¥3,000
+
+    The forward look-ahead in `_extract_financial_totals_impl` then picks
+    お預り's value as 合計 because it falls within the look-ahead window
+    after the 合計 label. This function detects the pattern (≥3 consecutive
+    label-only lines followed by ≥N value-only lines) and rewrites the
+    text so each label sits next to its position-paired value.
+
+    Conservative — only fires when:
+      - ≥3 consecutive lines match a known totals label
+      - At least N value-only lines follow (with optional non-Japanese noise)
+      - No item-name lines (Japanese text without label) intervene
+    """
+    lines = text.split('\n')
+
+    def _is_label_line(s: str) -> bool:
+        s = s.strip()
+        if not s or '¥' in s or '￥' in s:
+            return False
+        return bool(_TOTALS_LABEL_RE.match(s))
+
+    def _value_in(s: str) -> float | None:
+        s = s.strip()
+        if not s or re.search(r'[ぁ-んァ-ン一-龥]', s):
+            return None
+        m = _VALUE_LINE_RE.match(s)
+        if not m:
+            return None
+        try:
+            return float(m.group(2).replace(',', ''))
+        except ValueError:
+            return None
+
+    new_lines = list(lines)
+    i = 0
+    while i < len(lines):
+        if not _is_label_line(lines[i]):
+            i += 1
+            continue
+        # Collect a run of consecutive label lines.
+        run_start = i
+        labels: list[tuple[int, str]] = []
+        while i < len(lines) and _is_label_line(lines[i]):
+            labels.append((i, lines[i].strip()))
+            i += 1
+        # Require ≥2 labels. Higher confidence when ≥3.
+        if len(labels) < 2:
+            continue
+        # Collect ALL consecutive values starting after the last label.
+        # Allow noise lines (digit fragments like "1コ" or "11]") between
+        # values. Stop at the first name-like Japanese line, OR at any
+        # 小計-style label that begins a new sub-block.
+        values: list[tuple[int, str, float]] = []
+        scan_end = min(len(lines), labels[-1][0] + len(labels) * 4 + 12)
+        j = labels[-1][0] + 1
+        while j < scan_end:
+            s = lines[j].strip()
+            if not s:
+                j += 1
+                continue
+            v = _value_in(s)
+            if v is not None:
+                values.append((j, s, v))
+                j += 1
+                continue
+            # Tolerate noise fragments (item-count remnants, OCR bracket
+            # remnants) but break on name-like Japanese.
+            if re.match(r'^[\d\s\)\]コ個X\(]+$', s):
+                j += 1
+                continue
+            if re.search(r'[ぁ-んァ-ン一-龥]', s):
+                break
+            j += 1
+        # Require EXACT count match — fewer values than labels means we
+        # missed some, more values means the value run extends past the
+        # current label set (e.g., item prices interleaved with totals).
+        if len(values) != len(labels):
+            continue
+        # Apply: append paired value to label line, blank the value line.
+        for (li, lab), (vi, vstr, vv) in zip(labels, values[:len(labels)]):
+            # Strip any leading-noise prefix from vstr (e.g. "11] ¥2,050" → "¥2,050").
+            cleaned_v = re.sub(r'^[\d\s\)\]コX]+(?=[¥￥])', '', vstr)
+            if not re.match(r'^[¥￥]', cleaned_v.strip()):
+                # Add a ¥ prefix if the value is bare digits.
+                cleaned_v = '¥' + cleaned_v.strip().lstrip('¥￥').strip()
+            new_lines[li] = lab + ' ' + cleaned_v.strip()
+            new_lines[vi] = ''
+    return '\n'.join(new_lines)
 
 
 def clean_handwritten_ocr(text: str, ocr_confidence: float | None = None) -> str:

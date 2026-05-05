@@ -209,6 +209,7 @@ def _openrouter_chat(
     messages: list,
     temperature: float = 0.0,
     max_tokens: int = 8192,
+    seed: int = _LLM_SEED,
 ) -> LLMResult:
     """Call DeepSeek/OpenRouter API and return structured result."""
     client = _get_api_client()
@@ -219,7 +220,7 @@ def _openrouter_chat(
         response_format={"type": "json_object"},
         temperature=temperature,
         max_tokens=max_tokens,
-        seed=_LLM_SEED,
+        seed=seed,
         extra_body={"thinking": {"type": "disabled"}},
     )
     elapsed_ns = int((time.perf_counter() - t0) * 1e9)
@@ -349,6 +350,7 @@ def _llm_chat(
     schema: dict,
     temperature: float = 0.0,
     max_tokens: int = 8192,
+    seed: int = _LLM_SEED,
 ) -> LLMResult:
     """Unified LLM chat — dispatches to Ollama or OpenRouter."""
     if _is_ollama_model(model):
@@ -356,7 +358,7 @@ def _llm_chat(
             model=_ollama_model_name(model),
             messages=messages,
             format=schema,
-            options={"temperature": temperature, "num_predict": max_tokens},
+            options={"temperature": temperature, "num_predict": max_tokens, "seed": seed},
             think=False,
             keep_alive="60m",
         )
@@ -370,7 +372,7 @@ def _llm_chat(
             backend="ollama",
         )
     else:
-        return _openrouter_chat(model, messages, temperature, max_tokens)
+        return _openrouter_chat(model, messages, temperature, max_tokens, seed=seed)
 
 
 def extract_with_llm(
@@ -459,10 +461,36 @@ def extract_with_verification(
     passes: int = 1,
     validate_fn=None,
     doc_type: str = "receipt",
+    on_stage=None,
 ) -> tuple[dict, list[dict]]:
-    """Multi-pass text extraction. Pass 1 extracts. Pass 2+ self-corrects."""
+    """Multi-pass text extraction. Pass 1 extracts. Pass 2+ self-corrects.
+
+    on_stage, if provided, fires once per pass with stage="extract" and
+    monotonically increasing progress within the [0.45, 0.70) band. Imported
+    lazily to avoid a circular import with pipeline.py.
+    """
     passes = max(1, passes)
     history = []
+
+    # Lazy import to avoid pipeline.py <-> llm.py circular import at module load.
+    if on_stage is not None:
+        from .pipeline import _notify
+    else:
+        _notify = None
+
+    _PASS_BAND_START, _PASS_BAND_END = 0.45, 0.70
+    _PASS_BAND = _PASS_BAND_END - _PASS_BAND_START
+
+    def _pass_progress(pass_num: int) -> float:
+        # Spread N passes evenly across the pass band so each pass beat is monotonic.
+        return _PASS_BAND_START + ((pass_num - 1) / passes) * _PASS_BAND
+
+    if _notify is not None:
+        _notify(
+            on_stage, "extract", f"LLM pass 1 of {passes}",
+            _pass_progress(1),
+            payload={"pass": 1, "pass_budget": passes},
+        )
 
     extracted, llm_result = extract_with_llm(ocr_text, model=model, doc_type=doc_type)
     warnings = []
@@ -478,16 +506,40 @@ def extract_with_verification(
         "llm_timing": _llm_result_to_timing(llm_result),
     })
 
+    # Track the best extraction across all passes. Two filters apply:
+    # (1) only LLM-correctable warnings trigger a retry — subtotal-arithmetic
+    #     and tax-ratio warnings are auto-fixed in pipeline post-processing,
+    #     so retrying on them risks the LLM "fixing" the wrong thing
+    #     (e.g., dropping a valid duplicate item to make items_sum match a
+    #     wrongly-computed subtotal);
+    # (2) the verification prompt always references pass 1 as the baseline
+    #     so each retry sees the same problem fresh, not a possibly worse
+    #     pass-N-1 attempt.
+    best_extracted = extracted
+    best_warnings = warnings
+    best_llm_warnings = _llm_correctable(warnings)
+
     for pass_num in range(2, passes + 1):
-        if not warnings:
+        if not best_llm_warnings:
             break
+
+        if _notify is not None:
+            _notify(
+                on_stage, "extract", f"LLM pass {pass_num} of {passes}",
+                _pass_progress(pass_num),
+                payload={"pass": pass_num, "pass_budget": passes,
+                         "warnings_to_fix": len(best_llm_warnings)},
+            )
 
         v_system, v_user = generate_verification_prompt(
             ocr_text=ocr_text,
-            previous_extraction=extracted,
-            validation_warnings=warnings,
+            previous_extraction=best_extracted,
+            validation_warnings=best_llm_warnings,
         )
 
+        # Vary seed across passes so a deterministic LLM (temperature=0,
+        # seed=42) actually produces a different response on retry. Without
+        # this, pass 2+ just repeats pass 1 verbatim.
         llm_result = _llm_chat(
             model=model,
             messages=[
@@ -495,23 +547,47 @@ def extract_with_verification(
                 {"role": "user", "content": v_user},
             ],
             schema=get_ollama_schema(),
+            seed=_LLM_SEED + pass_num - 1,
         )
 
         raw = sanitize_llm_response(llm_result.content)
-        if raw.strip():
-            extracted = _parse_llm_json(raw)
+        pass_extracted = _parse_llm_json(raw) if raw.strip() else {"error": "empty response"}
 
-        warnings = []
-        if validate_fn and "error" not in extracted:
+        pass_warnings: list[str] = []
+        if validate_fn and "error" not in pass_extracted:
             try:
-                receipt = Receipt(**extracted)
-                warnings = validate_fn(receipt)
+                receipt = Receipt(**pass_extracted)
+                pass_warnings = validate_fn(receipt)
             except Exception:
-                warnings = [f"Schema validation failed on pass {pass_num}"]
+                pass_warnings = [f"Schema validation failed on pass {pass_num}"]
 
         history.append({
-            "pass": pass_num, "extraction": extracted, "warnings": warnings,
+            "pass": pass_num, "extraction": pass_extracted, "warnings": pass_warnings,
             "llm_timing": _llm_result_to_timing(llm_result),
         })
 
-    return extracted, history
+        pass_llm_warnings = _llm_correctable(pass_warnings)
+        if "error" not in pass_extracted and len(pass_llm_warnings) < len(best_llm_warnings):
+            best_extracted = pass_extracted
+            best_warnings = pass_warnings
+            best_llm_warnings = pass_llm_warnings
+
+    return best_extracted, history
+
+
+# Warnings the pipeline auto-corrects in post-processing. Including them in
+# the retry trigger or pass-selection metric causes the LLM to "fix" them by
+# corrupting valid extractions (e.g. dropping a duplicate item to make
+# items_sum match a wrongly-computed subtotal).
+_PIPELINE_FIXED_WARNING_PREFIXES = (
+    "Total ",          # "Total (X) does not match subtotal (Y) + taxes (Z)..."
+    "Tax ratio check", # "Tax ratio check: subtotal × rate does not produce total..."
+)
+
+
+def _llm_correctable(warnings: list[str]) -> list[str]:
+    """Filter to warnings the LLM should retry on (drops pipeline-fixable ones)."""
+    return [
+        w for w in warnings
+        if not any(w.startswith(p) for p in _PIPELINE_FIXED_WARNING_PREFIXES)
+    ]

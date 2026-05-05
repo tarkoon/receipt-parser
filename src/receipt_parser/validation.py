@@ -71,28 +71,30 @@ def _validate_receipt_fields(receipt: Receipt) -> list[str]:
                         f"but discount is {item.discount}."
                     )
 
-    # Check sum of line item totals ~ subtotal (+-2 tolerance)
+    # Check sum of line item totals matches either subtotal (pre-tax items)
+    # or total (post-tax items, common on 内税 receipts where printed prices
+    # already include tax). Tolerate ±2 yen rounding.
     if receipt.subtotal is not None and receipt.line_items:
         items_sum = sum(item.total for item in receipt.line_items)
-        if abs(items_sum - receipt.subtotal) > 2:
+        items_match_subtotal = abs(items_sum - receipt.subtotal) <= 2
+        items_match_total = (receipt.total is not None
+                             and abs(items_sum - receipt.total) <= 2)
+        if not (items_match_subtotal or items_match_total):
             warnings.append(
                 f"Sum of line items ({items_sum}) does not match "
-                f"subtotal ({receipt.subtotal}). Review all item quantities "
-                f"and unit prices — numbers in product names (e.g., size, "
-                f"pack count) may have been mistaken for quantities."
+                f"subtotal ({receipt.subtotal}) or total ({receipt.total}). "
+                f"Review all item quantities and unit prices — numbers in "
+                f"product names (e.g., size, pack count) may have been "
+                f"mistaken for quantities."
             )
 
-    # Check total vs subtotal + taxes (both inclusive and exclusive)
+    # Universal rule: subtotal + tax_sum = total
     if receipt.total is not None and receipt.subtotal is not None and receipt.taxes:
         tax_sum = sum(t.amount for t in receipt.taxes)
-
-        is_exclusive = abs((receipt.subtotal + tax_sum) - receipt.total) <= 2
-        is_inclusive = abs(receipt.subtotal - receipt.total) <= 2
-
-        if not (is_exclusive or is_inclusive):
+        if abs((receipt.subtotal + tax_sum) - receipt.total) > 2:
             warnings.append(
                 f"Total ({receipt.total}) does not match subtotal ({receipt.subtotal}) "
-                f"+/- taxes ({tax_sum}) under either inclusive or exclusive tax model."
+                f"+ taxes ({tax_sum}). Subtotal must be the pre-tax base."
             )
 
     # Tax ratio cross-check: does subtotal * (1 + rate) ≈ total?
@@ -130,20 +132,19 @@ def _check_tax_ratio(receipt: "Receipt") -> list[str]:
     if receipt.subtotal is None or receipt.total is None or not receipt.taxes:
         return warnings
 
-    # Also check tax-inclusive model (subtotal == total)
-    if abs(receipt.subtotal - receipt.total) <= 2:
+    # Skip when there's effectively no tax (0% / non-taxable). subtotal == total
+    # is then expected and there's no rate to check.
+    tax_sum = sum(t.amount for t in receipt.taxes)
+    if tax_sum == 0:
         return warnings
 
     known_rates = [0.08, 0.10]
     for rate in known_rates:
         if abs(receipt.subtotal * (1 + rate) - receipt.total) <= 2:
-            return warnings  # Matches a known rate, no warning
+            return warnings  # Matches a known single rate
 
-    # Multi-rate check: if multiple tax entries exist, compute blended rate
+    # Multi-rate check: blended effective rate
     if len(receipt.taxes) > 1 and receipt.subtotal > 0:
-        tax_sum = sum(t.amount for t in receipt.taxes)
-        if abs(receipt.subtotal + tax_sum - receipt.total) <= 2:
-            return warnings  # Subtotal + sum of per-rate taxes ≈ total
         effective_rate = tax_sum / receipt.subtotal
         if abs(receipt.subtotal * (1 + effective_rate) - receipt.total) <= 2:
             return warnings  # Blended rate matches
