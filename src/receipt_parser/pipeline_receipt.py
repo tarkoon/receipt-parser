@@ -1679,6 +1679,7 @@ def _fix_line_items(extracted, unified_text):
     _fix_item_desc_from_ocr_price_line(extracted["line_items"], unified_text)
     _merge_qty_detail_into_previous(extracted["line_items"], unified_text)
     _fix_junk_descriptions(extracted["line_items"], unified_text)
+    _strip_embedded_price_in_desc(extracted["line_items"])
     _remove_unit_rate_phantom_items(extracted)
     _fix_qty_hallucinations(extracted["line_items"], unified_text)
     _replace_duplicate_desc_from_ocr(extracted["line_items"], unified_text)
@@ -2577,6 +2578,53 @@ def _remove_unit_rate_phantom_items(extracted):
     extracted["line_items"] = keep
 
 
+def _strip_embedded_price_in_desc(items):
+    """Strip trailing whitespace+digit suffix from descriptions when the
+    digit equals the item's total/unit_price.
+
+    OCR sometimes appends a price into the description column, producing
+    descriptions like "ベビーダノンイ  228" (where 228 is the item's total)
+    or "TV減の恵みきざみねぎ  98" (where 98 matches another item's price
+    and the digit is leftover from the previous row).
+
+    Only fires when:
+      - description ends with whitespace + digit run
+      - the trailing digit equals total OR unit_price (or differs by ≤ 1)
+      - stripped description still has Japanese text
+
+    Generic-purpose: addresses inline price fragments left in description
+    by OCR row-detection failures.
+    """
+    if not items:
+        return
+    _SUFFIX_RE = re.compile(r'^(.+?)\s+([\d,]{1,6})\s*[\*※]?\s*$')
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        desc = (item.get("description") or "").strip()
+        if not desc:
+            continue
+        m = _SUFFIX_RE.match(desc)
+        if not m:
+            continue
+        prefix = m.group(1).strip()
+        try:
+            suffix_val = float(m.group(2).replace(',', ''))
+        except ValueError:
+            continue
+        # Must keep Japanese text in the stripped prefix
+        if not re.search(r'[ぁ-んァ-ン一-龥]', prefix):
+            continue
+        if len(prefix) < 3:
+            continue
+        total = item.get("total")
+        unit = item.get("unit_price")
+        matches_total = total is not None and abs(suffix_val - total) <= 1
+        matches_unit = unit is not None and abs(suffix_val - unit) <= 1
+        if matches_total or matches_unit:
+            item["description"] = prefix
+
+
 def _replace_duplicate_desc_from_ocr(items, unified_text):
     """When the LLM extracts duplicate (description, total) items but OCR
     shows distinct items at that total, swap a duplicate's description for
@@ -2651,6 +2699,13 @@ def _replace_duplicate_desc_from_ocr(items, unified_text):
             return cand
         return None
 
+    # Bare-digit price line: "228" or "228*" or "228※" (AEON column-format
+    # receipts often print prices without ¥ in the items zone).
+    _BARE_PRICE_LINE = re.compile(r'^\s*([\d,]+)\s*[\*※]?\s*$')
+    # Inline bare-digit price suffix: "ベビーダノンイ  228*" — digit at end
+    # of line preceded by Japanese text and whitespace.
+    _INLINE_BARE_PRICE = re.compile(r'[ぁ-んァ-ン一-龥]\s+([\d,]{2,})\s*[\*※]?\s*$')
+
     for (dup_desc, dup_total), dup_idxs in duplicates.items():
         # Collect OCR descriptions associated with prices ≈ dup_total
         ocr_descs: list[str] = []
@@ -2660,6 +2715,21 @@ def _replace_duplicate_desc_from_ocr(items, unified_text):
             for m in re.finditer(r'[¥￥]\s*([\d,]+)', line):
                 try:
                     amt = float(m.group(1).replace(',', ''))
+                except ValueError:
+                    continue
+                if abs(amt - dup_total) <= 2:
+                    cand = _candidate_desc_for_price(li, amt)
+                    if cand and cand not in ocr_descs:
+                        ocr_descs.append(cand)
+            # Also accept bare-digit price lines / inline-bare suffixes
+            stripped = line.strip()
+            bare_m = _BARE_PRICE_LINE.match(stripped)
+            inline_m = _INLINE_BARE_PRICE.search(line) if not bare_m else None
+            for matched in (bare_m, inline_m):
+                if not matched:
+                    continue
+                try:
+                    amt = float(matched.group(1).replace(',', ''))
                 except ValueError:
                     continue
                 if abs(amt - dup_total) <= 2:

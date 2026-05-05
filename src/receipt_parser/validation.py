@@ -71,6 +71,33 @@ def _validate_receipt_fields(receipt: Receipt) -> list[str]:
                         f"but discount is {item.discount}."
                     )
 
+    # Duplicate-description warning: when 2+ items share the same normalized
+    # description AND total. Real same-item-twice purchases usually print as
+    # qty>1 with a single line; same desc + same total is more likely a
+    # copy-paste error where the LLM duplicated a nearby item over a distinct
+    # one. Normalize: strip trailing whitespace+digits (OCR sometimes leaves
+    # the price embedded in the description).
+    if len(receipt.line_items) >= 2:
+        def _norm_desc(d: str) -> str:
+            d = (d or "").strip()
+            d = re.sub(r'\s+[\d,]{1,6}\s*[\*※]?\s*$', '', d)
+            return d.strip()
+        seen_pairs: dict[tuple, list[str]] = {}
+        for item in receipt.line_items:
+            norm = _norm_desc(item.description)
+            key = (norm, item.total)
+            seen_pairs.setdefault(key, []).append(item.description or "")
+        for (desc, total), descs in seen_pairs.items():
+            if len(descs) >= 2 and desc and total > 0:
+                shown = list(dict.fromkeys(descs))[:3]
+                warnings.append(
+                    f"Duplicate item: '{desc}' appears {len(descs)} times "
+                    f"with total {total} (descriptions: {shown}). If two "
+                    f"adjacent items share a price, the second item likely "
+                    f"has a DIFFERENT description in the OCR text — re-read "
+                    f"each row carefully and use the correct OCR description."
+                )
+
     # Check sum of line item totals matches either subtotal (pre-tax items)
     # or total (post-tax items, common on 内税 receipts where printed prices
     # already include tax). Tolerate ±2 yen rounding.
