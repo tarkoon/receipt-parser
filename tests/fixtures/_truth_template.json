@@ -11,6 +11,9 @@
   "account_number": null,
   "points_used": null,
   "amount_paid": null,
+  "_comment_line_items_per_weight": "When an item is priced per unit weight (e.g. 281 yen per 100g, 467g purchased, total 1313 yen), do NOT encode the per-weight rate. Use qty=1, unit_price=total, total=total. The schema's qty*unit_price=total invariant assumes a 1:1 unit ratio, and the per-weight rate is not used downstream.",
+  "_comment_payment_method": "Allowed values: 'cash', 'credit', 'debit', 'bank_payment', 'WAON', or null. Do NOT use 'credit_card' (use 'credit'). Use 'cash' only if お預り or 現計 is on the receipt — 上記正に領収いたしました alone is NOT enough.",
+  "_comment_time": "Only extract a printed transaction time (e.g. '2026年3月30日 (月) 16:21'). Do NOT extract from barcode/serial-suffix lines like '14:10-2109-01>' — they look like times but are not.",
   "line_items": [
     {
       "description": "Item name",
@@ -22,6 +25,7 @@
       "discount_rate": null
     }
   ],
+  "_comment_subtotal": "Pre-tax base amount, ALWAYS computed as subtotal = total - sum(taxes), regardless of 内税 / 外税 / 非課税. For 0-tax receipts (no taxes or all taxes = 0) subtotal = total. For 内税 receipts where line item prices are post-tax, sum(line_items) will equal total, NOT subtotal — that is expected. Use null only when total is also unknown.",
   "subtotal": null,
   "taxes": [
     {

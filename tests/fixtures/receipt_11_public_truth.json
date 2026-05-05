@@ -1,84 +1,84 @@
 {
-  "document_type": "receipt",
-  "merchant": "FamilyMart",
-  "date": "2026-03-23",
-  "time": "22:44",
-  "location": "福岡県宗像市三郎丸6丁目1番3号",
-  "currency": "JPY",
-  "total": 1630,
-  "payment_method": null,
-  "account_number": null,
-  "points_used": null,
-  "amount_paid": 1630,
-  "line_items": [
-    {
-      "description": "ミルクカスタードシュー",
-      "qty": 1,
-      "unit_price": 138,
-      "total": 138,
-      "tax_category": "8%"
-    },
-    {
-      "description": "ウェルチ 1房分のぶどう",
-      "qty": 1,
-      "unit_price": 183,
-      "total": 183,
-      "tax_category": "8%"
-    },
-    {
-      "description": "板チョコアイスマカダミ",
-      "qty": 1,
-      "unit_price": 351,
-      "total": 351,
-      "tax_category": "8%"
-    },
-    {
-      "description": "コク旨ピザまん",
-      "qty": 1,
-      "unit_price": 170,
-      "total": 170,
-      "tax_category": "8%"
-    },
-    {
-      "description": "チョコパーキング",
-      "qty": 1,
-      "unit_price": 183,
-      "total": 183,
-      "tax_category": "8%"
-    },
-    {
-      "description": "タルタルチキンとタコス",
-      "qty": 1,
-      "unit_price": 430,
-      "total": 430,
-      "tax_category": "8%"
-    },
-    {
-      "description": "濃厚札幌味噌",
-      "qty": 1,
-      "unit_price": 170,
-      "total": 170,
-      "tax_category": "8%"
-    },
-    {
-      "description": "レジ袋弁当大バイオマス",
-      "qty": 1,
-      "unit_price": 5,
-      "total": 5,
-      "tax_category": "10%"
-    }
-  ],
-  "subtotal": 1630,
-  "taxes": [
-    {
-      "rate": "8%",
-      "label": "内税",
-      "amount": 120
-    }
-  ],
-  "service_type": null,
-  "billing_period": null,
-  "usage": null,
-  "payer": null,
-  "payment_reference": null
+	"document_type": "receipt",
+	"merchant": "FamilyMart",
+	"date": "2026-03-23",
+	"time": "22:44",
+	"location": "福岡県宗像市三郎丸6丁目1番3号",
+	"currency": "JPY",
+	"total": 1630,
+	"payment_method": null,
+	"account_number": null,
+	"points_used": null,
+	"amount_paid": 1630,
+	"line_items": [
+		{
+			"description": "ミルクカスタードシュー",
+			"qty": 1,
+			"unit_price": 138,
+			"total": 138,
+			"tax_category": "8%"
+		},
+		{
+			"description": "ウェルチ 1房分のぶどう",
+			"qty": 1,
+			"unit_price": 183,
+			"total": 183,
+			"tax_category": "8%"
+		},
+		{
+			"description": "板チョコアイスマカダミ",
+			"qty": 1,
+			"unit_price": 351,
+			"total": 351,
+			"tax_category": "8%"
+		},
+		{
+			"description": "コク旨ピザまん",
+			"qty": 1,
+			"unit_price": 170,
+			"total": 170,
+			"tax_category": "8%"
+		},
+		{
+			"description": "チョコパーキング",
+			"qty": 1,
+			"unit_price": 183,
+			"total": 183,
+			"tax_category": "8%"
+		},
+		{
+			"description": "タルタルチキンとタコス",
+			"qty": 1,
+			"unit_price": 430,
+			"total": 430,
+			"tax_category": "8%"
+		},
+		{
+			"description": "濃厚札幌味噌",
+			"qty": 1,
+			"unit_price": 170,
+			"total": 170,
+			"tax_category": "8%"
+		},
+		{
+			"description": "レジ袋弁当大バイオマス",
+			"qty": 1,
+			"unit_price": 5,
+			"total": 5,
+			"tax_category": "10%"
+		}
+	],
+	"subtotal": 1510,
+	"taxes": [
+		{
+			"rate": "8%",
+			"label": "内税",
+			"amount": 120
+		}
+	],
+	"service_type": null,
+	"billing_period": null,
+	"usage": null,
+	"payer": null,
+	"payment_reference": null
 }

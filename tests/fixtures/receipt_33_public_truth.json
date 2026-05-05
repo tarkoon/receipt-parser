@@ -1,100 +1,100 @@
 {
-  "document_type": "receipt",
-  "merchant": "click",
-  "date": "2026-03-08",
-  "time": "16:52",
-  "location": "北九州市小倉北区魚町4-2-5",
-  "currency": "JPY",
-  "total": 99670,
-  "payment_method": "cash",
-  "account_number": null,
-  "points_used": null,
-  "amount_paid": 99670,
-  "line_items": [
-    {
-      "description": "自転車",
-      "qty": 1,
-      "unit_price": 69900,
-      "total": 66405,
-      "tax_category": "10%",
-      "discount": 3495,
-      "discount_rate": "5%"
-    },
-    {
-      "description": "アクセサリー",
-      "qty": 1,
-      "unit_price": 4700,
-      "total": 4700,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    },
-    {
-      "description": "アクセサリー",
-      "qty": 1,
-      "unit_price": 4180,
-      "total": 4180,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    },
-    {
-      "description": "部品",
-      "qty": 1,
-      "unit_price": 9295,
-      "total": 9295,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    },
-    {
-      "description": "メンテナンス用品",
-      "qty": 1,
-      "unit_price": 3400,
-      "total": 3400,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    },
-    {
-      "description": "ウェアー類",
-      "qty": 1,
-      "unit_price": 12100,
-      "total": 10890,
-      "tax_category": "10%",
-      "discount": 1210,
-      "discount_rate": "10%"
-    },
-    {
-      "description": "防犯登録料",
-      "qty": 1,
-      "unit_price": 800,
-      "total": 800,
-      "tax_category": "10%",
-      "discount": null,
-      "discount_rate": null
-    }
-  ],
-  "subtotal": 99670,
-  "taxes": [
-    {
-      "rate": "10%",
-      "label": "内税",
-      "amount": 9061
-    }
-  ],
-  "service_type": null,
-  "billing_period": {
-    "start": null,
-    "end": null
-  },
-  "usage": {
-    "amount": null,
-    "unit": null,
-    "cost_per": null,
-    "meter_previous": null,
-    "meter_current": null
-  },
-  "payer": null,
-  "payment_reference": null
+	"document_type": "receipt",
+	"merchant": "click",
+	"date": "2026-03-08",
+	"time": "16:52",
+	"location": "北九州市小倉北区魚町4-2-5",
+	"currency": "JPY",
+	"total": 99670,
+	"payment_method": "cash",
+	"account_number": null,
+	"points_used": null,
+	"amount_paid": 99670,
+	"line_items": [
+		{
+			"description": "自転車",
+			"qty": 1,
+			"unit_price": 69900,
+			"total": 66405,
+			"tax_category": "10%",
+			"discount": 3495,
+			"discount_rate": "5%"
+		},
+		{
+			"description": "アクセサリー",
+			"qty": 1,
+			"unit_price": 4700,
+			"total": 4700,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		},
+		{
+			"description": "アクセサリー",
+			"qty": 1,
+			"unit_price": 4180,
+			"total": 4180,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		},
+		{
+			"description": "部品",
+			"qty": 1,
+			"unit_price": 9295,
+			"total": 9295,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		},
+		{
+			"description": "メンテナンス用品",
+			"qty": 1,
+			"unit_price": 3400,
+			"total": 3400,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		},
+		{
+			"description": "ウェアー類",
+			"qty": 1,
+			"unit_price": 12100,
+			"total": 10890,
+			"tax_category": "10%",
+			"discount": 1210,
+			"discount_rate": "10%"
+		},
+		{
+			"description": "防犯登録料",
+			"qty": 1,
+			"unit_price": 800,
+			"total": 800,
+			"tax_category": "10%",
+			"discount": null,
+			"discount_rate": null
+		}
+	],
+	"subtotal": 90609,
+	"taxes": [
+		{
+			"rate": "10%",
+			"label": "内税",
+			"amount": 9061
+		}
+	],
+	"service_type": null,
+	"billing_period": {
+		"start": null,
+		"end": null
+	},
+	"usage": {
+		"amount": null,
+		"unit": null,
+		"cost_per": null,
+		"meter_previous": null,
+		"meter_current": null
+	},
+	"payer": null,
+	"payment_reference": null
 }
