@@ -1755,6 +1755,7 @@ def _fix_line_items(extracted, unified_text):
         return
 
     _drop_banner_phantom_items(extracted["line_items"], unified_text)
+    _drop_duplicate_with_embedded_price(extracted["line_items"])
     _fix_item_desc_from_ocr_price_line(extracted["line_items"], unified_text)
     _merge_qty_detail_into_previous(extracted["line_items"], unified_text)
     _fix_junk_descriptions(extracted["line_items"], unified_text)
@@ -2959,6 +2960,65 @@ def _drop_phantom_from_tax_amount(extracted):
         extracted["line_items"] = [
             it for i, it in enumerate(items) if i not in drop_idxs
         ]
+
+
+def _drop_duplicate_with_embedded_price(items):
+    """Drop items whose desc has 'X  N' suffix where N == this item's total
+    AND another item with desc 'X' (no suffix) and same total exists.
+
+    Pattern: LLM produced two items for one OCR row — one clean, one with
+    the trailing inline price merged into the desc.
+
+    Example:
+      [1] 'TV1.0テイシボ'           total=198    <- correct
+      [22] 'TV1.0テイシボ  198'     total=198    <- phantom duplicate
+
+    Drop item [22]. Generic across receipts. Conservative — only fires
+    when the embedded suffix exactly matches the item's own total AND a
+    twin without the suffix exists at the same total.
+    """
+    if not items or len(items) < 2:
+        return
+    _SUFFIX = re.compile(r'^(.+?)\s+([\d,]{1,6})\s*[\*※]?\s*$')
+    drop_idxs: set[int] = set()
+
+    # Build a map of clean_desc → list of (idx, total) for items WITHOUT
+    # a digit suffix
+    clean_items: dict[str, list[tuple[int, float]]] = {}
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        desc = (item.get("description") or "").strip()
+        total = item.get("total")
+        if not desc or total is None:
+            continue
+        if not _SUFFIX.match(desc):
+            clean_items.setdefault(desc, []).append((i, float(total)))
+
+    for i, item in enumerate(items):
+        if i in drop_idxs or not isinstance(item, dict):
+            continue
+        desc = (item.get("description") or "").strip()
+        total = item.get("total")
+        if not desc or total is None:
+            continue
+        m = _SUFFIX.match(desc)
+        if not m:
+            continue
+        prefix = m.group(1).strip()
+        try:
+            suffix_val = float(m.group(2).replace(',', ''))
+        except ValueError:
+            continue
+        # Suffix must match the item's own total
+        if abs(suffix_val - total) > 1:
+            continue
+        # Need a clean twin at the same total
+        if any(abs(t - total) <= 1 and j != i
+               for j, t in clean_items.get(prefix, [])):
+            drop_idxs.add(i)
+    if drop_idxs:
+        items[:] = [it for i, it in enumerate(items) if i not in drop_idxs]
 
 
 def _strip_embedded_price_in_desc(items):

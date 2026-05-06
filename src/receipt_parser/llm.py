@@ -824,21 +824,27 @@ def extract_with_verification(
                 break
 
     # Sanity-retry: if the chosen extraction has items_sum that doesn't match
-    # subtotal/total, do one more fresh-seed extraction (different prompt
-    # path: extraction prompt, NOT verification — verification biases toward
-    # the previous pass's mistake). If the fresh extraction has BETTER
-    # items_sum agreement, swap to it. Catches LLM API non-determinism where
-    # one seed produces a wrong items_sum and another seed produces correct.
+    # subtotal/total, try up to 2 fresh-seed extractions (extraction prompt,
+    # NOT verification — verification biases toward the previous pass's
+    # mistake). Pick the one with the smallest items_sum gap.
+    #
+    # Catches LLM API non-determinism: the same seed=42 occasionally
+    # produces different totals across runs. Trying additional seeds gives
+    # multiple chances at the correct extraction. We accept an alternate
+    # only if its gap is strictly better (or matches subtotal exactly).
     if "error" not in best_extracted:
         sanity = _items_sum_gap(best_extracted)
         if sanity is not None and sanity > 5:
-            sanity_alt = _alternate_seed_extract(
-                ocr_text, model, doc_type, seed_offset=2  # seed=44
-            )
-            if sanity_alt is not None and "error" not in sanity_alt:
+            for offset in (2, 3):  # seeds 44, 45
+                sanity_alt = _alternate_seed_extract(
+                    ocr_text, model, doc_type, seed_offset=offset
+                )
+                if sanity_alt is None or "error" in sanity_alt:
+                    continue
                 alt_gap = _items_sum_gap(sanity_alt)
-                if alt_gap is not None and alt_gap < sanity:
-                    # Validate alt and use it if no schema errors
+                if alt_gap is None:
+                    continue
+                if alt_gap < sanity:
                     alt_warnings: list[str] = []
                     if validate_fn:
                         try:
@@ -847,7 +853,8 @@ def extract_with_verification(
                         except Exception:
                             alt_warnings = []
                     history.append({
-                        "pass": "sanity-retry", "extraction": sanity_alt,
+                        "pass": f"sanity-retry-seed{_LLM_SEED + offset}",
+                        "extraction": sanity_alt,
                         "warnings": alt_warnings,
                         "items_sum_gap_before": sanity,
                         "items_sum_gap_after": alt_gap,
@@ -855,6 +862,9 @@ def extract_with_verification(
                     })
                     best_extracted = sanity_alt
                     best_warnings = alt_warnings
+                    sanity = alt_gap  # update baseline for next iteration
+                    if sanity <= 2:
+                        break  # close enough; stop spending LLM calls
 
     return best_extracted, history
 
