@@ -23,6 +23,7 @@ from .llm import check_model_available, extract_with_verification, DEFAULT_MODEL
 from .validation import validate_receipt
 from .normalize import (normalize_fullwidth, clean_handwritten_ocr, strip_barcode_lines,
                         rejoin_price_lines, _shift_misaligned_inline_prices, strip_banner_lines, strip_bonus_point_lines,
+                        join_split_qty_details,
                         rejoin_totals_label_value_columns)
 from .tracing import PipelineTrace, draw_ocr_bboxes, draw_field_overlay
 from .patterns import (
@@ -791,6 +792,7 @@ def _run_extraction_pipeline(
         # Strip bonus-point lines BEFORE rejoin so item↔price column matching
         # isn't disrupted by stray loyalty-point fragments.
         unified_text = strip_bonus_point_lines(unified_text)
+        unified_text = join_split_qty_details(unified_text)
         # strip_banner_lines disabled — even with empty placeholders, line
         # changes affect LLM extraction (position-sensitive). Banner-line
         # phantoms are filtered at item level via _drop_banner_phantom_items.

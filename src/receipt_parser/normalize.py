@@ -159,6 +159,30 @@ _QTY_DETAIL_RE = re.compile(
 )
 
 
+def join_split_qty_details(text: str) -> str:
+    """Join qty-detail lines that OCR split across two lines.
+
+    Example:
+        '(2個 X        <- L1: open paren + qty + multiplier
+        '128)'         <- L2: unit price + close paren
+
+    Becomes:
+        '(2個 X 128)'  <- joined onto L1; L2 becomes empty
+
+    Generic across receipts where Cloud Vision splits parenthetical qty
+    notation across rows. Preserves line count via empty placeholder.
+    """
+    lines = text.split('\n')
+    out = list(lines)
+    _OPEN = re.compile(r'^[\(\<]?\s*(\d+)\s*[個コ点]\s*[xX×]\s*(?:単)?\s*$')
+    _CLOSE = re.compile(r'^\s*(\d+)\s*[\)\>]\s*$')
+    for i in range(len(out) - 1):
+        if _OPEN.match(out[i].strip()) and _CLOSE.match(out[i + 1].strip()):
+            out[i] = out[i].rstrip() + ' ' + out[i + 1].strip()
+            out[i + 1] = ''
+    return '\n'.join(out)
+
+
 def _qty_detail_total(s: str) -> float | None:
     """If s is a qty-detail line, return qty * unit. Else None.
 
