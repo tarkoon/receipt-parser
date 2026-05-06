@@ -3210,12 +3210,36 @@ def _dedup_same_total_items(extracted):
 
 def _fix_qty_hallucinations(items, unified_text):
     """Fix LLM qty hallucinations by checking if total/price appear in OCR text."""
+    # Pre-compute qty-detail lines (e.g., "(3個 X 単68)") and the implied
+    # totals — we use these to validate the LLM's qty/unit_price extraction.
+    # If a qty-detail line corresponds to the item AND its qty*unit matches
+    # the LLM's qty*unit, the LLM is right and we should NOT "fix" it.
+    qty_detail_re = re.compile(
+        r'[\(\<]?\s*(\d+)\s*[個コ点]\s*[xX×]\s*(?:単|@)?\s*(\d+)\s*[\)\>]?'
+    )
+    qty_detail_pairs: list[tuple[int, int]] = []  # (qty, unit) pairs
+    for line in unified_text.split('\n'):
+        m = qty_detail_re.search(line.strip())
+        if m:
+            try:
+                qty_detail_pairs.append((int(m.group(1)), int(m.group(2))))
+            except ValueError:
+                pass
+
+    def _has_supporting_qty_detail(item_qty: int, item_unit: float) -> bool:
+        """OCR has a qty-detail line confirming this item's qty AND unit_price."""
+        return any(q == item_qty and abs(u - item_unit) < 1
+                   for q, u in qty_detail_pairs)
+
     for item in items:
         if not isinstance(item, dict) or item.get("qty", 1) <= 1:
             continue
         total = item.get("total", 0)
         unit_price = item.get("unit_price")
         if unit_price is None:
+            continue
+        # Skip if qty-detail line confirms this qty × unit_price
+        if _has_supporting_qty_detail(int(item.get("qty", 1)), float(unit_price)):
             continue
         total_str = str(int(total)) if total == int(total) else str(total)
         price_str = str(int(unit_price)) if unit_price == int(unit_price) else str(unit_price)
@@ -3230,6 +3254,9 @@ def _fix_qty_hallucinations(items, unified_text):
         total = item.get("total", 0)
         unit_price = item.get("unit_price")
         if unit_price is None or total <= 0:
+            continue
+        # Skip if qty-detail line confirms
+        if _has_supporting_qty_detail(int(item.get("qty", 1)), float(unit_price)):
             continue
         total_int = str(int(total)) if total == int(total) else str(total)
         price_int = str(int(unit_price)) if unit_price == int(unit_price) else str(unit_price)
