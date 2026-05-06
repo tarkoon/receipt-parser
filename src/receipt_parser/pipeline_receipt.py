@@ -1602,6 +1602,29 @@ def _fix_item_desc_from_ocr_price_line(items, unified_text):
                         desc_lines = [i, i + 1, i + 2]
                         break
 
+        # If desc literally appears in OCR AND there's a bare-digit total on
+        # an immediately adjacent line, trust the LLM and skip replacement.
+        # The bare-digit total isn't picked up by the marker/¥-prefix patterns
+        # below, so without this check we'd replace correct descs whose price
+        # is in column-format (price on next line, no markers).
+        if desc_lines:
+            has_adjacent_price = False
+            for dl in desc_lines:
+                for adj in (dl + 1, dl - 1, dl + 2):
+                    if 0 <= adj < len(lines):
+                        adj_text = lines[adj].strip()
+                        if re.fullmatch(r'[\d,]+', adj_text):
+                            try:
+                                if abs(float(adj_text.replace(',', '')) - total) < 1:
+                                    has_adjacent_price = True
+                                    break
+                            except ValueError:
+                                pass
+                if has_adjacent_price:
+                    break
+            if has_adjacent_price:
+                continue
+
         # Collect ALL OCR price lines that match this item's total. There
         # may be multiple at the same price (e.g., 3 items all priced 350).
         # When there are multiple, the desc must be far from EVERY one for us
