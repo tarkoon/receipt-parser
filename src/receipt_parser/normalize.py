@@ -126,13 +126,16 @@ _STRIP_SAFE_BANNER_RE = re.compile(
 
 
 def strip_banner_lines(text: str) -> str:
-    """Remove standalone receipt-banner lines that NEVER contain useful
-    fields (date, payment, total).
+    """Replace standalone receipt-banner lines with empty placeholders.
 
     Conservative — only the specific boilerplate phrases listed in
     _STRIP_SAFE_BANNER_RE are stripped. Acknowledgement phrases like
     '上記正に領収' which sometimes contain the receipt date inline are
     NOT stripped (handled separately by item-level filters).
+
+    IMPORTANT: empties the line content but preserves line count. The LLM
+    is sensitive to line positioning — wholesale removing lines causes
+    extraction regressions on otherwise-passing receipts.
 
     Generic across receipts.
     """
@@ -143,6 +146,7 @@ def strip_banner_lines(text: str) -> str:
             out.append(line)
             continue
         if _STRIP_SAFE_BANNER_RE.search(s):
+            out.append('')  # preserve line count
             continue
         out.append(line)
     return '\n'.join(out)

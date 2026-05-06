@@ -791,7 +791,9 @@ def _run_extraction_pipeline(
         # Strip bonus-point lines BEFORE rejoin so item↔price column matching
         # isn't disrupted by stray loyalty-point fragments.
         unified_text = strip_bonus_point_lines(unified_text)
-        unified_text = strip_banner_lines(unified_text)
+        # strip_banner_lines disabled — even with empty placeholders, line
+        # changes affect LLM extraction (position-sensitive). Banner-line
+        # phantoms are filtered at item level via _drop_banner_phantom_items.
         unified_text = rejoin_price_lines(unified_text)
         unified_text = _shift_misaligned_inline_prices(unified_text)
         unified_text = clean_handwritten_ocr(unified_text, ocr_confidence=ocr_conf)
