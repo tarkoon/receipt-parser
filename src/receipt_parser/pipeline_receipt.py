@@ -2683,6 +2683,81 @@ def _drop_banner_phantom_items(items, unified_text):
         items.extend(kept)
 
 
+def _drop_phantom_from_tax_amount(extracted):
+    """Drop items whose total equals a printed tax amount AND whose
+    description is a prefix of another item's description with an embedded
+    digit suffix matching some other item's price.
+
+    Scenario: OCR puts a tax amount (e.g., '¥97' for 8% tax) on a line
+    visually close to an item description. The LLM creates a phantom item
+    using that price and a corrupted description like 'X  98' (where 98 is
+    another item's price stuck on the end of X's name).
+
+    Conservative — fires only when ALL of:
+      - phantom.total == any tax_entry.amount (exact match)
+      - phantom.desc has a trailing whitespace+digit suffix
+      - the desc-without-suffix appears as another item's full description
+      - that suffix matches the other item's total
+
+    Generic across receipts.
+    """
+    items = extracted.get("line_items", []) or []
+    taxes = extracted.get("taxes", []) or []
+    if len(items) < 2 or not taxes:
+        return
+    tax_amounts = {
+        float(t.get("amount", 0))
+        for t in taxes
+        if isinstance(t, dict) and t.get("amount") not in (None, 0)
+    }
+    if not tax_amounts:
+        return
+
+    _SUFFIX = re.compile(r'^(.+?)\s+([\d,]{1,6})\s*[\*※]?\s*$')
+    by_desc_total: dict[tuple, int] = {}
+    for i, it in enumerate(items):
+        if isinstance(it, dict):
+            d = (it.get("description") or "").strip()
+            t = it.get("total")
+            if d and t is not None:
+                by_desc_total[(d, float(t))] = i
+
+    drop_idxs = set()
+    for i, it in enumerate(items):
+        if not isinstance(it, dict):
+            continue
+        total = it.get("total")
+        if total is None:
+            continue
+        try:
+            total_f = float(total)
+        except (TypeError, ValueError):
+            continue
+        if total_f not in tax_amounts:
+            continue
+        desc = (it.get("description") or "").strip()
+        m = _SUFFIX.match(desc)
+        if not m:
+            continue
+        prefix = m.group(1).strip()
+        try:
+            suffix_val = float(m.group(2).replace(',', ''))
+        except ValueError:
+            continue
+        # Must keep Japanese in the prefix
+        if not re.search(r'[ぁ-んァ-ン一-龥]', prefix):
+            continue
+        # Look for another item with desc==prefix and total==suffix_val
+        if (prefix, suffix_val) in by_desc_total:
+            other_idx = by_desc_total[(prefix, suffix_val)]
+            if other_idx != i:
+                drop_idxs.add(i)
+    if drop_idxs:
+        extracted["line_items"] = [
+            it for i, it in enumerate(items) if i not in drop_idxs
+        ]
+
+
 def _strip_embedded_price_in_desc(items):
     """Strip trailing whitespace+digit suffix from descriptions when the
     digit equals the item's total/unit_price.
@@ -3703,6 +3778,18 @@ def _recover_missing_items_from_gap(extracted, unified_text):
                 unmatched.pop(j)
                 break
 
+    # Exclude OCR prices that exactly match a printed tax amount — those
+    # are tax values, not items. Without this guard, a printed '¥97' for an
+    # 8% tax line gets recovered as a fake 97-yen item.
+    tax_amts = {
+        float(t.get("amount", 0))
+        for t in taxes
+        if isinstance(t, dict) and t.get("amount") not in (None, 0)
+    }
+    if tax_amts:
+        unmatched = [(idx, amt) for idx, amt in unmatched
+                     if amt not in tax_amts]
+
     # Try both targets: items add to total (内税) or to subtotal (外税).
     # Pre-normalize, the LLM-supplied tax label is unreliable, so test both
     # and only fire if exactly one yields a single matching unaccounted ¥.
@@ -3941,6 +4028,7 @@ def postprocess_receipt(
     _fix_time(extracted, unified_text)
     _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
     _fix_line_items(extracted, unified_text)
+    _drop_phantom_from_tax_amount(extracted)
     _fix_items_from_subtotal(extracted, unified_text, ocr_totals)
     _recover_missing_items_from_gap(extracted, unified_text)
 
