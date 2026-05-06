@@ -544,8 +544,23 @@ def _substitute_dup_descs_from_alt(extracted: dict, alt: dict) -> int:
         if not candidates:
             continue
 
-        # Replace all but the first dup occurrence with alt-pass descriptions
-        for cand_desc, idx in zip(candidates, idxs[1:]):
+        # Decide how many of the duplicates to replace:
+        # - If dup_desc ALSO appears in this extraction as a distinct item with
+        #   a DIFFERENT total, then ALL occurrences at dup_total are spurious
+        #   copy-pastes (the real item is the one at the different total).
+        #   Replace all of them.
+        # - Otherwise, assume one is the real original — keep it, replace the
+        #   rest.
+        real_at_diff_total = any(
+            _norm(it.get("description") or "") == dup_desc
+            and it.get("total") is not None
+            and abs(float(it.get("total")) - dup_total) > 1
+            for it in items
+            if isinstance(it, dict)
+        )
+        targets = idxs if real_at_diff_total else idxs[1:]
+
+        for cand_desc, idx in zip(candidates, targets):
             items[idx]["description"] = cand_desc
             existing.add(_norm(cand_desc))
             substituted += 1
@@ -724,6 +739,20 @@ def extract_with_verification(
             best_extracted = pass_extracted
             best_warnings = pass_warnings
             best_llm_warnings = pass_llm_warnings
+
+    # Final substitution: if the chosen pass still has duplicate-desc items,
+    # walk the other passes for distinct alternates at the same total. This
+    # rescues the case where pass 1 has a duplicate and pass 2 has the correct
+    # distinct desc but more total-side warnings — keep pass 1's structure
+    # (which scored better) but borrow pass 2's better desc for the dup slot.
+    if "error" not in best_extracted and _has_duplicate_descs(best_extracted):
+        for entry in history:
+            alt = entry.get("extraction")
+            if not alt or alt is best_extracted or "error" in alt:
+                continue
+            substituted = _substitute_dup_descs_from_alt(best_extracted, alt)
+            if substituted > 0 and not _has_duplicate_descs(best_extracted):
+                break
 
     return best_extracted, history
 

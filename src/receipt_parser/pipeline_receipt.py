@@ -1586,8 +1586,27 @@ def _fix_item_desc_from_ocr_price_line(items, unified_text):
 
         desc_lines = [i for i, line in enumerate(lines) if desc in line]
 
-        price_line_idx = None
-        price_desc = None
+        # Multi-line desc fallback: long descriptions sometimes split across
+        # consecutive OCR lines (e.g., 'どっさりキャベツと白身フライ' →
+        # 'どっさりキャベツと白' + '身フライ'). Treat as "found" if any
+        # contiguous sequence of OCR lines together contains the desc.
+        if not desc_lines and len(desc) >= 6:
+            for i in range(len(lines) - 1):
+                joined = lines[i].strip() + lines[i + 1].strip()
+                if desc in joined:
+                    desc_lines = [i, i + 1]
+                    break
+                if i + 2 < len(lines):
+                    joined3 = joined + lines[i + 2].strip()
+                    if desc in joined3:
+                        desc_lines = [i, i + 1, i + 2]
+                        break
+
+        # Collect ALL OCR price lines that match this item's total. There
+        # may be multiple at the same price (e.g., 3 items all priced 350).
+        # When there are multiple, the desc must be far from EVERY one for us
+        # to consider replacement; if it's near any, the LLM's desc is plausible.
+        price_matches: list[tuple[int, str]] = []  # (line_idx, candidate_desc)
         for pattern in (r'([\d,]+)\s*[非※*]', r'[¥￥]\s*([\d,]+)'):
             for i, line in enumerate(lines):
                 if _SKIP_PRICE_LINE.search(line):
@@ -1597,29 +1616,38 @@ def _fix_item_desc_from_ocr_price_line(items, unified_text):
                     if val_str:
                         price = float(val_str.replace(',', ''))
                         if abs(price - total) < 1:
-                            price_line_idx = i
                             text_before = line[:m.start()].strip()
                             text_before = re.sub(r'\s*[※\*非]\s*$', '', text_before).strip()
                             if (text_before and len(text_before) >= 2
                                     and not re.match(r'^[¥￥\d,.\s]+$', text_before)):
-                                price_desc = text_before
+                                price_matches.append((i, text_before))
+                            else:
+                                price_matches.append((i, ""))
                             break
-                if price_line_idx is not None:
-                    break
-            if price_line_idx is not None:
+            if price_matches:
                 break
 
-        if price_line_idx is None or price_desc is None:
+        if not price_matches:
             continue
 
-        # Don't replace with a generic category marker — that's a downgrade.
-        # The junk-description fixer will handle these cases by searching
-        # backward from the price line.
-        if price_desc in _GENERIC_DESC_MARKERS:
+        # Pick the price match whose candidate description is non-empty AND
+        # not a generic marker. If desc is near ANY price match, keep current.
+        viable = [(idx, cand) for idx, cand in price_matches
+                  if cand and cand not in _GENERIC_DESC_MARKERS]
+        if not viable:
             continue
 
-        near_price = any(abs(dl - price_line_idx) <= 3 for dl in desc_lines)
-        if not near_price and price_desc != desc:
+        # If LLM's current desc is near any price line for this total,
+        # trust it — the LLM picked the right row, even if its desc spans
+        # multiple OCR lines or differs from the inline candidate.
+        near_any_price = any(abs(dl - pidx) <= 3
+                             for dl in desc_lines
+                             for pidx, _ in price_matches)
+        if near_any_price:
+            continue
+
+        price_line_idx, price_desc = viable[0]
+        if price_desc != desc:
             item["description"] = price_desc
 
 
