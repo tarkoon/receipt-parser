@@ -1656,9 +1656,12 @@ def _fix_item_desc_from_ocr_price_line(items, unified_text):
             continue
 
         # Pick the price match whose candidate description is non-empty AND
-        # not a generic marker. If desc is near ANY price match, keep current.
+        # not a generic marker AND not a banner phrase. If desc is near ANY
+        # price match, keep current.
         viable = [(idx, cand) for idx, cand in price_matches
-                  if cand and cand not in _GENERIC_DESC_MARKERS]
+                  if cand and cand not in _GENERIC_DESC_MARKERS
+                  and not _BANNER_PHRASE_RE.search(cand)
+                  and not _HEADER_LINE_RE.search(cand)]
         if not viable:
             continue
 
@@ -2683,6 +2686,104 @@ def _drop_banner_phantom_items(items, unified_text):
     if len(kept) != len(items):
         items.clear()
         items.extend(kept)
+
+
+def _fix_priced_in_name_items(extracted, unified_text):
+    """Fix items whose description contains its price (e.g. '100円均一')
+    when the LLM extracted a wrong total.
+
+    Pattern: a description like '100円均一', '500円商品', '300円ショップ'
+    literally states the item's price in yen. If the LLM extracted such an
+    item with total ≠ N AND there's an unmatched orphan ¥N in the OCR,
+    update the item's total to N.
+
+    Generic — applies to any item whose description has 'N円' followed by
+    Japanese characters and where pipeline mis-extracted the price.
+
+    Conservative: only fires when (a) description prefix matches pattern,
+    (b) extracted total != name's stated price, (c) the corrected total
+    moves items_sum closer to subtotal/total target, and (d) an unmatched
+    orphan ¥N exists in OCR.
+    """
+    items = extracted.get("line_items") or []
+    subtotal = extracted.get("subtotal")
+    total = extracted.get("total")
+    if not items:
+        return
+
+    items_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+    targets = [t for t in (subtotal, total) if t]
+    if not targets:
+        return
+
+    # If items already balance, don't touch
+    if any(abs(items_sum - t) <= 2 for t in targets):
+        return
+
+    # Collect OCR ¥ amounts
+    lines = unified_text.split('\n')
+    ocr_amounts: list[float] = []
+    for line in lines:
+        if _SKIP_PRICE_LINE.search(line):
+            continue
+        for m in re.finditer(r'[¥￥]\s*([\d,]+)', line):
+            try:
+                ocr_amounts.append(float(m.group(1).replace(',', '')))
+            except ValueError:
+                pass
+
+    # Multiset diff: remove one OCR entry per item amount
+    item_totals = [i.get("total", 0) for i in items if isinstance(i, dict)]
+    unmatched = list(ocr_amounts)
+    for t in item_totals:
+        for j, oa in enumerate(unmatched):
+            if abs(oa - t) < 1:
+                unmatched.pop(j)
+                break
+
+    if not unmatched:
+        return
+
+    # Match items whose description has 'N円<japanese>' prefix where N is
+    # the implied price (e.g. '100円均一' → price 100).
+    _PRICED_NAME_RE = re.compile(r'^(\d{2,5})\s*円')
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        desc = (item.get("description") or "").strip()
+        m = _PRICED_NAME_RE.match(desc)
+        if not m:
+            continue
+        try:
+            named_price = float(m.group(1))
+        except ValueError:
+            continue
+        cur_total = item.get("total", 0)
+        if abs(named_price - cur_total) <= 2:
+            continue  # already correct
+
+        # Is named_price an unmatched OCR amount?
+        if not any(abs(oa - named_price) <= 1 for oa in unmatched):
+            continue
+
+        # Try the fix: update total/unit_price/qty
+        new_items_sum = items_sum - cur_total + named_price
+        # Only apply if it strictly improves the gap
+        old_gap = min(abs(items_sum - t) for t in targets)
+        new_gap = min(abs(new_items_sum - t) for t in targets)
+        if new_gap >= old_gap:
+            continue
+
+        # Apply
+        item["total"] = named_price
+        item["unit_price"] = named_price
+        item["qty"] = 1
+        items_sum = new_items_sum
+        # Remove the matched amount from unmatched so it can't be reused
+        for j, oa in enumerate(unmatched):
+            if abs(oa - named_price) <= 1:
+                unmatched.pop(j)
+                break
 
 
 def _drop_phantom_from_tax_amount(extracted):
@@ -4031,6 +4132,7 @@ def postprocess_receipt(
     _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
     _fix_line_items(extracted, unified_text)
     _drop_phantom_from_tax_amount(extracted)
+    _fix_priced_in_name_items(extracted, unified_text)
     _fix_items_from_subtotal(extracted, unified_text, ocr_totals)
     _recover_missing_items_from_gap(extracted, unified_text)
 
