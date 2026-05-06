@@ -456,14 +456,16 @@ def _has_duplicate_descs(extracted: dict) -> bool:
 
 
 def _alternate_seed_extract(
-    ocr_text: str, model: str, doc_type: str
+    ocr_text: str, model: str, doc_type: str, seed_offset: int = 1,
 ) -> dict | None:
-    """Re-run extraction with seed=43 (different from the default 42) using
-    the SAME extraction prompt — not verification.
+    """Re-run extraction with a non-default seed using the SAME extraction
+    prompt — not verification.
 
     Verification prompts bias toward the previous pass's mistake; for cross-
     check we want an independent extraction. Returns parsed dict or None on
     failure.
+
+    seed_offset: 1 → seed=43, 2 → seed=44, etc.
     """
     system_prompt, user_prompt = generate_extraction_prompt(ocr_text, doc_type=doc_type)
     try:
@@ -474,7 +476,7 @@ def _alternate_seed_extract(
                 {"role": "user", "content": user_prompt},
             ],
             schema=get_ollama_schema(),
-            seed=_LLM_SEED + 1,  # 43 instead of 42
+            seed=_LLM_SEED + seed_offset,
         )
     except Exception:
         return None
@@ -482,6 +484,28 @@ def _alternate_seed_extract(
     if "error" in parsed:
         return None
     return parsed
+
+
+def _items_sum_gap(extracted: dict) -> float | None:
+    """Return absolute gap between items_sum and the closest of subtotal/total.
+
+    Returns None if no items or no targets to compare against. A small gap
+    (≤ 2) means items_sum agrees with one of the targets — the extraction
+    is internally consistent. Larger gaps indicate the LLM is missing or
+    duplicating items, or has wrong totals.
+    """
+    items = extracted.get("line_items") or []
+    if not items:
+        return None
+    items_sum = sum(
+        i.get("total", 0) for i in items if isinstance(i, dict)
+    )
+    subtotal = extracted.get("subtotal")
+    total = extracted.get("total")
+    targets = [t for t in (subtotal, total) if t]
+    if not targets:
+        return None
+    return min(abs(items_sum - t) for t in targets)
 
 
 def _substitute_dup_descs_from_alt(extracted: dict, alt: dict) -> int:
@@ -798,6 +822,39 @@ def extract_with_verification(
             substituted = _substitute_dup_descs_from_alt(best_extracted, alt)
             if substituted > 0 and not _has_duplicate_descs(best_extracted):
                 break
+
+    # Sanity-retry: if the chosen extraction has items_sum that doesn't match
+    # subtotal/total, do one more fresh-seed extraction (different prompt
+    # path: extraction prompt, NOT verification — verification biases toward
+    # the previous pass's mistake). If the fresh extraction has BETTER
+    # items_sum agreement, swap to it. Catches LLM API non-determinism where
+    # one seed produces a wrong items_sum and another seed produces correct.
+    if "error" not in best_extracted:
+        sanity = _items_sum_gap(best_extracted)
+        if sanity is not None and sanity > 5:
+            sanity_alt = _alternate_seed_extract(
+                ocr_text, model, doc_type, seed_offset=2  # seed=44
+            )
+            if sanity_alt is not None and "error" not in sanity_alt:
+                alt_gap = _items_sum_gap(sanity_alt)
+                if alt_gap is not None and alt_gap < sanity:
+                    # Validate alt and use it if no schema errors
+                    alt_warnings: list[str] = []
+                    if validate_fn:
+                        try:
+                            receipt_alt = Receipt(**sanity_alt)
+                            alt_warnings = validate_fn(receipt_alt)
+                        except Exception:
+                            alt_warnings = []
+                    history.append({
+                        "pass": "sanity-retry", "extraction": sanity_alt,
+                        "warnings": alt_warnings,
+                        "items_sum_gap_before": sanity,
+                        "items_sum_gap_after": alt_gap,
+                        "llm_timing": None,
+                    })
+                    best_extracted = sanity_alt
+                    best_warnings = alt_warnings
 
     return best_extracted, history
 
