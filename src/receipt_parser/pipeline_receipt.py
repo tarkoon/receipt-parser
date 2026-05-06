@@ -4119,9 +4119,15 @@ def _recover_missing_items_from_gap(extracted, unified_text):
         return text
 
     def _is_existing_desc(text: str) -> bool:
+        # Normalize: strip trailing whitespace+digits to avoid 'X' and 'X  N'
+        # being treated as distinct when N is just an embedded price.
+        norm_text = re.sub(r'\s+[\d,]{1,6}\s*[\*※]?\s*$', '', text).strip()
         return any(
-            isinstance(o, dict)
-            and (o.get("description") or "").strip() == text
+            isinstance(o, dict) and (
+                (o.get("description") or "").strip() == text
+                or re.sub(r'\s+[\d,]{1,6}\s*[\*※]?\s*$', '',
+                          (o.get("description") or "").strip()).strip() == norm_text
+            )
             for o in items
         )
 
@@ -4322,6 +4328,11 @@ def postprocess_receipt(
     _fix_priced_in_name_items(extracted, unified_text)
     _fix_items_from_subtotal(extracted, unified_text, ocr_totals)
     _recover_missing_items_from_gap(extracted, unified_text)
+    # Run embedded-price dedup AGAIN after recovery — recovery can pick up
+    # OCR-merged 'X  N' lines as new phantom items even when 'X' already
+    # exists in the extraction at the same price.
+    if extracted.get("line_items"):
+        _drop_duplicate_with_embedded_price(extracted["line_items"])
     _fix_digit_misread_items(extracted, unified_text)
 
     # Clear account_number when it's a masked card number suffix, not a real account

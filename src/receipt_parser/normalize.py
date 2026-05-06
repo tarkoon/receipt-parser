@@ -466,6 +466,17 @@ def rejoin_price_lines(text: str) -> str:
     # Block matching: find runs of priceless items followed by price lines.
     # Items that already have an inline price (e.g. "食品ポリ袋L 3除") are
     # skipped so they don't consume prices meant for subsequent items.
+    def _is_price_or_bare_digit(s: str) -> bool:
+        """Inside the items zone, bare digits like '1,498' or '198' are
+        legitimate price lines (column-format receipts)."""
+        s = s.strip()
+        return _is_price(s) or bool(_BARE_DIGIT_PRICE_RE.match(s))
+
+    # Misread tax-marker pattern: '100%' alone is OCR's mistake for '100※'
+    # or '108※' (the trailing '8※' becomes '%'). Treat as a price line in
+    # the items zone.
+    _MISREAD_MARKER_RE = re.compile(r'^\d{2,6}\s*%\s*$')
+
     resolved = list(section)
     i = 0
     while i < len(resolved):
@@ -483,10 +494,27 @@ def rejoin_price_lines(text: str) -> str:
         while i < len(resolved) and _is_item_candidate(resolved[i].strip()) and _has_inline_price(resolved[i].strip()):
             i += 1
 
-        # Count consecutive price lines immediately after
+        # Count consecutive price lines immediately after. Accept bare digits
+        # as price lines only when ≥2 priceless items precede AND ≥2 bare-digit
+        # lines follow (column-format signal). Single bare digits are
+        # ambiguous (could be product code, qty, etc.).
         pstart = i
-        while i < len(resolved) and _is_price(resolved[i].strip()):
-            i += 1
+        n_priceless = iend - istart
+        accept_bare = n_priceless >= 2
+        # Bare digits and misread '%' markers are accepted only when ≥3
+        # priceless items precede AND ≥2 such bare lines follow — column-format
+        # signal that's hard to mistake. Single bare digits are too ambiguous.
+        accept_bare = (iend - istart) >= 3
+        while i < len(resolved):
+            s = resolved[i].strip()
+            if _is_price(s):
+                i += 1
+            elif accept_bare and _BARE_DIGIT_PRICE_RE.match(s):
+                i += 1
+            elif accept_bare and _MISREAD_MARKER_RE.match(s):
+                i += 1
+            else:
+                break
         pend = i
 
         pairs = min(iend - istart, pend - pstart)
