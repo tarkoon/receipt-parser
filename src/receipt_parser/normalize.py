@@ -25,6 +25,8 @@ _BANNER_PHRASE_RE = re.compile(
     r'プロの品質とプロの価格|'
     r'上記金額正に領収|上記正に領収|'
     r'本書保管|印字面|'
+    r'の商品です|まとめ値引|'
+    r'^[A-Z]\s*[:：]\s*\d+\s*[個コ点]|'
     r'^\s*消費税等?\s*$'
 )
 
@@ -103,6 +105,137 @@ def strip_bonus_point_lines(text: str) -> str:
         line for line in text.split('\n')
         if not _BONUS_POINT_LINE_RE.match(line.strip())
     )
+
+
+def strip_banner_lines(text: str) -> str:
+    """Remove standalone receipt-banner lines.
+
+    Removes whole lines that match the boilerplate banner regex (e.g.,
+    'A: 3個 ¥198 の商品です', 'お買上商品数:13'). These lines confuse the
+    LLM into extracting them as items because they often contain ¥ amounts.
+
+    Conservative: only drops lines that are mostly banner text. Keeps
+    lines that have substantial non-banner content. Generic across receipts.
+    """
+    out = []
+    for line in text.split('\n'):
+        s = line.strip()
+        if not s:
+            out.append(line)
+            continue
+        if _BANNER_PHRASE_RE.search(s):
+            # Drop the line entirely. Banners shouldn't bleed into items.
+            continue
+        out.append(line)
+    return '\n'.join(out)
+
+
+_QTY_DETAIL_RE = re.compile(
+    r'^[\(\<]?\s*(\d+)\s*[個コ点]\s*[xX×]\s*(?:単)?\s*(\d+)\s*[\)\>]?\s*$'
+    r'|'
+    r'^[\(\<]?\s*(\d+)\s*[個コ点]\s*[xX×]?\s*(\d+)\s*[\)\>]?\s*$'
+)
+
+
+def _qty_detail_total(s: str) -> float | None:
+    """If s is a qty-detail line, return qty * unit. Else None.
+
+    Examples:
+        '(3個 X 単68)' -> 204
+        '2コX単5' -> 10
+        '<2個 X 単248)' -> 496
+        '3コ X358' -> 1074
+    """
+    m = _QTY_DETAIL_RE.match(s.strip())
+    if not m:
+        return None
+    if m.group(1) and m.group(2):
+        return float(m.group(1)) * float(m.group(2))
+    if m.group(3) and m.group(4):
+        return float(m.group(3)) * float(m.group(4))
+    return None
+
+
+def _shift_misaligned_inline_prices(text: str) -> str:
+    """Detect inline prices that belong to the previous priceless line.
+
+    Pattern: line N has 'desc + inline_price_X', line N+1 is a qty-detail
+    saying qty*unit=Y, where Y != X. Then inline_price_X actually belongs
+    to line N-1 (which is a priceless description), and line N's true
+    total is Y (often appearing on a later line as bare digits).
+
+    Concrete example (AEON column-format):
+        TV いりごま 白         <- L33 priceless
+        たまねぎ バラ  98*     <- L34 desc + inline 98 (BELONGS TO L33)
+        (3個 X 単68)          <- L35 qty=3 unit=68 → 204 (true total for L34)
+        204 A                 <- L36 bare price 204 (matches qty*unit)
+
+    Transform:
+        TV いりごま 白  98*    <- L33 + L34's misaligned price
+        たまねぎ バラ          <- L34 priceless (price moved away)
+        (3個 X 単68)
+        204 A
+
+    Generic: only fires when the qty*unit math contradicts the inline price.
+    """
+    lines = text.split('\n')
+    out = list(lines)
+
+    # Match a desc with a trailing inline bare-digit price (with optional marker).
+    # Capture: prefix description (must contain Japanese), the digit value,
+    # optional marker.
+    _DESC_WITH_INLINE = re.compile(
+        r'^(.*?[ぁ-んァ-ン一-龥].*?)(\s+)([\d,]+)(\s*[\*※]?)\s*$'
+    )
+
+    for i in range(len(out) - 1):
+        m_desc = _DESC_WITH_INLINE.match(out[i].strip())
+        if not m_desc:
+            continue
+        prefix = m_desc.group(1).strip()
+        try:
+            inline_price = float(m_desc.group(3).replace(',', ''))
+        except ValueError:
+            continue
+        # Tiny prices (single digit) and very large prices are unlikely to be
+        # the misalignment pattern — skip to avoid false positives.
+        if inline_price < 5 or inline_price > 9999:
+            continue
+
+        qty_total = _qty_detail_total(out[i + 1])
+        if qty_total is None:
+            continue
+        # Only fire when math contradicts the inline price clearly
+        if abs(qty_total - inline_price) <= 2:
+            continue
+
+        # Look upward for a priceless desc line to attach to
+        for back in range(1, 4):
+            j = i - back
+            if j < 0:
+                break
+            up = out[j].strip()
+            if not up or '¥' in up or '￥' in up:
+                continue
+            # Skip qty-detail lines themselves
+            if _qty_detail_total(up) is not None:
+                continue
+            # Must look like an item line (Japanese, no inline trailing digits)
+            if not re.search(r'[ぁ-んァ-ン一-龥]', up):
+                continue
+            if _DESC_WITH_INLINE.match(up):
+                continue  # already has its own price
+            if re.search(r'小計|合計|外税|内税|消費税|お預|釣銭', up):
+                break  # totals zone — stop
+            # Attach misaligned price to this priceless line
+            marker = m_desc.group(4) or ''
+            digit_str = m_desc.group(3) + marker
+            out[j] = out[j].rstrip() + '  ' + digit_str.strip()
+            # Strip the inline price from line i, leaving just the description
+            out[i] = prefix
+            break
+
+    return '\n'.join(out)
 
 
 def rejoin_price_lines(text: str) -> str:

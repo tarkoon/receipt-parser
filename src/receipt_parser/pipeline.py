@@ -22,7 +22,7 @@ from .ocr import init_cloud_vision, run_cloud_vision, blocks_to_structured_text,
 from .llm import check_model_available, extract_with_verification, DEFAULT_MODEL
 from .validation import validate_receipt
 from .normalize import (normalize_fullwidth, clean_handwritten_ocr, strip_barcode_lines,
-                        rejoin_price_lines, strip_bonus_point_lines,
+                        rejoin_price_lines, _shift_misaligned_inline_prices, strip_banner_lines, strip_bonus_point_lines,
                         rejoin_totals_label_value_columns)
 from .tracing import PipelineTrace, draw_ocr_bboxes, draw_field_overlay
 from .patterns import (
@@ -791,7 +791,9 @@ def _run_extraction_pipeline(
         # Strip bonus-point lines BEFORE rejoin so item↔price column matching
         # isn't disrupted by stray loyalty-point fragments.
         unified_text = strip_bonus_point_lines(unified_text)
+        unified_text = strip_banner_lines(unified_text)
         unified_text = rejoin_price_lines(unified_text)
+        unified_text = _shift_misaligned_inline_prices(unified_text)
         unified_text = clean_handwritten_ocr(unified_text, ocr_confidence=ocr_conf)
 
     if not unified_text.strip():
