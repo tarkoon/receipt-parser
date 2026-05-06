@@ -1393,6 +1393,28 @@ _HEADER_LINE_RE = re.compile(
     r'領\s*収\s*証'                                           # 領収証
 )
 
+# Generic Japanese receipt boilerplate banners — appear on receipts from many
+# merchants but never as product names. Used to drop phantom items the LLM
+# created from header/footer text adjacent to a stray number.
+_BANNER_PHRASE_RE = re.compile(
+    r'ぜひ当店でお買物くださいませ|'
+    r'ありがとうございました|ありがとうございます|'
+    r'毎度ありがとうございます|'
+    r'毎月\s*\d+\s*日.*感謝デ[ーー]|'
+    r'お客さま感謝デ[ーー]|'
+    r'印は軽減税率|軽減税率\s*8?\s*%?\s*対象商品|'
+    r'お買上商品数|お買上点数|お買上げ点数|'
+    r'ポイントの有効期限|累計ポイント|'
+    r'今回獲得|現在のポイント|'
+    r'本人確認(?:省略)?|'
+    r'クレジットカード売上票|お客様控え?|'
+    r'当店をご利用|またのご利用|またお越し|'
+    r'お問い合わせ|営業時間|定休日|'
+    r'カードお取扱日|取引内容|伝票番号|承認番号|'
+    r'プロの品質とプロの価格|'
+    r'^\s*消費税等?\s*$'
+)
+
 
 def _fix_junk_descriptions(items, unified_text):
     """Replace 'junk' item descriptions (category markers, phone numbers,
@@ -1676,6 +1698,7 @@ def _fix_line_items(extracted, unified_text):
     if not extracted.get("line_items"):
         return
 
+    _drop_banner_phantom_items(extracted["line_items"], unified_text)
     _fix_item_desc_from_ocr_price_line(extracted["line_items"], unified_text)
     _merge_qty_detail_into_previous(extracted["line_items"], unified_text)
     _fix_junk_descriptions(extracted["line_items"], unified_text)
@@ -2576,6 +2599,37 @@ def _remove_unit_rate_phantom_items(extracted):
             continue
         keep.append(it)
     extracted["line_items"] = keep
+
+
+def _drop_banner_phantom_items(items, unified_text):
+    """Drop items whose description matches a known Japanese receipt banner
+    phrase (boilerplate header/footer text — never a real product).
+
+    Generic-purpose: applies to any receipt; the banner list is the small
+    set of boilerplate phrases that appear across Japanese receipts from
+    many merchants. Real product names contain product nouns and should
+    not match these patterns.
+
+    Examples caught:
+      - 'ぜひ当店でお買物くださいませ' (please shop at our store)
+      - '毎月20日・30日はお客さま感謝デー' (customer appreciation day)
+      - '※印は軽減税率8%対象商品' (asterisk = reduced rate item)
+      - '※印は軽減税率(8%) 適用商品です'
+    """
+    if not items:
+        return
+    kept = []
+    for item in items:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        desc = (item.get("description") or "").strip()
+        if desc and _BANNER_PHRASE_RE.search(desc):
+            continue
+        kept.append(item)
+    if len(kept) != len(items):
+        items.clear()
+        items.extend(kept)
 
 
 def _strip_embedded_price_in_desc(items):

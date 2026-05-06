@@ -3,6 +3,31 @@
 import re
 import unicodedata
 
+# Generic Japanese receipt boilerplate banners — never product names.
+# Used to keep rejoin_price_lines from pairing orphan totals-zone prices
+# with header/footer banner text in the "before" zone (which would
+# fabricate phantom items the LLM later picks up).
+_BANNER_PHRASE_RE = re.compile(
+    r'ぜひ当店でお買物くださいませ|'
+    r'ありがとうございました|ありがとうございます|'
+    r'毎度ありがとうございます|'
+    r'毎月\s*\d+\s*日.*感謝デ[ーー]|'
+    r'お客さま感謝デ[ーー]|'
+    r'印は軽減税率|軽減税率\s*8?\s*%?\s*対象商品|'
+    r'お買上商品数|お買上点数|お買上げ点数|'
+    r'ポイントの有効期限|累計ポイント|'
+    r'今回獲得|現在のポイント|'
+    r'本人確認(?:省略)?|'
+    r'クレジットカード売上票|お客様控え?|'
+    r'当店をご利用|またのご利用|またお越し|'
+    r'お問い合わせ|営業時間|定休日|'
+    r'カードお取扱日|取引内容|伝票番号|承認番号|'
+    r'プロの品質とプロの価格|'
+    r'上記金額正に領収|上記正に領収|'
+    r'本書保管|印字面|'
+    r'^\s*消費税等?\s*$'
+)
+
 # Price-only line: ¥-prefixed (¥656, ¥2,279, ¥168, ¥200外) or number + JP tax marker (278※, 3除)
 _PRICE_LINE_RE = re.compile(
     r'^[¥￥]\s*[\d,]+\s*[)）軽外内]?\s*$'
@@ -133,6 +158,11 @@ def rejoin_price_lines(text: str) -> str:
         # OCR sometimes reads "(" as "<" so accept either as the open bracket,
         # and the multiplier symbol may appear before or after the count marker.
         if re.match(r'^[\(\<](?=.*[×xX])(?=.*[個コ点])', s):
+            return False
+        # Receipt boilerplate banners — never product names. Without this,
+        # rejoin_price_lines pairs orphan totals-zone prices with banner
+        # lines in the "before" zone, fabricating phantom items.
+        if _BANNER_PHRASE_RE.search(s):
             return False
         return True
 
