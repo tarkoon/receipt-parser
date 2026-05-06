@@ -565,6 +565,51 @@ def _substitute_dup_descs_from_alt(extracted: dict, alt: dict) -> int:
             existing.add(_norm(cand_desc))
             substituted += 1
 
+    # Same-desc, different-total fix: when pass 1 has duplicate (desc, total)
+    # but the alt pass has the same desc with DIFFERENT totals (e.g. one
+    # at 640 and one at 606, when pass 1 has both at 606), substitute one
+    # of the dup's total to match the alt's distinct total.
+    #
+    # Conservative: only when the alt pass has exactly one item with the
+    # same desc at a different total, and applying that substitution moves
+    # the items_sum gap toward subtotal/total.
+    items_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+    target_v = (extracted.get("subtotal") or 0) or (extracted.get("total") or 0)
+    for (dup_desc, dup_total), idxs in duplicates.items():
+        # Find alt items with same desc but DIFFERENT total
+        alt_diff_totals: list[tuple[float, float, dict]] = []  # (total, unit, item)
+        for ai in alt_items:
+            if not isinstance(ai, dict):
+                continue
+            a_desc = _norm(ai.get("description") or "")
+            a_total = ai.get("total")
+            if not a_desc or a_total is None:
+                continue
+            if a_desc != dup_desc:
+                continue
+            if abs(float(a_total) - dup_total) <= 1:
+                continue
+            alt_diff_totals.append(
+                (float(a_total), float(ai.get("unit_price") or a_total), ai)
+            )
+
+        if not alt_diff_totals:
+            continue
+
+        # Try each alt total: would substituting one of the dup items
+        # (changing its total) move us closer to target?
+        for a_total, a_unit, _ai in alt_diff_totals:
+            new_sum = items_sum - dup_total + a_total
+            if target_v and abs(new_sum - target_v) < abs(items_sum - target_v):
+                # Apply: replace the LAST dup occurrence with alt's values
+                target_idx = idxs[-1]
+                items[target_idx]["total"] = a_total
+                items[target_idx]["unit_price"] = a_unit
+                items[target_idx]["qty"] = 1
+                items_sum = new_sum
+                substituted += 1
+                break
+
     return substituted
 
 

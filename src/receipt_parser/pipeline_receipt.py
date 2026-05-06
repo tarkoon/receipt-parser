@@ -1907,7 +1907,17 @@ def _fix_item_totals_from_ocr_neighborhood(items, unified_text, target_subtotal,
         return None
 
     def _ocr_price_inline(line: str) -> float | None:
+        # ¥-prefixed first
         m = re.search(r'[¥￥]\s*([\d,]+)', line)
+        if m:
+            try:
+                return float(m.group(1).replace(',', ''))
+            except ValueError:
+                return None
+        # Trailing bare-digit price with tax marker (e.g., "...  640X" or
+        # "... 228*"). Only the LAST trailing digit + marker on the line —
+        # mid-line digits may be part of the description (e.g., "TV1.0テイシボ").
+        m = re.search(r'\s+([\d,]{2,7})\s*[※\*X除軽]\s*$', line)
         if m:
             try:
                 return float(m.group(1).replace(',', ''))
