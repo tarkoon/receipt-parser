@@ -501,17 +501,19 @@ def rejoin_price_lines(text: str) -> str:
         pstart = i
         n_priceless = iend - istart
         accept_bare = n_priceless >= 2
-        # Bare digits and misread '%' markers are accepted only when ≥3
-        # priceless items precede AND ≥2 such bare lines follow — column-format
-        # signal that's hard to mistake. Single bare digits are too ambiguous.
-        accept_bare = (iend - istart) >= 3
+        # Bare digits and misread '%' markers accepted only when ≥3 priceless
+        # items precede AND the count of price-like lines that follow exactly
+        # matches. Conservative — column-format with multiple unmarked prices
+        # in a row is rare; matching multiple of these is a strong signal.
+        n_priceless = iend - istart
+        accept_extended = n_priceless >= 3
         while i < len(resolved):
             s = resolved[i].strip()
             if _is_price(s):
                 i += 1
-            elif accept_bare and _BARE_DIGIT_PRICE_RE.match(s):
+            elif accept_extended and _BARE_DIGIT_PRICE_RE.match(s):
                 i += 1
-            elif accept_bare and _MISREAD_MARKER_RE.match(s):
+            elif accept_extended and _MISREAD_MARKER_RE.match(s):
                 i += 1
             else:
                 break
