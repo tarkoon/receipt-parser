@@ -649,6 +649,64 @@ def _extract_financial_totals_impl(text: str) -> dict:
     return result
 
 
+_TOTALS_LABEL_RE = re.compile(
+    r'(小計|合計|現計|外税|内税|消費税|対象|お預り|お釣|釣銭|総額|お会計|'
+    r'WAON|現金|クレジット|カード|電子マネー|残高|支払|預り)'
+)
+_TOTALS_VALUE_RE = re.compile(r'^[¥￥]\s*[\d,]+\s*$')
+
+
+def _column_split_label_value_pairs(lines: list[str]) -> list[tuple[str, str]]:
+    """Detect column-split totals layout: N consecutive label lines followed
+    by N consecutive ¥-prefixed value lines. Returns ordered (label, value)
+    pairs from the first such block found.
+
+    AEON-style receipt OCR shape — labels block (小計/外税8%対象額/外税8%/
+    外税10%対象額/外税10%/合計) printed first, then a parallel block of values.
+    """
+    n = len(lines)
+    i = 0
+    while i < n:
+        if not _TOTALS_LABEL_RE.search(lines[i].strip()):
+            i += 1
+            continue
+        if re.search(r'[¥￥]\s*\d', lines[i]):
+            i += 1
+            continue
+        labels: list[str] = []
+        j = i
+        while j < n:
+            s = lines[j].strip()
+            if not s:
+                j += 1
+                continue
+            if _TOTALS_LABEL_RE.search(s) and not re.search(r'[¥￥]\s*\d', s):
+                labels.append(s)
+                j += 1
+            else:
+                break
+        if len(labels) < 3:
+            i = max(j, i + 1)
+            continue
+        values: list[str] = []
+        k = j
+        while k < n:
+            s = lines[k].strip()
+            if not s:
+                k += 1
+                continue
+            if _TOTALS_VALUE_RE.match(s):
+                values.append(s)
+                k += 1
+            else:
+                break
+        if len(values) >= 3 and len(labels) >= 3:
+            pair_count = min(len(labels), len(values))
+            return list(zip(labels[:pair_count], values[:pair_count]))
+        i = max(k, i + 1)
+    return []
+
+
 def extract_rate_bases(text: str) -> dict[str, float | None]:
     """Extract per-rate taxable base amounts (対象額) from OCR text."""
     bases: dict[str, float | None] = {}
@@ -695,6 +753,24 @@ def extract_rate_bases(text: str) -> dict[str, float | None]:
                 bases[rate_str] = plain_candidate
             elif not found:
                 bases[rate_str] = None
+
+    # Column-split fallback: when standard scan doesn't pair a base for some
+    # rate, look for a contiguous label block followed by a parallel \u00a5-value
+    # block. Handles AEON-receipt OCR where labels and values are printed in
+    # two separate columns linearized as block-A then block-B.
+    if any(v is None for v in bases.values()) or not bases:
+        pairs = _column_split_label_value_pairs(lines)
+        for label, value in pairs:
+            rm = re.search(r'(\d+(?:\.\d+)?)\s*%.*\u5bfe\u8c61', label)
+            if not rm:
+                continue
+            rate_num = float(rm.group(1))
+            rate_str = f"{int(rate_num)}%" if rate_num == int(rate_num) else f"{rate_num}%"
+            if bases.get(rate_str):
+                continue
+            vm = re.search(r'[\u00a5\uffe5]\s*([\d,]+)', value)
+            if vm:
+                bases[rate_str] = float(vm.group(1).replace(',', ''))
 
     return bases
 
@@ -1651,6 +1727,38 @@ def _fix_item_desc_from_ocr_price_line(items, unified_text):
                             break
             if price_matches:
                 break
+
+        # Also include bare-digit price lines (no marker, no ¥) within the
+        # item zone. These don't carry a candidate desc, so they only inform
+        # the near_any_price safety check below — column-format AEON-style
+        # receipts print item prices as bare digits in a block below a
+        # contiguous run of name lines, and without this the safety check
+        # misses a valid match and a correctly-paired item gets replaced.
+        zone_end = len(lines)
+        for zi, zline in enumerate(lines):
+            if re.search(
+                r'^(小\s*計|合\s*計|外税|内税|消費税|お預り|現計|お釣り|釣銭)',
+                zline.strip(),
+            ):
+                zone_end = zi
+                break
+        existing_match_idxs = {pi for pi, _ in price_matches}
+        for i in range(zone_end):
+            if i in existing_match_idxs:
+                continue
+            line = lines[i]
+            if _SKIP_PRICE_LINE.search(line):
+                continue
+            s = line.strip()
+            bare_m = re.fullmatch(r'\s*([\d,]+)\s*$', s)
+            if not bare_m:
+                continue
+            try:
+                price = float(bare_m.group(1).replace(',', ''))
+            except ValueError:
+                continue
+            if abs(price - total) < 1:
+                price_matches.append((i, ""))
 
         if not price_matches:
             continue
@@ -3264,7 +3372,13 @@ def _dedup_same_total_items(extracted):
 
     new_items = [item for item, keep in zip(items, keep_mask) if keep]
     new_sum = sum(i.get("total", 0) for i in new_items if isinstance(i, dict))
-    if abs(new_sum - target) < abs(original_sum - target):
+    # Accept the dedup if it brings new_sum within tolerance of ANY candidate.
+    # (Without this, a phantom-child duplicate that shifts items_sum from one
+    # close-to-total range into close-to-subtotal range gets rejected because
+    # the original target was picked as 'closest to original_sum'.)
+    if any(abs(new_sum - c) <= 2 for c in candidates):
+        extracted["line_items"] = new_items
+    elif abs(new_sum - target) < abs(original_sum - target):
         extracted["line_items"] = new_items
 
 
@@ -4309,6 +4423,55 @@ def _fix_items_from_subtotal(extracted, unified_text, ocr_totals):
             break
 
 
+def _fix_implausible_tax_amounts(extracted, unified_text, ocr_totals):
+    """Detect and fix tax amounts that are implausibly high relative to the
+    rate base. Common when column-format OCR mis-pairs label and value lines
+    (separate label block + separate value block), so the '対象額' value
+    lands on the bare-rate label and vice versa.
+
+    Conservative — fires only when:
+      - tax_amount > 3× expected from rate_base × rate_pct, AND
+      - tax_amount equals the rate_base (signature of a label/value swap)
+    Generic across receipts.
+    """
+    taxes = extracted.get("taxes")
+    if not taxes:
+        return
+    rate_bases = extract_rate_bases(unified_text)
+    breakdown = ocr_totals.get('_breakdown_rate_bases') or {}
+    for r, b in breakdown.items():
+        if r not in rate_bases or rate_bases[r] is None:
+            rate_bases[r] = b
+    rb_sum = sum(v for v in rate_bases.values() if v is not None and v > 0)
+    total = extracted.get("total") or 0
+    bases_inclusive = rb_sum > 0 and total > 0 and abs(rb_sum - total) < 5
+
+    for t in taxes:
+        if not isinstance(t, dict):
+            continue
+        rate = t.get("rate")
+        if not rate or rate == "0%":
+            continue
+        try:
+            rate_pct = float(rate.replace('%', '')) / 100.0
+        except (ValueError, AttributeError):
+            continue
+        if rate_pct <= 0:
+            continue
+        amount = t.get("amount") or 0
+        base = rate_bases.get(rate)
+        if base is None or base <= 0:
+            continue
+        if bases_inclusive:
+            expected = base * rate_pct / (1 + rate_pct)
+        else:
+            expected = base * rate_pct
+        if expected <= 0:
+            continue
+        if amount > expected * 3 and abs(amount - base) < 2:
+            t["amount"] = round(expected) if expected > 0.5 else 0
+
+
 def postprocess_receipt(
     extracted: dict,
     unified_text: str,
@@ -4320,6 +4483,7 @@ def postprocess_receipt(
     """Apply all receipt-specific post-processing to the LLM extraction."""
     _fix_company_name_merchant(extracted, unified_text)
     _apply_financial_overrides(extracted, ocr_totals, ocr_conf, llm_conf)
+    _fix_implausible_tax_amounts(extracted, unified_text, ocr_totals)
     _fix_date(extracted, unified_text)
     _fix_time(extracted, unified_text)
     _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
@@ -4378,6 +4542,41 @@ def postprocess_receipt(
                         "label": default_label,
                         "amount": computed_tax,
                     })
+
+        # Fix LLM-extracted tax entries with amount=0 when items at that
+        # rate yield non-zero expected tax. The LLM occasionally extracts
+        # {rate: X, amount: 0} when the receipt prints a "X% target N"
+        # rate-base line but no companion tax-amount line (e.g. receipts
+        # with a single レジ袋 at 10円 and 10% rate base 10 — no separate
+        # 10% tax printed because it rounds to ~1 yen).
+        # Skip rates the OCR explicitly reports as ¥0 (truth-file convention
+        # omits printed-zero tax entries).
+        ocr_zero_rates = {
+            t.get("rate") for t in (ocr_totals.get("taxes") or [])
+            if isinstance(t, dict) and (t.get("amount") or 0) == 0
+        }
+        for t in extracted["taxes"]:
+            if not isinstance(t, dict):
+                continue
+            r = t.get("rate")
+            if not r or r not in rate_sums or r in ocr_zero_rates:
+                continue
+            if (t.get("amount") or 0) != 0:
+                continue
+            try:
+                rate_pct = float(r.replace('%', '')) / 100.0
+            except ValueError:
+                continue
+            if rate_pct <= 0:
+                continue
+            entry_label = t.get("label") or default_label or ""
+            entry_inclusive = entry_label in ('内税', '消費税等') or entry_label.startswith('内')
+            if entry_inclusive:
+                expected = round(rate_sums[r] * rate_pct / (1 + rate_pct))
+            else:
+                expected = round(rate_sums[r] * rate_pct)
+            if expected > 0:
+                t["amount"] = expected
 
         # Drop tax entries for rates whose items-side computed tax rounds to 0
         # (e.g., LLM merged a `{rate: 10%, amount: 4}` entry by mis-reading a 4
