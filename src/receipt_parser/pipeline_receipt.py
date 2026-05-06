@@ -1896,6 +1896,14 @@ def _fix_line_items(extracted, unified_text):
     _fix_misattributed_discounts(extracted["line_items"])
     _detect_ocr_discounts(extracted["line_items"], unified_text)
     _project_totals_to_ocr_multiset(extracted, unified_text)
+    # Re-run dedup: _fix_qty_from_ocr_patterns / _expand_collapsed_items can
+    # rewrite an item's qty / unit_price after the first dedup pass, exposing
+    # a phantom-child duplicate that wasn't groupable before. Without this,
+    # an LLM extraction like (qty=1, unit=456, total=456) + phantom (qty=1,
+    # unit=228, total=228) — different unit_prices, so first dedup misses —
+    # gets corrected to (qty=2, unit=228, total=456) by qty-fix, but the
+    # phantom stays.
+    _dedup_same_total_items(extracted)
 
 
 # Matches qty-detail OCR fragments like "(2個 X 単70)", "2個 X70)", "(@100 × 2個)".
