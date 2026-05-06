@@ -107,15 +107,34 @@ def strip_bonus_point_lines(text: str) -> str:
     )
 
 
+_STRIP_SAFE_BANNER_RE = re.compile(
+    r'ぜひ当店でお買物くださいませ|'
+    r'毎度ありがとうございます|'
+    r'毎月\s*\d+\s*日.*感謝デ[ーー]|'
+    r'お客さま感謝デ[ーー]|'
+    r'印は軽減税率|軽減税率\s*8?\s*%?\s*対象商品|'
+    r'お買上商品数|お買上点数|お買上げ点数|'
+    r'ポイントの有効期限|累計ポイント|'
+    r'今回獲得|現在のポイント|'
+    r'クレジットカード売上票|お客様控え?|'
+    r'当店をご利用|またのご利用|またお越し|'
+    r'プロの品質とプロの価格|'
+    r'本書保管|印字面|'
+    r'の商品です|まとめ値引|'
+    r'^[A-Z]\s*[:：]\s*\d+\s*[個コ点]'
+)
+
+
 def strip_banner_lines(text: str) -> str:
-    """Remove standalone receipt-banner lines.
+    """Remove standalone receipt-banner lines that NEVER contain useful
+    fields (date, payment, total).
 
-    Removes whole lines that match the boilerplate banner regex (e.g.,
-    'A: 3個 ¥198 の商品です', 'お買上商品数:13'). These lines confuse the
-    LLM into extracting them as items because they often contain ¥ amounts.
+    Conservative — only the specific boilerplate phrases listed in
+    _STRIP_SAFE_BANNER_RE are stripped. Acknowledgement phrases like
+    '上記正に領収' which sometimes contain the receipt date inline are
+    NOT stripped (handled separately by item-level filters).
 
-    Conservative: only drops lines that are mostly banner text. Keeps
-    lines that have substantial non-banner content. Generic across receipts.
+    Generic across receipts.
     """
     out = []
     for line in text.split('\n'):
@@ -123,8 +142,7 @@ def strip_banner_lines(text: str) -> str:
         if not s:
             out.append(line)
             continue
-        if _BANNER_PHRASE_RE.search(s):
-            # Drop the line entirely. Banners shouldn't bleed into items.
+        if _STRIP_SAFE_BANNER_RE.search(s):
             continue
         out.append(line)
     return '\n'.join(out)
