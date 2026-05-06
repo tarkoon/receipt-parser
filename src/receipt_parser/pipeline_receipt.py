@@ -2796,6 +2796,96 @@ def _fix_priced_in_name_items(extracted, unified_text):
                 break
 
 
+def _fix_digit_misread_items(extracted, unified_text):
+    """When items_sum is short by a small N, try OCR digit-misread corrections
+    on items. A common scenario: OCR reads '108※' (108 yen, reduced rate) as
+    '100%' (the 8 + ※ became %). The LLM extracts total=100; we need 108.
+
+    Strategy: for items_sum gap N, look for items where:
+      - item.total + N is a plausible OCR misread (single-digit confusion:
+        0↔8, 0↔6, 1↔7, 6↔8, etc.)
+      - the corrected total appears in OCR text as a plausible price
+      - applying the correction moves items_sum exactly to subtotal/total
+
+    Conservative — only fires when the corrected total is in OCR (somewhere),
+    the gap matches exactly, and only one such correction is found.
+    """
+    items = extracted.get("line_items") or []
+    subtotal = extracted.get("subtotal")
+    total = extracted.get("total")
+    if not items:
+        return
+    items_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+    targets = [t for t in (subtotal, total) if t]
+    if not targets:
+        return
+
+    # Compute gap to each target; pick the smallest non-zero gap
+    gaps = [(t - items_sum, t) for t in targets]
+    valid_gaps = [(g, t) for g, t in gaps if 0 < g <= 50]
+    if not valid_gaps:
+        return
+    gap = min(g for g, _ in valid_gaps)
+
+    # Common OCR digit-confusion pairs (1-step perturbations)
+    # We test if item.total + gap is plausibly the correct total by checking
+    # if a single-digit replacement gets us there. Most useful is: the
+    # LAST digit of total_corrected differs from total by ≤ 1 digit pair.
+    def _single_digit_diff(a: int, b: int) -> bool:
+        sa, sb = str(a), str(b)
+        if len(sa) != len(sb):
+            return False
+        diffs = [(x, y) for x, y in zip(sa, sb) if x != y]
+        return len(diffs) == 1
+
+    candidates: list[tuple[int, float]] = []  # (item_idx, new_total)
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        t = item.get("total")
+        if t is None or t <= 0:
+            continue
+        try:
+            t_int = int(t)
+        except (TypeError, ValueError):
+            continue
+        new_total = t_int + int(gap)
+        if not _single_digit_diff(t_int, new_total):
+            continue
+        # Look for evidence in OCR: the corrected total may not appear
+        # literally (it's an OCR misread!), but a "T%"-style line matching
+        # the original OCR-misread pattern is a strong signal.
+        # E.g., 100 → 108 with 0/8 confusion → look for 'T%' on its own line
+        # which is common when '%' was misread of '8※' or similar.
+        sa, sb = str(t_int), str(new_total)
+        # If the differing digit changed to/from 0, 8, or 6 (common
+        # confusions), pattern '<original>%' or '<original>除' as a standalone
+        # line is suspicious — likely a misread.
+        diff_pairs = [(x, y) for x, y in zip(sa, sb) if x != y]
+        if not diff_pairs:
+            continue
+        old_d, new_d = diff_pairs[0]
+        if (old_d, new_d) not in {('0', '8'), ('8', '0'), ('0', '6'),
+                                  ('6', '0'), ('1', '7'), ('7', '1'),
+                                  ('6', '8'), ('8', '6'), ('5', '6'),
+                                  ('6', '5')}:
+            continue
+        # Match a standalone "<original>%" line in OCR (signature of
+        # 8/0 misread where the trailing '8※' became '%').
+        misread_pattern = re.compile(rf'^\s*{re.escape(sa)}%\s*$', re.MULTILINE)
+        if not misread_pattern.search(unified_text):
+            continue
+        candidates.append((idx, float(new_total)))
+
+    if len(candidates) != 1:
+        return
+
+    idx, new_total = candidates[0]
+    items[idx]["total"] = new_total
+    if items[idx].get("qty", 1) == 1:
+        items[idx]["unit_price"] = new_total
+
+
 def _drop_phantom_from_tax_amount(extracted):
     """Drop items whose total equals a printed tax amount AND whose
     description is a prefix of another item's description with an embedded
@@ -4145,6 +4235,7 @@ def postprocess_receipt(
     _fix_priced_in_name_items(extracted, unified_text)
     _fix_items_from_subtotal(extracted, unified_text, ocr_totals)
     _recover_missing_items_from_gap(extracted, unified_text)
+    _fix_digit_misread_items(extracted, unified_text)
 
     # Clear account_number when it's a masked card number suffix, not a real account
     acct = extracted.get("account_number")
