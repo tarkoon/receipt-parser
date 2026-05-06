@@ -427,6 +427,132 @@ def extract_with_llm(
     return parsed, llm_result
 
 
+def _has_duplicate_descs(extracted: dict) -> bool:
+    """Detect duplicate (description, total) pairs in line_items.
+
+    Returns True if 2+ items share the same normalized description AND total
+    — a strong signal the LLM copy-pasted a nearby item's name onto a
+    distinct adjacent row.
+    """
+    items = extracted.get("line_items", []) or []
+    if len(items) < 2:
+        return False
+    seen: dict[tuple, int] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        desc = (item.get("description") or "").strip()
+        # Normalize: strip trailing whitespace+digits (the embedded-price
+        # case where 'X' and 'X  228' should compare equal).
+        desc = re.sub(r'\s+[\d,]{1,6}\s*[\*※]?\s*$', '', desc).strip()
+        total = item.get("total")
+        if not desc or total is None:
+            continue
+        key = (desc, float(total))
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] >= 2:
+            return True
+    return False
+
+
+def _alternate_seed_extract(
+    ocr_text: str, model: str, doc_type: str
+) -> dict | None:
+    """Re-run extraction with seed=43 (different from the default 42) using
+    the SAME extraction prompt — not verification.
+
+    Verification prompts bias toward the previous pass's mistake; for cross-
+    check we want an independent extraction. Returns parsed dict or None on
+    failure.
+    """
+    system_prompt, user_prompt = generate_extraction_prompt(ocr_text, doc_type=doc_type)
+    try:
+        result = _llm_chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            schema=get_ollama_schema(),
+            seed=_LLM_SEED + 1,  # 43 instead of 42
+        )
+    except Exception:
+        return None
+    parsed = _parse_llm_json(sanitize_llm_response(result.content))
+    if "error" in parsed:
+        return None
+    return parsed
+
+
+def _substitute_dup_descs_from_alt(extracted: dict, alt: dict) -> int:
+    """For each duplicate-desc item in `extracted`, look for an alt-pass item
+    with the same total (±1) but a description not already present. If found,
+    substitute. Returns count of substitutions made.
+
+    This addresses the LLM copy-paste failure mode: when the OCR text has
+    two distinct adjacent items at the same price, the model sometimes
+    duplicates the first item's description over the second. A different
+    seed often picks up the second item's actual description.
+    """
+    items = extracted.get("line_items", []) or []
+    alt_items = alt.get("line_items", []) or []
+    if not items or not alt_items:
+        return 0
+
+    # Group extracted items by (normalized_desc, total)
+    def _norm(d: str) -> str:
+        return re.sub(r'\s+[\d,]{1,6}\s*[\*※]?\s*$', '', (d or "").strip()).strip()
+
+    groups: dict[tuple, list[int]] = {}
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        desc = _norm(item.get("description") or "")
+        total = item.get("total")
+        if not desc or total is None:
+            continue
+        groups.setdefault((desc, float(total)), []).append(i)
+
+    duplicates = {k: v for k, v in groups.items() if len(v) >= 2}
+    if not duplicates:
+        return 0
+
+    # Existing descriptions (normalized) currently in the extraction
+    existing = {_norm(it.get("description") or "")
+                for it in items if isinstance(it, dict)}
+
+    # For each duplicate group, find candidates in the alt extraction
+    substituted = 0
+    for (dup_desc, dup_total), idxs in duplicates.items():
+        # Alt items with matching total but different normalized desc
+        candidates = []
+        for ai in alt_items:
+            if not isinstance(ai, dict):
+                continue
+            a_desc = (ai.get("description") or "").strip()
+            a_total = ai.get("total")
+            if not a_desc or a_total is None:
+                continue
+            if abs(float(a_total) - dup_total) > 1:
+                continue
+            a_norm = _norm(a_desc)
+            if a_norm == dup_desc or a_norm in existing:
+                continue
+            if a_desc not in candidates:
+                candidates.append(a_desc)
+
+        if not candidates:
+            continue
+
+        # Replace all but the first dup occurrence with alt-pass descriptions
+        for cand_desc, idx in zip(candidates, idxs[1:]):
+            items[idx]["description"] = cand_desc
+            existing.add(_norm(cand_desc))
+            substituted += 1
+
+    return substituted
+
+
 def _extraction_is_low_quality(parsed: dict) -> bool:
     """Detect structurally valid but content-broken extractions."""
     items = parsed.get("line_items", [])
@@ -505,6 +631,33 @@ def extract_with_verification(
         "pass": 1, "extraction": extracted, "warnings": warnings,
         "llm_timing": _llm_result_to_timing(llm_result),
     })
+
+    # Cross-check pass: when pass 1 has duplicate-description items, run a
+    # fresh extraction with a DIFFERENT seed (not the verification prompt —
+    # that biases toward pass 1's mistake). Then for each duplicate in pass
+    # 1, look for an alternate-pass item with the same total but a distinct
+    # description. Substitute. This fixes the common LLM failure mode where
+    # the model copies a nearby item's name onto a distinct adjacent row.
+    if "error" not in extracted and _has_duplicate_descs(extracted):
+        alt_extracted = _alternate_seed_extract(ocr_text, model, doc_type)
+        if alt_extracted is not None and "error" not in alt_extracted:
+            substituted = _substitute_dup_descs_from_alt(extracted, alt_extracted)
+            if substituted > 0:
+                # Re-validate after substitution
+                alt_warnings = []
+                if validate_fn:
+                    try:
+                        receipt = Receipt(**extracted)
+                        alt_warnings = validate_fn(receipt)
+                    except Exception:
+                        alt_warnings = ["Schema validation failed after cross-check"]
+                history.append({
+                    "pass": "1-cross", "extraction": extracted,
+                    "warnings": alt_warnings, "alt_extraction": alt_extracted,
+                    "substitutions": substituted,
+                    "llm_timing": None,
+                })
+                warnings = alt_warnings
 
     # Track the best extraction across all passes. Two filters apply:
     # (1) only LLM-correctable warnings trigger a retry — subtotal-arithmetic
