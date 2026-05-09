@@ -1,4 +1,4 @@
-"""usage.py — Unified API usage tracking for Cloud Vision and DeepSeek.
+"""usage.py — Unified API usage tracking for Cloud Vision and LLM providers.
 
 Tracks calls, tokens, estimated costs, and document counts in a single
 JSON file with automatic monthly rollover and historical archiving.
@@ -38,6 +38,33 @@ CLOUD_VISION_COST_PER_1K = 1.50  # USD per 1000 calls beyond free tier
 DEEPSEEK_CACHE_HIT_COST_PER_M = 0.028  # USD per 1M cached input tokens
 DEEPSEEK_CACHE_MISS_COST_PER_M = 0.28  # USD per 1M non-cached input tokens
 DEEPSEEK_OUTPUT_COST_PER_M = 0.42      # USD per 1M output tokens
+
+
+def _empty_openrouter() -> dict:
+    """Return a fresh OpenRouter usage bucket."""
+    return {
+        "calls": 0,
+        "cache_hit_tokens": 0,
+        "cache_miss_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_write_tokens": 0,
+        "cost_usd": 0.0,
+        "models": {},
+    }
+
+
+def _empty_openrouter_model() -> dict:
+    """Return a fresh per-model OpenRouter usage bucket."""
+    return {
+        "calls": 0,
+        "cache_hit_tokens": 0,
+        "cache_miss_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_write_tokens": 0,
+        "cost_usd": 0.0,
+    }
 
 
 def _load_settings() -> dict:
@@ -120,6 +147,7 @@ def _empty_month(month: str) -> dict:
             "cache_miss_tokens": 0,
             "output_tokens": 0,
         },
+        "openrouter": _empty_openrouter(),
         "documents": {
             "total_processed": 0,
             "unique_hashes": [],
@@ -139,11 +167,36 @@ def _ensure_ds_keys(ds: dict):
         ds["calls"] = 0
 
 
+def _ensure_or_keys(or_data: dict):
+    """Ensure OpenRouter aggregate and per-model counters exist."""
+    defaults = _empty_openrouter()
+    for key, value in defaults.items():
+        if key not in or_data:
+            or_data[key] = value if not isinstance(value, dict) else {}
+    if "input_tokens" in or_data and "cache_miss_tokens" not in or_data:
+        or_data["cache_miss_tokens"] = or_data.pop("input_tokens", 0)
+    or_data["cost_usd"] = float(or_data.get("cost_usd", 0) or 0)
+
+    models = or_data.get("models")
+    if not isinstance(models, dict):
+        models = {}
+        or_data["models"] = models
+    for model_stats in models.values():
+        if not isinstance(model_stats, dict):
+            continue
+        model_defaults = _empty_openrouter_model()
+        for key, value in model_defaults.items():
+            model_stats.setdefault(key, value)
+        model_stats["cost_usd"] = float(model_stats.get("cost_usd", 0) or 0)
+
+
 def _compute_costs(data: dict) -> dict:
     """Compute cost estimates from raw usage data."""
     cv = data.get("cloud_vision", {})
     ds = data.get("deepseek", {})
+    or_data = data.get("openrouter", {})
     _ensure_ds_keys(ds)
+    _ensure_or_keys(or_data)
 
     cv_calls = cv.get("calls", 0)
     cv_billable = max(0, cv_calls - CLOUD_VISION_FREE_TIER)
@@ -153,12 +206,14 @@ def _compute_costs(data: dict) -> dict:
     ds_miss_cost = ds.get("cache_miss_tokens", 0) * DEEPSEEK_CACHE_MISS_COST_PER_M / 1_000_000
     ds_out_cost = ds.get("output_tokens", 0) * DEEPSEEK_OUTPUT_COST_PER_M / 1_000_000
     ds_cost = ds_hit_cost + ds_miss_cost + ds_out_cost
+    or_cost = float(or_data.get("cost_usd", 0) or 0)
 
     return {
         "cv_cost": round(cv_cost, 4),
         "cv_billable": cv_billable,
         "ds_cost": round(ds_cost, 4),
-        "total_cost": round(cv_cost + ds_cost, 4),
+        "or_cost": round(or_cost, 4),
+        "total_cost": round(cv_cost + ds_cost + or_cost, 4),
     }
 
 
@@ -175,6 +230,10 @@ def _load() -> dict:
                     _ensure_ds_keys(data["deepseek"])
                 if "cloud_vision" not in data:
                     data["cloud_vision"] = _empty_month(month)["cloud_vision"]
+                if "openrouter" not in data:
+                    data["openrouter"] = _empty_openrouter()
+                else:
+                    _ensure_or_keys(data["openrouter"])
                 if "documents" not in data:
                     data["documents"] = _empty_month(month)["documents"]
                 return data
@@ -197,7 +256,9 @@ def _archive_month(data: dict):
         costs = _compute_costs(data)
         docs = data.get("documents", {})
         ds = data.get("deepseek", {})
+        or_data = data.get("openrouter", {})
         _ensure_ds_keys(ds)
+        _ensure_or_keys(or_data)
         entry = {
             "month": month,
             "cloud_vision": data.get("cloud_vision", {}),
@@ -207,6 +268,7 @@ def _archive_month(data: dict):
                 "cache_miss_tokens": ds.get("cache_miss_tokens", 0),
                 "output_tokens": ds.get("output_tokens", 0),
             },
+            "openrouter": or_data,
             "documents": {
                 "total_processed": docs.get("total_processed", 0),
                 "unique_processed": len(docs.get("unique_hashes", [])),
@@ -348,6 +410,38 @@ def track_deepseek_call(
         _save(data)
 
 
+def track_openrouter_call(
+    model: str,
+    cache_hit_tokens: int | None,
+    cache_miss_tokens: int | None,
+    output_tokens: int | None,
+    cost_usd: float | None = None,
+    reasoning_tokens: int | None = None,
+    cache_write_tokens: int | None = None,
+):
+    """Record one OpenRouter API call with aggregate and per-model counters."""
+    model_key = model or "unknown"
+    with _lock:
+        data = _load()
+        or_data = data["openrouter"]
+        _ensure_or_keys(or_data)
+        model_stats = or_data["models"].setdefault(model_key, _empty_openrouter_model())
+
+        increment = {
+            "calls": 1,
+            "cache_hit_tokens": cache_hit_tokens or 0,
+            "cache_miss_tokens": cache_miss_tokens or 0,
+            "output_tokens": output_tokens or 0,
+            "reasoning_tokens": reasoning_tokens or 0,
+            "cache_write_tokens": cache_write_tokens or 0,
+            "cost_usd": float(cost_usd or 0),
+        }
+        for key, value in increment.items():
+            or_data[key] = or_data.get(key, 0) + value
+            model_stats[key] = model_stats.get(key, 0) + value
+        _save(data)
+
+
 def track_document(file_path: str | Path):
     """Record a document processed. Tracks total and unique (by file hash)."""
     path = Path(file_path)
@@ -370,6 +464,13 @@ def sync_usage(
     ds_cache_miss: int | None = None,
     ds_output: int | None = None,
     ds_calls: int | None = None,
+    or_cache_hit: int | None = None,
+    or_cache_miss: int | None = None,
+    or_output: int | None = None,
+    or_calls: int | None = None,
+    or_cost_usd: float | None = None,
+    or_reasoning: int | None = None,
+    or_cache_write: int | None = None,
 ):
     """Set usage counters to match values from the online dashboards."""
     with _lock:
@@ -384,6 +485,22 @@ def sync_usage(
             data["deepseek"]["cache_miss_tokens"] = ds_cache_miss
         if ds_output is not None:
             data["deepseek"]["output_tokens"] = ds_output
+        or_data = data["openrouter"]
+        _ensure_or_keys(or_data)
+        if or_calls is not None:
+            or_data["calls"] = or_calls
+        if or_cache_hit is not None:
+            or_data["cache_hit_tokens"] = or_cache_hit
+        if or_cache_miss is not None:
+            or_data["cache_miss_tokens"] = or_cache_miss
+        if or_output is not None:
+            or_data["output_tokens"] = or_output
+        if or_cost_usd is not None:
+            or_data["cost_usd"] = float(or_cost_usd)
+        if or_reasoning is not None:
+            or_data["reasoning_tokens"] = or_reasoning
+        if or_cache_write is not None:
+            or_data["cache_write_tokens"] = or_cache_write
         _save(data)
 
 
@@ -406,6 +523,8 @@ def get_usage(auto_fetch_cv: bool = False) -> dict:
 
     cv = data["cloud_vision"]
     ds = data["deepseek"]
+    or_data = data["openrouter"]
+    _ensure_or_keys(or_data)
 
     result = {
         "billing_period": f"{start.isoformat()} to {end.isoformat()}",
@@ -424,6 +543,28 @@ def get_usage(auto_fetch_cv: bool = False) -> dict:
             "cache_miss_tokens": ds["cache_miss_tokens"],
             "output_tokens": ds["output_tokens"],
             "est_cost_usd": costs["ds_cost"],
+        },
+        "openrouter": {
+            "calls": or_data["calls"],
+            "cache_hit_tokens": or_data["cache_hit_tokens"],
+            "cache_miss_tokens": or_data["cache_miss_tokens"],
+            "output_tokens": or_data["output_tokens"],
+            "reasoning_tokens": or_data["reasoning_tokens"],
+            "cache_write_tokens": or_data["cache_write_tokens"],
+            "est_cost_usd": costs["or_cost"],
+            "models": {
+                model: {
+                    "calls": stats.get("calls", 0),
+                    "cache_hit_tokens": stats.get("cache_hit_tokens", 0),
+                    "cache_miss_tokens": stats.get("cache_miss_tokens", 0),
+                    "output_tokens": stats.get("output_tokens", 0),
+                    "reasoning_tokens": stats.get("reasoning_tokens", 0),
+                    "cache_write_tokens": stats.get("cache_write_tokens", 0),
+                    "est_cost_usd": round(float(stats.get("cost_usd", 0) or 0), 4),
+                }
+                for model, stats in sorted(or_data["models"].items())
+                if isinstance(stats, dict)
+            },
         },
         "documents": {
             "total_processed": docs.get("total_processed", 0),

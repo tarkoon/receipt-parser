@@ -259,6 +259,11 @@ def usage(
     set_ds_miss: int = typer.Option(None, "--set-ds-miss", help="Set DeepSeek cache miss token count"),
     set_ds_out: int = typer.Option(None, "--set-ds-out", help="Set DeepSeek output token count"),
     set_ds_calls: int = typer.Option(None, "--set-ds-calls", help="Set DeepSeek API call count"),
+    set_or_hit: int = typer.Option(None, "--set-or-hit", help="Set OpenRouter cache hit token count"),
+    set_or_miss: int = typer.Option(None, "--set-or-miss", help="Set OpenRouter cache miss token count"),
+    set_or_out: int = typer.Option(None, "--set-or-out", help="Set OpenRouter output token count"),
+    set_or_calls: int = typer.Option(None, "--set-or-calls", help="Set OpenRouter API call count"),
+    set_or_cost: float = typer.Option(None, "--set-or-cost", help="Set OpenRouter exact cost in USD/credits"),
     billing_day: int = typer.Option(None, "--billing-day", min=1, max=28,
                                      help="Set billing period start day (1-28, persisted)"),
     no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip Cloud Vision API auto-fetch"),
@@ -274,7 +279,8 @@ def usage(
         set_billing_start_day(billing_day)
         typer.echo(f"Billing period start day set to {billing_day}.")
         if not any([reset, history, sync, json_output,
-                     set_ds_hit, set_ds_miss, set_ds_out, set_ds_calls]):
+                     set_ds_hit, set_ds_miss, set_ds_out, set_ds_calls,
+                     set_or_hit, set_or_miss, set_or_out, set_or_calls, set_or_cost]):
             return
 
     if reset:
@@ -287,9 +293,15 @@ def usage(
         _run_sync_interactive()
         return
 
-    if any(v is not None for v in (set_ds_hit, set_ds_miss, set_ds_out, set_ds_calls)):
+    if any(v is not None for v in (
+        set_ds_hit, set_ds_miss, set_ds_out, set_ds_calls,
+        set_or_hit, set_or_miss, set_or_out, set_or_calls, set_or_cost,
+    )):
         sync_usage(ds_cache_hit=set_ds_hit, ds_cache_miss=set_ds_miss,
-                   ds_output=set_ds_out, ds_calls=set_ds_calls)
+                   ds_output=set_ds_out, ds_calls=set_ds_calls,
+                   or_cache_hit=set_or_hit, or_cache_miss=set_or_miss,
+                   or_output=set_or_out, or_calls=set_or_calls,
+                   or_cost_usd=set_or_cost)
         typer.echo("Usage counters updated.")
         # Fall through to display updated stats
 
@@ -311,6 +323,7 @@ def usage(
 
     cv = stats["cloud_vision"]
     ds = stats["deepseek"]
+    or_usage = stats["openrouter"]
     docs = stats["documents"]
 
     typer.echo(f"API Usage — {stats['billing_period_label']}  ({stats['days_until_reset']} days left)")
@@ -342,21 +355,47 @@ def usage(
     typer.echo(f"    Output tokens:    {ds['output_tokens']:,}  (@ $0.42/1M)")
     typer.echo(f"    Est. cost:        ${ds['est_cost_usd']:.4f}")
 
+    # OpenRouter
+    typer.echo(f"\n  OpenRouter API")
+    typer.echo(f"    Calls:            {or_usage['calls']:,}")
+    typer.echo(f"    Cache hit tokens: {or_usage['cache_hit_tokens']:,}")
+    typer.echo(f"    Cache miss tokens:{or_usage['cache_miss_tokens']:>11,}")
+    typer.echo(f"    Output tokens:    {or_usage['output_tokens']:,}")
+    if or_usage.get("reasoning_tokens"):
+        typer.echo(f"    Reasoning tokens: {or_usage['reasoning_tokens']:,}")
+    if or_usage.get("cache_write_tokens"):
+        typer.echo(f"    Cache write toks: {or_usage['cache_write_tokens']:,}")
+    typer.echo(f"    Est. cost:        ${or_usage['est_cost_usd']:.4f}  (from OpenRouter usage.cost)")
+
+    models = or_usage.get("models", {})
+    if models:
+        typer.echo("    Models:")
+        for model, model_stats in models.items():
+            model_tokens = (
+                model_stats.get("cache_hit_tokens", 0)
+                + model_stats.get("cache_miss_tokens", 0)
+                + model_stats.get("output_tokens", 0)
+            )
+            typer.echo(
+                f"      {model}: {model_stats.get('calls', 0):,} calls, "
+                f"{model_tokens:,} tokens, ${model_stats.get('est_cost_usd', 0):.4f}"
+            )
+
     # Total
     typer.echo(f"\n{'─' * 56}")
     typer.echo(f"  Total est. cost:  ${stats['total_est_cost_usd']:.4f}")
 
 
 def _run_sync_interactive():
-    """Interactive sync: prompt user for DeepSeek dashboard values.
+    """Interactive sync: prompt user for DeepSeek/OpenRouter dashboard values.
 
-    Cloud Vision is auto-fetched from GCP, so only DeepSeek needs manual sync.
+    Cloud Vision is auto-fetched from GCP, so only LLM counters need manual sync.
     """
     from .usage import sync_usage, get_usage
 
     current = get_usage()
 
-    typer.echo("Sync DeepSeek usage from your dashboard.")
+    typer.echo("Sync LLM usage from your dashboards.")
     typer.echo("(Cloud Vision is auto-fetched from GCP — no manual sync needed.)")
     typer.echo("Press Enter to keep current value, or type a new number.\n")
 
@@ -364,6 +403,12 @@ def _run_sync_interactive():
     ds_hit_cur = current["deepseek"]["cache_hit_tokens"]
     ds_miss_cur = current["deepseek"]["cache_miss_tokens"]
     ds_out_cur = current["deepseek"]["output_tokens"]
+    or_cur = current["openrouter"]
+    or_calls_cur = or_cur["calls"]
+    or_hit_cur = or_cur["cache_hit_tokens"]
+    or_miss_cur = or_cur["cache_miss_tokens"]
+    or_out_cur = or_cur["output_tokens"]
+    or_cost_cur = or_cur["est_cost_usd"]
 
     ds_calls_input = typer.prompt(
         f"  DeepSeek API calls [{ds_calls_cur:,}]",
@@ -385,17 +430,54 @@ def _run_sync_interactive():
         default="", show_default=False,
     ).strip()
 
+    typer.echo("")
+    or_calls_input = typer.prompt(
+        f"  OpenRouter API calls [{or_calls_cur:,}]",
+        default="", show_default=False,
+    ).strip()
+
+    or_hit_input = typer.prompt(
+        f"  OpenRouter cache hit tokens [{or_hit_cur:,}]",
+        default="", show_default=False,
+    ).strip()
+
+    or_miss_input = typer.prompt(
+        f"  OpenRouter cache miss tokens [{or_miss_cur:,}]",
+        default="", show_default=False,
+    ).strip()
+
+    or_out_input = typer.prompt(
+        f"  OpenRouter output tokens [{or_out_cur:,}]",
+        default="", show_default=False,
+    ).strip()
+
+    or_cost_input = typer.prompt(
+        f"  OpenRouter exact cost USD/credits [{or_cost_cur:.4f}]",
+        default="", show_default=False,
+    ).strip()
+
     ds_calls_val = int(ds_calls_input) if ds_calls_input else None
     ds_hit_val = int(ds_hit_input) if ds_hit_input else None
     ds_miss_val = int(ds_miss_input) if ds_miss_input else None
     ds_out_val = int(ds_out_input) if ds_out_input else None
+    or_calls_val = int(or_calls_input) if or_calls_input else None
+    or_hit_val = int(or_hit_input) if or_hit_input else None
+    or_miss_val = int(or_miss_input) if or_miss_input else None
+    or_out_val = int(or_out_input) if or_out_input else None
+    or_cost_val = float(or_cost_input) if or_cost_input else None
 
-    if all(v is None for v in (ds_calls_val, ds_hit_val, ds_miss_val, ds_out_val)):
+    if all(v is None for v in (
+        ds_calls_val, ds_hit_val, ds_miss_val, ds_out_val,
+        or_calls_val, or_hit_val, or_miss_val, or_out_val, or_cost_val,
+    )):
         typer.echo("\nNo changes made.")
         return
 
     sync_usage(ds_calls=ds_calls_val,
-               ds_cache_hit=ds_hit_val, ds_cache_miss=ds_miss_val, ds_output=ds_out_val)
+               ds_cache_hit=ds_hit_val, ds_cache_miss=ds_miss_val, ds_output=ds_out_val,
+               or_calls=or_calls_val, or_cache_hit=or_hit_val,
+               or_cache_miss=or_miss_val, or_output=or_out_val,
+               or_cost_usd=or_cost_val)
     typer.echo("\nUsage counters synced.")
 
 
@@ -416,15 +498,19 @@ def _show_history(page: int, json_output: bool):
     typer.echo(f"Usage History  (page {result['page']}/{result['total_pages']}, "
                f"{result['total_months']} months)")
     typer.echo("─" * 62)
-    typer.echo(f"  {'Month':<10} {'CV Calls':>10} {'DS Tokens':>14} {'Docs':>7} {'Cost':>10}")
+    typer.echo(f"  {'Month':<10} {'CV Calls':>10} {'LLM Tokens':>14} {'Docs':>7} {'Cost':>10}")
     typer.echo(f"  {'─'*10} {'─'*10} {'─'*14} {'─'*7} {'─'*10}")
 
     for entry in result["entries"]:
         cv = entry.get("cloud_vision", {})
         ds = entry.get("deepseek", {})
+        or_usage = entry.get("openrouter", {})
         docs = entry.get("documents", {})
         total_tokens = (ds.get("cache_hit_tokens", 0) + ds.get("cache_miss_tokens", 0)
-                        + ds.get("output_tokens", 0))
+                        + ds.get("output_tokens", 0)
+                        + or_usage.get("cache_hit_tokens", 0)
+                        + or_usage.get("cache_miss_tokens", 0)
+                        + or_usage.get("output_tokens", 0))
         cost = entry.get("est_cost_usd", 0)
         doc_count = docs.get("total_processed", 0)
 

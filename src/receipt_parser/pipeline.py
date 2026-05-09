@@ -9,6 +9,7 @@ import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from pathlib import Path
 
 import cv2
@@ -219,6 +220,16 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
         # Bare phone number on its own line
         phone_match = re.search(r'^(0\d{1,4}-\d{1,4}-\d{2,4})\s*$', ocr_text, re.MULTILINE)
     phone_hint = phone_match.group(1) if phone_match else ""
+    if not phone_hint:
+        # Retail receipts often split the area code into parentheses:
+        # "(0940) 38-0130". Preserve it as a normal phone hint so the
+        # existing area-code resolver can use it.
+        paren_phone = re.search(
+            r'[（(]\s*(0\d{1,4})\s*[）)]\s*(\d{1,4})[-\s]?(\d{2,4})',
+            ocr_text,
+        )
+        if paren_phone:
+            phone_hint = "-".join(paren_phone.groups())
 
     # Extract branch/store name (e.g., "赤間店" → "赤間", "八幡店" → "八幡")
     branch_match = re.search(r'([\u3000-\u9fff]{2,})\s*店', ocr_text)
@@ -294,6 +305,9 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
                 break
 
     if area_city and neighborhood:
+        area_root = re.sub(r'[都道府県市区町村郡]+$', '', area_city)
+        if neighborhood == area_root:
+            return area_city, None
         candidate = f"{area_city}{neighborhood}"
         if ADMIN_SUFFIX_RE.search(candidate):
             return candidate, None
@@ -718,10 +732,17 @@ def process_document(
 
     # Step 4–5: LLM extraction → post-processing → validation (shared path)
     _notify(on_stage, "extract", "LLM extraction", 0.40)
+    all_layout_blocks = []
+    for page_idx, ocr_result in enumerate(all_ocr_results):
+        for block in getattr(ocr_result, "layout_blocks", []):
+            block_with_page = dict(block)
+            block_with_page["page"] = page_idx
+            all_layout_blocks.append(block_with_page)
     extracted, pass_history, final_warnings = _run_extraction_pipeline(
         unified_text=unified_text, raw_text=raw_text,
         ocr_conf=ocr_conf, doc_type=doc_type,
         model=model, passes=passes,
+        ocr_layout_blocks=all_layout_blocks,
         on_stage=on_stage,
     )
 
@@ -765,6 +786,124 @@ def process_document(
     return result
 
 
+def _receipt_items_target_gap(extracted: dict) -> float | None:
+    items = extracted.get("line_items") or []
+    if not items:
+        return None
+    items_sum = sum(
+        item.get("total", 0)
+        for item in items
+        if isinstance(item, dict)
+    )
+    targets: list[float] = []
+    subtotal = extracted.get("subtotal")
+    total = extracted.get("total")
+    taxes = extracted.get("taxes") or []
+    tax_sum = sum(
+        tax.get("amount", 0)
+        for tax in taxes
+        if isinstance(tax, dict) and tax.get("amount") is not None
+    )
+    canonical_subtotal = None
+    if total and tax_sum:
+        canonical_subtotal = float(total) - float(tax_sum)
+    if subtotal is not None:
+        if canonical_subtotal is None or abs(float(subtotal) - canonical_subtotal) <= 2:
+            targets.append(float(subtotal))
+    if total is not None:
+        targets.append(float(total))
+    if canonical_subtotal is not None:
+        targets.append(canonical_subtotal)
+    if not targets:
+        return None
+    return min(abs(items_sum - target) for target in targets)
+
+
+def _receipt_candidate_score(extracted: dict, warnings: list[str]) -> tuple:
+    gap = _receipt_items_target_gap(extracted)
+    gap_value = 1_000_000.0 if gap is None else float(gap)
+    item_warning_count = sum(
+        1 for warning in warnings
+        if "line items" in warning or "Items sum" in warning
+    )
+    item_count = len([
+        item for item in (extracted.get("line_items") or [])
+        if isinstance(item, dict)
+    ])
+    return (
+        gap_value > 2,
+        gap_value,
+        item_warning_count,
+        len(warnings),
+        -item_count,
+    )
+
+
+def _select_receipt_postprocessed_candidate(
+    extracted: dict,
+    pass_history: list[dict],
+    unified_text: str,
+    ocr_conf: float,
+    ocr_totals: dict,
+    model: str,
+    ocr_layout_blocks: list[dict] | None,
+) -> dict:
+    """Post-process all captured receipt candidates and keep the cleanest one.
+
+    Raw LLM retry scoring can miss candidates that deterministic post-processing
+    repairs cleanly. This selector scores the post-processed reality while still
+    preserving each history entry's raw extraction for diagnostics.
+    """
+    candidate_refs: list[tuple[int | None, dict]] = [(None, extracted)]
+    for idx, entry in enumerate(pass_history):
+        candidate = entry.get("extraction")
+        if not candidate or not isinstance(candidate, dict) or "error" in candidate:
+            continue
+        candidate_refs.append((idx, candidate))
+
+    best: tuple[tuple, int, dict, list[str], int | None] | None = None
+    for order, (history_idx, candidate) in enumerate(candidate_refs):
+        postprocessed = deepcopy(candidate)
+        llm_conf = postprocessed.get("_confidence")
+        postprocessed = postprocess_receipt(
+            postprocessed,
+            unified_text,
+            ocr_conf,
+            deepcopy(ocr_totals),
+            llm_conf,
+            model,
+            ocr_layout_blocks=ocr_layout_blocks,
+        )
+        try:
+            receipt = Receipt(**postprocessed)
+            warnings = validate_receipt(receipt)
+            for warning in receipt._soft_warnings:
+                if warning not in warnings:
+                    warnings.append(warning)
+        except Exception as exc:
+            warnings = [f"Schema validation failed after postprocess: {exc}"]
+        score = _receipt_candidate_score(postprocessed, warnings)
+
+        if history_idx is not None:
+            entry = pass_history[history_idx]
+            entry["postprocess_items_sum_gap"] = _receipt_items_target_gap(postprocessed)
+            entry["postprocess_warning_count"] = len(warnings)
+            entry["postprocess_warnings"] = warnings
+            entry["postprocess_selected"] = False
+
+        ranked = (score, order, postprocessed, warnings, history_idx)
+        if best is None or ranked[:2] < best[:2]:
+            best = ranked
+
+    if best is None:
+        return extracted
+
+    _score, _order, best_extracted, _warnings, best_history_idx = best
+    if best_history_idx is not None:
+        pass_history[best_history_idx]["postprocess_selected"] = True
+    return best_extracted
+
+
 def _run_extraction_pipeline(
     unified_text: str,
     raw_text: str,
@@ -772,6 +911,7 @@ def _run_extraction_pipeline(
     doc_type: str,
     model: str,
     passes: int,
+    ocr_layout_blocks: list[dict] | None = None,
     on_stage: StageCallback = None,
 ) -> tuple[dict, list[dict], list[str]]:
     """Shared extraction logic: LLM extraction → post-processing → location → validation.
@@ -826,9 +966,16 @@ def _run_extraction_pipeline(
 
     # Document-type-specific post-processing
     _notify(on_stage, "postprocess", "Post-processing", 0.70)
-    llm_conf = extracted.get("_confidence")
     if doc_type == "receipt" and "error" not in extracted:
-        extracted = postprocess_receipt(extracted, unified_text, ocr_conf, ocr_totals, llm_conf, model)
+        extracted = _select_receipt_postprocessed_candidate(
+            extracted,
+            pass_history,
+            unified_text,
+            ocr_conf,
+            ocr_totals,
+            model,
+            ocr_layout_blocks,
+        )
     elif doc_type == "utility_bill" and "error" not in extracted:
         extracted = postprocess_utility_bill(extracted, unified_text)
     elif doc_type == "payment_slip" and "error" not in extracted:

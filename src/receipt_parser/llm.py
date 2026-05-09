@@ -8,12 +8,17 @@ import signal
 import platform
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 import ollama as ollama_client
+from dotenv import load_dotenv
 from .schema import Receipt, generate_extraction_prompt, generate_verification_prompt
+
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", encoding="utf-8")
 
 OLLAMA_TIMEOUT_SECONDS = 180
 DEFAULT_MODEL = "deepseek-v4-flash"
@@ -47,16 +52,27 @@ def check_model_available(model: str = DEFAULT_MODEL) -> None:
     """Verify the LLM backend is reachable."""
     if _is_ollama_model(model):
         _check_ollama_available(_ollama_model_name(model))
-    else:
-        if not os.environ.get("DEEPSEEK_API_KEY") and not os.environ.get("OPENROUTER_API_KEY"):
+        return
+
+    provider, routed_model = _api_client_key_for_model(model)
+    if provider == "deepseek":
+        if not os.environ.get("DEEPSEEK_API_KEY"):
             raise RuntimeError(
-                "No API key configured.\n\n"
+                "DeepSeek API key is required for the default extraction model.\n\n"
                 "Quick fix:\n"
                 "  1. Copy .env.example to .env:  cp .env.example .env\n"
                 "  2. Add your DeepSeek API key:   DEEPSEEK_API_KEY=sk-...\n"
                 "     Get one at: https://platform.deepseek.com/api_keys\n\n"
-                "Or run the setup wizard:  receipt-parser setup"
+                "OpenRouter models must be requested explicitly with an openrouter/ "
+                "prefix or provider/model name."
             )
+        return
+
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        raise RuntimeError(
+            "OpenRouter API key is required for routed model "
+            f"'{routed_model or model}'. Add OPENROUTER_API_KEY to .env."
+        )
 
 
 def _check_ollama_available(model: str) -> None:
@@ -154,38 +170,69 @@ def _parse_llm_json(raw: str) -> dict:
         return {"error": f"LLM output failed schema validation: {e}", "raw": raw}
 
 
-_api_client = None
+_api_clients = {}
 _instructor_client = None
 _client_lock = threading.Lock()
+_OPENROUTER_CREDIT_MESSAGE = (
+    "OpenRouter credits are exhausted. Top off your OpenRouter account and "
+    "rerun, or clear RECEIPT_TRIAGE_MODELS to skip optional model triage."
+)
 
 
-def _get_api_client():
+def _api_client_key_for_model(model: str | None = None) -> tuple[str, str | None]:
+    """Select DeepSeek direct for DeepSeek models, OpenRouter for routed models."""
+    if model and model.startswith("openrouter/"):
+        return "openrouter", model.removeprefix("openrouter/")
+    if model and "/" in model:
+        return "openrouter", model
+    return "deepseek", model
+
+
+def _is_openrouter_credit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "openrouter credits are exhausted" in text
+        or ("402" in text and "credit" in text)
+        or "requires more credits" in text
+        or "openrouter.ai/settings/credits" in text
+    )
+
+
+def _format_llm_error(exc: Exception, model: str | None = None) -> str:
+    provider, _ = _api_client_key_for_model(model)
+    if provider == "openrouter" and _is_openrouter_credit_error(exc):
+        return f"openrouter_insufficient_credits: {_OPENROUTER_CREDIT_MESSAGE}"
+    return f"llm_error: {exc}"
+
+
+def _get_api_client(model: str | None = None):
     """Get or create the API client (DeepSeek direct or OpenRouter fallback)."""
-    global _api_client
-    if _api_client is not None:
-        return _api_client
+    provider, _ = _api_client_key_for_model(model)
+    if provider in _api_clients:
+        return _api_clients[provider]
     with _client_lock:
-        if _api_client is None:
+        if provider not in _api_clients:
             from openai import OpenAI
             deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
             openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-            if deepseek_key:
-                _api_client = OpenAI(
+            if provider == "deepseek" and deepseek_key:
+                _api_clients[provider] = OpenAI(
                     base_url="https://api.deepseek.com",
                     api_key=deepseek_key,
                     timeout=OLLAMA_TIMEOUT_SECONDS,
                 )
             elif openrouter_key:
-                _api_client = OpenAI(
+                _api_clients[provider] = OpenAI(
                     base_url="https://openrouter.ai/api/v1",
                     api_key=openrouter_key,
                     timeout=OLLAMA_TIMEOUT_SECONDS,
                 )
             else:
                 raise RuntimeError(
-                    "No API key set. Add DEEPSEEK_API_KEY or OPENROUTER_API_KEY to .env."
+                    "No API key set. Add DEEPSEEK_API_KEY for the default DeepSeek "
+                    "model, or OPENROUTER_API_KEY for explicitly routed models."
                 )
-    return _api_client
+    return _api_clients[provider]
 
 
 def _get_instructor_client():
@@ -204,6 +251,40 @@ def _get_instructor_client():
     return _instructor_client
 
 
+def _usage_attr(obj: object, key: str, default: object = None) -> object:
+    """Read usage fields from OpenAI SDK objects, dicts, or model_extra."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    value = getattr(obj, key, None)
+    if value is not None:
+        return value
+    extra = getattr(obj, "model_extra", None)
+    if isinstance(extra, dict):
+        return extra.get(key, default)
+    return default
+
+
+def _usage_nested(obj: object, parent_key: str, child_key: str) -> object:
+    parent = _usage_attr(obj, parent_key)
+    return _usage_attr(parent, child_key)
+
+
+def _as_int(value: object) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: object) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _openrouter_chat(
     model: str,
     messages: list,
@@ -212,33 +293,60 @@ def _openrouter_chat(
     seed: int = _LLM_SEED,
 ) -> LLMResult:
     """Call DeepSeek/OpenRouter API and return structured result."""
-    client = _get_api_client()
+    provider, routed_model = _api_client_key_for_model(model)
+    client = _get_api_client(model)
     t0 = time.perf_counter()
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        response_format={"type": "json_object"},
-        temperature=temperature,
-        max_tokens=max_tokens,
-        seed=seed,
-        extra_body={"thinking": {"type": "disabled"}},
-    )
+    try:
+        response = client.chat.completions.create(
+            model=routed_model or model,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=temperature,
+            max_tokens=max_tokens,
+            seed=seed,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+    except Exception as e:
+        if provider == "openrouter" and _is_openrouter_credit_error(e):
+            raise RuntimeError(_OPENROUTER_CREDIT_MESSAGE) from e
+        raise
     elapsed_ns = int((time.perf_counter() - t0) * 1e9)
     usage = response.usage
-    input_toks = usage.prompt_tokens if usage else None
-    output_toks = usage.completion_tokens if usage else None
+    input_toks = _as_int(_usage_attr(usage, "prompt_tokens"))
+    output_toks = _as_int(_usage_attr(usage, "completion_tokens"))
 
-    # DeepSeek returns cache hit/miss breakdown in usage
-    cache_hit = getattr(usage, "prompt_cache_hit_tokens", None) if usage else None
-    cache_miss = getattr(usage, "prompt_cache_miss_tokens", None) if usage else None
-    # Fallback: if cache fields not available, treat all input as cache miss
-    if cache_hit is None and cache_miss is None and input_toks:
-        cache_hit = 0
-        cache_miss = input_toks
+    if provider == "deepseek":
+        # DeepSeek returns cache hit/miss breakdown in usage.
+        cache_hit = _as_int(_usage_attr(usage, "prompt_cache_hit_tokens"))
+        cache_miss = _as_int(_usage_attr(usage, "prompt_cache_miss_tokens"))
+        if cache_hit is None and cache_miss is None and input_toks:
+            cache_hit = 0
+            cache_miss = input_toks
 
-    # Track DeepSeek token usage
-    from .usage import track_deepseek_call
-    track_deepseek_call(cache_hit, cache_miss, output_toks)
+        from .usage import track_deepseek_call
+        track_deepseek_call(cache_hit, cache_miss, output_toks)
+    else:
+        cache_hit = _as_int(_usage_nested(usage, "prompt_tokens_details", "cached_tokens"))
+        cache_write = _as_int(_usage_nested(usage, "prompt_tokens_details", "cache_write_tokens"))
+        if cache_hit is None:
+            cache_hit = _as_int(_usage_attr(usage, "prompt_cache_hit_tokens")) or 0
+        cache_miss = None
+        if input_toks is not None:
+            cache_miss = max(0, input_toks - (cache_hit or 0))
+        reasoning = _as_int(_usage_nested(usage, "completion_tokens_details", "reasoning_tokens"))
+        cost_usd = _as_float(_usage_attr(usage, "cost"))
+        response_model = getattr(response, "model", None) or routed_model or model
+
+        from .usage import track_openrouter_call
+        track_openrouter_call(
+            model=response_model,
+            cache_hit_tokens=cache_hit,
+            cache_miss_tokens=cache_miss,
+            output_tokens=output_toks,
+            cost_usd=cost_usd,
+            reasoning_tokens=reasoning,
+            cache_write_tokens=cache_write,
+        )
 
     return LLMResult(
         content=response.choices[0].message.content,
@@ -467,6 +575,18 @@ def _alternate_seed_extract(
 
     seed_offset: 1 → seed=43, 2 → seed=44, etc.
     """
+    parsed, _, error_reason = _alternate_seed_extract_with_result(
+        ocr_text, model, doc_type, seed_offset=seed_offset
+    )
+    if error_reason:
+        return None
+    return parsed
+
+
+def _alternate_seed_extract_with_result(
+    ocr_text: str, model: str, doc_type: str, seed_offset: int = 1,
+) -> tuple[dict | None, LLMResult | None, str | None]:
+    """Re-run extraction and return enough detail for diagnostic history."""
     system_prompt, user_prompt = generate_extraction_prompt(ocr_text, doc_type=doc_type)
     try:
         result = _llm_chat(
@@ -478,12 +598,78 @@ def _alternate_seed_extract(
             schema=get_ollama_schema(),
             seed=_LLM_SEED + seed_offset,
         )
-    except Exception:
-        return None
+    except Exception as e:
+        return None, None, _format_llm_error(e, model)
     parsed = _parse_llm_json(sanitize_llm_response(result.content))
     if "error" in parsed:
-        return None
-    return parsed
+        return parsed, result, str(parsed.get("error") or "parse_error")
+    return parsed, result, None
+
+
+_CROSS_PROMPT_VARIANTS = {
+    "row_audit": """
+ADDITIONAL ROW-AUDIT RULES:
+- Treat line item extraction as a row-by-row transcription task, not a summary.
+- Before returning JSON, verify every line_item total against a visible OCR price.
+- If item names and prices are split into separate blocks, preserve the OCR price
+  sequence one-for-one. Do not substitute an adjacent price just because it makes
+  a subtotal look closer.
+- Do not change a distinct visible OCR price into a duplicated neighboring price
+  unless the OCR itself shows that duplicated price.
+""".strip(),
+}
+
+
+def _cross_prompt_extract_with_result(
+    ocr_text: str, model: str, doc_type: str, variant: str,
+    max_tokens: int = 8192,
+) -> tuple[dict | None, LLMResult | None, str | None]:
+    """Run an extraction with an alternate prompt surface for validator rescue."""
+    system_prompt, user_prompt = generate_extraction_prompt(ocr_text, doc_type=doc_type)
+    extra_rules = _CROSS_PROMPT_VARIANTS.get(variant)
+    if not extra_rules:
+        return None, None, f"unknown_prompt_variant: {variant}"
+    try:
+        result = _llm_chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": f"{system_prompt}\n\n{extra_rules}"},
+                {"role": "user", "content": user_prompt},
+            ],
+            schema=get_ollama_schema(),
+            seed=_LLM_SEED,
+            max_tokens=max_tokens,
+        )
+    except Exception as e:
+        return None, None, _format_llm_error(e, model)
+    parsed = _parse_llm_json(sanitize_llm_response(result.content))
+    if "error" in parsed:
+        return parsed, result, str(parsed.get("error") or "parse_error")
+    return parsed, result, None
+
+
+def _configured_triage_models() -> list[str]:
+    raw = os.environ.get("RECEIPT_TRIAGE_MODELS", "")
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+
+def _triage_max_tokens() -> int:
+    raw = os.environ.get("RECEIPT_TRIAGE_MAX_TOKENS", "2048")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 2048
+    return min(max(value, 1024), 8192)
+
+
+def _model_triage_extract_with_result(
+    ocr_text: str, model: str, doc_type: str,
+) -> tuple[dict | None, LLMResult | None, str | None]:
+    """Run validator-flagged residual through a configured alternate model."""
+    return _cross_prompt_extract_with_result(
+        ocr_text, model=model, doc_type=doc_type, variant="row_audit",
+        max_tokens=_triage_max_tokens(),
+    )
 
 
 def _items_sum_gap(extracted: dict) -> float | None:
@@ -502,10 +688,82 @@ def _items_sum_gap(extracted: dict) -> float | None:
     )
     subtotal = extracted.get("subtotal")
     total = extracted.get("total")
-    targets = [t for t in (subtotal, total) if t]
+    targets = []
+    taxes = extracted.get("taxes") or []
+    canonical_subtotal = None
+    if total and taxes:
+        tax_sum = sum(
+            t.get("amount", 0) for t in taxes
+            if isinstance(t, dict) and t.get("amount") is not None
+        )
+        if tax_sum:
+            canonical_subtotal = total - tax_sum
+    if subtotal and (
+        canonical_subtotal is None or abs(float(subtotal) - float(canonical_subtotal)) <= 2
+    ):
+        targets.append(subtotal)
+    if total:
+        targets.append(total)
+    if canonical_subtotal is not None:
+        targets.append(canonical_subtotal)
     if not targets:
         return None
     return min(abs(items_sum - t) for t in targets)
+
+
+def _has_item_sum_warning(warnings: list[str]) -> bool:
+    return any(
+        "Sum of line items" in warning or "Items sum" in warning
+        for warning in warnings
+    )
+
+
+def _validator_visible_item_sum_gap(extracted: dict, warnings: list[str]) -> float | None:
+    """Return the item-sum gap only when validation has surfaced that issue."""
+    if not _has_item_sum_warning(warnings):
+        return None
+    gap = _items_sum_gap(extracted)
+    if gap is None or gap <= 5:
+        return None
+    return gap
+
+
+def _item_sum_gap_if_validator_flagged(
+    extracted: dict,
+    *warning_sets: list[str],
+) -> float | None:
+    if not any(_has_item_sum_warning(warnings) for warnings in warning_sets):
+        return None
+    gap = _items_sum_gap(extracted)
+    if gap is None or gap <= 5:
+        return None
+    return gap
+
+
+def _with_financial_anchors(candidate: dict, anchor: dict) -> dict:
+    """Preserve trusted financial fields when scoring item-retry candidates."""
+    anchored = deepcopy(candidate)
+    for key in ("total", "subtotal", "taxes"):
+        if anchor.get(key) is not None:
+            anchored[key] = deepcopy(anchor[key])
+    return anchored
+
+
+def _retry_history_extractions(
+    raw_candidate: dict | None,
+    scored_candidate: dict | None,
+) -> dict:
+    """Record the exact scored candidate, preserving raw LLM output if anchored."""
+    entry = {
+        "extraction": (
+            deepcopy(scored_candidate)
+            if scored_candidate is not None
+            else deepcopy(raw_candidate) if raw_candidate else {}
+        )
+    }
+    if raw_candidate is not None and scored_candidate is not None and raw_candidate != scored_candidate:
+        entry["raw_extraction"] = deepcopy(raw_candidate)
+    return entry
 
 
 def _substitute_dup_descs_from_alt(extracted: dict, alt: dict) -> int:
@@ -712,7 +970,7 @@ def extract_with_verification(
             warnings = ["Schema validation failed on pass 1"]
 
     history.append({
-        "pass": 1, "extraction": extracted, "warnings": warnings,
+        "pass": 1, "extraction": deepcopy(extracted), "warnings": warnings,
         "llm_timing": _llm_result_to_timing(llm_result),
     })
 
@@ -736,8 +994,8 @@ def extract_with_verification(
                     except Exception:
                         alt_warnings = ["Schema validation failed after cross-check"]
                 history.append({
-                    "pass": "1-cross", "extraction": extracted,
-                    "warnings": alt_warnings, "alt_extraction": alt_extracted,
+                    "pass": "1-cross", "extraction": deepcopy(extracted),
+                    "warnings": alt_warnings, "alt_extraction": deepcopy(alt_extracted),
                     "substitutions": substituted,
                     "llm_timing": None,
                 })
@@ -799,7 +1057,7 @@ def extract_with_verification(
                 pass_warnings = [f"Schema validation failed on pass {pass_num}"]
 
         history.append({
-            "pass": pass_num, "extraction": pass_extracted, "warnings": pass_warnings,
+            "pass": pass_num, "extraction": deepcopy(pass_extracted), "warnings": pass_warnings,
             "llm_timing": _llm_result_to_timing(llm_result),
         })
 
@@ -836,35 +1094,191 @@ def extract_with_verification(
         sanity = _items_sum_gap(best_extracted)
         if sanity is not None and sanity > 5:
             for offset in (2, 3):  # seeds 44, 45
-                sanity_alt = _alternate_seed_extract(
+                sanity_alt, sanity_llm_result, error_reason = _alternate_seed_extract_with_result(
                     ocr_text, model, doc_type, seed_offset=offset
                 )
-                if sanity_alt is None or "error" in sanity_alt:
-                    continue
-                alt_gap = _items_sum_gap(sanity_alt)
-                if alt_gap is None:
-                    continue
-                if alt_gap < sanity:
-                    alt_warnings: list[str] = []
-                    if validate_fn:
-                        try:
-                            receipt_alt = Receipt(**sanity_alt)
-                            alt_warnings = validate_fn(receipt_alt)
-                        except Exception:
-                            alt_warnings = []
-                    history.append({
-                        "pass": f"sanity-retry-seed{_LLM_SEED + offset}",
-                        "extraction": sanity_alt,
-                        "warnings": alt_warnings,
-                        "items_sum_gap_before": sanity,
-                        "items_sum_gap_after": alt_gap,
-                        "llm_timing": None,
-                    })
-                    best_extracted = sanity_alt
+                sanity_scored = (
+                    _with_financial_anchors(sanity_alt, best_extracted)
+                    if sanity_alt and "error" not in sanity_alt else None
+                )
+                alt_gap = _items_sum_gap(sanity_scored) if sanity_scored else None
+                alt_warnings: list[str] = []
+                if sanity_scored and validate_fn:
+                    try:
+                        receipt_alt = Receipt(**sanity_scored)
+                        alt_warnings = validate_fn(receipt_alt)
+                    except Exception:
+                        alt_warnings = []
+
+                accepted = (
+                    error_reason is None
+                    and sanity_alt is not None
+                    and "error" not in sanity_alt
+                    and alt_gap is not None
+                    and alt_gap < sanity
+                )
+                if error_reason:
+                    rejection_reason = error_reason
+                elif sanity_alt is None or "error" in sanity_alt:
+                    rejection_reason = "invalid_extraction"
+                elif alt_gap is None:
+                    rejection_reason = "items_sum_gap_unavailable"
+                elif not accepted:
+                    rejection_reason = "items_sum_gap_not_improved"
+                else:
+                    rejection_reason = None
+
+                history.append({
+                    "pass": f"sanity-retry-seed{_LLM_SEED + offset}",
+                    "retry_kind": "sanity",
+                    "seed": _LLM_SEED + offset,
+                    "accepted": accepted,
+                    "rejection_reason": rejection_reason,
+                    "financial_anchors_preserved": True,
+                    **_retry_history_extractions(sanity_alt, sanity_scored),
+                    "warnings": alt_warnings,
+                    "items_sum_gap_before": sanity,
+                    "items_sum_gap_after": alt_gap,
+                    "llm_timing": _llm_result_to_timing(sanity_llm_result),
+                })
+
+                if accepted:
+                    best_extracted = sanity_scored
                     best_warnings = alt_warnings
                     sanity = alt_gap  # update baseline for next iteration
                     if sanity <= 2:
                         break  # close enough; stop spending LLM calls
+
+    # Cross-prompt rescue: if validator-visible item-sum inconsistency remains,
+    # try a different prompt surface before escalating to a different model.
+    if "error" not in best_extracted:
+        current_gap = _item_sum_gap_if_validator_flagged(
+            best_extracted, best_warnings, warnings
+        )
+        if current_gap is not None:
+            for variant in _CROSS_PROMPT_VARIANTS:
+                alt, alt_llm_result, error_reason = _cross_prompt_extract_with_result(
+                    ocr_text, model, doc_type, variant=variant
+                )
+                alt_scored = (
+                    _with_financial_anchors(alt, best_extracted)
+                    if alt and "error" not in alt else None
+                )
+                alt_gap = _items_sum_gap(alt_scored) if alt_scored else None
+                alt_warnings: list[str] = []
+                if alt_scored and validate_fn:
+                    try:
+                        receipt_alt = Receipt(**alt_scored)
+                        alt_warnings = validate_fn(receipt_alt)
+                    except Exception:
+                        alt_warnings = []
+
+                accepted = (
+                    error_reason is None
+                    and alt is not None
+                    and "error" not in alt
+                    and alt_gap is not None
+                    and alt_gap <= 2
+                )
+                if error_reason:
+                    rejection_reason = error_reason
+                elif alt is None or "error" in alt:
+                    rejection_reason = "invalid_extraction"
+                elif alt_gap is None:
+                    rejection_reason = "items_sum_gap_unavailable"
+                elif alt_gap > 2 and alt_gap < current_gap:
+                    rejection_reason = "items_sum_gap_not_closed"
+                elif not accepted:
+                    rejection_reason = "items_sum_gap_not_improved"
+                else:
+                    rejection_reason = None
+
+                history.append({
+                    "pass": f"cross-prompt-{variant}",
+                    "retry_kind": "cross_prompt",
+                    "prompt_variant": variant,
+                    "accepted": accepted,
+                    "rejection_reason": rejection_reason,
+                    "financial_anchors_preserved": True,
+                    **_retry_history_extractions(alt, alt_scored),
+                    "warnings": alt_warnings,
+                    "items_sum_gap_before": current_gap,
+                    "items_sum_gap_after": alt_gap,
+                    "llm_timing": _llm_result_to_timing(alt_llm_result),
+                })
+
+                if accepted:
+                    best_extracted = alt_scored
+                    best_warnings = alt_warnings
+                    current_gap = alt_gap
+                    if current_gap <= 2:
+                        break
+
+    # Model triage: disabled by default. Set RECEIPT_TRIAGE_MODELS to a
+    # comma-separated list and benchmark candidates before promoting any one
+    # model into normal production routing.
+    if "error" not in best_extracted:
+        current_gap = _item_sum_gap_if_validator_flagged(
+            best_extracted, best_warnings, warnings
+        )
+        if current_gap is not None:
+            for triage_model in _configured_triage_models():
+                alt, alt_llm_result, error_reason = _model_triage_extract_with_result(
+                    ocr_text, model=triage_model, doc_type=doc_type
+                )
+                alt_scored = (
+                    _with_financial_anchors(alt, best_extracted)
+                    if alt and "error" not in alt else None
+                )
+                alt_gap = _items_sum_gap(alt_scored) if alt_scored else None
+                alt_warnings: list[str] = []
+                if alt_scored and validate_fn:
+                    try:
+                        receipt_alt = Receipt(**alt_scored)
+                        alt_warnings = validate_fn(receipt_alt)
+                    except Exception:
+                        alt_warnings = []
+
+                accepted = (
+                    error_reason is None
+                    and alt is not None
+                    and "error" not in alt
+                    and alt_gap is not None
+                    and alt_gap <= 2
+                )
+                if error_reason:
+                    rejection_reason = error_reason
+                elif alt is None or "error" in alt:
+                    rejection_reason = "invalid_extraction"
+                elif alt_gap is None:
+                    rejection_reason = "items_sum_gap_unavailable"
+                elif alt_gap > 2 and alt_gap < current_gap:
+                    rejection_reason = "items_sum_gap_not_closed"
+                elif not accepted:
+                    rejection_reason = "items_sum_gap_not_improved"
+                else:
+                    rejection_reason = None
+
+                history.append({
+                    "pass": f"model-triage-{triage_model}",
+                    "retry_kind": "model_triage",
+                    "triage_model": triage_model,
+                    "accepted": accepted,
+                    "rejection_reason": rejection_reason,
+                    "financial_anchors_preserved": True,
+                    **_retry_history_extractions(alt, alt_scored),
+                    "warnings": alt_warnings,
+                    "items_sum_gap_before": current_gap,
+                    "items_sum_gap_after": alt_gap,
+                    "llm_timing": _llm_result_to_timing(alt_llm_result),
+                })
+
+                if accepted:
+                    best_extracted = alt_scored
+                    best_warnings = alt_warnings
+                    current_gap = alt_gap
+                    if current_gap <= 2:
+                        break
 
     return best_extracted, history
 

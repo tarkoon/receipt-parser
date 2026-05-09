@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 class OCRResult:
     """Structured result from run_cloud_vision()."""
     blocks: list[dict] = field(default_factory=list)
+    layout_blocks: list[dict] = field(default_factory=list)
     confidence: float = 0.0
     retried: bool = False
     retry_reason: str | None = None
@@ -193,6 +194,36 @@ def _extract_blocks_from_response(response) -> list[dict]:
     return blocks
 
 
+def _extract_words_from_response(response) -> list[dict]:
+    """Extract word-level OCR geometry from a Cloud Vision response."""
+    if not response or not response.full_text_annotation.pages:
+        return []
+
+    words = []
+    for page_idx, page in enumerate(response.full_text_annotation.pages):
+        for block in page.blocks:
+            for paragraph in block.paragraphs:
+                for word in paragraph.words:
+                    text = "".join(s.text for s in word.symbols)
+                    if not text.strip():
+                        continue
+                    vertices = word.bounding_box.vertices
+                    bbox = [[int(v.x or 0), int(v.y or 0)] for v in vertices]
+                    xs = [p[0] for p in bbox]
+                    ys = [p[1] for p in bbox]
+                    words.append({
+                        "text": text,
+                        "confidence": float(word.confidence or paragraph.confidence or 0.0),
+                        "x": min(xs) if xs else 0,
+                        "y": min(ys) if ys else 0,
+                        "bbox": bbox,
+                        "page": page_idx,
+                    })
+
+    words.sort(key=lambda b: (b["page"], b["y"], b["x"]))
+    return words
+
+
 def _extract_fulltext_from_response(response) -> str | None:
     """Extract the full pre-formatted text from a Cloud Vision response."""
     if not response or not response.text_annotations:
@@ -268,11 +299,19 @@ def run_cloud_vision(image: np.ndarray, client=None, *, skip_cache: bool = False
     if not skip_cache:
         key = _ocr_cache_key(image)
         cache_path = _OCR_CACHE_DIR / f"{key}.txt"
+        layout_path = _OCR_CACHE_DIR / f"{key}.layout.json"
         if cache_path.exists():
             fulltext = cache_path.read_text(encoding="utf-8")
+            layout_blocks = []
+            if layout_path.exists():
+                try:
+                    layout_blocks = json.loads(layout_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    layout_blocks = []
             blocks = _fulltext_to_blocks(fulltext)
             return OCRResult(
                 blocks=blocks,
+                layout_blocks=layout_blocks,
                 confidence=compute_ocr_confidence(blocks),
                 source="cache",
                 chosen_text=fulltext,
@@ -289,9 +328,11 @@ def run_cloud_vision(image: np.ndarray, client=None, *, skip_cache: bool = False
 
     # Compute confidence from first call — retry only if low quality
     blocks1 = _extract_blocks_from_response(response1)
+    layout_blocks1 = _extract_words_from_response(response1)
     confidence1 = compute_ocr_confidence(blocks1) if blocks1 else 0.0
 
     fulltext = fulltext1
+    layout_blocks = layout_blocks1
     retried = False
     retry_reason = None
 
@@ -301,17 +342,25 @@ def run_cloud_vision(image: np.ndarray, client=None, *, skip_cache: bool = False
         response2 = _call_cloud_vision(image, client)
         fulltext2 = _extract_fulltext_from_response(response2)
         if fulltext2:
-            fulltext = _pick_better_fulltext(fulltext1, fulltext2)
+            picked = _pick_better_fulltext(fulltext1, fulltext2)
+            fulltext = picked
+            if picked == fulltext2:
+                layout_blocks = _extract_words_from_response(response2)
 
     # Save to cache (unless skipping)
     if not skip_cache:
         _OCR_CACHE_DIR.mkdir(exist_ok=True)
-        cache_path = _OCR_CACHE_DIR / f"{_ocr_cache_key(image)}.txt"
+        key = _ocr_cache_key(image)
+        cache_path = _OCR_CACHE_DIR / f"{key}.txt"
         cache_path.write_text(fulltext, encoding="utf-8")
+        if layout_blocks:
+            layout_path = _OCR_CACHE_DIR / f"{key}.layout.json"
+            layout_path.write_text(json.dumps(layout_blocks, ensure_ascii=False), encoding="utf-8")
 
     blocks = _fulltext_to_blocks(fulltext)
     return OCRResult(
         blocks=blocks,
+        layout_blocks=layout_blocks,
         confidence=compute_ocr_confidence(blocks),
         retried=retried,
         retry_reason=retry_reason,

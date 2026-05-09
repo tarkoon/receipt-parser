@@ -8,6 +8,7 @@ Extracted from pipeline.py for maintainability. Contains:
 """
 
 import re
+from difflib import SequenceMatcher
 from itertools import combinations
 
 from .schema import VALID_TAX_RATES, REDUCED_RATE, STANDARD_RATE
@@ -1680,6 +1681,29 @@ def _fix_item_desc_from_ocr_price_line(items, unified_text):
                         desc_lines = [i, i + 1, i + 2]
                         break
 
+        # OCR may truncate or slightly misread the current description while
+        # still clearly showing the same item row. Treat a strong fuzzy match
+        # as OCR evidence so a neighboring product-code line does not steal
+        # this item's price/description pairing.
+        if not desc_lines and len(desc) >= 5:
+            def _norm_desc_evidence(text: str) -> str:
+                text = re.sub(r'^(?:\d{2,}-){1,}\d+\)?\s*', '', text or "")
+                text = re.sub(r'^\d{4,}[A-Za-z0-9-]*\)?\s*', '', text or "")
+                text = re.sub(r'[¥￥]?\s*\d[\d,]*\s*[※\*除軽]?\s*$', '', text)
+                text = re.sub(r'\s+', '', text)
+                text = re.sub(r'[^\wぁ-んァ-ン一-龥]', '', text, flags=re.UNICODE)
+                return text.lower()
+
+            nd = _norm_desc_evidence(desc)
+            if len(nd) >= 4:
+                for i, line in enumerate(lines):
+                    nl = _norm_desc_evidence(line)
+                    if len(nl) < 4 or re.fullmatch(r'\d+', nl):
+                        continue
+                    if nd in nl or nl in nd or SequenceMatcher(None, nd, nl).ratio() >= 0.82:
+                        desc_lines = [i]
+                        break
+
         # If desc literally appears in OCR AND there's a bare-digit total on
         # an immediately adjacent line, trust the LLM and skip replacement.
         # The bare-digit total isn't picked up by the marker/¥-prefix patterns
@@ -1787,7 +1811,7 @@ def _fix_item_desc_from_ocr_price_line(items, unified_text):
             item["description"] = price_desc
 
 
-def _fix_line_items(extracted, unified_text):
+def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
     """Fix line item quantities, prices, and discounts using OCR evidence."""
     # Fallback: department-coded items
     if not extracted.get("line_items") and extracted.get("total"):
@@ -1874,6 +1898,7 @@ def _fix_line_items(extracted, unified_text):
     _fix_item_totals_from_ocr_neighborhood(
         extracted["line_items"], unified_text,
         extracted.get("subtotal"), extracted.get("total"),
+        canonical_subtotal=_canonical_subtotal_from_taxes(extracted),
     )
     _repair_column_split_items(
         extracted["line_items"], unified_text,
@@ -1896,6 +1921,7 @@ def _fix_line_items(extracted, unified_text):
     _fix_misattributed_discounts(extracted["line_items"])
     _detect_ocr_discounts(extracted["line_items"], unified_text)
     _project_totals_to_ocr_multiset(extracted, unified_text)
+    _project_totals_to_layout_rows(extracted, ocr_layout_blocks)
     # Re-run dedup: _fix_qty_from_ocr_patterns / _expand_collapsed_items can
     # rewrite an item's qty / unit_price after the first dedup pass, exposing
     # a phantom-child duplicate that wasn't groupable before. Without this,
@@ -1981,7 +2007,23 @@ def _merge_qty_detail_into_previous(items, unified_text):
         items[:] = [it for j, it in enumerate(items) if j not in to_drop]
 
 
-def _fix_item_totals_from_ocr_neighborhood(items, unified_text, target_subtotal, target_total):
+def _canonical_subtotal_from_taxes(extracted) -> float | None:
+    total = extracted.get("total")
+    taxes = extracted.get("taxes") or []
+    if total is None or not taxes:
+        return None
+    tax_sum = sum(
+        t.get("amount", 0) for t in taxes
+        if isinstance(t, dict) and t.get("amount") is not None
+    )
+    if not tax_sum:
+        return None
+    return float(total) - float(tax_sum)
+
+
+def _fix_item_totals_from_ocr_neighborhood(
+    items, unified_text, target_subtotal, target_total, canonical_subtotal=None,
+):
     """When items_sum is off-target, re-anchor each item's total to the price
     immediately following its description in OCR text.
 
@@ -1996,11 +2038,10 @@ def _fix_item_totals_from_ocr_neighborhood(items, unified_text, target_subtotal,
     if not items:
         return
     items_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
-    targets = [t for t in (target_subtotal, target_total) if t]
+    targets = [t for t in (canonical_subtotal, target_subtotal, target_total) if t]
     if not targets:
         return
-    if any(abs(items_sum - t) <= 2 for t in targets):
-        return
+    items_sum_already_matches = any(abs(items_sum - t) <= 2 for t in targets)
 
     lines = unified_text.split('\n')
 
@@ -2042,6 +2083,27 @@ def _fix_item_totals_from_ocr_neighborhood(items, unified_text, target_subtotal,
                 return None
         return None
 
+    def _ocr_window_contains_price(li: int, price: float) -> bool:
+        if price is None:
+            return False
+        for j in range(li, min(li + 7, len(lines))):
+            s = lines[j].strip()
+            if not s:
+                continue
+            inline = _ocr_price_inline(s)
+            if inline is not None and abs(inline - price) <= 1:
+                return True
+            m = re.match(r'^[¥￥]?\s*([\d,]+)\s*[※\*除]?\s*$', s)
+            if m:
+                try:
+                    if abs(float(m.group(1).replace(',', '')) - price) <= 1:
+                        return True
+                except ValueError:
+                    pass
+            if j > li and re.search(r'[ぁ-んァ-ン一-龥]{2,}', s):
+                return False
+        return False
+
     # Apply candidate fixes one at a time, verifying each improves items_sum
     # toward a target. Stop when items_sum is within 2 yen of a target.
     progress = True
@@ -2062,6 +2124,8 @@ def _fix_item_totals_from_ocr_neighborhood(items, unified_text, target_subtotal,
             for li, line in enumerate(lines):
                 if desc_prefix not in line:
                     continue
+                if _ocr_window_contains_price(li, float(total)):
+                    break  # original total is OCR-supported; do not chase neighbors
                 ocr_total = _ocr_price_inline(line)
                 if ocr_total is None:
                     ocr_total = _ocr_price_after(li)
@@ -2560,6 +2624,23 @@ _OCR_ZONE_END_RE = re.compile(r'^(小計|合計|現計|外税|内税|消費税|�
 _OCR_QTY_NOTATION_RE = re.compile(r'\d+\s*個\s*[xX×Ⅹ]\s*\d')
 
 
+def _parse_qty_detail_total(line: str) -> tuple[float, float] | None:
+    """Return (qty, unit_price) from OCR qty detail like "2個 X70)"."""
+    m = re.search(r'(\d+)\s*[コ個点]\s*[xX×Ⅹ]\s*(?:単|@)?\s*(\d[\d,]*)', line)
+    if not m:
+        m = re.search(r'(?:単|@)\s*(\d[\d,]*)\s*[xX×Ⅹ]\s*(\d+)\s*[コ個点]', line)
+        if not m:
+            return None
+        unit = float(m.group(1).replace(',', ''))
+        qty = float(m.group(2))
+    else:
+        qty = float(m.group(1))
+        unit = float(m.group(2).replace(',', ''))
+    if qty < 2 or unit <= 0:
+        return None
+    return qty, unit
+
+
 def _project_totals_to_ocr_multiset(extracted, unified_text):
     """When LLM items_sum is off-target but the OCR's price-column multiset
     sums to a target, snap the LLM's totals onto the OCR multiset.
@@ -2572,10 +2653,9 @@ def _project_totals_to_ocr_multiset(extracted, unified_text):
       - the resulting OCR multiset sums to a target (subtotal-qtyN_total or
         total-qtyN_total)
 
-    The new totals replace the LLM's by total-rank (sorted-OCR -> sorted-items).
-    Description↔total pairing is not preserved — the test compares totals as
-    a multiset, and any (desc, total) coherence is incidental on column-stacked
-    OCR layouts where the LLM couldn't recover the visual row order.
+    The new totals first try to preserve OCR row order by matching item
+    descriptions back to OCR item lines. If that is not reliable, fall back to
+    total-rank projection.
     """
     items = extracted.get("line_items") or []
     if not items:
@@ -2583,11 +2663,11 @@ def _project_totals_to_ocr_multiset(extracted, unified_text):
     items_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
     subtotal = extracted.get("subtotal")
     total = extracted.get("total")
-    targets = [t for t in (subtotal, total) if t]
+    canonical_subtotal = _canonical_subtotal_from_taxes(extracted)
+    targets = [t for t in (canonical_subtotal, subtotal, total) if t]
     if not targets:
         return
-    if any(abs(items_sum - t) <= 2 for t in targets):
-        return
+    items_sum_already_matches = any(abs(items_sum - t) <= 2 for t in targets)
 
     lines = unified_text.split('\n')
 
@@ -2596,7 +2676,7 @@ def _project_totals_to_ocr_multiset(extracted, unified_text):
     for i, line in enumerate(lines):
         s = line.strip()
         if re.search(r'[¥￥]\s*\d', s) or re.search(r'\d[\d,]*\s*[*※除軽]\s*$', s):
-            zone_start = i
+            zone_start = max(0, i - 1)
             break
     if zone_start is None:
         return
@@ -2624,7 +2704,24 @@ def _project_totals_to_ocr_multiset(extracted, unified_text):
             v = int(raw)
         except ValueError:
             continue
+        token = m.group(0)
+        if v < 10 and not re.search(r'[*※除軽]', token):
+            continue
         if v < 1 or v > 99999:
+            continue
+        qty_detail = None
+        for lookahead in range(li + 1, min(li + 3, zone_end)):
+            lookahead_s = lines[lookahead].strip()
+            qty_detail = _parse_qty_detail_total(lookahead_s)
+            if qty_detail:
+                break
+            if _OCR_TRAILING_PRICE_RE.search(lookahead_s):
+                break
+            if re.search(r'[ぁ-んァ-ン一-龥]{2,}', lookahead_s):
+                break
+        if qty_detail:
+            qty, unit = qty_detail
+            candidates.append((li, int(qty * unit)))
             continue
         candidates.append((li, v))
 
@@ -2640,10 +2737,18 @@ def _project_totals_to_ocr_multiset(extracted, unified_text):
     pool = list(candidates)
     for it in qty_n_items:
         up = it.get("unit_price")
-        if up is None:
+        total_val = it.get("total")
+        reserved = False
+        if up is not None:
+            for j, (_, v) in enumerate(pool):
+                if abs(v - up) < 1:
+                    pool.pop(j)
+                    reserved = True
+                    break
+        if reserved or total_val is None:
             continue
         for j, (_, v) in enumerate(pool):
-            if abs(v - up) < 1:
+            if abs(v - total_val) < 1:
                 pool.pop(j)
                 break
 
@@ -2661,40 +2766,104 @@ def _project_totals_to_ocr_multiset(extracted, unified_text):
         return None
 
     pool_values = [v for _, v in pool]
-    chosen: list[int] | None = None
+    chosen_pairs: list[tuple[int, int]] | None = None
 
     if len(pool_values) == n_qty1:
         if _multiset_matches(pool_values) is not None:
-            chosen = list(pool_values)
+            chosen_pairs = list(pool)
     elif len(pool_values) == n_qty1 + 1:
         # Try dropping each candidate; apply only if exactly one drop produces
         # a sum that matches a target.
-        viable: list[list[int]] = []
-        for k in range(len(pool_values)):
-            sub = pool_values[:k] + pool_values[k + 1:]
-            if _multiset_matches(sub) is not None:
-                viable.append(sub)
+        viable: list[list[tuple[int, int]]] = []
+        for k in range(len(pool)):
+            sub_pairs = pool[:k] + pool[k + 1:]
+            if _multiset_matches([v for _, v in sub_pairs]) is not None:
+                viable.append(sub_pairs)
         # Multiple drops can produce equivalent sums when duplicate values
         # are present (dropping any of three "228"s gives the same subset).
         # Treat them as one viable solution.
-        unique = {tuple(sorted(v)) for v in viable}
+        unique = {tuple(sorted(v for _, v in pairs)) for pairs in viable}
         if len(unique) == 1:
-            chosen = list(viable[0])
+            chosen_pairs = list(viable[0])
 
-    if chosen is None:
+    if chosen_pairs is None:
         return
 
     # Verify the projection actually changes the multiset (no point otherwise).
     sorted_qty1_totals = sorted(i.get("total", 0) for i in qty_1_items)
-    sorted_chosen = sorted(chosen)
-    if sorted_qty1_totals == sorted_chosen:
-        return
+    sorted_chosen = sorted(v for _, v in chosen_pairs)
 
     # Sanity: same length
     if len(sorted_chosen) != len(qty_1_items):
         return
+    if items_sum_already_matches and sorted_qty1_totals != sorted_chosen:
+        return
 
-    # Apply: assign sorted-OCR totals to qty=1 items by their current total-rank.
+    def _norm_desc(text: str) -> str:
+        text = re.sub(r'^\d{4,}[A-Za-z0-9-]*\)?\s*', '', text or "")
+        text = re.sub(r'[¥￥]?\s*\d[\d,]*\s*[*※除軽]?\s*$', '', text)
+        text = re.sub(r'\s+', '', text)
+        text = re.sub(r'[^\wぁ-んァ-ン一-龥]', '', text, flags=re.UNICODE)
+        return text.lower()
+
+    def _ocr_line_for_desc(desc: str) -> int | None:
+        nd = _norm_desc(desc)
+        if len(nd) < 3:
+            return None
+        best: tuple[float, int] | None = None
+        for li in range(zone_start, zone_end):
+            nl = _norm_desc(lines[li])
+            if len(nl) < 3 or re.match(r'^\d+$', nl):
+                continue
+            if nd in nl or nl in nd:
+                score = 1.0
+            else:
+                score = SequenceMatcher(None, nd, nl).ratio()
+            if score >= 0.72 and (best is None or score > best[0]):
+                best = (score, li)
+        return best[1] if best else None
+
+    # Prefer row-order projection when descriptions can be matched uniquely to
+    # OCR item lines. This keeps description↔price pairing intact on receipts
+    # that print several descriptions before their price column.
+    desc_order: list[tuple[int, int]] = []
+    used_lines: set[int] = set()
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict) or (item.get("qty") or 1) != 1:
+            continue
+        line_idx = _ocr_line_for_desc(item.get("description") or "")
+        if line_idx is None or line_idx in used_lines:
+            desc_order = []
+            break
+        used_lines.add(line_idx)
+        desc_order.append((line_idx, idx))
+
+    if len(desc_order) == len(qty_1_items):
+        for (_, idx), (_, new_total) in zip(
+            sorted(desc_order),
+            sorted(chosen_pairs, key=lambda p: p[0]),
+        ):
+            items[idx]["total"] = new_total
+            items[idx]["unit_price"] = new_total
+        return
+
+    qty1_current_idxs = [
+        idx for idx, item in enumerate(items)
+        if isinstance(item, dict) and (item.get("qty") or 1) == 1
+    ]
+    if not qty_n_items and len(qty1_current_idxs) == len(chosen_pairs):
+        for idx, (_, new_total) in zip(
+            qty1_current_idxs,
+            sorted(chosen_pairs, key=lambda p: p[0]),
+        ):
+            items[idx]["total"] = new_total
+            items[idx]["unit_price"] = new_total
+        return
+
+    if sorted_qty1_totals == sorted_chosen or items_sum_already_matches:
+        return
+
+    # Fallback: assign sorted-OCR totals to qty=1 items by their current total-rank.
     qty1_sorted_idxs = sorted(
         range(len(items)),
         key=lambda j: (
@@ -2709,6 +2878,265 @@ def _project_totals_to_ocr_multiset(extracted, unified_text):
         new_total = sorted_chosen[k]
         items[idx]["total"] = new_total
         items[idx]["unit_price"] = new_total
+
+
+def _layout_block_height(block: dict) -> float:
+    bbox = block.get("bbox") or []
+    ys = [p[1] for p in bbox if isinstance(p, (list, tuple)) and len(p) >= 2]
+    if ys:
+        return float(max(ys) - min(ys))
+    return 0.0
+
+
+def _layout_block_center_y(block: dict) -> float:
+    bbox = block.get("bbox") or []
+    ys = [p[1] for p in bbox if isinstance(p, (list, tuple)) and len(p) >= 2]
+    if ys:
+        return (max(ys) + min(ys)) / 2
+    return float(block.get("y") or 0)
+
+
+def _group_layout_rows(layout_blocks: list[dict]) -> list[list[dict]]:
+    blocks = [b for b in layout_blocks or [] if (b.get("text") or "").strip()]
+    if not blocks:
+        return []
+    heights = sorted(h for h in (_layout_block_height(b) for b in blocks) if h > 0)
+    median_h = heights[len(heights) // 2] if heights else 20.0
+    y_tol = max(8.0, median_h * 0.55)
+
+    rows: list[list[dict]] = []
+    row_y: float | None = None
+    current_page = None
+    for block in sorted(blocks, key=lambda b: (b.get("page", 0), _layout_block_center_y(b), b.get("x") or 0)):
+        cy = _layout_block_center_y(block)
+        page = block.get("page", 0)
+        if current_page != page:
+            rows.append([block])
+            row_y = cy
+            current_page = page
+        elif row_y is None or abs(cy - row_y) <= y_tol:
+            if not rows:
+                rows.append([])
+            rows[-1].append(block)
+            row_y = cy if row_y is None else (row_y + cy) / 2
+        else:
+            rows.append([block])
+            row_y = cy
+    return [sorted(row, key=lambda b: b.get("x") or 0) for row in rows]
+
+
+def _layout_price_value(text: str, *, allow_small: bool = False) -> int | None:
+    s = (text or "").strip()
+    m = re.match(r'^[¥￥]?\s*(\d[\d,]*)\s*[*※除軽]?\s*$', s)
+    if not m:
+        return None
+    try:
+        value = int(m.group(1).replace(',', ''))
+    except ValueError:
+        return None
+    min_value = 1 if allow_small else 10
+    if value < min_value or value > 99999:
+        return None
+    return value
+
+
+def _layout_qty_detail_total(row_text: str) -> int | None:
+    compact = re.sub(r'\s+', '', row_text or '')
+    m = re.search(r'(?<!\d)(\d{1,2})個[×xX]\s*(\d{1,5})', compact)
+    if not m:
+        return None
+    try:
+        qty = int(m.group(1))
+        unit = int(m.group(2))
+    except ValueError:
+        return None
+    if qty <= 1 or unit <= 0:
+        return None
+    total = qty * unit
+    if total < 10 or total > 99999:
+        return None
+    return total
+
+
+def _norm_layout_desc(text: str) -> str:
+    text = re.sub(r'^\d{4,}[A-Za-z0-9-]*\)?\s*', '', text or "")
+    text = re.sub(r'[¥￥]?\s*\d[\d,]*\s*[*※除軽]?\s*$', '', text)
+    text = re.sub(r'\s+', '', text)
+    text = re.sub(r'[^\wぁ-んァ-ン一-龥]', '', text, flags=re.UNICODE)
+    return text.lower()
+
+
+def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]:
+    rows = _group_layout_rows(layout_blocks or [])
+    raw_rows: list[dict] = []
+    for row_idx, row in enumerate(rows):
+        row_text = "".join(str(b.get("text") or "") for b in row).strip()
+        if not row_text:
+            continue
+        if _OCR_ZONE_END_RE.match(row_text):
+            break
+        price_positions = [
+            (idx, _layout_price_value(str(block.get("text") or ""), allow_small=True))
+            for idx, block in enumerate(row)
+        ]
+        price_positions = [(idx, value) for idx, value in price_positions if value is not None]
+        if not price_positions:
+            continue
+        raw_rows.append({
+            "row_idx": row_idx,
+            "row": row,
+            "price_positions": price_positions,
+        })
+
+    price_xs = [
+        float(raw["row"][idx].get("x") or 0)
+        for raw in raw_rows
+        for idx, _value in raw["price_positions"]
+        if float(raw["row"][idx].get("x") or 0) >= 180
+    ]
+    if not price_xs:
+        price_xs = [
+            float(raw["row"][idx].get("x") or 0)
+            for raw in raw_rows
+            for idx, _value in raw["price_positions"]
+        ]
+    if not price_xs:
+        return []
+    price_xs = sorted(price_xs)
+    price_col_x = price_xs[len(price_xs) // 2]
+    x_tol = max(45.0, price_col_x * 0.16)
+
+    candidates: list[dict] = []
+    for raw in raw_rows:
+        row = raw["row"]
+        near_column = [
+            pair for pair in raw["price_positions"]
+            if abs(float(row[pair[0]].get("x") or 0) - price_col_x) <= x_tol
+        ]
+        if not near_column:
+            continue
+        price_idx, value = max(
+            near_column,
+            key=lambda pair: float(row[pair[0]].get("x") or 0),
+        )
+        price_x = float(row[price_idx].get("x") or 0)
+        desc_text = "".join(str(b.get("text") or "") for b in row[:price_idx]).strip()
+        if not desc_text or _SKIP_PRICE_LINE.search(desc_text):
+            continue
+        if not re.search(r'[ぁ-んァ-ン一-龥]', desc_text):
+            continue
+        next_row_text = ""
+        next_row_idx = raw["row_idx"] + 1
+        if next_row_idx < len(rows):
+            next_row_text = "".join(str(b.get("text") or "") for b in rows[next_row_idx])
+        qty_detail_total = _layout_qty_detail_total(next_row_text)
+        if qty_detail_total is not None:
+            value = qty_detail_total
+        candidates.append({
+            "description": desc_text,
+            "value": int(value),
+            "y": _layout_block_center_y(row[price_idx]),
+            "x": price_x,
+        })
+    return candidates
+
+
+def _project_totals_to_layout_rows(extracted, ocr_layout_blocks):
+    """Use preserved OCR row geometry to resolve price-token swaps.
+
+    This is intentionally conservative and only fires when the geometric row
+    prices form a subtotal/total-matching multiset while the current extraction
+    does not.
+    """
+    items = extracted.get("line_items") or []
+    if not items or not ocr_layout_blocks:
+        return
+
+    subtotal = extracted.get("subtotal")
+    total = extracted.get("total")
+    canonical_subtotal = _canonical_subtotal_from_taxes(extracted)
+    targets = [t for t in (canonical_subtotal, subtotal, total) if t]
+    if not targets:
+        return
+
+    item_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+    if any(abs(item_sum - t) <= 2 for t in targets):
+        return
+
+    qty_n_items = [i for i in items if isinstance(i, dict) and (i.get("qty") or 1) > 1]
+    qty_1_indices = [
+        idx for idx, item in enumerate(items)
+        if isinstance(item, dict) and (item.get("qty") or 1) == 1
+    ]
+    if not qty_1_indices:
+        return
+
+    candidates = _layout_row_price_candidates(ocr_layout_blocks)
+    if not candidates:
+        return
+
+    qtyN_total = sum(i.get("total", 0) for i in qty_n_items)
+    target_qty1_sums = [t - qtyN_total for t in targets]
+
+    def _matches_target(values: list[int]) -> bool:
+        s = sum(values)
+        return any(abs(s - t) <= 2 for t in target_qty1_sums)
+
+    chosen = None
+    n_qty1 = len(qty_1_indices)
+    values = [c["value"] for c in candidates]
+    if len(values) == n_qty1 and _matches_target(values):
+        chosen = list(candidates)
+    elif len(values) == n_qty1 + 1:
+        viable = []
+        for drop_idx in range(len(candidates)):
+            subset = candidates[:drop_idx] + candidates[drop_idx + 1:]
+            if _matches_target([c["value"] for c in subset]):
+                viable.append(subset)
+        unique = {tuple(sorted(c["value"] for c in subset)) for subset in viable}
+        if len(unique) == 1:
+            chosen = viable[0]
+
+    if chosen is None or len(chosen) != n_qty1:
+        return
+
+    assignments: dict[int, int] = {}
+    used_candidate_idxs: set[int] = set()
+    for item_idx in qty_1_indices:
+        item_desc = _norm_layout_desc(items[item_idx].get("description") or "")
+        if len(item_desc) < 3:
+            assignments = {}
+            break
+        best: tuple[float, int] | None = None
+        for cand_idx, cand in enumerate(chosen):
+            if cand_idx in used_candidate_idxs:
+                continue
+            cand_desc = _norm_layout_desc(cand["description"])
+            if item_desc in cand_desc or cand_desc in item_desc:
+                score = 1.0
+            else:
+                score = SequenceMatcher(None, item_desc, cand_desc).ratio()
+            if score >= 0.72 and (best is None or score > best[0]):
+                best = (score, cand_idx)
+        if best is None:
+            assignments = {}
+            break
+        used_candidate_idxs.add(best[1])
+        assignments[item_idx] = chosen[best[1]]["value"]
+
+    if len(assignments) != n_qty1:
+        return
+
+    new_sum = sum(
+        assignments.get(idx, item.get("total", 0))
+        for idx, item in enumerate(items) if isinstance(item, dict)
+    )
+    if not any(abs(new_sum - t) <= 2 for t in targets):
+        return
+
+    for idx, value in assignments.items():
+        items[idx]["total"] = value
+        items[idx]["unit_price"] = value
 
 
 def _find_ocr_item_desc(lines, price_line_idx, existing_items):
@@ -4401,6 +4829,21 @@ def _fix_items_from_subtotal(extracted, unified_text, ocr_totals):
     if subtotal is None:
         return
     item_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
+    taxes = extracted.get("taxes") or []
+    total = extracted.get("total")
+    tax_sum = sum(
+        t.get("amount", 0) for t in taxes
+        if isinstance(t, dict) and t.get("amount") is not None
+    )
+    # OCR may expose per-rate taxable bases (e.g. "8%対象") as subtotal-like
+    # candidates. If the items already match the canonical subtotal, do not
+    # rewrite correct item prices toward that tax-base value.
+    if total is not None and tax_sum:
+        canonical_subtotal = float(total) - float(tax_sum)
+        if abs(item_sum - canonical_subtotal) <= 2:
+            return
+        if abs(canonical_subtotal - subtotal) <= 2:
+            subtotal = canonical_subtotal
     if abs(item_sum - subtotal) < 2:
         return
     ocr_lines = unified_text.split('\n')
@@ -4487,6 +4930,7 @@ def postprocess_receipt(
     ocr_totals: dict,
     llm_conf: dict | None,
     model: str,
+    ocr_layout_blocks: list[dict] | None = None,
 ) -> dict:
     """Apply all receipt-specific post-processing to the LLM extraction."""
     _fix_company_name_merchant(extracted, unified_text)
@@ -4495,7 +4939,7 @@ def postprocess_receipt(
     _fix_date(extracted, unified_text)
     _fix_time(extracted, unified_text)
     _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
-    _fix_line_items(extracted, unified_text)
+    _fix_line_items(extracted, unified_text, ocr_layout_blocks=ocr_layout_blocks)
     _drop_phantom_from_tax_amount(extracted)
     _fix_priced_in_name_items(extracted, unified_text)
     _fix_items_from_subtotal(extracted, unified_text, ocr_totals)

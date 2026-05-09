@@ -22,6 +22,7 @@ import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -279,7 +280,9 @@ def _run_fixture(
                 "source": result.get("_ocr_source", "unknown"),
             },
             "ocr_text": result.get("_ocr_text", ""),
-            "llm_raw": llm_raw,
+            "llm_raw": deepcopy(llm_raw),
+            "llm_pass_history": deepcopy(pass_history),
+            "final_extraction": _public_extraction(result),
             "warnings": result.get("_warnings", []),
             "warning_count": len(result.get("_warnings", [])),
             "llm_passes_used": result.get("_pass_count", 1),
@@ -501,8 +504,24 @@ def _get_git_sha() -> str:
         return "unknown"
 
 
+def _artifact_report_path(path: Path) -> str:
+    try:
+        return path.relative_to(RESULTS_DIR).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _public_extraction(result: dict) -> dict:
+    return {
+        key: deepcopy(value)
+        for key, value in (result or {}).items()
+        if not key.startswith("_")
+    }
+
+
 def _assemble_results(metadata: dict, per_fixture: dict) -> dict:
     # Clean run data for JSON output (strip large text fields)
+    artifact_dir = Path(metadata.get("artifact_dir") or (RESULTS_DIR / "artifacts" / "latest"))
     clean_fixtures = {}
     for fname, fdata in per_fixture.items():
         clean_fdata = dict(fdata)
@@ -511,21 +530,46 @@ def _assemble_results(metadata: dict, per_fixture: dict) -> dict:
             clean_run = dict(run)
             # Save OCR text as companion file, remove from JSON
             if clean_run.get("ocr_text"):
-                ocr_dir = RESULTS_DIR / "ocr"
+                ocr_dir = artifact_dir / "ocr"
                 ocr_dir.mkdir(parents=True, exist_ok=True)
                 ocr_path = ocr_dir / f"{fname}_run{run['run']}.txt"
                 ocr_path.write_text(clean_run["ocr_text"], encoding="utf-8")
-                clean_run["ocr"]["text_file"] = f"ocr/{fname}_run{run['run']}.txt"
+                clean_run["ocr"]["text_file"] = _artifact_report_path(ocr_path)
             clean_run.pop("ocr_text", None)
             # Save LLM raw as companion file
             if clean_run.get("llm_raw"):
-                llm_dir = RESULTS_DIR / "llm"
+                llm_dir = artifact_dir / "llm"
                 llm_dir.mkdir(parents=True, exist_ok=True)
                 llm_path = llm_dir / f"{fname}_run{run['run']}.json"
                 llm_path.write_text(json.dumps(clean_run["llm_raw"], ensure_ascii=False, indent=2),
                                     encoding="utf-8")
-                clean_run["llm_raw_file"] = f"llm/{fname}_run{run['run']}.json"
+                clean_run["llm_raw_file"] = _artifact_report_path(llm_path)
             clean_run.pop("llm_raw", None)
+            # Save full pass history as companion file. This preserves rejected
+            # sanity candidates without bloating the main benchmark report.
+            if clean_run.get("llm_pass_history"):
+                llm_dir = artifact_dir / "llm"
+                llm_dir.mkdir(parents=True, exist_ok=True)
+                history_path = llm_dir / f"{fname}_run{run['run']}_history.json"
+                history_path.write_text(
+                    json.dumps(clean_run["llm_pass_history"], ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                clean_run["llm_pass_history_file"] = _artifact_report_path(history_path)
+            clean_run.pop("llm_pass_history", None)
+            # Save final extraction evaluated by checks. This is distinct from
+            # pass history because deterministic post-processing can select or
+            # mutate candidates after the LLM responses are recorded.
+            if clean_run.get("final_extraction"):
+                final_dir = artifact_dir / "final"
+                final_dir.mkdir(parents=True, exist_ok=True)
+                final_path = final_dir / f"{fname}_run{run['run']}_final.json"
+                final_path.write_text(
+                    json.dumps(clean_run["final_extraction"], ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                clean_run["final_file"] = _artifact_report_path(final_path)
+            clean_run.pop("final_extraction", None)
             clean_runs.append(clean_run)
         clean_fdata["runs"] = clean_runs
         clean_fixtures[fname] = clean_fdata
@@ -549,7 +593,11 @@ def _save_results(results: dict, output_path: Path):
     # Also save timestamped archive
     git_sha = results["metadata"].get("git_sha", "unknown")
     ts = datetime.now().strftime("%Y-%m-%d")
-    archive_path = output_path.parent / f"{ts}_{git_sha}.json"
+    run_id = results["metadata"].get("run_id")
+    archive_stem = f"{ts}_{git_sha}"
+    if run_id:
+        archive_stem += f"_{run_id}"
+    archive_path = output_path.parent / f"{archive_stem}.json"
     if not archive_path.exists():
         archive_path.write_text(
             json.dumps(results, ensure_ascii=False, indent=2, default=str),
@@ -648,8 +696,10 @@ def run_benchmark(
         print("All fixtures use OCR text — no Cloud Vision needed.")
 
     git_sha = _get_git_sha()
+    run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
     metadata = {
         "timestamp": datetime.now().isoformat(),
+        "run_id": run_id,
         "git_sha": git_sha,
         "model": model,
         "runs_per_fixture": runs,
@@ -658,6 +708,7 @@ def run_benchmark(
         "ci_mode": ci,
         "fixtures": fixture_name_list,
         "output_path": str(output_path),
+        "artifact_dir": str(RESULTS_DIR / "artifacts" / run_id),
     }
 
     per_fixture: dict = {}
@@ -754,7 +805,9 @@ def _run_fixture_sequential(
                 "source": result.get("_ocr_source", "unknown"),
             },
             "ocr_text": result.get("_ocr_text", ""),
-            "llm_raw": llm_raw,
+            "llm_raw": deepcopy(llm_raw),
+            "llm_pass_history": deepcopy(pass_history),
+            "final_extraction": _public_extraction(result),
             "warnings": result.get("_warnings", []),
             "warning_count": len(result.get("_warnings", [])),
             "llm_passes_used": result.get("_pass_count", 1),

@@ -20,7 +20,8 @@ The setup wizard walks you through configuring API keys, GCP credentials, and ru
 ## Requirements
 
 - Python 3.10+
-- [DeepSeek API key](https://platform.deepseek.com/api_keys) (primary LLM)
+- [DeepSeek API key](https://platform.deepseek.com/api_keys) (primary LLM; used directly)
+- [OpenRouter API key](https://openrouter.ai/keys) (optional, only for explicit routed models or validator-gated triage)
 - [Google Cloud](https://console.cloud.google.com) project with Cloud Vision API enabled
 
 ## Manual Setup
@@ -37,7 +38,17 @@ If you prefer to configure manually instead of using the wizard:
    DEEPSEEK_API_KEY=sk-your-key-here
    ```
 
-3. **Set up Google Cloud Vision**:
+3. **Optional: add OpenRouter for routed/triage models**:
+   ```
+   OPENROUTER_API_KEY=sk-or-your-key-here
+
+   # Optional safety net for validator-flagged item-sum failures only.
+   # Leave unset or blank for normal low-cost runs.
+   RECEIPT_TRIAGE_MODELS=openrouter/anthropic/claude-sonnet-4.6
+   RECEIPT_TRIAGE_MAX_TOKENS=2048
+   ```
+
+4. **Set up Google Cloud Vision**:
    ```bash
    # Set your project ID in .env
    GOOGLE_CLOUD_PROJECT=your-project-id
@@ -95,6 +106,9 @@ receipt-parser usage --billing-day 15
 # Sync DeepSeek tokens from dashboard
 receipt-parser usage --sync
 receipt-parser usage --set-ds-hit 18507008 --set-ds-miss 1019604 --set-ds-out 2662239
+
+# Sync OpenRouter triage totals from dashboard, if used
+receipt-parser usage --set-or-calls 12 --set-or-cost 1.25
 ```
 
 ### Clean up
@@ -117,7 +131,7 @@ financial-aid/
   src/receipt_parser/     # Installable Python package
     pipeline.py           # Main orchestrator
     ocr.py                # Google Cloud Vision OCR
-    llm.py                # DeepSeek / Ollama LLM backend
+    llm.py                # DeepSeek direct / OpenRouter routed / Ollama LLM backend
     schema.py             # Pydantic models + prompt generation
     validation.py         # Arithmetic & consistency checks
     normalize.py          # OCR text normalization
@@ -208,12 +222,16 @@ No restart needed -- the file is read on each pipeline run.
 # Unit + validation tests (fast, no API calls)
 python -m pytest tests/test_unit.py tests/test_validation.py -v
 
-# Accuracy tests (uses cached OCR, needs Cloud Vision configured)
+# Accuracy tests (uses cached OCR)
 python -m pytest tests/test_accuracy.py -v
 
 # Robustness benchmark (fresh OCR, multiple runs)
 python tests/benchmark.py --runs 5 --workers 4
 ```
+
+Benchmark runs preserve run-specific debugging artifacts under
+`tests/results/benchmark/artifacts/`, including OCR text/layout, raw LLM output,
+`_pass_history`, and the final extraction path for failed or inspected runs.
 
 ### Test Fixtures
 
@@ -230,13 +248,22 @@ To add a fixture:
 Usage is tracked automatically:
 - **Cloud Vision**: call count auto-fetched from GCP Monitoring API
 - **DeepSeek**: tokens tracked per-call with cache hit/miss breakdown
+- **OpenRouter**: optional routed/triage calls tracked with aggregate and per-model totals
 
-The `receipt-parser usage` command shows real-time cost estimates. Cloud Vision offers 1,000 free calls/month. DeepSeek pricing: $0.028/1M (cache hit), $0.28/1M (cache miss), $0.42/1M (output).
+The `receipt-parser usage` command shows real-time cost estimates. Cloud Vision offers 1,000 free calls/month. DeepSeek pricing: $0.028/1M (cache hit), $0.28/1M (cache miss), $0.42/1M (output). OpenRouter cost is recorded from provider-reported usage when available, which is especially useful for monitoring validator-gated model triage.
 
 ## Troubleshooting
 
 ### "No API key configured"
 Run `receipt-parser setup` or manually add `DEEPSEEK_API_KEY` to your `.env` file.
+
+The default DeepSeek model does not fall back to OpenRouter. To run an explicit
+OpenRouter model, use an `openrouter/...` model name and set `OPENROUTER_API_KEY`.
+
+### "OpenRouter credits are exhausted"
+Top off your OpenRouter account, then rerun. If you do not need model triage,
+clear `RECEIPT_TRIAGE_MODELS` and rerun to keep the pipeline on the default
+DeepSeek path.
 
 ### "GOOGLE_CLOUD_PROJECT environment variable is not set"
 Add `GOOGLE_CLOUD_PROJECT=your-project-id` to `.env` and run `gcloud auth application-default login`.

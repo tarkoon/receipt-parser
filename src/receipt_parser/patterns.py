@@ -35,6 +35,7 @@ LOCATION_CLUE_RE = re.compile(
     r'|[都道府県市区町村郡]'             # Address text with admin units
     r'|〒\d{3}'                        # Postal code
     r'|(?:TEL|電話|☎)\s*[:\s]?\s*0\d'  # Labeled phone number
+    r'|[（(]\s*0\d{1,4}\s*[）)]\s*\d{1,4}'  # Parenthesized area code, e.g. (0940) 38-0130
     r'|^0\d{1,4}-\d{1,4}-\d{2,4}$'    # Bare phone number on its own line
 , re.MULTILINE)
 
