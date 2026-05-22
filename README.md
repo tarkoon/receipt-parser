@@ -6,7 +6,7 @@ Extract structured data from Japanese receipts, utility bills, and payment slips
 
 ```bash
 # Clone and install
-git clone <repo-url> && cd financial-aid
+git clone <repo-url> && cd receipt-parser
 conda create -n financial-aid python=3.12
 conda activate financial-aid
 pip install -e .
@@ -127,7 +127,7 @@ receipt-parser clean --all
 ## Project Structure
 
 ```
-financial-aid/
+receipt-parser/
   src/receipt_parser/     # Installable Python package
     pipeline.py           # Main orchestrator
     ocr.py                # Google Cloud Vision OCR
