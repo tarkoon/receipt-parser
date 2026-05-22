@@ -17,7 +17,7 @@ from receipt_parser.llm import get_ollama_schema, _extract_confidence
 from receipt_parser.validation import validate_receipt
 from receipt_parser.normalize import normalize_fullwidth, clean_handwritten_ocr
 from receipt_parser.ocr import compute_ocr_confidence, OCRResult
-from receipt_parser.checks import check_tree_edit_distance
+from receipt_parser.checks import check_time, check_tree_edit_distance
 
 
 # --- Tree Edit Distance tests ---
@@ -48,6 +48,11 @@ def test_tree_ed_completely_wrong():
     result_d = {"total": 999, "merchant": "Wrong", "date": "1999-01-01"}
     result = check_tree_edit_distance(result_d, truth)
     assert result["score"] < 0.5
+
+
+def test_time_check_tolerates_leading_zero_difference():
+    result = check_time({"time": "9:53"}, {"time": "09:53"})
+    assert result["pass"]
 
 
 # --- Normalization tests ---
@@ -934,6 +939,143 @@ def test_ocr_multiset_projection_preserves_description_price_order():
     assert by_desc["ヴルストクロワッサン"] == 420
 
 
+def test_ocr_multiset_projection_preserves_discounted_net_total():
+    from receipt_parser.pipeline_receipt import _project_totals_to_ocr_multiset
+
+    extracted = {
+        "subtotal": 600,
+        "total": 600,
+        "taxes": [],
+        "line_items": [
+            {"description": "商品A", "qty": 1, "unit_price": 100, "total": 120},
+            {"description": "商品B", "qty": 1, "unit_price": 200, "total": 200},
+            {"description": "値引商品", "qty": 1, "unit_price": 330, "total": 280,
+             "discount": 50, "discount_rate": "15%"},
+        ],
+    }
+    ocr_text = "\n".join([
+        "商品A",
+        "120*",
+        "商品B",
+        "200*",
+        "値引商品",
+        "330*",
+        "割引",
+        "-50",
+        "小計",
+    ])
+
+    _project_totals_to_ocr_multiset(extracted, ocr_text)
+
+    assert extracted["line_items"][2]["unit_price"] == 330
+    assert extracted["line_items"][2]["total"] == 280
+    assert extracted["line_items"][2]["discount"] == 50
+
+
+def test_ocr_discount_detection_uses_full_description_not_shared_prefix():
+    from receipt_parser.pipeline_receipt import _detect_ocr_discounts
+
+    items = [
+        {"description": "FFB いちごジャムパン", "qty": 1, "unit_price": 158,
+         "total": 158, "discount": 0, "discount_rate": ""},
+        {"description": "FFB メロンパン", "qty": 1, "unit_price": 148,
+         "total": 148, "discount": 0, "discount_rate": ""},
+    ]
+    ocr_text = "\n".join([
+        "FFB いちごジャムパン",
+        "158*",
+        "FFB メロンパン",
+        "148*",
+        "割引",
+        "20%",
+        "-30",
+        "小計",
+    ])
+
+    _detect_ocr_discounts(items, ocr_text)
+
+    assert items[0]["discount"] == 0
+    assert items[0]["total"] == 158
+    assert items[1]["discount"] == 30
+    assert items[1]["discount_rate"] == "20%"
+    assert items[1]["total"] == 118
+
+
+def test_item_total_repair_keeps_duplicate_description_supported_price():
+    from receipt_parser.pipeline_receipt import _fix_item_totals_from_ocr_neighborhood
+
+    items = [
+        {"description": "じゃがいも", "qty": 1, "unit_price": 259, "total": 259},
+        {"description": "じゃがいも", "qty": 1, "unit_price": 231, "total": 231},
+        {"description": "ごまスティック", "qty": 1, "unit_price": 228, "total": 228},
+    ]
+    ocr_text = "\n".join([
+        "じゃがいも",
+        "259*",
+        "じゃがいも",
+        "231 ※",
+        "ごまスティック",
+        "228*",
+        "小計",
+    ])
+
+    _fix_item_totals_from_ocr_neighborhood(items, ocr_text, 700, 700)
+
+    assert [item["total"] for item in items] == [259, 231, 228]
+
+
+def test_time_fix_zero_pads_single_digit_hour():
+    from receipt_parser.pipeline_receipt import _fix_time
+
+    extracted = {"date": "2026-05-08", "time": "9:53"}
+    _fix_time(extracted, "2026/5/8(金)\n9:53 レジ 0143")
+
+    assert extracted["time"] == "09:53"
+
+
+def test_payment_method_normalizes_quicpay_when_credit_is_printed():
+    from receipt_parser.pipeline_receipt import _fix_payment_method
+
+    extracted = {"payment_method": "QUICPay"}
+    _fix_payment_method(extracted, "クレジット(内\n¥3,630)", 0.9, {})
+
+    assert extracted["payment_method"] == "credit"
+
+
+def test_location_resolution_uses_area_code_when_no_clean_branch():
+    from receipt_parser.pipeline import _resolve_location
+
+    extracted = {"merchant": "コスモス", "location": None}
+    ocr_text = "\n".join([
+        "ドラッグストア",
+        "コスモス",
+        "元店 TEL0940-72-5355",
+        "領収証",
+    ])
+
+    location, warning = _resolve_location(extracted, ocr_text, "unused")
+
+    assert location == "宗像市"
+    assert warning is None
+
+
+def test_location_resolution_uses_explicit_city_marker_over_area_default():
+    from receipt_parser.pipeline import _resolve_location
+
+    extracted = {"merchant": "Mister Donut", "location": None}
+    ocr_text = "\n".join([
+        "mister",
+        "Donut",
+        "イオンモール福津ショップ",
+        "電話0940-43-8016",
+    ])
+
+    location, warning = _resolve_location(extracted, ocr_text, "unused")
+
+    assert location == "福津市"
+    assert warning is None
+
+
 def test_item_desc_repair_keeps_fuzzy_ocr_supported_description():
     from receipt_parser.pipeline_receipt import _fix_item_desc_from_ocr_price_line
 
@@ -1045,6 +1187,37 @@ def test_layout_row_projection_uses_price_column_and_qty_detail():
 
     assert [item["total"] for item in extracted["line_items"]] == [3, 20, 98]
     assert [item["unit_price"] for item in extracted["line_items"]] == [3, 10, 98]
+
+
+def test_layout_row_projection_preserves_discounted_net_total():
+    from receipt_parser.pipeline_receipt import _project_totals_to_layout_rows
+
+    extracted = {
+        "subtotal": 600,
+        "total": 600,
+        "taxes": [],
+        "line_items": [
+            {"description": "商品A", "qty": 1, "unit_price": 120, "total": 120},
+            {"description": "商品B", "qty": 1, "unit_price": 200, "total": 220},
+            {"description": "値引商品", "qty": 1, "unit_price": 330, "total": 280,
+             "discount": 50, "discount_rate": "15%"},
+        ],
+    }
+    layout = [
+        {"text": "商品A", "x": 10, "y": 10, "bbox": [[10, 10], [80, 10], [80, 25], [10, 25]]},
+        {"text": "120", "x": 220, "y": 10, "bbox": [[220, 10], [260, 10], [260, 25], [220, 25]]},
+        {"text": "商品B", "x": 10, "y": 35, "bbox": [[10, 35], [80, 35], [80, 50], [10, 50]]},
+        {"text": "200", "x": 220, "y": 35, "bbox": [[220, 35], [260, 35], [260, 50], [220, 50]]},
+        {"text": "値引商品", "x": 10, "y": 60, "bbox": [[10, 60], [90, 60], [90, 75], [10, 75]]},
+        {"text": "330", "x": 220, "y": 60, "bbox": [[220, 60], [260, 60], [260, 75], [220, 75]]},
+        {"text": "小計", "x": 10, "y": 85, "bbox": [[10, 85], [60, 85], [60, 100], [10, 100]]},
+    ]
+
+    _project_totals_to_layout_rows(extracted, layout)
+
+    assert extracted["line_items"][1]["total"] == 200
+    assert extracted["line_items"][2]["unit_price"] == 330
+    assert extracted["line_items"][2]["total"] == 280
 
 
 def test_receipt_postprocess_selector_prefers_clean_history_candidate():

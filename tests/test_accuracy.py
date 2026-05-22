@@ -103,7 +103,26 @@ def _discover_test_cases():
     return cases
 
 
-_CASES = _discover_test_cases()
+def _receipt_number(case_id: str) -> int | None:
+    m = re.match(r'^receipt_(\d+)(?:_|$)', case_id)
+    return int(m.group(1)) if m else None
+
+
+def _filter_by_receipt_ceiling(cases):
+    raw_limit = os.environ.get("RECEIPT_MAX_FIXTURE")
+    if not raw_limit:
+        return cases
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        return cases
+    return [
+        case for case in cases
+        if (num := _receipt_number(case[0])) is None or num <= limit
+    ]
+
+
+_CASES = _filter_by_receipt_ceiling(_discover_test_cases())
 _CASE_IDS = [c[0] for c in _CASES]
 _RESULTS_CACHE: dict[str, dict] = {}
 

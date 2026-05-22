@@ -7,6 +7,7 @@ Single source of truth for all field validation logic. Used by:
 """
 
 from difflib import SequenceMatcher
+import re
 
 
 # ---------------------------------------------------------------------------
@@ -67,9 +68,21 @@ def check_time(result: dict, truth: dict) -> dict:
     if exp is None:
         return {"pass": True, "detail": "no time in truth, skipped"}
     got = result.get("time")
-    ok = got == exp
+    ok = _normalize_time_for_compare(got) == _normalize_time_for_compare(exp)
     return {"pass": ok, "expected": exp, "got": got,
             "detail": f"got {got}, expected {exp}"}
+
+
+def _normalize_time_for_compare(value: object) -> str | None:
+    if value is None:
+        return None
+    m = re.match(r'^\s*(\d{1,2})\s*[:：]\s*(\d{1,2})(?:\s*[:：]\s*\d{1,2})?\s*$', str(value))
+    if not m:
+        return str(value).strip()
+    hh, mm = int(m.group(1)), int(m.group(2))
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return str(value).strip()
+    return f"{hh:02d}:{mm:02d}"
 
 
 def check_currency(result: dict, truth: dict) -> dict:

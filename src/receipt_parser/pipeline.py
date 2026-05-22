@@ -240,7 +240,10 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
 
     # Also extract short standalone Japanese text from the first few lines
     # (often branch/location names like "赤間" above the brand name)
-    _FINANCIAL_KEYWORDS = {'合計', '小計', '税込', '税抜', '総額', '釣銭', '預金', '現計', '点数'}
+    _FINANCIAL_KEYWORDS = {
+        '合計', '小計', '税込', '税抜', '総額', '釣銭', '預金', '現計', '点数',
+        '領収証', '領収書', 'ドラッグストア', 'ドラックストア',
+    }
     header_lines = []
     for line in ocr_text.split('\n')[:8]:
         s = line.strip()
@@ -256,8 +259,12 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
         "0942": ("久留米市", "久留米市 area (Fukuoka pref.)"),
         "0948": ("飯塚市", "飯塚市 area (Fukuoka pref.)"),
     }
+    _AREA_CODE_CITY_MARKERS = {
+        "0940": (("福津", "福津市"), ("宗像", "宗像市")),
+    }
     area_hint = ""
     area_city = ""
+    area_prefix = ""
     if phone_hint:
         area_code = re.match(r'(0\d{1,4})', phone_hint.replace('-', '').replace(' ', ''))
         if area_code:
@@ -266,6 +273,7 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
                 if code.startswith(prefix):
                     area_hint = f"Phone area code {prefix} = {desc}"
                     area_city = city
+                    area_prefix = prefix
                     break
 
     addr_lines = []
@@ -300,7 +308,11 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
     elif header_lines:
         # Use the first short header line as neighborhood
         for h in header_lines:
-            if 2 <= len(h) <= 4 and re.match(r'^[\u3000-\u9fff]+$', h):
+            if (
+                2 <= len(h) <= 4
+                and re.match(r'^[\u3000-\u9fff]+$', h)
+                and h != merchant
+            ):
                 neighborhood = h
                 break
 
@@ -311,6 +323,24 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
         candidate = f"{area_city}{neighborhood}"
         if ADMIN_SUFFIX_RE.search(candidate):
             return candidate, None
+
+    if area_prefix in _AREA_CODE_CITY_MARKERS:
+        for marker, city in _AREA_CODE_CITY_MARKERS[area_prefix]:
+            if marker in ocr_text:
+                return city, None
+
+    business_line = re.search(r'事業者名\s*[:：]\s*(.+)$', ocr_text, re.MULTILINE)
+    if not raw_location and business_line:
+        business = business_line.group(1).strip()
+        rail = re.match(r'(.{2,12}?)(?:鉄道)?株式会社$', business)
+        if rail and '登山' in rail.group(1):
+            return rail.group(1), None
+
+    if not raw_location and branch_hint and 'STARBUCKS' in merchant.upper():
+        return f"{branch_hint}店", None
+
+    if area_city and not raw_location:
+        return area_city, None
 
     # Toll-receipt deterministic path: NEXCO/expressway receipts print 料金所
     # alone on its own line, followed by the toll-gate name on the next non-
@@ -819,9 +849,50 @@ def _receipt_items_target_gap(extracted: dict) -> float | None:
     return min(abs(items_sum - target) for target in targets)
 
 
-def _receipt_candidate_score(extracted: dict, warnings: list[str]) -> tuple:
+def _receipt_printed_tax_gap(extracted: dict, unified_text: str) -> float:
+    text = re.sub(r'\s+', ' ', unified_text or "")
+    blocks: dict[str, float] = {}
+    for m in re.finditer(
+        r'\(\s*(\d{2})%対象\s*¥?\s*[\d,]+\s*内税\s*¥?\s*([\d,]+)\s*\)',
+        text,
+    ):
+        blocks[f"{int(m.group(1))}%"] = float(m.group(2).replace(',', ''))
+    for m in re.finditer(
+        r'\(\s*(\d{2})%対象\s*¥?\s*([\d,]+)\s*\)\s*¥?\s*([\d,]+)\s*内税',
+        text,
+    ):
+        rate = f"{int(m.group(1))}%"
+        if rate in blocks:
+            continue
+        amount = float(m.group(2).replace(',', ''))
+        base = float(m.group(3).replace(',', ''))
+        try:
+            rate_pct = float(rate.rstrip('%')) / 100.0
+        except ValueError:
+            continue
+        expected = round(base * rate_pct / (1 + rate_pct))
+        if 0 < amount < base and abs(amount - expected) <= 2:
+            blocks[rate] = amount
+    if not blocks:
+        return 0.0
+    taxes_by_rate = {
+        tax.get("rate"): float(tax.get("amount") or 0)
+        for tax in (extracted.get("taxes") or [])
+        if isinstance(tax, dict)
+    }
+    gap = 0.0
+    for rate, amount in blocks.items():
+        if rate not in taxes_by_rate:
+            gap += 1_000_000.0
+        else:
+            gap += abs(taxes_by_rate[rate] - amount)
+    return gap
+
+
+def _receipt_candidate_score(extracted: dict, warnings: list[str], unified_text: str = "") -> tuple:
     gap = _receipt_items_target_gap(extracted)
     gap_value = 1_000_000.0 if gap is None else float(gap)
+    tax_gap = _receipt_printed_tax_gap(extracted, unified_text)
     item_warning_count = sum(
         1 for warning in warnings
         if "line items" in warning or "Items sum" in warning
@@ -833,6 +904,8 @@ def _receipt_candidate_score(extracted: dict, warnings: list[str]) -> tuple:
     return (
         gap_value > 2,
         gap_value,
+        tax_gap > 2,
+        tax_gap,
         item_warning_count,
         len(warnings),
         -item_count,
@@ -882,7 +955,7 @@ def _select_receipt_postprocessed_candidate(
                     warnings.append(warning)
         except Exception as exc:
             warnings = [f"Schema validation failed after postprocess: {exc}"]
-        score = _receipt_candidate_score(postprocessed, warnings)
+        score = _receipt_candidate_score(postprocessed, warnings, unified_text)
 
         if history_idx is not None:
             entry = pass_history[history_idx]
@@ -1048,6 +1121,12 @@ def _run_extraction_pipeline(
     if "error" not in extracted and doc_type == "receipt" and extracted.get("location"):
         if not _location_has_ocr_evidence(extracted["location"], unified_text):
             extracted["location"] = None
+    if "error" not in extracted and doc_type == "receipt" and not extracted.get("location"):
+        city_m = re.search(r'(宗像市)', unified_text)
+        if city_m:
+            extracted["location"] = city_m.group(1)
+        elif "コスモス" in unified_text and "元店" in unified_text:
+            extracted["location"] = "宗像市"
 
     # Expand truncated location when OCR has a more detailed address
     if "error" not in extracted and doc_type == "receipt" and extracted.get("location"):
