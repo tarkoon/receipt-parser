@@ -10,6 +10,7 @@ from unittest.mock import patch, MagicMock
 
 import cv2
 import numpy as np
+import pytest
 
 from receipt_parser.schema import Receipt, generate_extraction_prompt, get_debug_color_map
 import receipt_parser.llm as llm_module
@@ -18,6 +19,7 @@ from receipt_parser.validation import validate_receipt
 from receipt_parser.normalize import normalize_fullwidth, clean_handwritten_ocr
 from receipt_parser.ocr import compute_ocr_confidence, OCRResult
 from receipt_parser.checks import check_time, check_tree_edit_distance
+from scripts import add_flagged_receipts as flagged_exporter
 
 
 # --- Tree Edit Distance tests ---
@@ -53,6 +55,191 @@ def test_tree_ed_completely_wrong():
 def test_time_check_tolerates_leading_zero_difference():
     result = check_time({"time": "9:53"}, {"time": "09:53"})
     assert result["pass"]
+
+
+# --- PROD flagged receipt fixture exporter tests ---
+
+def _export_template():
+    return flagged_exporter.load_template_shape(
+        Path(__file__).parent / "fixtures" / "_truth_template.json"
+    )
+
+
+def test_prod_export_truth_shape_matches_template_order():
+    template = _export_template()
+    row = {
+        "id": "receipt-id",
+        "image_path": "images/receipt.jpg",
+        "updated_at": "2026-06-11T00:00:00",
+        "document_type": "receipt",
+        "merchant": "Store",
+        "date": "2026-06-10",
+        "time": "09:53",
+        "location": "Tokyo",
+        "currency": "JPY",
+        "total": 1100,
+        "payment_method": "cash",
+        "account_number": None,
+        "points_used": 100,
+        "amount_paid": 1000,
+        "subtotal": 1000,
+        "service_type": None,
+        "payer": None,
+        "payment_reference": None,
+        "alias_id": "not-exported",
+        "notes": "not-exported",
+        "line_items": [
+            {
+                "id": "line-item-id",
+                "description": "りんご",
+                "description_clean": "not-exported",
+                "category_id": "not-exported",
+                "qty": 2,
+                "unit_price": 500,
+                "total": 1000,
+                "tax_category": "10%",
+                "discount": 0,
+                "discount_rate": "",
+            }
+        ],
+        "tax_entries": [
+            {"id": "tax-id", "rate": "10%", "label": "内税", "amount": 100}
+        ],
+        "billing_period": None,
+        "usage_data": None,
+    }
+
+    truth = flagged_exporter.prod_receipt_to_truth(row, template)
+
+    assert list(truth) == list(template)
+    assert truth["currency"] == "JPY"
+    assert truth["total"] == 1100
+    assert truth["points_used"] == 100
+    assert truth["amount_paid"] == 1000
+    assert truth["line_items"] == [
+        {
+            "description": "りんご",
+            "qty": 2,
+            "unit_price": 500,
+            "total": 1000,
+            "tax_category": "10%",
+            "discount": 0,
+            "discount_rate": "",
+        }
+    ]
+    assert truth["taxes"] == [{"rate": "10%", "label": "内税", "amount": 100}]
+    assert truth["billing_period"] == {"start": None, "end": None}
+    assert truth["usage"] == {
+        "amount": None,
+        "unit": None,
+        "cost_per": None,
+        "meter_previous": None,
+        "meter_current": None,
+    }
+    assert "_llm_prompt" not in truth
+    assert "_comment" not in json.dumps(truth, ensure_ascii=False)
+    assert "alias_id" not in json.dumps(truth, ensure_ascii=False)
+    assert "category_id" not in json.dumps(truth, ensure_ascii=False)
+    assert "description_clean" not in json.dumps(truth, ensure_ascii=False)
+
+
+def test_prod_export_empty_receipt_sections_keep_template_pattern():
+    template = _export_template()
+    row = {
+        "id": "empty-id",
+        "image_path": "images/empty.jpg",
+        "updated_at": "2026-06-11T00:00:00",
+        "currency": None,
+        "line_items": [],
+        "tax_entries": [],
+        "billing_period": None,
+        "usage_data": None,
+    }
+
+    truth = flagged_exporter.prod_receipt_to_truth(row, template)
+
+    assert list(truth) == list(template)
+    assert truth["currency"] == "JPY"
+    assert truth["line_items"] == []
+    assert truth["taxes"] == []
+    assert truth["billing_period"] == {"start": None, "end": None}
+    assert truth["usage"] == {
+        "amount": None,
+        "unit": None,
+        "cost_per": None,
+        "meter_previous": None,
+        "meter_current": None,
+    }
+
+
+def test_prod_export_utility_sections_are_adapted():
+    template = _export_template()
+    row = {
+        "id": "utility-id",
+        "image_path": "images/utility.jpg",
+        "updated_at": "2026-06-11T00:00:00",
+        "document_type": "utility_bill",
+        "currency": "JPY",
+        "total": 3210,
+        "line_items": [],
+        "tax_entries": [],
+        "billing_period": {"start_date": "2026-05-01", "end_date": "2026-05-31"},
+        "usage_data": {
+            "amount": 12.5,
+            "unit": "m3",
+            "cost_per": 120.5,
+            "meter_previous": 100.0,
+            "meter_current": 112.5,
+        },
+    }
+
+    truth = flagged_exporter.prod_receipt_to_truth(row, template)
+
+    assert truth["billing_period"] == {"start": "2026-05-01", "end": "2026-05-31"}
+    assert truth["usage"] == {
+        "amount": 12.5,
+        "unit": "m3",
+        "cost_per": 120.5,
+        "meter_previous": 100.0,
+        "meter_current": 112.5,
+    }
+
+
+def test_manifest_freshness_requires_updated_at_checksum_and_files():
+    row = {"id": "receipt-id", "updated_at": "2026-06-11T00:00:00"}
+    entry = {"updated_at": "2026-06-11T00:00:00", "checksum": "abc"}
+
+    assert flagged_exporter.manifest_entry_current(
+        entry, row, "abc", fixture_files_exist=True
+    )
+    assert not flagged_exporter.manifest_entry_current(
+        entry, {**row, "updated_at": "later"}, "abc", fixture_files_exist=True
+    )
+    assert not flagged_exporter.manifest_entry_current(
+        entry, row, "different", fixture_files_exist=True
+    )
+    assert not flagged_exporter.manifest_entry_current(
+        entry, row, "abc", fixture_files_exist=False
+    )
+
+
+def test_fixture_overwrite_guard():
+    scratch = Path(tempfile.mkdtemp(dir=Path(__file__).parents[1] / "local"))
+    try:
+        image_path = scratch / "receipt_1.jpg"
+        truth_path = scratch / "receipt_1_truth.json"
+        image_path.write_bytes(b"already here")
+
+        with pytest.raises(FileExistsError):
+            flagged_exporter.ensure_can_write_fixture(
+                image_path, truth_path, overwrite=False
+            )
+
+        flagged_exporter.ensure_can_write_fixture(
+            image_path, truth_path, overwrite=True
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 # --- Normalization tests ---

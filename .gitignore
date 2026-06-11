@@ -10,7 +10,8 @@ __pycache__/
 .api_usage*.json
 tmp/
 tmp*.py
-scripts/
+scripts/*
+!scripts/add_flagged_receipts.py
 docs/
 CLAUDE.md
 tests/fixtures/*

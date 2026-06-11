@@ -52,6 +52,25 @@ Before starting the loop, determine which mode you're in:
 
 In multi-receipt mode, the loop is the same but with a different emphasis: you diagnose across the full set first, then fix root causes in batches rather than walking each receipt end-to-end in isolation.
 
+## Adding Flagged PROD Fixtures
+
+When the user asks to add flagged receipts from production, use the tracked exporter instead of generating truth with an LLM:
+
+```bash
+PYTHONIOENCODING=utf-8 python scripts/add_flagged_receipts.py --source prod --dry-run --limit 3
+PYTHONIOENCODING=utf-8 python scripts/add_flagged_receipts.py --source prod --apply --limit 3
+```
+
+The exporter reads flagged saved receipts from Stardust Postgres over SSH, copies images from `/home/tarkoon/data/paper-ledger/storage`, and writes `tests/fixtures/receipt_N_truth.json` from the existing `_truth_template.json` shape.
+
+Important conventions:
+
+- Production saved rows are the truth source: `receipts`, `line_items`, `tax_entries`, `billing_periods`, and `usage_data`. `raw_json` is audit context only.
+- Every truth JSON must follow the stripped fixture template order. Empty list sections are `[]`; object sections stay present with null members, e.g. `billing_period: {"start": null, "end": null}` and the full null-shaped `usage` object.
+- The exporter tracks production `receipt_id`, `image_path`, `updated_at`, fixture name, and checksum in `local/prod_flagged_receipts_manifest.json`.
+- Do not overwrite existing fixture images or truth files unless the user explicitly approves `--overwrite`.
+- After exporting, continue with the normal benchmark/debug loop below.
+
 ## The Loop
 
 ### Step 1 — Benchmark the target receipt(s)
