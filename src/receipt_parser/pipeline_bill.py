@@ -5,8 +5,6 @@ Extracted from pipeline.py for maintainability.
 
 import re
 
-from .patterns import era_to_western_year
-
 
 def postprocess_utility_bill(extracted: dict, unified_text: str) -> dict:
     """Apply utility bill-specific post-processing to the LLM extraction."""

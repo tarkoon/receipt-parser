@@ -122,7 +122,26 @@ def _filter_by_receipt_ceiling(cases):
     ]
 
 
-_CASES = _filter_by_receipt_ceiling(_discover_test_cases())
+def _filter_by_requested_fixtures(cases):
+    raw_names = os.environ.get("RECEIPT_FIXTURES")
+    if not raw_names:
+        return cases
+    requested = {
+        name.strip()
+        for name in re.split(r'[,;\s]+', raw_names)
+        if name.strip()
+    }
+    if not requested:
+        return cases
+
+    def _matches(case_id: str) -> bool:
+        base = _extract_base_name(case_id)
+        return case_id in requested or base in requested
+
+    return [case for case in cases if _matches(case[0])]
+
+
+_CASES = _filter_by_requested_fixtures(_filter_by_receipt_ceiling(_discover_test_cases()))
 _CASE_IDS = [c[0] for c in _CASES]
 _RESULTS_CACHE: dict[str, dict] = {}
 

@@ -16,7 +16,6 @@ Usage:
 
 import argparse
 import json
-import re
 import subprocess
 import sys
 import time
@@ -30,9 +29,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from receipt_parser.checks import get_checks_for, ALL_CHECKS
+from receipt_parser.checks import get_checks_for
 from receipt_parser.llm import check_model_available, DEFAULT_MODEL
-from receipt_parser.ocr import init_cloud_vision, get_api_usage, get_ollama_gpu_status
+from receipt_parser.ocr import init_cloud_vision, get_api_usage
 from receipt_parser.pipeline import process_document, process_ocr_text
 
 # ---------------------------------------------------------------------------
@@ -48,7 +47,6 @@ DEFAULT_BUDGET_LIMIT = 200
 
 # DeepSeek pricing — imported from the canonical source
 from receipt_parser.usage import (
-    DEEPSEEK_CACHE_HIT_COST_PER_M,
     DEEPSEEK_CACHE_MISS_COST_PER_M,
     DEEPSEEK_OUTPUT_COST_PER_M,
 )

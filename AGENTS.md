@@ -1,6 +1,6 @@
 # Project Setup
 - Python: Use `python` instead of `python3`. Conda is installed - Use the environment `financial-aid`
-- Default LLM: DeepSeek V3.2 via direct API (api.deepseek.com). Always use `seed=42` for deterministic output.
+- Default LLM: DeepSeek V4 flash via direct API (api.deepseek.com). Always use `seed=42` for deterministic output.
 - Prefer latest library versions over pinning old ones - adapt code to new APIs instead of downgrading
 
 ## Testing Rules

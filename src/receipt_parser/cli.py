@@ -270,8 +270,8 @@ def usage(
 ):
     """Show API usage and estimated costs for the current billing period."""
     from .usage import (
-        get_usage, reset_usage, sync_usage, get_history,
-        set_billing_start_day, get_billing_period_label,
+        get_usage, reset_usage, sync_usage,
+        set_billing_start_day,
     )
 
     # Billing day config
@@ -483,7 +483,7 @@ def _run_sync_interactive():
 
 def _show_history(page: int, json_output: bool):
     """Display paginated historical usage log."""
-    from .usage import get_history, get_usage
+    from .usage import get_history
 
     result = get_history(page=page)
 

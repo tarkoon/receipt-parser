@@ -12,9 +12,10 @@ Works for **one receipt or many** — the loop is the same, with some multi-rece
 ## Critical Rules
 
 1. **Never modify truth files.** If the truth file is wrong, tell the user exactly what to change and wait for confirmation before continuing.
-2. **No brittle fixes.** Every code change must be general-purpose. No hardcoded receipt-specific mappings, no `if receipt_37`-style logic, no lookup tables that only solve one case. If a fix wouldn't work on a receipt you've never seen, it's too brittle.
+2. **No brittle fixes or embedded answer keys.** Production parsing code must not special-case specific merchants, receipt IDs, known fixture ranges, known dates, known product lists, or known final totals. It may implement general layout/format strategies when they are triggered by structural OCR evidence and validated by arithmetic consistency. No hardcoded receipt-specific mappings, no `if receipt_37`-style logic, no target-range helpers, no full hardcoded `line_items` answer lists, and no late "known final output" overrides. If a fix would not work on a receipt you've never seen, it is too brittle.
 3. **Benchmark runs = 10.** Always use `--runs 10` to confirm determinism.
 4. **In multi-receipt mode, group failures by type before fixing.** A single root cause often spans multiple receipts — fixing it once is better than fixing five symptoms.
+5. **A passing score is not valid if the implementation is invalid.** 100% accuracy is the acceptance test, not the implementation strategy. A score achieved through merchant/product/date/fixture-specific overrides is a failed run and must be cleaned up before completion.
 
 ## Environment
 
@@ -51,6 +52,19 @@ Before starting the loop, determine which mode you're in:
 - **Multi-receipt mode** — two or more receipts (e.g., `/debug-receipt receipt_40 receipt_41 receipt_42`, or "debug all the new ones")
 
 In multi-receipt mode, the loop is the same but with a different emphasis: you diagnose across the full set first, then fix root causes in batches rather than walking each receipt end-to-end in isolation.
+
+## Compaction / Resume Checkpoint
+
+After any context compaction, resume, or long-running continuation, stop before editing files or running more benchmarks and restate:
+
+- Target fixture(s) and current mode
+- Non-negotiable rules from this skill, especially the no-brittle-fixes rule
+- Last trusted benchmark or accuracy artifact
+- Last explicit user decision
+- Current blockers or truth-file questions
+- Next planned action and why it is still general-purpose
+
+If any item is unknown, inspect the current repo state and artifacts first. Do not continue from memory alone. If a future step would contradict the last user decision, stop and ask. If identical image/OCR fixtures have conflicting truth expectations, stop immediately and ask the user which truth convention should win; do not add parser logic that distinguishes identical inputs by fixture identity.
 
 ## Adding Flagged PROD Fixtures
 
@@ -159,15 +173,19 @@ Before writing any fix, state:
 2. **Fix approach** — what you'll change
 3. **Generality check** — why this fix works for any receipt, not just the current targets. In multi-receipt mode, explicitly name which receipts in the target set the fix addresses, and why it won't regress others.
 
+The generality check must explicitly reject known-answer behavior. A valid fix may key off OCR structure such as row geometry, repeated column format, printed tax-summary labels, item/price alignment, or arithmetic consistency. It must not key off merchant identity, date, receipt ID, fixture range, a known product set, or a known final total except as diagnostic evidence reported to the user.
+
 After applying fixes:
 
 ```bash
-# Run unit + validation tests first
-conda run -n financial-aid python -m pytest tests/test_unit.py tests/test_validation.py -v
+# Run unit + validation + production-code guardrails first
+conda run -n financial-aid python -m pytest tests/test_unit.py tests/test_validation.py tests/test_pipeline_guardrails.py -v
 
 # Then re-benchmark the target receipt(s) — all of them in one call
 conda run -n financial-aid python tests/benchmark.py --fixtures receipt_N [receipt_M receipt_P ...] --runs 10
 ```
+
+`tests/test_pipeline_guardrails.py` enforces the no-brittle-production-code rule. If it fails, the benchmark score does not count as a valid pass. Either remove/redesign the brittle production code or, for a pre-existing documented violation only, update the exact allowlist with a clear explanation and a plan to shrink it later. Do not add a new allowlist entry for code introduced in the current fix unless the user explicitly approves keeping that debt.
 
 **Before re-benchmarking, snapshot the pre-fix results** so you can diff them against the post-fix run. The benchmark overwrites `latest.json` on each run, so copy it aside first:
 
@@ -188,7 +206,7 @@ If the fix breaks unit tests, revert and rethink.
 Once all target receipts pass at 100%:
 
 ```bash
-conda run -n financial-aid python -m pytest tests/test_accuracy.py -v
+conda run -n financial-aid python -m pytest tests/test_accuracy.py tests/test_pipeline_guardrails.py -v
 ```
 
 If ANY other receipt regresses, go back to Step 2 for each regression. The fix was too broad or exposed a latent issue. In multi-receipt mode this is especially important because a batched fix has more surface area to cause unintended regressions.
@@ -206,6 +224,15 @@ conda run -n financial-aid python tests/benchmark.py --fixtures receipt_N [recei
 ```
 
 Confirm 100% pass rate, 100% determinism, on every target.
+
+Before marking the task complete, audit the production diff for brittle-code smells:
+
+```bash
+conda run -n financial-aid python -m pytest tests/test_pipeline_guardrails.py -v
+rg -n "receipt_[0-9]+|target_[0-9]+|known|final_known|override|_known_item|line_items\\] = \\[|merchant|date" src/receipt_parser tests
+```
+
+For each new production-code match, explain why it is a general layout/format strategy rather than a fixture answer key. If it cannot be justified, remove or redesign it before completing. Final-result assembly must not silently mutate receipt fields after validation unless that stage is explicitly named, tested, and included in the benchmark evidence. A failing `tests/test_pipeline_guardrails.py` is a completion blocker even if all receipt benchmarks pass.
 
 ### Step 8 — Document
 

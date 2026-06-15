@@ -13,7 +13,8 @@ from copy import deepcopy
 from pathlib import Path
 
 import cv2
-import numpy as np
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -23,17 +24,62 @@ from .ocr import init_cloud_vision, run_cloud_vision, blocks_to_structured_text,
 from .llm import check_model_available, extract_with_verification, DEFAULT_MODEL
 from .validation import validate_receipt
 from .normalize import (normalize_fullwidth, clean_handwritten_ocr, strip_barcode_lines,
-                        rejoin_price_lines, _shift_misaligned_inline_prices, strip_banner_lines, strip_bonus_point_lines,
+                        rejoin_price_lines, _shift_misaligned_inline_prices, strip_bonus_point_lines,
                         join_split_qty_details,
                         rejoin_totals_label_value_columns)
 from .tracing import PipelineTrace, draw_ocr_bboxes, draw_field_overlay
 from .patterns import (
     UTILITY_BILL_KEYWORDS, PAYMENT_SLIP_KEYWORDS, RECEIPT_KEYWORDS,
-    ADMIN_SUFFIX_RE, LOCATION_CLUE_RE, ERA_TABLE,
-    era_to_western_year, should_override_field,
+    ADMIN_SUFFIX_RE, LOCATION_CLUE_RE,
 )
 from .pipeline_receipt import (
     extract_financial_totals, extract_points_used, postprocess_receipt,
+    extract_rate_bases,
+    reconcile_tax_categories_from_rate_bases,
+    reconcile_points_payment_from_ocr,
+    _drop_unprinted_small_target_only_taxes,
+    _restore_bare_number_tax_summary,
+    _drop_duplicate_with_embedded_price,
+    _fix_company_name_merchant,
+    _fix_item_totals_from_following_discount_lines,
+    _apply_coupon_discount_blocks,
+    _drop_applied_coupon_line_items,
+    _repair_tiny_item_prices_from_following_ocr,
+    _repair_discounted_line_item_totals_when_balanced,
+    _repair_discounted_ocr_pair_descriptions,
+    _repair_pre_price_stack_descriptions_from_ocr,
+    _drop_duplicate_rows_when_subtotal_balances,
+    _replace_basket_marker_rows_when_balanced,
+    _fix_adjacent_ocr_price_shift_when_balanced,
+    _fix_o_ring_descriptions_from_ocr,
+    _fix_qty_totals_from_ocr_unit_lines,
+    _fix_bag_item_prices_from_rate_bases,
+    _fix_code_table_descriptions_by_order,
+    _fix_unlabeled_cash_tender_change_block,
+    _drop_numeric_marker_description_rows,
+    _clear_discount_when_negative_line_precedes_own_price,
+    _prefer_printed_item_sum_total_when_balanced,
+    _replace_campaign_discount_stream_when_balanced,
+    _replace_dense_sequence_rows_when_balanced,
+    _replace_prefixed_tax_marker_item_rows_when_balanced,
+    _replace_jan_pos_items_when_balanced,
+    _replace_barcode_unit_qty_amount_stack_when_balanced,
+    _recover_labeled_purchase_site_location,
+    _restore_printed_external_tax_amounts,
+    _restore_printed_summary_total_when_tax_balanced,
+    _restore_external_tax_total_from_printed_subtotal,
+    _restore_zero_points_when_no_redemption,
+    _replace_barcode_qty_price_rows_when_balanced,
+    _replace_item_price_qty_rows_when_balanced,
+    _recover_repeated_item_from_gap,
+    _recover_missing_items_from_gap,
+    _replace_split_price_block_when_balanced,
+    _fix_split_item_price_body_total_layout,
+    _replace_stacked_name_price_rows_when_balanced,
+    _restore_stacked_inclusive_tax_block,
+    _restore_single_rate_inclusive_tax_block,
+    _record_receipt_mutation,
+    _snapshot_receipt_mutation_fields,
 )
 from .pipeline_bill import postprocess_utility_bill
 from .pipeline_slip import postprocess_payment_slip
@@ -204,6 +250,243 @@ def _location_has_ocr_evidence(location: str, ocr_text: str) -> bool:
     return False
 
 
+_PURCHASE_STORE_METADATA_RE = re.compile(
+    r'^\s*(?:ご購入店|購入店|お買上店|お買い上げ店)\s*[:：]?\s*(?P<store>.+店)\s*$'
+)
+
+
+def _trim_purchase_store_metadata_location(extracted: dict, ocr_text: str) -> None:
+    """Avoid expanding location from a labeled host-store metadata line."""
+    location = re.sub(r'\s+', '', extracted.get("location") or "")
+    if not location:
+        return
+    if location in re.sub(r'\s+', '', ocr_text):
+        return
+
+    base_match = re.match(r'(?P<base>.*?[市区町村])(?P<tail>.+)$', location)
+    if not base_match:
+        return
+    base = base_match.group("base")
+    tail = base_match.group("tail")
+    if len(tail) < 2:
+        return
+
+    for raw_line in ocr_text.splitlines():
+        metadata = _PURCHASE_STORE_METADATA_RE.match(raw_line.strip())
+        if not metadata:
+            continue
+        store_line = re.sub(r'\s+', '', metadata.group("store"))
+        if tail in store_line:
+            extracted["location"] = base
+            return
+
+
+def _trim_store_in_store_header_location(extracted: dict, ocr_text: str) -> None:
+    """Avoid treating a host store in a mixed brand/store header as the location."""
+    location = re.sub(r'\s+', '', str(extracted.get("location") or ""))
+    if not location or not ocr_text:
+        return
+    merchant = re.sub(r'\s+', '', str(extracted.get("merchant") or "")).upper()
+    for raw_line in ocr_text.splitlines()[:8]:
+        line = re.split(r'(?:TEL|電話|☎)', raw_line.strip(), maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        if not line:
+            continue
+        match = re.match(r"^(?P<brand>[A-Z][A-Z0-9&.'-]{2,})\s+(?P<host>.+店)$", line)
+        if not match:
+            continue
+        brand = match.group("brand").upper()
+        host = re.sub(r'\s+', '', match.group("host"))
+        if merchant and merchant != brand:
+            continue
+        if not re.search(r'[ぁ-んァ-ン一-龥]', host):
+            continue
+        city = _city_from_phone_area_hint(ocr_text) or _city_from_geographic_marker(host)
+        if not city:
+            continue
+        whole_header = re.sub(r'\s+', '', line)
+        if location in {host, whole_header} or (brand in location and host in location):
+            extracted["location"] = city
+            return
+
+
+def _recover_header_branch_store_location(extracted: dict, ocr_text: str) -> None:
+    """Recover a visible branch/store token from the receipt header."""
+    if not ocr_text:
+        return
+    current_location = re.sub(r'\s+', '', str(extracted.get("location") or ""))
+    phone_area_city = _city_from_phone_area_hint(ocr_text)
+    can_override_phone_area_city = bool(
+        current_location and phone_area_city and current_location == phone_area_city
+    )
+    can_override_admin_fragment = _is_broad_japanese_admin_location(current_location)
+    if current_location and not can_override_phone_area_city and not can_override_admin_fragment:
+        return
+    for raw_line in ocr_text.splitlines()[:16]:
+        line = raw_line.strip()
+        if not line:
+            continue
+        line_for_branch = re.split(r'(?:TEL|電話|☎)', line, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        if re.search(r'www\.|https?://|登録番号|領収|レシート|合計|小計|支払', line, re.IGNORECASE):
+            continue
+        if re.search(r'\d{4}[年/-]\d{1,2}[月/-]\d{1,2}', line):
+            break
+        if _PURCHASE_STORE_METADATA_RE.match(line_for_branch):
+            continue
+        if not re.search(r'[ぁ-んァ-ン一-龥]', line_for_branch):
+            continue
+        parts = [part.strip() for part in re.split(r'\s+', line_for_branch) if part.strip()]
+        candidates = [part for part in parts if re.search(r'[ぁ-んァ-ン一-龥]', part) and part.endswith("店")]
+        if not candidates and line_for_branch.endswith("店"):
+            candidates = [line_for_branch]
+        if not candidates:
+            continue
+        candidate = candidates[-1]
+        stem = candidate[:-1] if candidate.endswith("店") else candidate
+        if can_override_phone_area_city and len(stem) > 6:
+            continue
+        if can_override_admin_fragment and not _branch_extends_admin_fragment(current_location, candidate):
+            continue
+        if 2 <= len(stem) and len(candidate) <= 20:
+            extracted["location"] = candidate
+            return
+
+
+def _is_broad_japanese_admin_location(value: str) -> bool:
+    """Return true for city/ward/prefecture fragments that are not store names."""
+    location = re.sub(r'\s+', '', str(value or ""))
+    if not location or "店" in location or re.search(r'\d', location):
+        return False
+    admin_unit = r'[一-龥]{1,10}(?:都|道|府|県|市|区|町|村)'
+    return bool(re.fullmatch(rf'(?:{admin_unit}){{1,4}}', location))
+
+
+def _branch_extends_admin_fragment(location: str, branch: str) -> bool:
+    location = re.sub(r'\s+', '', str(location or ""))
+    stem = re.sub(r'\s+', '', str(branch or ""))
+    if stem.endswith("店"):
+        stem = stem[:-1]
+    admin_roots = re.findall(r'([一-龥]{1,10}?)(?:都|道|府|県|市|区|町|村)', location)
+    if not admin_roots:
+        return False
+    root = admin_roots[-1]
+    return (
+        (stem.startswith(root) or stem.endswith(root))
+        and 3 <= len(stem) <= 6
+        and len(stem) - len(root) >= 2
+    )
+
+
+_PHONE_AREA_CITY_HINTS = {
+    "0940": ("宗像市", (("福津", "福津市"), ("宗像", "宗像市"))),
+    "093": ("北九州市", ()),
+    "092": ("福岡市", ()),
+    "0942": ("久留米市", ()),
+    "0948": ("飯塚市", ()),
+}
+
+
+def _extract_japanese_phone_hint(ocr_text: str) -> str:
+    phone_match = re.search(r'(?:TEL|電話|☎)\s*[:\s]?\s*(0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{2,4})', ocr_text)
+    if phone_match:
+        return phone_match.group(1)
+    phone_match = re.search(r'^(0\d{1,4}-\d{1,4}-\d{2,4})\s*$', ocr_text, re.MULTILINE)
+    if phone_match:
+        return phone_match.group(1)
+    paren_phone = re.search(
+        r'[（(]\s*(0\d{1,4})\s*[）)]\s*(\d{1,4})[-\s]?(\d{2,4})',
+        ocr_text,
+    )
+    if paren_phone:
+        return "-".join(paren_phone.groups())
+    return ""
+
+
+def _city_from_phone_area_hint(ocr_text: str) -> str:
+    phone_hint = _extract_japanese_phone_hint(ocr_text)
+    if not phone_hint:
+        return ""
+    area_code = re.match(r'(0\d{1,4})', phone_hint.replace('-', '').replace(' ', ''))
+    if not area_code:
+        return ""
+    code = area_code.group(1)
+    for prefix, (default_city, markers) in _PHONE_AREA_CITY_HINTS.items():
+        if not code.startswith(prefix):
+            continue
+        for marker, city in markers:
+            if marker in ocr_text:
+                return city
+        return default_city
+    return ""
+
+
+def _city_from_geographic_marker(text: str) -> str:
+    for _prefix, (_default_city, markers) in _PHONE_AREA_CITY_HINTS.items():
+        for marker, city in markers:
+            if marker and marker in text:
+                return city
+    return ""
+
+
+def _recover_phone_area_city_location(extracted: dict, ocr_text: str) -> None:
+    if extracted.get("location") or not ocr_text:
+        return
+    has_ambiguous_store_phone_line = any(
+        re.search(r'[ぁ-んァ-ン一-龥]{1,}店.*(?:TEL|電話|☎)', line, re.IGNORECASE)
+        for line in ocr_text.splitlines()[:12]
+    )
+    if not has_ambiguous_store_phone_line:
+        return
+    city = _city_from_phone_area_hint(ocr_text)
+    if city:
+        extracted["location"] = city
+
+
+def _recover_short_branch_over_phone_area_city(extracted: dict, ocr_text: str) -> None:
+    current_location = re.sub(r'\s+', '', str(extracted.get("location") or ""))
+    phone_area_city = _city_from_phone_area_hint(ocr_text or "")
+    if not current_location or not phone_area_city or not current_location.startswith(phone_area_city):
+        return
+    if current_location == phone_area_city:
+        return
+    current_tail = current_location[len(phone_area_city):]
+    if ADMIN_SUFFIX_RE.search(current_tail):
+        return
+    for raw_line in (ocr_text or "").splitlines()[:16]:
+        line = raw_line.strip()
+        if re.search(r'購入店|お買上店|登録番号|領収|レシート|合計|小計|支払', line):
+            continue
+        line_for_branch = re.split(r'(?:TEL|電話|☎)', line, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        match = re.fullmatch(r'([ぁ-んァ-ン一-龥]{2,6}店)', line_for_branch)
+        if match:
+            branch = match.group(1)
+            stem = branch[:-1]
+            if (
+                stem in current_location
+                or (current_tail and current_tail in stem)
+            ):
+                extracted["location"] = branch
+                return
+
+
+def _normalize_noisy_city_location(extracted: dict, ocr_text: str) -> None:
+    location = re.sub(r'\s+', '', str(extracted.get("location") or ""))
+    if not location:
+        return
+    match = re.match(r'(?P<base>.*?[市区町村])(?P<tail>.+)$', location)
+    if not match:
+        return
+    base = match.group("base")
+    tail = match.group("tail")
+    compact_ocr = re.sub(r'\s+', '', ocr_text or "")
+    if location in compact_ocr:
+        return
+    if tail and f"{tail}店" in compact_ocr:
+        extracted["location"] = base
+        return
+    if re.match(r'^(?:ご来|ご利用|ありが|担当|No|レジ)', tail):
+        extracted["location"] = base
+
+
 def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str | None, str | None]:
     """Use a focused LLM call to resolve a partial location to city/ward level.
 
@@ -215,24 +498,17 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
     merchant = extracted.get("merchant") or ""
     raw_location = extracted.get("location") or ""
 
-    phone_match = re.search(r'(?:TEL|電話|☎)\s*[:\s]?\s*(0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{2,4})', ocr_text)
-    if not phone_match:
-        # Bare phone number on its own line
-        phone_match = re.search(r'^(0\d{1,4}-\d{1,4}-\d{2,4})\s*$', ocr_text, re.MULTILINE)
-    phone_hint = phone_match.group(1) if phone_match else ""
-    if not phone_hint:
-        # Retail receipts often split the area code into parentheses:
-        # "(0940) 38-0130". Preserve it as a normal phone hint so the
-        # existing area-code resolver can use it.
-        paren_phone = re.search(
-            r'[（(]\s*(0\d{1,4})\s*[）)]\s*(\d{1,4})[-\s]?(\d{2,4})',
-            ocr_text,
-        )
-        if paren_phone:
-            phone_hint = "-".join(paren_phone.groups())
+    phone_hint = _extract_japanese_phone_hint(ocr_text)
 
     # Extract branch/store name (e.g., "赤間店" → "赤間", "八幡店" → "八幡")
-    branch_match = re.search(r'([\u3000-\u9fff]{2,})\s*店', ocr_text)
+    branch_match = None
+    for raw_line in ocr_text.splitlines():
+        line = raw_line.strip()
+        if _PURCHASE_STORE_METADATA_RE.match(line):
+            continue
+        branch_match = re.search(r'([\u3000-\u9fff]{2,})\s*店', line)
+        if branch_match:
+            break
     if not branch_match:
         # Location-type indicators: toll gate, station, branch office
         branch_match = re.search(r'(?:料金所|営業所|支店|出張所)\s*\n?\s*([\u3000-\u9fff]{2,})', ocr_text)
@@ -252,16 +528,6 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
     header_hint = ", ".join(header_lines) if header_lines else ""
 
     # Phone area code → region hint
-    _AREA_CODES = {
-        "0940": ("宗像市", "宗像市/福津市 area (Fukuoka pref.)"),
-        "093": ("北九州市", "北九州市 area (Fukuoka pref.)"),
-        "092": ("福岡市", "福岡市 area (Fukuoka pref.)"),
-        "0942": ("久留米市", "久留米市 area (Fukuoka pref.)"),
-        "0948": ("飯塚市", "飯塚市 area (Fukuoka pref.)"),
-    }
-    _AREA_CODE_CITY_MARKERS = {
-        "0940": (("福津", "福津市"), ("宗像", "宗像市")),
-    }
     area_hint = ""
     area_city = ""
     area_prefix = ""
@@ -269,8 +535,9 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
         area_code = re.match(r'(0\d{1,4})', phone_hint.replace('-', '').replace(' ', ''))
         if area_code:
             code = area_code.group(1)
-            for prefix, (city, desc) in _AREA_CODES.items():
+            for prefix, (city, _markers) in _PHONE_AREA_CITY_HINTS.items():
                 if code.startswith(prefix):
+                    desc = f"{city} area"
                     area_hint = f"Phone area code {prefix} = {desc}"
                     area_city = city
                     area_prefix = prefix
@@ -324,10 +591,13 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
         if ADMIN_SUFFIX_RE.search(candidate):
             return candidate, None
 
-    if area_prefix in _AREA_CODE_CITY_MARKERS:
-        for marker, city in _AREA_CODE_CITY_MARKERS[area_prefix]:
+    if area_prefix in _PHONE_AREA_CITY_HINTS:
+        for marker, city in _PHONE_AREA_CITY_HINTS[area_prefix][1]:
             if marker in ocr_text:
                 return city, None
+
+    if area_city and raw_location and not ADMIN_SUFFIX_RE.search(raw_location):
+        return area_city, None
 
     business_line = re.search(r'事業者名\s*[:：]\s*(.+)$', ocr_text, re.MULTILINE)
     if not raw_location and business_line:
@@ -336,7 +606,12 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
         if rail and '登山' in rail.group(1):
             return rail.group(1), None
 
-    if not raw_location and branch_hint and 'STARBUCKS' in merchant.upper():
+    if (
+        not raw_location
+        and branch_hint
+        and not branch_hint.endswith("店")
+        and re.fullmatch(r'[\wぁ-んァ-ン一-龥ー・]{2,20}', branch_hint)
+    ):
         return f"{branch_hint}店", None
 
     if area_city and not raw_location:
@@ -528,11 +803,129 @@ def _build_classify_payload(doc_type: str, source: str) -> dict:
     }
 
 
-def _build_result(receipt, final_warnings, pass_history, model, debug=False, trace=None,
+def _record_final_receipt_output_repair(
+    stage: str,
+    result: dict,
+    mutation_trace: list[dict] | None,
+    repair: Callable[[], None],
+) -> None:
+    before = (
+        _snapshot_receipt_mutation_fields(result)
+        if mutation_trace is not None
+        else None
+    )
+    repair()
+    _record_receipt_mutation(mutation_trace, stage, before, result)
+
+
+def _apply_final_receipt_output_repairs(
+    result: dict,
+    ocr_text: str | None,
+    mutation_trace: list[dict] | None = None,
+) -> None:
+    """Apply legacy receipt repairs that still run after model validation."""
+    if result.get("document_type") != "receipt" or not ocr_text:
+        return
+
+    def run(stage: str, repair: Callable[[], None]) -> None:
+        _record_final_receipt_output_repair(stage, result, mutation_trace, repair)
+
+    run(
+        "barcode_unit_qty_amount_stack",
+        lambda: _replace_barcode_unit_qty_amount_stack_when_balanced(result, ocr_text),
+    )
+    run(
+        "barcode_qty_price_rows",
+        lambda: _replace_barcode_qty_price_rows_when_balanced(result, ocr_text),
+    )
+    run(
+        "item_price_qty_rows",
+        lambda: _replace_item_price_qty_rows_when_balanced(result, ocr_text),
+    )
+    run("numeric_marker_description_rows", lambda: _drop_numeric_marker_description_rows(result, ocr_text))
+    run("labeled_purchase_site_location", lambda: _recover_labeled_purchase_site_location(result, ocr_text))
+    run("store_in_store_header_location", lambda: _trim_store_in_store_header_location(result, ocr_text))
+    run("header_branch_store_location", lambda: _recover_header_branch_store_location(result, ocr_text))
+    run("phone_area_city_location", lambda: _recover_phone_area_city_location(result, ocr_text))
+    run("short_branch_over_phone_area_city", lambda: _recover_short_branch_over_phone_area_city(result, ocr_text))
+    run("noisy_city_location", lambda: _normalize_noisy_city_location(result, ocr_text))
+    run("zero_points_no_redemption", lambda: _restore_zero_points_when_no_redemption(result, ocr_text))
+    run("single_rate_inclusive_tax_block", lambda: _restore_single_rate_inclusive_tax_block(result, ocr_text))
+    run("following_discount_lines", lambda: _fix_item_totals_from_following_discount_lines(result, ocr_text))
+    run("coupon_discount_blocks", lambda: _apply_coupon_discount_blocks(result, ocr_text))
+    run("drop_applied_coupon_line_items", lambda: _drop_applied_coupon_line_items(result, ocr_text))
+    run("tiny_item_prices_from_following_ocr", lambda: _repair_tiny_item_prices_from_following_ocr(result, ocr_text))
+    run("split_price_block", lambda: _replace_split_price_block_when_balanced(result, ocr_text))
+    run("split_item_price_body_total", lambda: _fix_split_item_price_body_total_layout(result, ocr_text))
+    run("stacked_name_price_rows", lambda: _replace_stacked_name_price_rows_when_balanced(result, ocr_text))
+    run("stacked_inclusive_tax_block", lambda: _restore_stacked_inclusive_tax_block(result, ocr_text))
+    run("printed_summary_total_tax_balanced", lambda: _restore_printed_summary_total_when_tax_balanced(result, ocr_text))
+    run("printed_item_sum_total", lambda: _prefer_printed_item_sum_total_when_balanced(result, ocr_text))
+    run("o_ring_descriptions", lambda: _fix_o_ring_descriptions_from_ocr(result, ocr_text))
+    run("company_name_merchant", lambda: _fix_company_name_merchant(result, ocr_text))
+    run("adjacent_ocr_price_shift", lambda: _fix_adjacent_ocr_price_shift_when_balanced(result, ocr_text))
+    run("repeated_item_gap", lambda: _recover_repeated_item_from_gap(result, ocr_text))
+    if result.get("line_items"):
+        run(
+            "drop_duplicate_embedded_price",
+            lambda: _drop_duplicate_with_embedded_price(result["line_items"]),
+        )
+    run("dense_sequence_rows", lambda: _replace_dense_sequence_rows_when_balanced(result, ocr_text))
+    run("campaign_discount_stream", lambda: _replace_campaign_discount_stream_when_balanced(result, ocr_text))
+    run(
+        "jan_pos_items",
+        lambda: _replace_jan_pos_items_when_balanced(
+            result,
+            ocr_text,
+            extract_financial_totals(ocr_text),
+        ),
+    )
+    run("qty_totals_from_unit_lines", lambda: _fix_qty_totals_from_ocr_unit_lines(result, ocr_text))
+    run(
+        "bag_item_prices_from_rate_bases",
+        lambda: _fix_bag_item_prices_from_rate_bases(
+            result,
+            extract_rate_bases(ocr_text),
+            ocr_text,
+        ),
+    )
+    run("code_table_descriptions", lambda: _fix_code_table_descriptions_by_order(result, ocr_text))
+    run("printed_external_tax_amounts", lambda: _restore_printed_external_tax_amounts(result, ocr_text))
+    run("bare_number_tax_summary", lambda: _restore_bare_number_tax_summary(result, ocr_text))
+    run("external_tax_total_from_printed_subtotal", lambda: _restore_external_tax_total_from_printed_subtotal(result, ocr_text))
+    run("drop_small_target_only_taxes", lambda: _drop_unprinted_small_target_only_taxes(result, ocr_text))
+    run("printed_summary_total_tax_balanced_2", lambda: _restore_printed_summary_total_when_tax_balanced(result, ocr_text))
+    run("unlabeled_cash_tender_change", lambda: _fix_unlabeled_cash_tender_change_block(result, ocr_text))
+    run("points_payment", lambda: reconcile_points_payment_from_ocr(result, ocr_text))
+    run(
+        "clear_discount_before_own_price",
+        lambda: _clear_discount_when_negative_line_precedes_own_price(result, ocr_text),
+    )
+    run("campaign_discount_stream_2", lambda: _replace_campaign_discount_stream_when_balanced(result, ocr_text))
+    run("following_discount_lines_after_layout", lambda: _fix_item_totals_from_following_discount_lines(result, ocr_text))
+    run("discounted_line_item_totals", lambda: _repair_discounted_line_item_totals_when_balanced(result, ocr_text))
+    run("adjacent_ocr_price_shift_final", lambda: _fix_adjacent_ocr_price_shift_when_balanced(result, ocr_text))
+    run("prefixed_tax_marker_item_rows", lambda: _replace_prefixed_tax_marker_item_rows_when_balanced(result, ocr_text))
+    run("missing_items_from_gap", lambda: _recover_missing_items_from_gap(result, ocr_text))
+    run("discounted_ocr_pair_descriptions", lambda: _repair_discounted_ocr_pair_descriptions(result, ocr_text))
+    run("pre_price_stack_descriptions", lambda: _repair_pre_price_stack_descriptions_from_ocr(result, ocr_text))
+    run("drop_duplicate_rows_when_subtotal_balances", lambda: _drop_duplicate_rows_when_subtotal_balances(result, ocr_text))
+    run("basket_marker_rows", lambda: _replace_basket_marker_rows_when_balanced(result, ocr_text))
+    run("tax_categories_from_rate_bases", lambda: reconcile_tax_categories_from_rate_bases(result, ocr_text))
+    run("external_tax_total_from_printed_subtotal_final", lambda: _restore_external_tax_total_from_printed_subtotal(result, ocr_text))
+
+
+def _prepare_receipt_output_payload(receipt, ocr_text: str | None = None) -> dict:
+    result = receipt.model_dump()
+    _apply_final_receipt_output_repairs(result, ocr_text)
+    return result
+
+
+def _build_result(receipt_payload, final_warnings, pass_history, model, debug=False, trace=None,
                    ocr_confidence=None, llm_confidence=None,
                    ocr_source=None, ocr_retried=None, ocr_retry_reason=None,
                    ocr_text=None):
-    result = receipt.model_dump()
+    result = deepcopy(receipt_payload)
     result["_warnings"] = final_warnings
     result["_pass_count"] = len(pass_history)
     result["_pass_history"] = pass_history
@@ -637,6 +1030,7 @@ def process_document(
                 resolved, _loc_warn = _resolve_location(extracted, digital_text, model)
                 if resolved:
                     extracted["location"] = resolved
+            _trim_purchase_store_metadata_location(extracted, digital_text)
 
             try:
                 receipt = Receipt(**extracted)
@@ -654,7 +1048,8 @@ def process_document(
                     "SKIPPED: Digital PDF fast path — no OCR bounding boxes available.")
                 (debug_dir / "pipeline_trace.txt").write_text(trace.summary())
 
-            result = _build_result(receipt, final_warnings, pass_history, model, debug=debug, trace=trace,
+            receipt_payload = _prepare_receipt_output_payload(receipt)
+            result = _build_result(receipt_payload, final_warnings, pass_history, model, debug=debug, trace=trace,
                                    ocr_confidence=1.0, llm_confidence=llm_conf_pdf)
             if apply_user_rules:
                 result = _apply_user_rules(result)
@@ -802,13 +1197,15 @@ def process_document(
     except Exception:
         receipt = Receipt()
     primary_ocr = all_ocr_results[0] if all_ocr_results else None
+    repair_ocr_text = primary_ocr.chosen_text if primary_ocr else None
+    receipt_payload = _prepare_receipt_output_payload(receipt, repair_ocr_text)
     result = _build_result(
-        receipt, final_warnings, pass_history, model, debug=debug, trace=trace,
+        receipt_payload, final_warnings, pass_history, model, debug=debug, trace=trace,
         ocr_confidence=ocr_conf, llm_confidence=posthoc_conf,
         ocr_source=primary_ocr.source if primary_ocr else None,
         ocr_retried=primary_ocr.retried if primary_ocr else None,
         ocr_retry_reason=primary_ocr.retry_reason if primary_ocr else None,
-        ocr_text=primary_ocr.chosen_text if primary_ocr else None,
+        ocr_text=repair_ocr_text,
     )
     if apply_user_rules:
         result = _apply_user_rules(result)
@@ -1070,7 +1467,10 @@ def _run_extraction_pipeline(
             and not re.search(r'小計|合計|対象|税率', unified_text)
         )
         if is_handwritten:
-            has_tender = bool(re.search(r'お預り|現金|現計|お釣り|釣銭', unified_text))
+            has_tender = bool(re.search(
+                r'(?:お預り金?|お預かり)(?!票)|現金|現計|お釣り|釣銭',
+                unified_text,
+            ))
             has_acknowledgement = bool(
                 re.search(r'上記正に\s*(?:領収|受領)', unified_text)
             )
@@ -1081,7 +1481,7 @@ def _run_extraction_pipeline(
 
     # Final cash fallback
     if "error" not in extracted and not extracted.get("payment_method"):
-        has_tender_label = bool(re.search(r'お預り', unified_text))
+        has_tender_label = bool(re.search(r'(?:お預り金?|お預かり)(?!票)', unified_text))
         has_change_label_final = bool(re.search(r'釣', unified_text))
         has_electronic = bool(_ELECTRONIC_PAY_RE.search(unified_text))
         if has_tender_label and has_change_label_final and not has_electronic:
@@ -1093,6 +1493,14 @@ def _run_extraction_pipeline(
 
     # Common post-processing
     if "error" not in extracted:
+        if doc_type == "receipt":
+            ocr_points = extract_points_used(unified_text)
+            existing_points = extracted.get("points_used")
+            if (
+                ocr_points is not None
+                and (existing_points is None or (ocr_points > 0 and float(existing_points or 0) == 0))
+            ):
+                extracted["points_used"] = ocr_points
         total = extracted.get("total")
         points = extracted.get("points_used")
         if total is not None:
@@ -1117,6 +1525,9 @@ def _run_extraction_pipeline(
             elif loc_warning:
                 location_warnings.append(loc_warning)
 
+    _trim_purchase_store_metadata_location(extracted, unified_text)
+    _trim_store_in_store_header_location(extracted, unified_text)
+
     # Location validation: clear if no OCR evidence supports it
     if "error" not in extracted and doc_type == "receipt" and extracted.get("location"):
         if not _location_has_ocr_evidence(extracted["location"], unified_text):
@@ -1125,8 +1536,6 @@ def _run_extraction_pipeline(
         city_m = re.search(r'(宗像市)', unified_text)
         if city_m:
             extracted["location"] = city_m.group(1)
-        elif "コスモス" in unified_text and "元店" in unified_text:
-            extracted["location"] = "宗像市"
 
     # Expand truncated location when OCR has a more detailed address
     if "error" not in extracted and doc_type == "receipt" and extracted.get("location"):
@@ -1209,9 +1618,10 @@ def process_ocr_text(
         return extracted
 
     _notify(on_stage, "done", "Complete", 1.0)
+    receipt = Receipt(**extracted) if "error" not in extracted else Receipt()
+    receipt_payload = _prepare_receipt_output_payload(receipt, ocr_text)
     result = _build_result(
-        Receipt(**extracted) if "error" not in extracted else Receipt(),
-        final_warnings, pass_history, model,
+        receipt_payload, final_warnings, pass_history, model,
         ocr_confidence=ocr_conf, ocr_source="injected",
         ocr_text=ocr_text,
     )

@@ -34,7 +34,6 @@ class OCRResult:
 from .usage import (
     track_cloud_vision_call as _track_api_call_impl,
     get_usage as _get_unified_usage,
-    CLOUD_VISION_FREE_TIER as _FREE_TIER_LIMIT,
 )
 
 

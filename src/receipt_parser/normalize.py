@@ -628,7 +628,6 @@ def rejoin_totals_label_value_columns(text: str) -> str:
             i += 1
             continue
         # Collect a run of consecutive label lines.
-        run_start = i
         labels: list[tuple[int, str]] = []
         while i < len(lines) and _is_label_line(lines[i]):
             labels.append((i, lines[i].strip()))
