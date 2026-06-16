@@ -901,6 +901,25 @@ def _run_final_split_price_block_projection_phase(
             )
 
 
+def _run_final_body_total_layout_reconstruction_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: item rows appear before a printed body-total block.
+
+    Invariant: reconstructed items, subtotal, and tax entries must remain
+    backed by visible body-total layout rows and subtotal plus tax arithmetic.
+    """
+    for repair in repairs:
+        if repair == "split_item_price_body_total":
+            _fix_split_item_price_body_total_layout(result, ocr_text)
+        else:
+            raise ValueError(
+                f"Unknown final body-total layout reconstruction repair: {repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -964,7 +983,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "split_item_price_body_total": (
         "structural_item_reconstruction",
-        "Retained late to keep body-total split layouts balanced after final cleanup.",
+        "Owned by the final body-total layout reconstruction helper until body-total split layouts move out of post-serialization repair.",
     ),
     "stacked_name_price_rows": (
         "structural_item_reconstruction",
@@ -1164,7 +1183,14 @@ def _apply_final_receipt_output_repairs(
             ("split_price_block",),
         ),
     )
-    run("split_item_price_body_total", lambda: _fix_split_item_price_body_total_layout(result, ocr_text))
+    run(
+        "split_item_price_body_total",
+        lambda: _run_final_body_total_layout_reconstruction_phase(
+            result,
+            ocr_text,
+            ("split_item_price_body_total",),
+        ),
+    )
     run("stacked_name_price_rows", lambda: _replace_stacked_name_price_rows_when_balanced(result, ocr_text))
     run("stacked_inclusive_tax_block", lambda: _restore_stacked_inclusive_tax_block(result, ocr_text))
     run("printed_summary_total_tax_balanced", lambda: _restore_printed_summary_total_when_tax_balanced(result, ocr_text))

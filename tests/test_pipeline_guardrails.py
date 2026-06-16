@@ -140,6 +140,13 @@ FINAL_SPLIT_PRICE_BLOCK_PROJECTION_HELPER = (
     "_run_final_split_price_block_projection_phase"
 )
 FINAL_SPLIT_PRICE_BLOCK_PROJECTION_STAGE_LIMIT = 1
+FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS = {
+    "_fix_split_item_price_body_total_layout",
+}
+FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_HELPER = (
+    "_run_final_body_total_layout_reconstruction_phase"
+)
+FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_STAGE_LIMIT = 1
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -1018,6 +1025,56 @@ def test_final_split_price_block_projection_debt_is_helper_owned():
         "bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_SPLIT_PRICE_BLOCK_PROJECTION_STAGE_LIMIT}"
+    )
+
+
+def test_final_body_total_layout_reconstruction_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late body-total layout reconstruction must be owned by the named "
+        f"{FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_HELPER} must document "
+        "the printed body-total layout trigger and subtotal/tax invariant."
+    )
+
+
+def test_final_body_total_layout_reconstruction_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_reconstruction_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_HELPER
+    ]
+
+    assert not direct_reconstruction_calls, (
+        "Late body-total layout reconstruction should run through the named "
+        "helper so printed body-total layout triggers and subtotal/tax "
+        "invariants have one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_reconstruction_calls}"
+    )
+    assert 0 < len(helper_calls) <= FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_STAGE_LIMIT, (
+        "Late body-total layout reconstruction helper calls must be explicit "
+        "and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_STAGE_LIMIT}"
     )
 
 
