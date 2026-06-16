@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 90
+POSTPROCESS_REPAIR_CALL_LIMIT = 81
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -107,10 +107,7 @@ POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     # phases expose new candidate rows. Counts may shrink, but must not grow.
     "_fix_adjacent_ocr_price_shift_when_balanced": 4,
     "_fix_name_bag_amount_shift_from_ocr": 3,
-    "_fix_numeric_desc_from_ocr_price_context": 3,
     "_fix_split_item_price_body_total_layout": 3,
-    "_recover_missing_bag_items_from_ocr": 3,
-    "_replace_overage_item_with_low_value_bag": 3,
     "_restore_explicit_tax_rate_amount_lines": 3,
     "_restore_external_tax_total_from_printed_subtotal": 3,
     "_restore_single_rate_inclusive_tax_block": 3,
@@ -180,6 +177,13 @@ GAP_ITEM_RECOVERY_REPAIRS = {
 }
 GAP_ITEM_RECOVERY_PHASE_HELPER = "_run_gap_item_recovery_phase"
 GAP_ITEM_RECOVERY_PHASE_CALL_LIMIT = 8
+LOW_VALUE_BAG_RECOVERY_REPAIRS = {
+    "_fix_numeric_desc_from_ocr_price_context",
+    "_recover_missing_bag_items_from_ocr",
+    "_replace_overage_item_with_low_value_bag",
+}
+LOW_VALUE_BAG_RECOVERY_PHASE_HELPER = "_run_low_value_bag_recovery_phase"
+LOW_VALUE_BAG_RECOVERY_PHASE_CALL_LIMIT = 4
 LINE_ITEM_CLEANUP_REPAIRS = {
     "_drop_duplicate_with_embedded_price",
     "_drop_non_product_line_items",
@@ -1070,6 +1074,51 @@ def test_postprocess_gap_item_recovery_debt_is_phase_owned():
         "Gap item recovery phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {GAP_ITEM_RECOVERY_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_low_value_bag_recovery_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, LOW_VALUE_BAG_RECOVERY_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        LOW_VALUE_BAG_RECOVERY_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Low-value bag recovery repairs must be owned by the named "
+        f"{LOW_VALUE_BAG_RECOVERY_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{LOW_VALUE_BAG_RECOVERY_PHASE_HELPER} must document the OCR small-bag "
+        "trigger and subtotal/total arithmetic invariant."
+    )
+
+
+def test_postprocess_low_value_bag_recovery_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_bag_calls = [
+        name for name in postprocess_calls if name in LOW_VALUE_BAG_RECOVERY_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == LOW_VALUE_BAG_RECOVERY_PHASE_HELPER
+    ]
+
+    assert not direct_bag_calls, (
+        "Low-value bag recovery repairs should run through the named phase "
+        "helper so missing bag rows, overage replacement, and numeric OCR "
+        "context share one OCR/arithmetic owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_bag_calls}"
+    )
+    assert 0 < len(phase_calls) <= LOW_VALUE_BAG_RECOVERY_PHASE_CALL_LIMIT, (
+        "Low-value bag recovery phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {LOW_VALUE_BAG_RECOVERY_PHASE_CALL_LIMIT}"
     )
 
 

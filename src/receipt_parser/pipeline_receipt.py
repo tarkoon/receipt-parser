@@ -14509,6 +14509,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Gap item recovery requires visible missing, discounted, or repeated OCR rows and subtotal/total item-sum arithmetic.",
     },
     {
+        "name": "low_value_bag_recovery",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Low-value bag recovery requires visible small-bag or numeric OCR context and subtotal/total item-sum arithmetic.",
+    },
+    {
         "name": "item_cleanup",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -14753,6 +14759,28 @@ def _run_gap_item_recovery_phase(
             raise ValueError(f"Unknown gap item recovery repair: {repair}")
 
 
+def _run_low_value_bag_recovery_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR exposes low-value bag rows or numeric bag price context.
+
+    Invariant: missing bag rows, overage replacement, and numeric-description
+    repair must be visible in OCR and keep item sums consistent with subtotal
+    or total arithmetic.
+    """
+    for repair in repairs:
+        if repair == "missing_bag_items":
+            _recover_missing_bag_items_from_ocr(extracted, unified_text)
+        elif repair == "overage_low_value_bag":
+            _replace_overage_item_with_low_value_bag(extracted, unified_text)
+        elif repair == "numeric_description_context":
+            _fix_numeric_desc_from_ocr_price_context(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown low-value bag recovery repair: {repair}")
+
+
 def _run_payment_points_reconciliation_phase(
     extracted: dict,
     unified_text: str,
@@ -14974,9 +15002,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _recover_missing_bag_items_from_ocr(extracted, unified_text)
-    _replace_overage_item_with_low_value_bag(extracted, unified_text)
-    _fix_numeric_desc_from_ocr_price_context(extracted, unified_text)
+    _run_low_value_bag_recovery_phase(
+        extracted,
+        unified_text,
+        ("missing_bag_items", "overage_low_value_bag", "numeric_description_context"),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "low_value_bag_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _run_ocr_description_reconciliation_phase(
         extracted,
         unified_text,
@@ -15154,9 +15190,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _recover_missing_bag_items_from_ocr(extracted, unified_text)
-    _replace_overage_item_with_low_value_bag(extracted, unified_text)
-    _fix_numeric_desc_from_ocr_price_context(extracted, unified_text)
+    _run_low_value_bag_recovery_phase(
+        extracted,
+        unified_text,
+        ("missing_bag_items", "overage_low_value_bag", "numeric_description_context"),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "low_value_bag_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _run_ocr_description_reconciliation_phase(
         extracted,
         unified_text,
@@ -15551,8 +15595,17 @@ def postprocess_receipt(
         unified_text,
         ("stacked_cash_tender", "unlabeled_cash_tender_change"),
     )
-    _replace_overage_item_with_low_value_bag(extracted, unified_text)
-    _fix_numeric_desc_from_ocr_price_context(extracted, unified_text)
+    _run_low_value_bag_recovery_phase(
+        extracted,
+        unified_text,
+        ("overage_low_value_bag", "numeric_description_context"),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "low_value_bag_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _run_ocr_description_reconciliation_phase(
         extracted,
         unified_text,
@@ -15586,7 +15639,13 @@ def postprocess_receipt(
         ("service_table_items",),
     )
     _append_missing_low_value_bag_from_gap(extracted, unified_text)
-    _recover_missing_bag_items_from_ocr(extracted, unified_text)
+    _run_low_value_bag_recovery_phase(extracted, unified_text, ("missing_bag_items",))
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "low_value_bag_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _run_tax_category_assignment_phase(
         extracted,
         unified_text,
