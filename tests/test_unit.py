@@ -4406,6 +4406,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "financial_totals_repair",
         "cash_tender_reconciliation",
         "service_receipt_recovery",
+        "body_total_layout_reconstruction",
         "initial_item_recovery",
         "gap_item_recovery",
         "low_value_bag_recovery",
@@ -4421,7 +4422,10 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     )
     assert "location" in phases["header_identity_repair"]["writes"]
     assert "date" in phases["header_identity_repair"]["writes"]
+    assert "location" in phases["body_total_layout_reconstruction"]["writes"]
+    assert "subtotal" in phases["body_total_layout_reconstruction"]["writes"]
     assert "line_items" in phases["initial_item_recovery"]["writes"]
+    assert "line_items" in phases["body_total_layout_reconstruction"]["writes"]
     assert "line_items" in phases["gap_item_recovery"]["writes"]
     assert "line_items" in phases["low_value_bag_recovery"]["writes"]
     assert "line_items" in phases["adjacent_price_shift_reconciliation"]["writes"]
@@ -4441,6 +4445,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "line_items": {
             "adjacent_price_shift_reconciliation",
             "bag_amount_shift_reconciliation",
+            "body_total_layout_reconstruction",
             "gap_item_recovery",
             "initial_item_recovery",
             "low_value_bag_recovery",
@@ -4458,8 +4463,10 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "tax_category_assignment",
             "structural_item_reconstruction",
             "final_consistency_pass",
+            "body_total_layout_reconstruction",
         },
         "subtotal": {
+            "body_total_layout_reconstruction",
             "financial_totals_repair",
             "payment_points_reconciliation",
             "service_receipt_recovery",
@@ -4486,7 +4493,10 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "service_receipt_recovery",
         },
         "merchant": {"header_identity_repair"},
-        "location": {"header_identity_repair"},
+        "location": {
+            "body_total_layout_reconstruction",
+            "header_identity_repair",
+        },
         "date": {"header_identity_repair"},
     }
     actual_owners = {

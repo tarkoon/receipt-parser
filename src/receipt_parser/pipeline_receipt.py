@@ -14497,6 +14497,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Service receipt recovery requires visible service/table or bare-receipt OCR layout and item/tax arithmetic consistency.",
     },
     {
+        "name": "body_total_layout_reconstruction",
+        "reads": ("line_items", "subtotal", "total", "taxes", "location", "ocr_text"),
+        "writes": ("line_items", "taxes", "subtotal", "location"),
+        "invariant": "Body-total layout reconstruction requires visible item rows before a printed body-total block and subtotal/tax arithmetic consistency.",
+    },
+    {
         "name": "initial_item_recovery",
         "reads": ("line_items", "subtotal", "total", "ocr_text", "ocr_layout_blocks"),
         "writes": ("line_items",),
@@ -14719,6 +14725,26 @@ def _run_service_receipt_recovery_phase(
             _fix_single_service_inclusive_tax(extracted, unified_text)
         else:
             raise ValueError(f"Unknown service receipt recovery repair: {repair}")
+
+
+def _run_body_total_layout_reconstruction_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: item rows appear before a printed 本体合計 body-total block.
+
+    Invariant: reconstructed items, subtotal, tax entries, and optional branch
+    location must be backed by visible body-total layout rows and subtotal plus
+    tax arithmetic.
+    """
+    for repair in repairs:
+        if repair == "split_item_price_body_total":
+            _fix_split_item_price_body_total_layout(extracted, unified_text)
+        else:
+            raise ValueError(
+                f"Unknown body-total layout reconstruction repair: {repair}"
+            )
 
 
 def _run_ocr_description_reconciliation_phase(
@@ -14975,7 +15001,17 @@ def postprocess_receipt(
         else None
     )
     _fix_company_name_merchant(extracted, unified_text)
-    _fix_split_item_price_body_total_layout(extracted, unified_text)
+    _run_body_total_layout_reconstruction_phase(
+        extracted,
+        unified_text,
+        ("split_item_price_body_total",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "body_total_layout_reconstruction",
+        trace_snapshot,
+        extracted,
+    )
     _apply_financial_overrides(extracted, ocr_totals, ocr_conf, llm_conf)
     _run_cash_tender_reconciliation_phase(
         extracted,
@@ -15638,7 +15674,17 @@ def postprocess_receipt(
     _extract_fuel_usage(extracted, unified_text)
     if extracted.get("line_items"):
         _fix_single_item_qty_from_ocr(extracted, unified_text)
-    _fix_split_item_price_body_total_layout(extracted, unified_text)
+    _run_body_total_layout_reconstruction_phase(
+        extracted,
+        unified_text,
+        ("split_item_price_body_total",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "body_total_layout_reconstruction",
+        trace_snapshot,
+        extracted,
+    )
     _run_gap_item_recovery_phase(extracted, unified_text, ("discounted_gap",))
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
@@ -15900,7 +15946,17 @@ def postprocess_receipt(
         ("qty_totals_from_unit_lines",),
     )
     _fix_bag_item_prices_from_rate_bases(extracted, extract_rate_bases(unified_text), unified_text)
-    _fix_split_item_price_body_total_layout(extracted, unified_text)
+    _run_body_total_layout_reconstruction_phase(
+        extracted,
+        unified_text,
+        ("split_item_price_body_total",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "body_total_layout_reconstruction",
+        trace_snapshot,
+        extracted,
+    )
     _clean_code_prefixed_item_descriptions(extracted)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,

@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 74
+POSTPROCESS_REPAIR_CALL_LIMIT = 71
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -105,7 +105,6 @@ REPAIR_CALL_PREFIXES = (
 POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     # Temporary debt: the current stack re-runs item row cleanup after recovery
     # phases expose new candidate rows. Counts may shrink, but must not grow.
-    "_fix_split_item_price_body_total_layout": 3,
     "_restore_explicit_tax_rate_amount_lines": 3,
     "_restore_external_tax_total_from_printed_subtotal": 3,
     "_restore_single_rate_inclusive_tax_block": 3,
@@ -157,6 +156,13 @@ SERVICE_RECEIPT_RECOVERY_REPAIRS = {
 }
 SERVICE_RECEIPT_RECOVERY_PHASE_HELPER = "_run_service_receipt_recovery_phase"
 SERVICE_RECEIPT_RECOVERY_PHASE_CALL_LIMIT = 6
+BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS = {
+    "_fix_split_item_price_body_total_layout",
+}
+BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_HELPER = (
+    "_run_body_total_layout_reconstruction_phase"
+)
+BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_CALL_LIMIT = 3
 OCR_DESCRIPTION_RECONCILIATION_REPAIRS = {
     "_fix_bag_description_from_ocr_code_context",
     "_fix_code_table_descriptions_by_order",
@@ -992,6 +998,53 @@ def test_postprocess_service_receipt_recovery_debt_is_phase_owned():
         "Service receipt recovery phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {SERVICE_RECEIPT_RECOVERY_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_body_total_layout_reconstruction_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Body-total layout reconstruction repairs must be owned by the named "
+        f"{BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_HELPER} must document the "
+        "visible body-total layout trigger and item/tax arithmetic invariant."
+    )
+
+
+def test_postprocess_body_total_layout_reconstruction_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_layout_calls = [
+        name
+        for name in postprocess_calls
+        if name in BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_HELPER
+    ]
+
+    assert not direct_layout_calls, (
+        "Body-total layout reconstruction should run through the named phase "
+        "helper so split item rows, location, subtotal, and tax entries have "
+        "one layout/arithmetic owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_layout_calls}"
+    )
+    assert 0 < len(phase_calls) <= BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_CALL_LIMIT, (
+        "Body-total layout reconstruction phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_CALL_LIMIT}"
     )
 
 
