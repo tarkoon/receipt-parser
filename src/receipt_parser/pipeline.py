@@ -920,6 +920,25 @@ def _run_final_body_total_layout_reconstruction_phase(
             )
 
 
+def _run_final_stacked_name_price_projection_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: stacked description rows paired with nearby price rows.
+
+    Invariant: projected items may replace current rows only when OCR-derived
+    totals balance against the printed subtotal and, when present, rate bases.
+    """
+    for repair in repairs:
+        if repair == "stacked_name_price_rows":
+            _replace_stacked_name_price_rows_when_balanced(result, ocr_text)
+        else:
+            raise ValueError(
+                f"Unknown final stacked name/price projection repair: {repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -987,7 +1006,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "stacked_name_price_rows": (
         "structural_item_reconstruction",
-        "Retained late for stacked row projection pending phase migration.",
+        "Owned by the final stacked name/price projection helper until stacked row projection moves out of post-serialization repair.",
     ),
     "stacked_inclusive_tax_block": (
         "tax_category_assignment",
@@ -1191,7 +1210,14 @@ def _apply_final_receipt_output_repairs(
             ("split_item_price_body_total",),
         ),
     )
-    run("stacked_name_price_rows", lambda: _replace_stacked_name_price_rows_when_balanced(result, ocr_text))
+    run(
+        "stacked_name_price_rows",
+        lambda: _run_final_stacked_name_price_projection_phase(
+            result,
+            ocr_text,
+            ("stacked_name_price_rows",),
+        ),
+    )
     run("stacked_inclusive_tax_block", lambda: _restore_stacked_inclusive_tax_block(result, ocr_text))
     run("printed_summary_total_tax_balanced", lambda: _restore_printed_summary_total_when_tax_balanced(result, ocr_text))
     run("printed_item_sum_total", lambda: _prefer_printed_item_sum_total_when_balanced(result, ocr_text))
