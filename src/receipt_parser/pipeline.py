@@ -1025,6 +1025,26 @@ def _run_final_stacked_inclusive_tax_restoration_phase(
             )
 
 
+def _run_final_printed_item_sum_total_repair_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: visible printed item-sum or summary total rows.
+
+    Invariant: total/subtotal changes must be backed by printed item sums
+    and preserve item, tax, payment, and points arithmetic consistency.
+    """
+    for repair in repairs:
+        if repair == "printed_item_sum_total":
+            _prefer_printed_item_sum_total_when_balanced(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final printed item-sum total repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1104,7 +1124,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "printed_item_sum_total": (
         "financial_totals_repair",
-        "Retained late to prefer visible printed item-sum totals when balanced.",
+        "Owned by the final printed item-sum total helper until this printed total correction moves out of post-serialization repair.",
     ),
     "o_ring_descriptions": (
         "item_cleanup",
@@ -1362,7 +1382,14 @@ def _apply_final_receipt_output_repairs(
         ),
     )
     run("printed_summary_total_tax_balanced", lambda: _restore_printed_summary_total_when_tax_balanced(result, ocr_text))
-    run("printed_item_sum_total", lambda: _prefer_printed_item_sum_total_when_balanced(result, ocr_text))
+    run(
+        "printed_item_sum_total",
+        lambda: _run_final_printed_item_sum_total_repair_phase(
+            result,
+            ocr_text,
+            ("printed_item_sum_total",),
+        ),
+    )
     run("o_ring_descriptions", lambda: _fix_o_ring_descriptions_from_ocr(result, ocr_text))
     run("company_name_merchant", lambda: _fix_company_name_merchant(result, ocr_text))
     run("adjacent_ocr_price_shift", lambda: _fix_adjacent_ocr_price_shift_when_balanced(result, ocr_text))

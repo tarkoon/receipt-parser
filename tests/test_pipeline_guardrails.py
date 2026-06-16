@@ -193,6 +193,13 @@ FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_HELPER = (
     "_run_final_stacked_inclusive_tax_restoration_phase"
 )
 FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT = 1
+FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPERS = {
+    "_prefer_printed_item_sum_total_when_balanced",
+}
+FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPER = (
+    "_run_final_printed_item_sum_total_repair_phase"
+)
+FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_STAGE_LIMIT = 1
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -1457,6 +1464,59 @@ def test_final_stacked_inclusive_tax_restoration_debt_is_helper_owned():
         "and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT}"
+    )
+
+
+def test_final_printed_item_sum_total_repair_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPERS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late printed item-sum total repair must be owned by the named "
+        f"{FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPER} must document the "
+        "printed item-sum total trigger and item/tax/payment arithmetic "
+        "invariant."
+    )
+
+
+def test_final_printed_item_sum_total_repair_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_total_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPERS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPER
+    ]
+
+    assert not direct_total_calls, (
+        "Late printed item-sum total repair should run through the named "
+        "helper so printed total triggers and item/tax/payment arithmetic "
+        "invariants have one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_total_calls}"
+    )
+    assert (
+        0 < len(helper_calls) <= FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_STAGE_LIMIT
+    ), (
+        "Late printed item-sum total repair helper calls must be explicit "
+        "and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_STAGE_LIMIT}"
     )
 
 
