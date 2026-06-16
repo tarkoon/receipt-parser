@@ -4408,6 +4408,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "service_receipt_recovery",
         "initial_item_recovery",
         "item_cleanup",
+        "ocr_description_reconciliation",
         "quantity_detail_reconciliation",
         "tax_category_assignment",
         "payment_points_reconciliation",
@@ -4418,6 +4419,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "date" in phases["header_identity_repair"]["writes"]
     assert "line_items" in phases["initial_item_recovery"]["writes"]
     assert "line_items" in phases["item_cleanup"]["writes"]
+    assert "line_items" in phases["ocr_description_reconciliation"]["writes"]
     assert "line_items" in phases["service_receipt_recovery"]["writes"]
     assert "line_items" in phases["quantity_detail_reconciliation"]["writes"]
     assert "line_items" in phases["structural_item_reconstruction"]["writes"]
@@ -4431,6 +4433,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "line_items": {
             "initial_item_recovery",
             "item_cleanup",
+            "ocr_description_reconciliation",
             "quantity_detail_reconciliation",
             "service_receipt_recovery",
             "tax_category_assignment",

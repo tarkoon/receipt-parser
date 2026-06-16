@@ -14509,6 +14509,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Cleanup may remove or rename rows only when OCR evidence and row sums stay coherent.",
     },
     {
+        "name": "ocr_description_reconciliation",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Description reconciliation requires visible OCR code/name context and must preserve item counts, prices, and totals.",
+    },
+    {
         "name": "quantity_detail_reconciliation",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -14689,6 +14695,33 @@ def _run_service_receipt_recovery_phase(
             _fix_single_service_inclusive_tax(extracted, unified_text)
         else:
             raise ValueError(f"Unknown service receipt recovery repair: {repair}")
+
+
+def _run_ocr_description_reconciliation_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR code rows, duplicated names, O-ring text, or bag context.
+
+    Invariant: description changes require visible OCR support and must keep
+    item count, quantity, unit price, total, discount, and tax fields coherent.
+    """
+    for repair in repairs:
+        if repair == "qty_code_rows":
+            _fix_qty_code_row_descriptions_from_ocr(extracted, unified_text)
+        elif repair == "code_table_order":
+            _fix_code_table_descriptions_by_order(extracted, unified_text)
+        elif repair == "duplicate_descriptions":
+            _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
+        elif repair == "o_ring_descriptions":
+            _fix_o_ring_descriptions_from_ocr(extracted, unified_text)
+        elif repair == "colon_split_names":
+            _fix_colon_split_product_names_from_ocr(extracted, unified_text)
+        elif repair == "bag_code_context":
+            _fix_bag_description_from_ocr_code_context(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown OCR description reconciliation repair: {repair}")
 
 
 def _run_payment_points_reconciliation_phase(
@@ -14909,7 +14942,17 @@ def postprocess_receipt(
     _recover_missing_bag_items_from_ocr(extracted, unified_text)
     _replace_overage_item_with_low_value_bag(extracted, unified_text)
     _fix_numeric_desc_from_ocr_price_context(extracted, unified_text)
-    _fix_o_ring_descriptions_from_ocr(extracted, unified_text)
+    _run_ocr_description_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("o_ring_descriptions",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "ocr_description_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text)
     _recover_discounted_item_from_gap(extracted, unified_text)
     _recover_repeated_item_from_gap(extracted, unified_text)
@@ -14922,11 +14965,23 @@ def postprocess_receipt(
         unified_text,
         ("drop_duplicate_embedded_price",),
     )
-    _fix_qty_code_row_descriptions_from_ocr(extracted, unified_text)
-    _fix_code_table_descriptions_by_order(extracted, unified_text)
-    _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
+    _run_ocr_description_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("qty_code_rows", "code_table_order", "duplicate_descriptions"),
+    )
     _fix_digit_misread_items(extracted, unified_text)
-    _fix_o_ring_descriptions_from_ocr(extracted, unified_text)
+    _run_ocr_description_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("o_ring_descriptions",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "ocr_description_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_structural_item_projection_phase(
         extracted,
         unified_text,
@@ -14966,10 +15021,22 @@ def postprocess_receipt(
         unified_text,
         ("drop_duplicate_embedded_price",),
     )
-    _fix_qty_code_row_descriptions_from_ocr(extracted, unified_text)
-    _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
-    _fix_colon_split_product_names_from_ocr(extracted, unified_text)
-    _fix_bag_description_from_ocr_code_context(extracted, unified_text)
+    _run_ocr_description_reconciliation_phase(
+        extracted,
+        unified_text,
+        (
+            "qty_code_rows",
+            "duplicate_descriptions",
+            "colon_split_names",
+            "bag_code_context",
+        ),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "ocr_description_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_tax_category_assignment_phase(
         extracted,
         unified_text,
@@ -15029,8 +15096,17 @@ def postprocess_receipt(
     _recover_missing_bag_items_from_ocr(extracted, unified_text)
     _replace_overage_item_with_low_value_bag(extracted, unified_text)
     _fix_numeric_desc_from_ocr_price_context(extracted, unified_text)
-    _fix_o_ring_descriptions_from_ocr(extracted, unified_text)
-    _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
+    _run_ocr_description_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("o_ring_descriptions", "duplicate_descriptions"),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "ocr_description_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
@@ -15398,10 +15474,22 @@ def postprocess_receipt(
     )
     _replace_overage_item_with_low_value_bag(extracted, unified_text)
     _fix_numeric_desc_from_ocr_price_context(extracted, unified_text)
-    _fix_o_ring_descriptions_from_ocr(extracted, unified_text)
-    _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
-    _fix_colon_split_product_names_from_ocr(extracted, unified_text)
-    _fix_bag_description_from_ocr_code_context(extracted, unified_text)
+    _run_ocr_description_reconciliation_phase(
+        extracted,
+        unified_text,
+        (
+            "o_ring_descriptions",
+            "duplicate_descriptions",
+            "colon_split_names",
+            "bag_code_context",
+        ),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "ocr_description_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_tax_category_assignment_phase(
         extracted,
         unified_text,
@@ -15489,11 +15577,23 @@ def postprocess_receipt(
             unified_text,
             ("qty_context_and_reduced_rate",),
         )
-    _fix_o_ring_descriptions_from_ocr(extracted, unified_text)
-    _fix_code_table_descriptions_by_order(extracted, unified_text)
-    _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
-    _fix_colon_split_product_names_from_ocr(extracted, unified_text)
-    _fix_bag_description_from_ocr_code_context(extracted, unified_text)
+    _run_ocr_description_reconciliation_phase(
+        extracted,
+        unified_text,
+        (
+            "o_ring_descriptions",
+            "code_table_order",
+            "duplicate_descriptions",
+            "colon_split_names",
+            "bag_code_context",
+        ),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "ocr_description_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _fix_item_totals_from_following_discount_lines(extracted, unified_text)
     _apply_coupon_discount_blocks(extracted, unified_text)
     _drop_applied_coupon_line_items(extracted, unified_text)

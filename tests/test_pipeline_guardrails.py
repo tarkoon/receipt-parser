@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 120
+POSTPROCESS_REPAIR_CALL_LIMIT = 100
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -106,12 +106,8 @@ POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     # Temporary debt: the current stack re-runs item row cleanup after recovery
     # phases expose new candidate rows. Counts may shrink, but must not grow.
     "_fix_adjacent_ocr_price_shift_when_balanced": 4,
-    "_fix_bag_description_from_ocr_code_context": 3,
-    "_fix_colon_split_product_names_from_ocr": 3,
-    "_fix_duplicate_descriptions_from_ocr": 5,
     "_fix_name_bag_amount_shift_from_ocr": 3,
     "_fix_numeric_desc_from_ocr_price_context": 3,
-    "_fix_o_ring_descriptions_from_ocr": 5,
     "_fix_split_item_price_body_total_layout": 3,
     "_recover_discounted_item_from_gap": 3,
     "_recover_missing_bag_items_from_ocr": 3,
@@ -168,6 +164,16 @@ SERVICE_RECEIPT_RECOVERY_REPAIRS = {
 }
 SERVICE_RECEIPT_RECOVERY_PHASE_HELPER = "_run_service_receipt_recovery_phase"
 SERVICE_RECEIPT_RECOVERY_PHASE_CALL_LIMIT = 6
+OCR_DESCRIPTION_RECONCILIATION_REPAIRS = {
+    "_fix_bag_description_from_ocr_code_context",
+    "_fix_code_table_descriptions_by_order",
+    "_fix_colon_split_product_names_from_ocr",
+    "_fix_duplicate_descriptions_from_ocr",
+    "_fix_o_ring_descriptions_from_ocr",
+    "_fix_qty_code_row_descriptions_from_ocr",
+}
+OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER = "_run_ocr_description_reconciliation_phase"
+OCR_DESCRIPTION_RECONCILIATION_PHASE_CALL_LIMIT = 7
 LINE_ITEM_CLEANUP_REPAIRS = {
     "_drop_duplicate_with_embedded_price",
     "_drop_non_product_line_items",
@@ -968,6 +974,51 @@ def test_postprocess_service_receipt_recovery_debt_is_phase_owned():
         "Service receipt recovery phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {SERVICE_RECEIPT_RECOVERY_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_ocr_description_reconciliation_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        OCR_DESCRIPTION_RECONCILIATION_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "OCR description reconciliation repairs must be owned by the named "
+        f"{OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER} must document the OCR "
+        "description-context trigger and item field-consistency invariant."
+    )
+
+
+def test_postprocess_ocr_description_reconciliation_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_description_calls = [
+        name for name in postprocess_calls if name in OCR_DESCRIPTION_RECONCILIATION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER
+    ]
+
+    assert not direct_description_calls, (
+        "OCR description reconciliation repairs should run through the named "
+        "phase helper so code-row, duplicate, O-ring, colon-split, and bag "
+        "description invariants have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_description_calls}"
+    )
+    assert 0 < len(phase_calls) <= OCR_DESCRIPTION_RECONCILIATION_PHASE_CALL_LIMIT, (
+        "OCR description reconciliation phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {OCR_DESCRIPTION_RECONCILIATION_PHASE_CALL_LIMIT}"
     )
 
 
