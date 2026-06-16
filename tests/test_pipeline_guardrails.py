@@ -133,6 +133,13 @@ FINAL_ITEM_PRICE_QTY_PROJECTION_HELPER = (
     "_run_final_item_price_qty_projection_phase"
 )
 FINAL_ITEM_PRICE_QTY_PROJECTION_STAGE_LIMIT = 1
+FINAL_SPLIT_PRICE_BLOCK_PROJECTION_REPAIRS = {
+    "_replace_split_price_block_when_balanced",
+}
+FINAL_SPLIT_PRICE_BLOCK_PROJECTION_HELPER = (
+    "_run_final_split_price_block_projection_phase"
+)
+FINAL_SPLIT_PRICE_BLOCK_PROJECTION_STAGE_LIMIT = 1
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -961,6 +968,56 @@ def test_final_item_price_qty_projection_debt_is_helper_owned():
         "and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_ITEM_PRICE_QTY_PROJECTION_STAGE_LIMIT}"
+    )
+
+
+def test_final_split_price_block_projection_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_SPLIT_PRICE_BLOCK_PROJECTION_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_SPLIT_PRICE_BLOCK_PROJECTION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late split price block projection must be owned by the named "
+        f"{FINAL_SPLIT_PRICE_BLOCK_PROJECTION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_SPLIT_PRICE_BLOCK_PROJECTION_HELPER} must document the "
+        "split description/price OCR trigger and subtotal invariant."
+    )
+
+
+def test_final_split_price_block_projection_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_projection_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_SPLIT_PRICE_BLOCK_PROJECTION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_SPLIT_PRICE_BLOCK_PROJECTION_HELPER
+    ]
+
+    assert not direct_projection_calls, (
+        "Late split price block projection should run through the named "
+        "helper so OCR layout triggers and subtotal invariants have one "
+        "owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_projection_calls}"
+    )
+    assert 0 < len(helper_calls) <= FINAL_SPLIT_PRICE_BLOCK_PROJECTION_STAGE_LIMIT, (
+        "Late split price block projection helper calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_SPLIT_PRICE_BLOCK_PROJECTION_STAGE_LIMIT}"
     )
 
 

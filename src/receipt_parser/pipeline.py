@@ -882,6 +882,25 @@ def _run_final_item_price_qty_projection_phase(
             )
 
 
+def _run_final_split_price_block_projection_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: split description block paired with separated price rows.
+
+    Invariant: projected items may replace current rows only when OCR-derived
+    prices balance with the printed subtotal or later total target.
+    """
+    for repair in repairs:
+        if repair == "split_price_block":
+            _replace_split_price_block_when_balanced(result, ocr_text)
+        else:
+            raise ValueError(
+                f"Unknown final split price block projection repair: {repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -941,7 +960,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "split_price_block": (
         "structural_item_reconstruction",
-        "Retained late for split price blocks pending full postprocess ownership.",
+        "Owned by the final split price block projection helper until split price blocks move out of post-serialization repair.",
     ),
     "split_item_price_body_total": (
         "structural_item_reconstruction",
@@ -1137,7 +1156,14 @@ def _apply_final_receipt_output_repairs(
     run("coupon_discount_blocks", lambda: _apply_coupon_discount_blocks(result, ocr_text))
     run("drop_applied_coupon_line_items", lambda: _drop_applied_coupon_line_items(result, ocr_text))
     run("tiny_item_prices_from_following_ocr", lambda: _repair_tiny_item_prices_from_following_ocr(result, ocr_text))
-    run("split_price_block", lambda: _replace_split_price_block_when_balanced(result, ocr_text))
+    run(
+        "split_price_block",
+        lambda: _run_final_split_price_block_projection_phase(
+            result,
+            ocr_text,
+            ("split_price_block",),
+        ),
+    )
     run("split_item_price_body_total", lambda: _fix_split_item_price_body_total_layout(result, ocr_text))
     run("stacked_name_price_rows", lambda: _replace_stacked_name_price_rows_when_balanced(result, ocr_text))
     run("stacked_inclusive_tax_block", lambda: _restore_stacked_inclusive_tax_block(result, ocr_text))
