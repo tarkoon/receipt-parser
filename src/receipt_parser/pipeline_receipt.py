@@ -14491,6 +14491,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Cash tender/change repairs require visible printed total, tendered amount, and change arithmetic.",
     },
     {
+        "name": "service_receipt_recovery",
+        "reads": ("line_items", "subtotal", "total", "taxes", "payment_method", "ocr_text"),
+        "writes": ("line_items", "taxes", "subtotal", "payment_method"),
+        "invariant": "Service receipt recovery requires visible service/table or bare-receipt OCR layout and item/tax arithmetic consistency.",
+    },
+    {
         "name": "initial_item_recovery",
         "reads": ("line_items", "subtotal", "total", "ocr_text", "ocr_layout_blocks"),
         "writes": ("line_items",),
@@ -14664,6 +14670,27 @@ def _run_cash_tender_reconciliation_phase(
             raise ValueError(f"Unknown cash tender reconciliation repair: {repair}")
 
 
+def _run_service_receipt_recovery_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR service tables, bare receipt layouts, or single service rows.
+
+    Invariant: service item recovery/removal and inclusive-tax reconstruction
+    must preserve visible row layout, printed total evidence, and tax arithmetic.
+    """
+    for repair in repairs:
+        if repair == "bare_service_without_itemization":
+            _fix_bare_service_receipt_without_itemization(extracted, unified_text)
+        elif repair == "service_table_items":
+            _replace_service_table_items_when_balanced(extracted, unified_text)
+        elif repair == "single_service_inclusive_tax":
+            _fix_single_service_inclusive_tax(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown service receipt recovery repair: {repair}")
+
+
 def _run_payment_points_reconciliation_phase(
     extracted: dict,
     unified_text: str,
@@ -14834,10 +14861,20 @@ def postprocess_receipt(
     )
     _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
     _fix_toll_payment_reference(extracted, unified_text)
-    _fix_bare_service_receipt_without_itemization(extracted, unified_text)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
         "financial_totals_repair",
+        trace_snapshot,
+        extracted,
+    )
+    _run_service_receipt_recovery_phase(
+        extracted,
+        unified_text,
+        ("bare_service_without_itemization",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "service_receipt_recovery",
         trace_snapshot,
         extracted,
     )
@@ -14852,10 +14889,20 @@ def postprocess_receipt(
     _fix_items_from_subtotal(extracted, unified_text, ocr_totals)
     _recover_missing_items_from_gap(extracted, unified_text)
     _replace_prefixed_tax_marker_item_rows_when_balanced(extracted, unified_text)
-    _fix_bare_service_receipt_without_itemization(extracted, unified_text)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
         "initial_item_recovery",
+        trace_snapshot,
+        extracted,
+    )
+    _run_service_receipt_recovery_phase(
+        extracted,
+        unified_text,
+        ("bare_service_without_itemization",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "service_receipt_recovery",
         trace_snapshot,
         extracted,
     )
@@ -14993,7 +15040,23 @@ def postprocess_receipt(
             "drop_numeric_marker_description_rows",
         ),
     )
-    _replace_service_table_items_when_balanced(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
+    )
+    _run_service_receipt_recovery_phase(
+        extracted,
+        unified_text,
+        ("service_table_items",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "service_receipt_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
@@ -15033,8 +15096,24 @@ def postprocess_receipt(
             ),
             rate_bases=rate_bases,
         )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "tax_category_assignment",
+        trace_snapshot,
+        extracted,
+    )
 
-    _fix_single_service_inclusive_tax(extracted, unified_text)
+    _run_service_receipt_recovery_phase(
+        extracted,
+        unified_text,
+        ("single_service_inclusive_tax",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "service_receipt_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _fix_printed_tax_amounts_from_structural_blocks(extracted, unified_text)
     _restore_tax_excluded_per_rate_blocks(extracted, unified_text)
     _restore_single_rate_inclusive_tax_block(extracted, unified_text)
@@ -15334,7 +15413,11 @@ def postprocess_receipt(
         unified_text,
         ("drop_non_product_line_items",),
     )
-    _replace_service_table_items_when_balanced(extracted, unified_text)
+    _run_service_receipt_recovery_phase(
+        extracted,
+        unified_text,
+        ("service_table_items",),
+    )
     _append_missing_low_value_bag_from_gap(extracted, unified_text)
     _recover_missing_bag_items_from_ocr(extracted, unified_text)
     _run_tax_category_assignment_phase(
@@ -15447,7 +15530,11 @@ def postprocess_receipt(
         ("following_qty_detail",),
     )
     _replace_campaign_discount_stream_when_balanced(extracted, unified_text)
-    _fix_bare_service_receipt_without_itemization(extracted, unified_text)
+    _run_service_receipt_recovery_phase(
+        extracted,
+        unified_text,
+        ("bare_service_without_itemization",),
+    )
     _run_quantity_detail_reconciliation_phase(
         extracted,
         unified_text,

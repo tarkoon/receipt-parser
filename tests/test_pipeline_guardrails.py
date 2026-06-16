@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 126
+POSTPROCESS_REPAIR_CALL_LIMIT = 120
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -107,7 +107,6 @@ POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     # phases expose new candidate rows. Counts may shrink, but must not grow.
     "_fix_adjacent_ocr_price_shift_when_balanced": 4,
     "_fix_bag_description_from_ocr_code_context": 3,
-    "_fix_bare_service_receipt_without_itemization": 3,
     "_fix_colon_split_product_names_from_ocr": 3,
     "_fix_duplicate_descriptions_from_ocr": 5,
     "_fix_name_bag_amount_shift_from_ocr": 3,
@@ -162,6 +161,13 @@ PAYMENT_POINTS_RECONCILIATION_REPAIRS = {
 }
 PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER = "_run_payment_points_reconciliation_phase"
 PAYMENT_POINTS_RECONCILIATION_PHASE_CALL_LIMIT = 2
+SERVICE_RECEIPT_RECOVERY_REPAIRS = {
+    "_fix_bare_service_receipt_without_itemization",
+    "_fix_single_service_inclusive_tax",
+    "_replace_service_table_items_when_balanced",
+}
+SERVICE_RECEIPT_RECOVERY_PHASE_HELPER = "_run_service_receipt_recovery_phase"
+SERVICE_RECEIPT_RECOVERY_PHASE_CALL_LIMIT = 6
 LINE_ITEM_CLEANUP_REPAIRS = {
     "_drop_duplicate_with_embedded_price",
     "_drop_non_product_line_items",
@@ -917,6 +923,51 @@ def test_postprocess_payment_points_reconciliation_debt_is_phase_owned():
         "Payment/points reconciliation phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {PAYMENT_POINTS_RECONCILIATION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_service_receipt_recovery_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, SERVICE_RECEIPT_RECOVERY_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        SERVICE_RECEIPT_RECOVERY_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Service receipt recovery repairs must be owned by the named "
+        f"{SERVICE_RECEIPT_RECOVERY_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{SERVICE_RECEIPT_RECOVERY_PHASE_HELPER} must document the OCR "
+        "service-layout trigger and item/total/tax consistency invariant."
+    )
+
+
+def test_postprocess_service_receipt_recovery_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_service_calls = [
+        name for name in postprocess_calls if name in SERVICE_RECEIPT_RECOVERY_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == SERVICE_RECEIPT_RECOVERY_PHASE_HELPER
+    ]
+
+    assert not direct_service_calls, (
+        "Service receipt recovery repairs should run through the named phase "
+        "helper so service-table layout, bare-service suppression, and "
+        "single-service tax invariants have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_service_calls}"
+    )
+    assert 0 < len(phase_calls) <= SERVICE_RECEIPT_RECOVERY_PHASE_CALL_LIMIT, (
+        "Service receipt recovery phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {SERVICE_RECEIPT_RECOVERY_PHASE_CALL_LIMIT}"
     )
 
 
