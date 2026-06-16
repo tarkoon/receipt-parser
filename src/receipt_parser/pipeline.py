@@ -1108,6 +1108,26 @@ def _run_final_payment_points_reconciliation_phase(
             )
 
 
+def _run_final_tax_category_reconciliation_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: printed per-rate base rows after final item repairs.
+
+    Invariant: tax_category changes must preserve per-item totals and align
+    item categories with the printed rate-base arithmetic.
+    """
+    for repair in repairs:
+        if repair == "tax_categories_from_rate_bases":
+            reconcile_tax_categories_from_rate_bases(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final tax category reconciliation repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1309,7 +1329,8 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "tax_categories_from_rate_bases": (
         "tax_category_assignment",
-        "Late-only tax category reconciliation from final rate bases.",
+        "Owned by the final tax category reconciliation helper until rate-base "
+        "category repair moves out of post-serialization repair.",
     ),
     "external_tax_total_from_printed_subtotal_final": (
         "financial_totals_repair",
@@ -1554,7 +1575,14 @@ def _apply_final_receipt_output_repairs(
     run("pre_price_stack_descriptions", lambda: _repair_pre_price_stack_descriptions_from_ocr(result, ocr_text))
     run("drop_duplicate_rows_when_subtotal_balances", lambda: _drop_duplicate_rows_when_subtotal_balances(result, ocr_text))
     run("basket_marker_rows", lambda: _replace_basket_marker_rows_when_balanced(result, ocr_text))
-    run("tax_categories_from_rate_bases", lambda: reconcile_tax_categories_from_rate_bases(result, ocr_text))
+    run(
+        "tax_categories_from_rate_bases",
+        lambda: _run_final_tax_category_reconciliation_phase(
+            result,
+            ocr_text,
+            ("tax_categories_from_rate_bases",),
+        ),
+    )
     run("external_tax_total_from_printed_subtotal_final", lambda: _restore_external_tax_total_from_printed_subtotal(result, ocr_text))
 
 
