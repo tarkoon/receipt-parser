@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 152
+POSTPROCESS_REPAIR_CALL_LIMIT = 132
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -114,9 +114,6 @@ POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     "_fix_numeric_desc_from_ocr_price_context": 3,
     "_fix_o_ring_descriptions_from_ocr": 5,
     "_fix_split_item_price_body_total_layout": 3,
-    "_fix_tax_categories_from_ocr_markers": 4,
-    "_fix_tax_categories_from_price_line_markers": 4,
-    "_rebalance_tax_categories_to_rate_bases": 3,
     "_recover_discounted_item_from_gap": 3,
     "_recover_missing_bag_items_from_ocr": 3,
     "_recover_repeated_item_from_gap": 3,
@@ -125,7 +122,6 @@ POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     "_restore_external_tax_total_from_printed_subtotal": 3,
     "_restore_single_rate_inclusive_tax_block": 3,
     "_restore_tax_excluded_per_rate_blocks": 3,
-    "_apply_single_bag_standard_rate_split": 4,
 }
 STRUCTURAL_ITEM_PROJECTION_REPAIRS = {
     "_replace_barcode_qty_price_rows_when_balanced",
@@ -142,6 +138,18 @@ QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
 }
 QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER = "_run_quantity_detail_reconciliation_phase"
 QUANTITY_DETAIL_RECONCILIATION_PHASE_CALL_LIMIT = 10
+TAX_CATEGORY_ASSIGNMENT_REPAIRS = {
+    "_apply_single_bag_standard_rate_split",
+    "_assign_single_standard_rate_from_small_base",
+    "_fix_nonfood_packaging_tax_categories",
+    "_fix_tax_categories_from_ocr_markers",
+    "_fix_tax_categories_from_price_line_markers",
+    "_rebalance_standard_categories_from_reduced_rate_markers",
+    "_rebalance_tax_categories_to_rate_bases",
+    "assign_tax_categories",
+}
+TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER = "_run_tax_category_assignment_phase"
+TAX_CATEGORY_ASSIGNMENT_PHASE_CALL_LIMIT = 6
 LINE_ITEM_CLEANUP_REPAIRS = {
     "_drop_duplicate_with_embedded_price",
     "_drop_non_product_line_items",
@@ -764,6 +772,49 @@ def test_postprocess_quantity_detail_reconciliation_debt_is_phase_owned():
         "Quantity detail reconciliation phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {QUANTITY_DETAIL_RECONCILIATION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_tax_category_assignment_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        TAX_CATEGORY_ASSIGNMENT_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Tax category assignment and rate-base rebalance repairs must be owned "
+        f"by the named {TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER} must document the OCR "
+        "rate-marker trigger and tax/line-item consistency invariant."
+    )
+
+
+def test_postprocess_tax_category_assignment_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_tax_calls = [
+        name for name in postprocess_calls if name in TAX_CATEGORY_ASSIGNMENT_REPAIRS
+    ]
+    phase_calls = [
+        name for name in postprocess_calls if name == TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER
+    ]
+
+    assert not direct_tax_calls, (
+        "Tax category assignment repairs should run through the named phase "
+        "helper so OCR rate markers, rate bases, and item/tax invariants have "
+        "one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
+    )
+    assert 0 < len(phase_calls) <= TAX_CATEGORY_ASSIGNMENT_PHASE_CALL_LIMIT, (
+        "Tax category assignment phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {TAX_CATEGORY_ASSIGNMENT_PHASE_CALL_LIMIT}"
     )
 
 

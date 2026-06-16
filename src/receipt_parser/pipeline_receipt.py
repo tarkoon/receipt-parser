@@ -14639,6 +14639,75 @@ def _run_quantity_detail_reconciliation_phase(
             raise ValueError(f"Unknown quantity detail reconciliation repair: {repair}")
 
 
+def _tax_assignment_rate_bases(unified_text: str, ocr_totals: dict | None) -> dict:
+    rate_bases = extract_rate_bases(unified_text)
+    for rate, base in ((ocr_totals or {}).get('_breakdown_rate_bases') or {}).items():
+        if rate not in rate_bases or rate_bases[rate] is None:
+            rate_bases[rate] = base
+    return rate_bases
+
+
+def _run_tax_category_assignment_phase(
+    extracted: dict,
+    unified_text: str,
+    ocr_totals: dict | None,
+    repairs: tuple[str, ...],
+    rate_bases: dict | None = None,
+) -> dict:
+    """Trigger: OCR rate markers, rate-base summaries, or price-line flags.
+
+    Invariant: item tax categories must remain consistent with visible rate
+    markers, printed rate bases, extracted tax entries, and single-bag splits.
+    """
+    items = extracted.get("line_items") or []
+    merged_rate_bases = rate_bases if rate_bases is not None else _tax_assignment_rate_bases(
+        unified_text,
+        ocr_totals,
+    )
+    for repair in repairs:
+        if repair == "assign_tax_categories":
+            if items:
+                assign_tax_categories(
+                    items,
+                    unified_text,
+                    ocr_totals or {},
+                    merged_rate_bases,
+                    extracted_taxes=extracted.get("taxes"),
+                )
+        elif repair == "ocr_markers":
+            if items:
+                _fix_tax_categories_from_ocr_markers(items, unified_text)
+        elif repair == "price_line_markers":
+            _fix_tax_categories_from_price_line_markers(extracted, unified_text)
+        elif repair == "single_bag_standard_split":
+            if items:
+                _apply_single_bag_standard_rate_split(items, merged_rate_bases)
+        elif repair == "rebalance_rate_bases":
+            if items:
+                _rebalance_tax_categories_to_rate_bases(
+                    items,
+                    unified_text,
+                    extracted.get("taxes"),
+                    merged_rate_bases,
+                )
+        elif repair == "rebalance_standard_from_reduced_markers":
+            if items:
+                _rebalance_standard_categories_from_reduced_rate_markers(
+                    items,
+                    unified_text,
+                    merged_rate_bases,
+                )
+        elif repair == "nonfood_packaging":
+            if items:
+                _fix_nonfood_packaging_tax_categories(items, unified_text, merged_rate_bases)
+        elif repair == "single_standard_from_small_base":
+            if items:
+                _assign_single_standard_rate_from_small_base(items, merged_rate_bases)
+        else:
+            raise ValueError(f"Unknown tax category assignment repair: {repair}")
+    return merged_rate_bases
+
+
 def _run_line_item_cleanup_phase(
     extracted: dict,
     unified_text: str,
@@ -14785,7 +14854,12 @@ def postprocess_receipt(
     _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
     _fix_colon_split_product_names_from_ocr(extracted, unified_text)
     _fix_bag_description_from_ocr_code_context(extracted, unified_text)
-    _fix_tax_categories_from_price_line_markers(extracted, unified_text)
+    _run_tax_category_assignment_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("price_line_markers",),
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
@@ -14870,27 +14944,26 @@ def postprocess_receipt(
 
     # Tax categories
     if extracted.get("line_items"):
-        rate_bases = extract_rate_bases(unified_text)
-        breakdown_bases = ocr_totals.get('_breakdown_rate_bases', {})
-        for rate, base in breakdown_bases.items():
-            if rate not in rate_bases or rate_bases[rate] is None:
-                rate_bases[rate] = base
+        rate_bases = _tax_assignment_rate_bases(unified_text, ocr_totals)
         _fix_bag_item_prices_from_rate_bases(extracted, rate_bases, unified_text)
-        assign_tax_categories(extracted["line_items"], unified_text, ocr_totals, rate_bases,
-                              extracted_taxes=extracted.get("taxes"))
-        _fix_tax_categories_from_ocr_markers(extracted["line_items"], unified_text)
-        _fix_tax_categories_from_price_line_markers(extracted, unified_text)
-        _apply_single_bag_standard_rate_split(extracted["line_items"], rate_bases)
-        _rebalance_tax_categories_to_rate_bases(
-            extracted["line_items"], unified_text, extracted.get("taxes"), rate_bases
+        _run_tax_category_assignment_phase(
+            extracted,
+            unified_text,
+            ocr_totals,
+            (
+                "assign_tax_categories",
+                "ocr_markers",
+                "price_line_markers",
+                "single_bag_standard_split",
+                "rebalance_rate_bases",
+                "rebalance_standard_from_reduced_markers",
+                "nonfood_packaging",
+                "ocr_markers",
+                "single_bag_standard_split",
+                "single_standard_from_small_base",
+            ),
+            rate_bases=rate_bases,
         )
-        _rebalance_standard_categories_from_reduced_rate_markers(
-            extracted["line_items"], unified_text, rate_bases
-        )
-        _fix_nonfood_packaging_tax_categories(extracted["line_items"], unified_text, rate_bases)
-        _fix_tax_categories_from_ocr_markers(extracted["line_items"], unified_text)
-        _apply_single_bag_standard_rate_split(extracted["line_items"], rate_bases)
-        _assign_single_standard_rate_from_small_base(extracted["line_items"], rate_bases)
 
     _fix_single_service_inclusive_tax(extracted, unified_text)
     _fix_printed_tax_amounts_from_structural_blocks(extracted, unified_text)
@@ -15188,7 +15261,12 @@ def postprocess_receipt(
     _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
     _fix_colon_split_product_names_from_ocr(extracted, unified_text)
     _fix_bag_description_from_ocr_code_context(extracted, unified_text)
-    _fix_tax_categories_from_price_line_markers(extracted, unified_text)
+    _run_tax_category_assignment_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("price_line_markers",),
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
@@ -15197,12 +15275,12 @@ def postprocess_receipt(
     _replace_service_table_items_when_balanced(extracted, unified_text)
     _append_missing_low_value_bag_from_gap(extracted, unified_text)
     _recover_missing_bag_items_from_ocr(extracted, unified_text)
-    if extracted.get("line_items"):
-        late_rate_bases = extract_rate_bases(unified_text)
-        for rate, base in (ocr_totals.get('_breakdown_rate_bases') or {}).items():
-            if rate not in late_rate_bases or late_rate_bases[rate] is None:
-                late_rate_bases[rate] = base
-        _assign_single_standard_rate_from_small_base(extracted["line_items"], late_rate_bases)
+    _run_tax_category_assignment_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("single_standard_from_small_base",),
+    )
     _normalize_taxes(extracted, unified_text, ocr_totals)
     _restore_explicit_tax_rate_amount_lines(extracted, unified_text)
     _restore_tax_excluded_per_rate_blocks(extracted, unified_text)
@@ -15214,8 +15292,13 @@ def postprocess_receipt(
         if computed_sub >= 0:
             extracted["subtotal"] = computed_sub
     _append_missing_low_value_bag_from_gap(extracted, unified_text)
-    if extracted.get("line_items"):
-        _apply_single_bag_standard_rate_split(extracted["line_items"], extract_rate_bases(unified_text))
+    _run_tax_category_assignment_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("single_bag_standard_split",),
+        rate_bases=extract_rate_bases(unified_text),
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
@@ -15240,19 +15323,21 @@ def postprocess_receipt(
     )
     if extracted.get("line_items"):
         final_rate_bases = extract_rate_bases(unified_text)
-        _fix_tax_categories_from_ocr_markers(extracted["line_items"], unified_text)
-        _rebalance_tax_categories_to_rate_bases(
-            extracted["line_items"], unified_text, extracted.get("taxes"), final_rate_bases
-        )
-        _rebalance_standard_categories_from_reduced_rate_markers(
-            extracted["line_items"], unified_text, final_rate_bases
-        )
-        _fix_nonfood_packaging_tax_categories(extracted["line_items"], unified_text, final_rate_bases)
-        _apply_single_bag_standard_rate_split(extracted["line_items"], final_rate_bases)
-        _fix_tax_categories_from_price_line_markers(extracted, unified_text)
-        _fix_tax_categories_from_ocr_markers(extracted["line_items"], unified_text)
-        _rebalance_tax_categories_to_rate_bases(
-            extracted["line_items"], unified_text, extracted.get("taxes"), final_rate_bases
+        _run_tax_category_assignment_phase(
+            extracted,
+            unified_text,
+            ocr_totals,
+            (
+                "ocr_markers",
+                "rebalance_rate_bases",
+                "rebalance_standard_from_reduced_markers",
+                "nonfood_packaging",
+                "single_bag_standard_split",
+                "price_line_markers",
+                "ocr_markers",
+                "rebalance_rate_bases",
+            ),
+            rate_bases=final_rate_bases,
         )
         _run_quantity_detail_reconciliation_phase(
             extracted,
