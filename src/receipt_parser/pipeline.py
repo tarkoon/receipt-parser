@@ -844,6 +844,25 @@ def _run_final_structural_item_projection_phase(
             )
 
 
+def _run_final_barcode_qty_price_projection_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: visible barcode/JAN rows followed by quantity-price rows.
+
+    Invariant: projected items may replace collapsed duplicates only when the
+    OCR-derived item sum remains consistent with the printed receipt total.
+    """
+    for repair in repairs:
+        if repair == "barcode_qty_price_rows":
+            _replace_barcode_qty_price_rows_when_balanced(result, ocr_text)
+        else:
+            raise ValueError(
+                f"Unknown final barcode quantity-price projection repair: {repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -851,7 +870,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "barcode_qty_price_rows": (
         "structural_item_reconstruction",
-        "Retained late for row projection consistency after schema serialization.",
+        "Owned by the final barcode quantity-price projection helper until barcode row projection moves out of post-serialization repair.",
     ),
     "item_price_qty_rows": (
         "structural_item_reconstruction",
@@ -1074,7 +1093,11 @@ def _apply_final_receipt_output_repairs(
     )
     run(
         "barcode_qty_price_rows",
-        lambda: _replace_barcode_qty_price_rows_when_balanced(result, ocr_text),
+        lambda: _run_final_barcode_qty_price_projection_phase(
+            result,
+            ocr_text,
+            ("barcode_qty_price_rows",),
+        ),
     )
     run(
         "item_price_qty_rows",

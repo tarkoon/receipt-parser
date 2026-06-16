@@ -119,6 +119,13 @@ FINAL_STRUCTURAL_ITEM_PROJECTION_HELPER = (
     "_run_final_structural_item_projection_phase"
 )
 FINAL_STRUCTURAL_ITEM_PROJECTION_STAGE_LIMIT = 1
+FINAL_BARCODE_QTY_PRICE_PROJECTION_REPAIRS = {
+    "_replace_barcode_qty_price_rows_when_balanced",
+}
+FINAL_BARCODE_QTY_PRICE_PROJECTION_HELPER = (
+    "_run_final_barcode_qty_price_projection_phase"
+)
+FINAL_BARCODE_QTY_PRICE_PROJECTION_STAGE_LIMIT = 1
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -845,6 +852,58 @@ def test_final_structural_item_projection_debt_is_helper_owned():
         "explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_STRUCTURAL_ITEM_PROJECTION_STAGE_LIMIT}"
+    )
+
+
+def test_final_barcode_qty_price_projection_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_BARCODE_QTY_PRICE_PROJECTION_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_BARCODE_QTY_PRICE_PROJECTION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late barcode quantity/price row projection must be owned by the "
+        f"named {FINAL_BARCODE_QTY_PRICE_PROJECTION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_BARCODE_QTY_PRICE_PROJECTION_HELPER} must document the "
+        "barcode/JAN quantity-price row trigger and arithmetic invariant."
+    )
+
+
+def test_final_barcode_qty_price_projection_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_projection_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_BARCODE_QTY_PRICE_PROJECTION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_BARCODE_QTY_PRICE_PROJECTION_HELPER
+    ]
+
+    assert not direct_projection_calls, (
+        "Late barcode quantity/price row projection should run through the "
+        "named helper so OCR row-stack triggers and item-sum invariants have "
+        "one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_projection_calls}"
+    )
+    assert (
+        0 < len(helper_calls) <= FINAL_BARCODE_QTY_PRICE_PROJECTION_STAGE_LIMIT
+    ), (
+        "Late barcode quantity/price projection helper calls must be explicit "
+        "and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_BARCODE_QTY_PRICE_PROJECTION_STAGE_LIMIT}"
     )
 
 
