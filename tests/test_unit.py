@@ -4417,6 +4417,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "quantity_detail_reconciliation",
         "single_rate_inclusive_tax_restoration",
         "tax_excluded_rate_block_restoration",
+        "explicit_tax_amount_restoration",
         "tax_category_assignment",
         "payment_points_reconciliation",
         "structural_item_reconstruction",
@@ -4440,6 +4441,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "subtotal" in phases["single_rate_inclusive_tax_restoration"]["writes"]
     assert "taxes" in phases["single_rate_inclusive_tax_restoration"]["writes"]
     assert "taxes" in phases["tax_excluded_rate_block_restoration"]["writes"]
+    assert "taxes" in phases["explicit_tax_amount_restoration"]["writes"]
     assert "line_items" in phases["structural_item_reconstruction"]["writes"]
     assert "taxes" in phases["tax_category_assignment"]["writes"]
     assert "amount_paid" in phases["cash_tender_reconciliation"]["writes"]
@@ -4469,6 +4471,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "service_receipt_recovery",
             "single_rate_inclusive_tax_restoration",
             "tax_excluded_rate_block_restoration",
+            "explicit_tax_amount_restoration",
             "tax_category_assignment",
             "structural_item_reconstruction",
             "final_consistency_pass",

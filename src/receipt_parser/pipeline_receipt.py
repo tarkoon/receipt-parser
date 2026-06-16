@@ -14563,6 +14563,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Tax-excluded rate-block restoration requires visible paired 小計(税抜N%) and 消費税等(N%) rows with rate-consistent tax entries.",
     },
     {
+        "name": "explicit_tax_amount_restoration",
+        "reads": ("line_items", "taxes", "ocr_text"),
+        "writes": ("taxes",),
+        "invariant": "Explicit tax amount restoration requires visible 税率N%税額 rows and tax amounts bounded by item/tax-rate arithmetic.",
+    },
+    {
         "name": "tax_category_assignment",
         "reads": ("line_items", "taxes", "subtotal", "total", "ocr_totals", "ocr_text"),
         "writes": ("line_items", "taxes"),
@@ -14940,6 +14946,26 @@ def _run_tax_excluded_rate_block_restoration_phase(
         else:
             raise ValueError(
                 f"Unknown tax-excluded rate block restoration repair: {repair}"
+            )
+
+
+def _run_explicit_tax_amount_restoration_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: visible 税率N%税額 rows followed by yen amount candidates.
+
+    Invariant: restored external-tax entries must be bounded by item totals
+    and the printed rate arithmetic, and must match visible item categories
+    when categories are already assigned.
+    """
+    for repair in repairs:
+        if repair == "explicit_tax_rate_amount_lines":
+            _restore_explicit_tax_rate_amount_lines(extracted, unified_text)
+        else:
+            raise ValueError(
+                f"Unknown explicit tax amount restoration repair: {repair}"
             )
 
 
@@ -15631,6 +15657,12 @@ def postprocess_receipt(
         llm_conf,
         ("points_used", "points_payment"),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "payment_points_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
 
     # Fix pre-tax item totals for inclusive-tax receipts
     if extracted.get("line_items") and extracted.get("total"):
@@ -15650,7 +15682,17 @@ def postprocess_receipt(
                 if item.get("unit_price") and abs(item["unit_price"] - item_sum) < 1:
                     item["unit_price"] = receipt_total
     _normalize_taxes(extracted, unified_text, ocr_totals)
-    _restore_explicit_tax_rate_amount_lines(extracted, unified_text)
+    _run_explicit_tax_amount_restoration_phase(
+        extracted,
+        unified_text,
+        ("explicit_tax_rate_amount_lines",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "explicit_tax_amount_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _restore_printed_summary_total_when_tax_balanced(extracted, unified_text)
     _prefer_printed_item_sum_total_when_balanced(extracted, unified_text)
 
@@ -15890,7 +15932,17 @@ def postprocess_receipt(
         ("single_standard_from_small_base",),
     )
     _normalize_taxes(extracted, unified_text, ocr_totals)
-    _restore_explicit_tax_rate_amount_lines(extracted, unified_text)
+    _run_explicit_tax_amount_restoration_phase(
+        extracted,
+        unified_text,
+        ("explicit_tax_rate_amount_lines",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "explicit_tax_amount_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _run_tax_excluded_rate_block_restoration_phase(
         extracted,
         unified_text,
@@ -16024,7 +16076,17 @@ def postprocess_receipt(
         extracted,
     )
     _restore_printed_external_tax_amounts(extracted, unified_text)
-    _restore_explicit_tax_rate_amount_lines(extracted, unified_text)
+    _run_explicit_tax_amount_restoration_phase(
+        extracted,
+        unified_text,
+        ("explicit_tax_rate_amount_lines",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "explicit_tax_amount_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _restore_bare_number_tax_summary(extracted, unified_text)
     _restore_external_tax_total_from_printed_subtotal(extracted, unified_text)
     _drop_unprinted_small_target_only_taxes(extracted, unified_text)

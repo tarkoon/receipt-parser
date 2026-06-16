@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 65
+POSTPROCESS_REPAIR_CALL_LIMIT = 62
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -105,7 +105,6 @@ REPAIR_CALL_PREFIXES = (
 POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     # Temporary debt: the current stack re-runs item row cleanup after recovery
     # phases expose new candidate rows. Counts may shrink, but must not grow.
-    "_restore_explicit_tax_rate_amount_lines": 3,
     "_restore_external_tax_total_from_printed_subtotal": 3,
 }
 STRUCTURAL_ITEM_PROJECTION_REPAIRS = {
@@ -149,6 +148,13 @@ TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_HELPER = (
     "_run_tax_excluded_rate_block_restoration_phase"
 )
 TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_CALL_LIMIT = 3
+EXPLICIT_TAX_AMOUNT_RESTORATION_REPAIRS = {
+    "_restore_explicit_tax_rate_amount_lines",
+}
+EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_HELPER = (
+    "_run_explicit_tax_amount_restoration_phase"
+)
+EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_CALL_LIMIT = 3
 CASH_TENDER_RECONCILIATION_REPAIRS = {
     "_fix_total_from_stacked_cash_tender_block",
     "_fix_unlabeled_cash_tender_change_block",
@@ -974,6 +980,56 @@ def test_postprocess_tax_excluded_rate_block_restoration_debt_is_phase_owned():
         "and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_explicit_tax_amount_restoration_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        EXPLICIT_TAX_AMOUNT_RESTORATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Explicit tax amount restorations must be owned by the named "
+        f"{EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_HELPER} must document "
+        "the visible tax-rate amount row trigger and item/tax consistency "
+        "invariant."
+    )
+
+
+def test_postprocess_explicit_tax_amount_restoration_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_tax_calls = [
+        name
+        for name in postprocess_calls
+        if name in EXPLICIT_TAX_AMOUNT_RESTORATION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_HELPER
+    ]
+
+    assert not direct_tax_calls, (
+        "Explicit tax amount restoration should run through the named phase "
+        "helper so visible 税率N%税額 rows and tax-entry replacement have one "
+        "owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
+    )
+    assert 0 < len(phase_calls) <= EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_CALL_LIMIT, (
+        "Explicit tax amount restoration phase calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_CALL_LIMIT}"
     )
 
 
