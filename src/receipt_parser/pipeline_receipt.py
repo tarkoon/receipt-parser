@@ -14523,6 +14523,36 @@ def _record_receipt_phase_mutation(
     return after
 
 
+def _run_structural_item_projection_phase(
+    extracted: dict,
+    unified_text: str,
+    ocr_totals: dict | None,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR row layout exposes item/price/qty sequences or POS codes.
+
+    Invariant: each projection helper may replace rows only when its own
+    arithmetic checks keep item totals coherent with printed receipt amounts.
+    """
+    for repair in repairs:
+        if repair == "barcode_unit_qty_amount_stack":
+            _replace_barcode_unit_qty_amount_stack_when_balanced(extracted, unified_text)
+        elif repair == "barcode_qty_price_rows":
+            _replace_barcode_qty_price_rows_when_balanced(extracted, unified_text)
+        elif repair == "dense_item_rows":
+            _replace_dense_item_rows_when_balanced(extracted, unified_text)
+        elif repair == "dense_sequence_rows":
+            _replace_dense_sequence_rows_when_balanced(extracted, unified_text)
+        elif repair == "jan_pos_items":
+            _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals or {})
+        elif repair == "qty_context_and_reduced_rate":
+            _fix_qty_context_and_reduced_rate_from_ocr(extracted, unified_text)
+        elif repair == "qty_totals_from_unit_lines":
+            _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown structural item projection repair: {repair}")
+
+
 def postprocess_receipt(
     extracted: dict,
     unified_text: str,
@@ -14601,17 +14631,33 @@ def postprocess_receipt(
     _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
     _fix_digit_misread_items(extracted, unified_text)
     _fix_o_ring_descriptions_from_ocr(extracted, unified_text)
-    _replace_barcode_unit_qty_amount_stack_when_balanced(extracted, unified_text)
-    _replace_barcode_qty_price_rows_when_balanced(extracted, unified_text)
-    _replace_dense_sequence_rows_when_balanced(extracted, unified_text)
+    _run_structural_item_projection_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        (
+            "barcode_unit_qty_amount_stack",
+            "barcode_qty_price_rows",
+            "dense_sequence_rows",
+        ),
+    )
     _repair_previous_item_from_following_qty_detail(extracted, unified_text)
     _replace_campaign_discount_stream_when_balanced(extracted, unified_text)
     _replace_prefixed_tax_marker_item_rows_when_balanced(extracted, unified_text)
-    _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text)
-    _fix_qty_context_and_reduced_rate_from_ocr(extracted, unified_text)
+    _run_structural_item_projection_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
+    )
     _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
     _drop_numeric_marker_description_rows(extracted, unified_text)
-    _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals)
+    _run_structural_item_projection_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("jan_pos_items",),
+    )
     if extracted.get("line_items"):
         _drop_duplicate_with_embedded_price(extracted["line_items"])
     _fix_qty_code_row_descriptions_from_ocr(extracted, unified_text)
@@ -14624,17 +14670,28 @@ def postprocess_receipt(
     _fix_non_bag_items_named_as_bag(extracted, unified_text)
     _fix_embedded_price_suffix_totals(extracted, unified_text)
     _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text)
-    _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals)
-    _replace_barcode_unit_qty_amount_stack_when_balanced(extracted, unified_text)
-    _replace_barcode_qty_price_rows_when_balanced(extracted, unified_text)
-    _replace_dense_item_rows_when_balanced(extracted, unified_text)
-    _replace_dense_sequence_rows_when_balanced(extracted, unified_text)
+    _run_structural_item_projection_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        (
+            "jan_pos_items",
+            "barcode_unit_qty_amount_stack",
+            "barcode_qty_price_rows",
+            "dense_item_rows",
+            "dense_sequence_rows",
+        ),
+    )
     _repair_previous_item_from_following_qty_detail(extracted, unified_text)
     _drop_numeric_marker_description_rows(extracted, unified_text)
     if extracted.get("line_items"):
         _drop_duplicate_with_embedded_price(extracted["line_items"])
-    _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text)
-    _fix_qty_context_and_reduced_rate_from_ocr(extracted, unified_text)
+    _run_structural_item_projection_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
+    )
     _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
     _drop_numeric_marker_description_rows(extracted, unified_text)
     _recover_discounted_item_from_gap(extracted, unified_text)
@@ -14954,13 +15011,20 @@ def postprocess_receipt(
     _ensure_discounted_ocr_pairs_present(extracted, unified_text)
     _recover_missing_items_from_gap(extracted, unified_text)
     _replace_vertical_price_qty_total_rows_when_balanced(extracted, unified_text)
-    _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals)
-    _replace_barcode_unit_qty_amount_stack_when_balanced(extracted, unified_text)
-    _replace_barcode_qty_price_rows_when_balanced(extracted, unified_text)
-    _replace_dense_item_rows_when_balanced(extracted, unified_text)
-    _replace_dense_sequence_rows_when_balanced(extracted, unified_text)
-    _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text)
-    _fix_qty_context_and_reduced_rate_from_ocr(extracted, unified_text)
+    _run_structural_item_projection_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        (
+            "jan_pos_items",
+            "barcode_unit_qty_amount_stack",
+            "barcode_qty_price_rows",
+            "dense_item_rows",
+            "dense_sequence_rows",
+            "qty_totals_from_unit_lines",
+            "qty_context_and_reduced_rate",
+        ),
+    )
     _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
     _drop_numeric_marker_description_rows(extracted, unified_text)
     _fix_total_from_stacked_cash_tender_block(extracted, unified_text)
@@ -14997,8 +15061,12 @@ def postprocess_receipt(
         _apply_single_bag_standard_rate_split(extracted["line_items"], extract_rate_bases(unified_text))
     _drop_non_product_line_items(extracted, unified_text)
     _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text)
-    _replace_dense_sequence_rows_when_balanced(extracted, unified_text)
-    _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text)
+    _run_structural_item_projection_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("dense_sequence_rows", "qty_totals_from_unit_lines"),
+    )
     _drop_numeric_marker_description_rows(extracted, unified_text)
     if extracted.get("line_items"):
         final_rate_bases = extract_rate_bases(unified_text)
@@ -15016,7 +15084,12 @@ def postprocess_receipt(
         _rebalance_tax_categories_to_rate_bases(
             extracted["line_items"], unified_text, extracted.get("taxes"), final_rate_bases
         )
-        _fix_qty_context_and_reduced_rate_from_ocr(extracted, unified_text)
+        _run_structural_item_projection_phase(
+            extracted,
+            unified_text,
+            ocr_totals,
+            ("qty_context_and_reduced_rate",),
+        )
     _fix_o_ring_descriptions_from_ocr(extracted, unified_text)
     _fix_code_table_descriptions_by_order(extracted, unified_text)
     _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
@@ -15027,7 +15100,12 @@ def postprocess_receipt(
     _drop_applied_coupon_line_items(extracted, unified_text)
     _repair_tiny_item_prices_from_following_ocr(extracted, unified_text)
     _replace_split_price_block_when_balanced(extracted, unified_text)
-    _fix_qty_context_and_reduced_rate_from_ocr(extracted, unified_text)
+    _run_structural_item_projection_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("qty_context_and_reduced_rate",),
+    )
     _replace_stacked_name_price_rows_when_balanced(extracted, unified_text)
     _restore_stacked_inclusive_tax_block(extracted, unified_text)
     _restore_tax_excluded_per_rate_blocks(extracted, unified_text)
@@ -15038,11 +15116,21 @@ def postprocess_receipt(
     _restore_external_tax_total_from_printed_subtotal(extracted, unified_text)
     _drop_unprinted_small_target_only_taxes(extracted, unified_text)
     _drop_numeric_marker_description_rows(extracted, unified_text)
-    _replace_dense_sequence_rows_when_balanced(extracted, unified_text)
+    _run_structural_item_projection_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("dense_sequence_rows",),
+    )
     _repair_previous_item_from_following_qty_detail(extracted, unified_text)
     _replace_campaign_discount_stream_when_balanced(extracted, unified_text)
     _fix_bare_service_receipt_without_itemization(extracted, unified_text)
-    _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text)
+    _run_structural_item_projection_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("qty_totals_from_unit_lines",),
+    )
     _fix_bag_item_prices_from_rate_bases(extracted, extract_rate_bases(unified_text), unified_text)
     _fix_split_item_price_body_total_layout(extracted, unified_text)
     _clean_code_prefixed_item_descriptions(extracted)

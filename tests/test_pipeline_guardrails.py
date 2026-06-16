@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 198
+POSTPROCESS_REPAIR_CALL_LIMIT = 172
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -116,8 +116,6 @@ POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     "_fix_name_bag_amount_shift_from_ocr": 3,
     "_fix_numeric_desc_from_ocr_price_context": 3,
     "_fix_o_ring_descriptions_from_ocr": 5,
-    "_fix_qty_context_and_reduced_rate_from_ocr": 5,
-    "_fix_qty_totals_from_ocr_unit_lines": 5,
     "_fix_split_item_price_body_total_layout": 3,
     "_fix_tax_categories_from_ocr_markers": 4,
     "_fix_tax_categories_from_price_line_markers": 4,
@@ -126,10 +124,6 @@ POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     "_recover_missing_bag_items_from_ocr": 3,
     "_recover_repeated_item_from_gap": 3,
     "_repair_previous_item_from_following_qty_detail": 3,
-    "_replace_barcode_qty_price_rows_when_balanced": 3,
-    "_replace_barcode_unit_qty_amount_stack_when_balanced": 3,
-    "_replace_dense_sequence_rows_when_balanced": 5,
-    "_replace_jan_pos_items_when_balanced": 3,
     "_replace_overage_item_with_low_value_bag": 3,
     "_restore_explicit_tax_rate_amount_lines": 3,
     "_restore_external_tax_total_from_printed_subtotal": 3,
@@ -137,6 +131,16 @@ POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     "_restore_tax_excluded_per_rate_blocks": 3,
     "_apply_single_bag_standard_rate_split": 4,
 }
+STRUCTURAL_ITEM_PROJECTION_REPAIRS = {
+    "_fix_qty_context_and_reduced_rate_from_ocr",
+    "_fix_qty_totals_from_ocr_unit_lines",
+    "_replace_barcode_qty_price_rows_when_balanced",
+    "_replace_barcode_unit_qty_amount_stack_when_balanced",
+    "_replace_dense_sequence_rows_when_balanced",
+    "_replace_jan_pos_items_when_balanced",
+}
+STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER = "_run_structural_item_projection_phase"
+STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT = 11
 FINAL_OUTPUT_REPAIR_STAGES = (
     "barcode_unit_qty_amount_stack",
     "barcode_qty_price_rows",
@@ -272,6 +276,16 @@ def _function_def(tree: ast.AST, name: str) -> ast.FunctionDef:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return node
     raise AssertionError(f"Function not found: {name}")
+
+
+def _call_names_in_function(function: ast.FunctionDef) -> list[str]:
+    names = []
+    for node in ast.walk(function):
+        if isinstance(node, ast.Call):
+            name = _call_name(node.func)
+            if name:
+                names.append(name)
+    return names
 
 
 def _parse_file(path: Path) -> ast.Module:
@@ -644,6 +658,50 @@ def test_postprocess_receipt_repeated_mutators_are_explicitly_allowlisted():
         "temporary debt and must not grow.\n"
         f"Unexpected repeated mutators: {unexpected}\n"
         f"Allowlisted mutators whose call counts grew: {grown}"
+    )
+
+
+def test_structural_item_projection_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        STRUCTURAL_ITEM_PROJECTION_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Structural item row projection repairs must be owned by the named "
+        f"{STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER} must document the OCR/layout "
+        "trigger and arithmetic or field-consistency invariant it enforces."
+    )
+
+
+def test_postprocess_structural_item_projection_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_projection_calls = [
+        name for name in postprocess_calls if name in STRUCTURAL_ITEM_PROJECTION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER
+    ]
+
+    assert not direct_projection_calls, (
+        "Structural item projection repairs should run through the named phase "
+        "helper so OCR/layout triggers and arithmetic invariants have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_projection_calls}"
+    )
+    assert 0 < len(phase_calls) <= STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT, (
+        "Structural item projection phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT}"
     )
 
 
