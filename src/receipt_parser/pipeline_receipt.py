@@ -14485,6 +14485,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Totals must remain consistent with printed cash/tax/summary arithmetic.",
     },
     {
+        "name": "cash_tender_reconciliation",
+        "reads": ("total", "amount_paid", "payment_method", "points_used", "ocr_text"),
+        "writes": ("total", "amount_paid", "payment_method"),
+        "invariant": "Cash tender/change repairs require visible printed total, tendered amount, and change arithmetic.",
+    },
+    {
         "name": "initial_item_recovery",
         "reads": ("line_items", "subtotal", "total", "ocr_text", "ocr_layout_blocks"),
         "writes": ("line_items",),
@@ -14639,6 +14645,25 @@ def _run_quantity_detail_reconciliation_phase(
             raise ValueError(f"Unknown quantity detail reconciliation repair: {repair}")
 
 
+def _run_cash_tender_reconciliation_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR cash-layout rows print total, tendered amount, and change.
+
+    Invariant: total, amount_paid, and cash payment method changes must be
+    consistent with printed tender/change arithmetic and points adjustments.
+    """
+    for repair in repairs:
+        if repair == "stacked_cash_tender":
+            _fix_total_from_stacked_cash_tender_block(extracted, unified_text)
+        elif repair == "unlabeled_cash_tender_change":
+            _fix_unlabeled_cash_tender_change_block(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown cash tender reconciliation repair: {repair}")
+
+
 def _tax_assignment_rate_bases(unified_text: str, ocr_totals: dict | None) -> dict:
     rate_bases = extract_rate_bases(unified_text)
     for rate, base in ((ocr_totals or {}).get('_breakdown_rate_bases') or {}).items():
@@ -14749,8 +14774,17 @@ def postprocess_receipt(
     _fix_company_name_merchant(extracted, unified_text)
     _fix_split_item_price_body_total_layout(extracted, unified_text)
     _apply_financial_overrides(extracted, ocr_totals, ocr_conf, llm_conf)
-    _fix_total_from_stacked_cash_tender_block(extracted, unified_text)
-    _fix_unlabeled_cash_tender_change_block(extracted, unified_text)
+    _run_cash_tender_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("stacked_cash_tender", "unlabeled_cash_tender_change"),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "cash_tender_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _fix_implausible_tax_amounts(extracted, unified_text, ocr_totals)
     _fix_date(extracted, unified_text)
     _fix_time(extracted, unified_text)
@@ -15253,8 +15287,11 @@ def postprocess_receipt(
         unified_text,
         ("drop_numeric_marker_description_rows",),
     )
-    _fix_total_from_stacked_cash_tender_block(extracted, unified_text)
-    _fix_unlabeled_cash_tender_change_block(extracted, unified_text)
+    _run_cash_tender_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("stacked_cash_tender", "unlabeled_cash_tender_change"),
+    )
     _replace_overage_item_with_low_value_bag(extracted, unified_text)
     _fix_numeric_desc_from_ocr_price_context(extracted, unified_text)
     _fix_o_ring_descriptions_from_ocr(extracted, unified_text)

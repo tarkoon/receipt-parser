@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 132
+POSTPROCESS_REPAIR_CALL_LIMIT = 128
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -150,6 +150,12 @@ TAX_CATEGORY_ASSIGNMENT_REPAIRS = {
 }
 TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER = "_run_tax_category_assignment_phase"
 TAX_CATEGORY_ASSIGNMENT_PHASE_CALL_LIMIT = 6
+CASH_TENDER_RECONCILIATION_REPAIRS = {
+    "_fix_total_from_stacked_cash_tender_block",
+    "_fix_unlabeled_cash_tender_change_block",
+}
+CASH_TENDER_RECONCILIATION_PHASE_HELPER = "_run_cash_tender_reconciliation_phase"
+CASH_TENDER_RECONCILIATION_PHASE_CALL_LIMIT = 2
 LINE_ITEM_CLEANUP_REPAIRS = {
     "_drop_duplicate_with_embedded_price",
     "_drop_non_product_line_items",
@@ -815,6 +821,51 @@ def test_postprocess_tax_category_assignment_debt_is_phase_owned():
         "Tax category assignment phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {TAX_CATEGORY_ASSIGNMENT_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_cash_tender_reconciliation_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, CASH_TENDER_RECONCILIATION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        CASH_TENDER_RECONCILIATION_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Cash tender/change repairs must be owned by the named "
+        f"{CASH_TENDER_RECONCILIATION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{CASH_TENDER_RECONCILIATION_PHASE_HELPER} must document the OCR "
+        "cash-layout trigger and total/payment consistency invariant."
+    )
+
+
+def test_postprocess_cash_tender_reconciliation_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_cash_calls = [
+        name for name in postprocess_calls if name in CASH_TENDER_RECONCILIATION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == CASH_TENDER_RECONCILIATION_PHASE_HELPER
+    ]
+
+    assert not direct_cash_calls, (
+        "Cash tender/change repairs should run through the named phase helper "
+        "so printed total, tendered amount, and change arithmetic have one "
+        "owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_cash_calls}"
+    )
+    assert 0 < len(phase_calls) <= CASH_TENDER_RECONCILIATION_PHASE_CALL_LIMIT, (
+        "Cash tender reconciliation phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {CASH_TENDER_RECONCILIATION_PHASE_CALL_LIMIT}"
     )
 
 

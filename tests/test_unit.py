@@ -4404,6 +4404,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert tuple(phases) == (
         "header_identity_repair",
         "financial_totals_repair",
+        "cash_tender_reconciliation",
         "initial_item_recovery",
         "item_cleanup",
         "quantity_detail_reconciliation",
@@ -4419,6 +4420,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["quantity_detail_reconciliation"]["writes"]
     assert "line_items" in phases["structural_item_reconstruction"]["writes"]
     assert "taxes" in phases["tax_category_assignment"]["writes"]
+    assert "amount_paid" in phases["cash_tender_reconciliation"]["writes"]
     assert "total" in phases["financial_totals_repair"]["writes"]
     assert "amount_paid" in phases["payment_points_reconciliation"]["reads"]
     assert "payment_method" in phases["payment_points_reconciliation"]["writes"]
@@ -4446,17 +4448,20 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         },
         "total": {
             "financial_totals_repair",
+            "cash_tender_reconciliation",
             "structural_item_reconstruction",
             "final_consistency_pass",
         },
         "amount_paid": {
             "financial_totals_repair",
+            "cash_tender_reconciliation",
             "payment_points_reconciliation",
             "structural_item_reconstruction",
             "final_consistency_pass",
         },
         "payment_method": {
             "financial_totals_repair",
+            "cash_tender_reconciliation",
             "payment_points_reconciliation",
         },
         "merchant": {"header_identity_repair"},
