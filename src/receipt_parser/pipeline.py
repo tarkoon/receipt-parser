@@ -985,6 +985,26 @@ def _run_final_header_location_repair_phase(
             raise ValueError(f"Unknown final header location repair: {repair}")
 
 
+def _run_final_single_rate_inclusive_tax_restoration_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: printed single-rate inclusive target/tax summary rows.
+
+    Invariant: restored tax entries, subtotal, and categories must preserve
+    total/tax arithmetic and visible inclusive tax-summary evidence.
+    """
+    for repair in repairs:
+        if repair == "single_rate_inclusive_tax_block":
+            _restore_single_rate_inclusive_tax_block(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final single-rate inclusive tax restoration repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1024,7 +1044,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "single_rate_inclusive_tax_block": (
         "tax_category_assignment",
-        "Retained late for serialized tax block consistency.",
+        "Owned by the final single-rate inclusive tax restoration helper until this serialized tax block repair moves out of post-serialization repair.",
     ),
     "following_discount_lines": (
         "structural_item_reconstruction",
@@ -1277,7 +1297,14 @@ def _apply_final_receipt_output_repairs(
             ("noisy_city_location",),
         ),
     )
-    run("single_rate_inclusive_tax_block", lambda: _restore_single_rate_inclusive_tax_block(result, ocr_text))
+    run(
+        "single_rate_inclusive_tax_block",
+        lambda: _run_final_single_rate_inclusive_tax_restoration_phase(
+            result,
+            ocr_text,
+            ("single_rate_inclusive_tax_block",),
+        ),
+    )
     run("following_discount_lines", lambda: _fix_item_totals_from_following_discount_lines(result, ocr_text))
     run("coupon_discount_blocks", lambda: _apply_coupon_discount_blocks(result, ocr_text))
     run("drop_applied_coupon_line_items", lambda: _drop_applied_coupon_line_items(result, ocr_text))
