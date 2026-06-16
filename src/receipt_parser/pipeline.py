@@ -825,10 +825,29 @@ def _record_final_receipt_output_repair(
         mutation_trace[-1]["justification"] = justification
 
 
+def _run_final_structural_item_projection_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: visible JAN/barcode item rows followed by unit x qty amounts.
+
+    Invariant: projected rows may replace collapsed line items only when
+    OCR-derived item totals balance with the receipt subtotal and tax summary.
+    """
+    for repair in repairs:
+        if repair == "barcode_unit_qty_amount_stack":
+            _replace_barcode_unit_qty_amount_stack_when_balanced(result, ocr_text)
+        else:
+            raise ValueError(
+                f"Unknown final structural item projection repair: {repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
-        "Retained late until barcode stack projection is fully owned by postprocess output parity tests.",
+        "Owned by the final structural item-projection helper until this barcode stack projection no longer needs post-serialization repair.",
     ),
     "barcode_qty_price_rows": (
         "structural_item_reconstruction",
@@ -1047,7 +1066,11 @@ def _apply_final_receipt_output_repairs(
 
     run(
         "barcode_unit_qty_amount_stack",
-        lambda: _replace_barcode_unit_qty_amount_stack_when_balanced(result, ocr_text),
+        lambda: _run_final_structural_item_projection_phase(
+            result,
+            ocr_text,
+            ("barcode_unit_qty_amount_stack",),
+        ),
     )
     run(
         "barcode_qty_price_rows",
