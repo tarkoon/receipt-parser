@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 68
+POSTPROCESS_REPAIR_CALL_LIMIT = 65
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -107,7 +107,6 @@ POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     # phases expose new candidate rows. Counts may shrink, but must not grow.
     "_restore_explicit_tax_rate_amount_lines": 3,
     "_restore_external_tax_total_from_printed_subtotal": 3,
-    "_restore_tax_excluded_per_rate_blocks": 3,
 }
 STRUCTURAL_ITEM_PROJECTION_REPAIRS = {
     "_replace_barcode_qty_price_rows_when_balanced",
@@ -143,6 +142,13 @@ SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER = (
     "_run_single_rate_inclusive_tax_restoration_phase"
 )
 SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT = 3
+TAX_EXCLUDED_RATE_BLOCK_RESTORATION_REPAIRS = {
+    "_restore_tax_excluded_per_rate_blocks",
+}
+TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_HELPER = (
+    "_run_tax_excluded_rate_block_restoration_phase"
+)
+TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_CALL_LIMIT = 3
 CASH_TENDER_RECONCILIATION_REPAIRS = {
     "_fix_total_from_stacked_cash_tender_block",
     "_fix_unlabeled_cash_tender_change_block",
@@ -918,6 +924,56 @@ def test_postprocess_single_rate_inclusive_tax_restoration_debt_is_phase_owned()
         "and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_tax_excluded_rate_block_restoration_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        TAX_EXCLUDED_RATE_BLOCK_RESTORATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Tax-excluded per-rate block restorations must be owned by the named "
+        f"{TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_HELPER} must document "
+        "the printed tax-excluded subtotal/tax-row trigger and rate-pair "
+        "consistency invariant."
+    )
+
+
+def test_postprocess_tax_excluded_rate_block_restoration_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_tax_calls = [
+        name
+        for name in postprocess_calls
+        if name in TAX_EXCLUDED_RATE_BLOCK_RESTORATION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_HELPER
+    ]
+
+    assert not direct_tax_calls, (
+        "Tax-excluded per-rate block restoration should run through the named "
+        "phase helper so printed subtotal/tax labels and rate-paired tax "
+        "entries have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
+    )
+    assert 0 < len(phase_calls) <= TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_CALL_LIMIT, (
+        "Tax-excluded per-rate block restoration phase calls must be explicit "
+        "and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_CALL_LIMIT}"
     )
 
 

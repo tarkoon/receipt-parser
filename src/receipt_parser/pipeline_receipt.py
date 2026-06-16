@@ -14557,6 +14557,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Single-rate inclusive tax restoration requires a visible printed target/tax block and total/tax arithmetic consistency.",
     },
     {
+        "name": "tax_excluded_rate_block_restoration",
+        "reads": ("taxes", "ocr_text"),
+        "writes": ("taxes",),
+        "invariant": "Tax-excluded rate-block restoration requires visible paired 小計(税抜N%) and 消費税等(N%) rows with rate-consistent tax entries.",
+    },
+    {
         "name": "tax_category_assignment",
         "reads": ("line_items", "taxes", "subtotal", "total", "ocr_totals", "ocr_text"),
         "writes": ("line_items", "taxes"),
@@ -14915,6 +14921,25 @@ def _run_single_rate_inclusive_tax_restoration_phase(
         else:
             raise ValueError(
                 f"Unknown single-rate inclusive tax restoration repair: {repair}"
+            )
+
+
+def _run_tax_excluded_rate_block_restoration_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: paired 小計(税抜N%) and 消費税等(N%) printed rows.
+
+    Invariant: restored external-tax entries must come from visible tax rows
+    whose rates match the paired printed tax-excluded subtotal labels.
+    """
+    for repair in repairs:
+        if repair == "tax_excluded_per_rate_blocks":
+            _restore_tax_excluded_per_rate_blocks(extracted, unified_text)
+        else:
+            raise ValueError(
+                f"Unknown tax-excluded rate block restoration repair: {repair}"
             )
 
 
@@ -15458,7 +15483,17 @@ def postprocess_receipt(
         extracted,
     )
     _fix_printed_tax_amounts_from_structural_blocks(extracted, unified_text)
-    _restore_tax_excluded_per_rate_blocks(extracted, unified_text)
+    _run_tax_excluded_rate_block_restoration_phase(
+        extracted,
+        unified_text,
+        ("tax_excluded_per_rate_blocks",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "tax_excluded_rate_block_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _run_single_rate_inclusive_tax_restoration_phase(
         extracted,
         unified_text,
@@ -15856,7 +15891,17 @@ def postprocess_receipt(
     )
     _normalize_taxes(extracted, unified_text, ocr_totals)
     _restore_explicit_tax_rate_amount_lines(extracted, unified_text)
-    _restore_tax_excluded_per_rate_blocks(extracted, unified_text)
+    _run_tax_excluded_rate_block_restoration_phase(
+        extracted,
+        unified_text,
+        ("tax_excluded_per_rate_blocks",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "tax_excluded_rate_block_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _run_single_rate_inclusive_tax_restoration_phase(
         extracted,
         unified_text,
@@ -15956,7 +16001,17 @@ def postprocess_receipt(
     )
     _replace_stacked_name_price_rows_when_balanced(extracted, unified_text)
     _restore_stacked_inclusive_tax_block(extracted, unified_text)
-    _restore_tax_excluded_per_rate_blocks(extracted, unified_text)
+    _run_tax_excluded_rate_block_restoration_phase(
+        extracted,
+        unified_text,
+        ("tax_excluded_per_rate_blocks",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "tax_excluded_rate_block_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _run_single_rate_inclusive_tax_restoration_phase(
         extracted,
         unified_text,
