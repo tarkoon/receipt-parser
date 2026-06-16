@@ -17,6 +17,16 @@ Works for **one receipt or many** — the loop is the same, with some multi-rece
 4. **In multi-receipt mode, group failures by type before fixing.** A single root cause often spans multiple receipts — fixing it once is better than fixing five symptoms.
 5. **A passing score is not valid if the implementation is invalid.** 100% accuracy is the acceptance test, not the implementation strategy. A score achieved through merchant/product/date/fixture-specific overrides is a failed run and must be cleaned up before completion.
 
+## Reviewability Rules
+
+- Do not make a parser PR over roughly 1,500 changed lines without explicit user approval.
+- Keep one behavior cluster per commit.
+- Every behavior cluster must include: root cause, generality check, targeted `--runs 10`, guardrail run, and full accuracy when shared parser behavior changed.
+- Any new production parser helper must state its structural trigger and arithmetic or field-consistency invariant in a test name, docstring, or phase metadata.
+- For broad multi-receipt cleanup, use separate investigations for code archaeology, fixture convention survey, and test/benchmark evidence review before editing parser behavior.
+- Do not grow `postprocess_receipt` or `_apply_final_receipt_output_repairs` unless the guardrail test is updated with an explicit temporary-debt reason and a plan to shrink it later.
+- Late final-output repairs must remain explicit traced stages. Silent semantic mutation after validation is not acceptable.
+
 ## Environment
 
 All Python commands run through conda:

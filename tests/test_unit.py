@@ -1969,14 +1969,29 @@ def test_zero_points_restore_preserves_absent_value_when_redemption_printed():
     assert extracted["points_used"] is None
 
 
-def test_final_receipt_repairs_trace_semantic_field_changes():
-    from receipt_parser.pipeline import _apply_final_receipt_output_repairs
+def test_amount_fragment_parser_normalizes_common_ocr_amount_tokens():
+    from receipt_parser.pipeline_receipt import (
+        _amount_from_yen_text,
+        _parse_amount_fragment,
+    )
+
+    assert _parse_amount_fragment("1,234") == 1234
+    assert _parse_amount_fragment("1.118") == 1118
+    assert _parse_amount_fragment("12.5") == 12.5
+    assert _parse_amount_fragment("abc") is None
+    assert _amount_from_yen_text("合計 ¥1,234") == 1234
+
+
+def test_postprocess_receipt_payment_phase_traces_zero_points_restore():
+    from receipt_parser.pipeline_receipt import postprocess_receipt
 
     extracted = {
         "document_type": "receipt",
         "total": 36460,
         "amount_paid": 36460,
         "points_used": None,
+        "line_items": [],
+        "taxes": [],
     }
     text = "\n".join([
         "グローバルカードで最大 1.5% 547円",
@@ -1984,15 +1999,25 @@ def test_final_receipt_repairs_trace_semantic_field_changes():
     ])
     trace = []
 
-    _apply_final_receipt_output_repairs(extracted, text, mutation_trace=trace)
+    postprocess_receipt(
+        extracted,
+        text,
+        0.9,
+        {},
+        {},
+        "test-model",
+        mutation_trace=trace,
+    )
 
     assert extracted["points_used"] == 0
-    assert trace == [
-        {
-            "stage": "zero_points_no_redemption",
-            "changes": {"points_used": {"before": None, "after": 0}},
-        }
+    payment_events = [
+        event for event in trace
+        if event["stage"] == "payment_points_reconciliation"
     ]
+    assert payment_events
+    assert payment_events[0]["changes"]["points_used"] == {"before": None, "after": 0}
+    assert payment_events[0]["writes"]
+    assert payment_events[0]["invariant"]
 
 
 def test_single_count_customization_line_is_not_product():
@@ -4355,13 +4380,96 @@ def test_postprocess_receipt_mutation_trace_records_semantic_phase_changes():
     )
 
     assert trace
-    assert any(event["stage"] == "points_and_subtotal" for event in trace)
+    payment_events = [
+        event for event in trace
+        if event["stage"] == "payment_points_reconciliation"
+    ]
+    assert payment_events
+    assert payment_events[0]["reads"]
+    assert payment_events[0]["writes"]
+    assert payment_events[0]["invariant"]
     changed_fields = {
         field
         for event in trace
         for field in event["changes"]
     }
     assert {"subtotal", "points_used"} <= changed_fields
+
+
+def test_postprocess_receipt_phase_metadata_declares_field_ownership():
+    from receipt_parser.pipeline_receipt import POSTPROCESS_PHASES
+
+    phases = {phase["name"]: phase for phase in POSTPROCESS_PHASES}
+
+    assert tuple(phases) == (
+        "header_identity_repair",
+        "financial_totals_repair",
+        "initial_item_recovery",
+        "item_cleanup",
+        "tax_category_assignment",
+        "payment_points_reconciliation",
+        "structural_item_reconstruction",
+        "final_consistency_pass",
+    )
+    assert "location" in phases["header_identity_repair"]["writes"]
+    assert "date" in phases["header_identity_repair"]["writes"]
+    assert "line_items" in phases["initial_item_recovery"]["writes"]
+    assert "line_items" in phases["item_cleanup"]["writes"]
+    assert "line_items" in phases["structural_item_reconstruction"]["writes"]
+    assert "taxes" in phases["tax_category_assignment"]["writes"]
+    assert "total" in phases["financial_totals_repair"]["writes"]
+    assert "amount_paid" in phases["payment_points_reconciliation"]["reads"]
+    assert "payment_method" in phases["payment_points_reconciliation"]["writes"]
+    assert "total" in phases["final_consistency_pass"]["writes"]
+    expected_owners = {
+        "line_items": {
+            "initial_item_recovery",
+            "item_cleanup",
+            "tax_category_assignment",
+            "structural_item_reconstruction",
+            "final_consistency_pass",
+        },
+        "taxes": {
+            "financial_totals_repair",
+            "tax_category_assignment",
+            "structural_item_reconstruction",
+            "final_consistency_pass",
+        },
+        "subtotal": {
+            "financial_totals_repair",
+            "payment_points_reconciliation",
+            "structural_item_reconstruction",
+            "final_consistency_pass",
+        },
+        "total": {
+            "financial_totals_repair",
+            "structural_item_reconstruction",
+            "final_consistency_pass",
+        },
+        "amount_paid": {
+            "financial_totals_repair",
+            "payment_points_reconciliation",
+            "structural_item_reconstruction",
+            "final_consistency_pass",
+        },
+        "payment_method": {
+            "financial_totals_repair",
+            "payment_points_reconciliation",
+        },
+        "merchant": {"header_identity_repair"},
+        "location": {"header_identity_repair"},
+        "date": {"header_identity_repair"},
+    }
+    actual_owners = {
+        field: {
+            phase["name"]
+            for phase in POSTPROCESS_PHASES
+            if field in phase["writes"]
+        }
+        for field in expected_owners
+    }
+    assert actual_owners == expected_owners
+    assert all(phase["invariant"] for phase in POSTPROCESS_PHASES)
 
 
 def test_postprocess_receipt_is_idempotent_for_balanced_simple_receipt():
@@ -4778,6 +4886,48 @@ def test_stage_callback_none_default():
         # Should not raise — on_stage defaults to None
         result = process_ocr_text(ocr_text)
         assert "merchant" in result
+
+
+def test_process_ocr_text_debug_exposes_receipt_mutation_trace():
+    from receipt_parser.pipeline import process_ocr_text
+
+    ocr_text = "\n".join([
+        "テスト店",
+        "2025-01-15",
+        "テスト商品",
+        "¥1,000",
+        "外税",
+        "¥100",
+        "合計",
+        "¥1,100",
+    ])
+    extraction = {
+        "document_type": "receipt",
+        "merchant": "テスト店",
+        "date": "2025-01-15",
+        "total": 1100,
+        "subtotal": None,
+        "taxes": [{"rate": "10%", "label": "外税", "amount": 100}],
+        "line_items": [
+            {"description": "テスト商品", "qty": 1, "unit_price": 1000, "total": 1000},
+        ],
+        "currency": "JPY",
+        "_confidence": {"overall": "high"},
+    }
+
+    with patch("receipt_parser.pipeline.extract_with_verification") as mock_extract:
+        mock_extract.return_value = (
+            extraction,
+            [{"pass": 1, "extraction": extraction, "warnings": []}],
+        )
+        normal = process_ocr_text(ocr_text, debug=False)
+        debug = process_ocr_text(ocr_text, debug=True)
+
+    assert "_receipt_mutation_trace" not in normal
+    trace = debug["_receipt_mutation_trace"]
+    assert any(event["stage"] == "payment_points_reconciliation" for event in trace)
+    assert all("changes" in event for event in trace)
+    assert any("invariant" in event for event in trace)
 
 
 def test_stage_callback_emits_classify_and_plan():
@@ -8056,10 +8206,18 @@ def test_final_receipt_output_repairs_reject_invoice_registration_merchant():
         "T1234567890123",
         "領収証",
     ])
+    trace = []
 
-    _apply_final_receipt_output_repairs(result, ocr_text)
+    _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=trace)
 
     assert result["merchant"] == "テストストア"
+    company_events = [
+        event for event in trace if event["stage"] == "company_name_merchant"
+    ]
+    assert company_events
+    assert company_events[0]["owner_phase"] == "header_identity_repair"
+    assert company_events[0]["owner_invariant"]
+    assert company_events[0]["justification"]
 
 
 def test_final_receipt_output_repairs_recover_visible_repeated_item_gap():

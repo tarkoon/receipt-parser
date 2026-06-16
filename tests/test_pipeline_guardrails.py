@@ -15,8 +15,10 @@ removed or replaced with general parsers.
 from __future__ import annotations
 
 import ast
+import copy
 import io
 import re
+import subprocess
 import tokenize
 from collections import Counter
 from dataclasses import dataclass
@@ -81,6 +83,120 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "fix_final_known_financial_overrides",
     "postprocess_receipt",
 }
+BASELINE_COMMIT = "c175c17"
+POSTPROCESS_REPAIR_CALL_LIMIT = 198
+
+REPAIR_CALL_PREFIXES = (
+    "_append_",
+    "_apply_",
+    "_clear_",
+    "_clean_",
+    "_drop_",
+    "_fix_",
+    "_normalize_",
+    "_rebalance_",
+    "_recover_",
+    "_repair_",
+    "_replace_",
+    "_restore_",
+    "assign_",
+    "reconcile_",
+)
+POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
+    # Temporary debt: the current stack re-runs item row cleanup after recovery
+    # phases expose new candidate rows. Counts may shrink, but must not grow.
+    "_drop_duplicate_with_embedded_price": 5,
+    "_drop_non_product_line_items": 4,
+    "_drop_numeric_marker_description_rows": 8,
+    "_fix_adjacent_ocr_price_shift_when_balanced": 4,
+    "_fix_bag_description_from_ocr_code_context": 3,
+    "_fix_bare_service_receipt_without_itemization": 3,
+    "_fix_colon_split_product_names_from_ocr": 3,
+    "_fix_duplicate_descriptions_from_ocr": 5,
+    "_fix_name_bag_amount_shift_from_ocr": 3,
+    "_fix_numeric_desc_from_ocr_price_context": 3,
+    "_fix_o_ring_descriptions_from_ocr": 5,
+    "_fix_qty_context_and_reduced_rate_from_ocr": 5,
+    "_fix_qty_totals_from_ocr_unit_lines": 5,
+    "_fix_split_item_price_body_total_layout": 3,
+    "_fix_tax_categories_from_ocr_markers": 4,
+    "_fix_tax_categories_from_price_line_markers": 4,
+    "_rebalance_tax_categories_to_rate_bases": 3,
+    "_recover_discounted_item_from_gap": 3,
+    "_recover_missing_bag_items_from_ocr": 3,
+    "_recover_repeated_item_from_gap": 3,
+    "_repair_previous_item_from_following_qty_detail": 3,
+    "_replace_barcode_qty_price_rows_when_balanced": 3,
+    "_replace_barcode_unit_qty_amount_stack_when_balanced": 3,
+    "_replace_dense_sequence_rows_when_balanced": 5,
+    "_replace_jan_pos_items_when_balanced": 3,
+    "_replace_overage_item_with_low_value_bag": 3,
+    "_restore_explicit_tax_rate_amount_lines": 3,
+    "_restore_external_tax_total_from_printed_subtotal": 3,
+    "_restore_single_rate_inclusive_tax_block": 3,
+    "_restore_tax_excluded_per_rate_blocks": 3,
+    "_apply_single_bag_standard_rate_split": 4,
+}
+FINAL_OUTPUT_REPAIR_STAGES = (
+    "barcode_unit_qty_amount_stack",
+    "barcode_qty_price_rows",
+    "item_price_qty_rows",
+    "labeled_purchase_site_location",
+    "store_in_store_header_location",
+    "header_branch_store_location",
+    "phone_area_city_location",
+    "short_branch_over_phone_area_city",
+    "noisy_city_location",
+    "single_rate_inclusive_tax_block",
+    "following_discount_lines",
+    "coupon_discount_blocks",
+    "drop_applied_coupon_line_items",
+    "tiny_item_prices_from_following_ocr",
+    "split_price_block",
+    "split_item_price_body_total",
+    "stacked_name_price_rows",
+    "stacked_inclusive_tax_block",
+    "printed_summary_total_tax_balanced",
+    "printed_item_sum_total",
+    "o_ring_descriptions",
+    "company_name_merchant",
+    "adjacent_ocr_price_shift",
+    "repeated_item_gap",
+    "drop_duplicate_embedded_price",
+    "dense_sequence_rows",
+    "campaign_discount_stream",
+    "jan_pos_items",
+    "qty_totals_from_unit_lines",
+    "bag_item_prices_from_rate_bases",
+    "code_table_descriptions",
+    "printed_external_tax_amounts",
+    "bare_number_tax_summary",
+    "external_tax_total_from_printed_subtotal",
+    "drop_small_target_only_taxes",
+    "printed_summary_total_tax_balanced_2",
+    "unlabeled_cash_tender_change",
+    "points_payment",
+    "clear_discount_before_own_price",
+    "campaign_discount_stream_2",
+    "following_discount_lines_after_layout",
+    "discounted_line_item_totals",
+    "adjacent_ocr_price_shift_final",
+    "prefixed_tax_marker_item_rows",
+    "missing_items_from_gap",
+    "discounted_ocr_pair_descriptions",
+    "pre_price_stack_descriptions",
+    "drop_duplicate_rows_when_subtotal_balances",
+    "basket_marker_rows",
+    "tax_categories_from_rate_bases",
+    "external_tax_total_from_printed_subtotal_final",
+)
+STRUCTURAL_JAPANESE_LITERAL_RE = re.compile(
+    r"(小計|合計|内税|外税|非課税|消費税|税|対象|軽減|税込|税抜|"
+    r"現金|預|釣|支払|ポイント|領収|レシート|登録番号|電話|TEL|"
+    r"店|支店|営業所|料金所|住所|市|区|町|村|県|都|道|府|"
+    r"年|月|日|時|分|個|点|円|品番|JAN|バーコード)"
+)
+JAPANESE_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 
 
 @dataclass(frozen=True)
@@ -145,6 +261,137 @@ def _call_name(node: ast.AST) -> str | None:
     if isinstance(node, ast.Attribute):
         return node.attr
     return None
+
+
+def _is_repair_call_name(name: str | None) -> bool:
+    return bool(name) and name.startswith(REPAIR_CALL_PREFIXES)
+
+
+def _function_def(tree: ast.AST, name: str) -> ast.FunctionDef:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"Function not found: {name}")
+
+
+def _parse_file(path: Path) -> ast.Module:
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+def _postprocess_repair_calls() -> list[tuple[str, int]]:
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    function = _function_def(tree, "postprocess_receipt")
+    calls = []
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node.func)
+        if _is_repair_call_name(name):
+            calls.append((name or "", node.lineno))
+    return calls
+
+
+def _final_output_repair_stage_calls() -> list[tuple[str, int]]:
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    function = _function_def(tree, "_apply_final_receipt_output_repairs")
+    stages = []
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call) or _call_name(node.func) != "run":
+            continue
+        if not node.args or not isinstance(node.args[0], ast.Constant):
+            stages.append(("<nonliteral>", node.lineno))
+            continue
+        stages.append((str(node.args[0].value), node.lineno))
+    return sorted(stages, key=lambda item: item[1])
+
+
+def _final_output_repair_justifications() -> dict[str, tuple[str, str]]:
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS"
+                for target in node.targets
+            )
+        ):
+            try:
+                value = ast.literal_eval(node.value)
+            except (SyntaxError, ValueError) as exc:
+                raise AssertionError(
+                    "FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS must be literal"
+                ) from exc
+            return value
+    raise AssertionError("FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS not found")
+
+
+def _postprocess_phase_names() -> set[str]:
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "POSTPROCESS_PHASES"
+                for target in node.targets
+            )
+        ):
+            try:
+                value = ast.literal_eval(node.value)
+            except (SyntaxError, ValueError) as exc:
+                raise AssertionError("POSTPROCESS_PHASES must be literal") from exc
+            return {
+                phase["name"]
+                for phase in value
+                if isinstance(phase, dict) and isinstance(phase.get("name"), str)
+            }
+    raise AssertionError("POSTPROCESS_PHASES not found")
+
+
+def _current_japanese_string_counts() -> Counter[tuple[str, str]]:
+    counts: Counter[tuple[str, str]] = Counter()
+    for path in SCANNED_FILES:
+        tree = _parse_file(path)
+        rel = _relative(path)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and JAPANESE_CHAR_RE.search(node.value)
+            ):
+                counts[(rel, node.value)] += 1
+    return counts
+
+
+def _baseline_japanese_string_counts() -> Counter[tuple[str, str]]:
+    counts: Counter[tuple[str, str]] = Counter()
+    for path in SCANNED_FILES:
+        rel = _relative(path)
+        try:
+            source = subprocess.check_output(
+                ["git", "show", f"{BASELINE_COMMIT}:{rel}"],
+                cwd=ROOT,
+                text=True,
+                encoding="utf-8",
+            )
+        except subprocess.CalledProcessError as exc:
+            raise AssertionError(
+                f"Could not read {rel} from baseline {BASELINE_COMMIT}"
+            ) from exc
+        tree = ast.parse(source, filename=rel)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and JAPANESE_CHAR_RE.search(node.value)
+            ):
+                counts[(rel, node.value)] += 1
+    return counts
+
+
+def _looks_structural_japanese_literal(value: str) -> bool:
+    return bool(STRUCTURAL_JAPANESE_LITERAL_RE.search(value))
 
 
 def _assigned_semantic_fields(node: ast.AST) -> set[str]:
@@ -370,3 +617,130 @@ def test_production_pipeline_has_no_new_brittle_known_answer_overrides():
             )
 
     assert not unexpected and not stale_allowlist, message.getvalue()
+
+
+def test_postprocess_receipt_repair_stack_does_not_grow_without_review():
+    calls = _postprocess_repair_calls()
+    assert len(calls) <= POSTPROCESS_REPAIR_CALL_LIMIT, (
+        "postprocess_receipt gained repair/mutator calls. Split the work into "
+        "a named phase with structural trigger and invariant, or explicitly "
+        "lower existing debt before adding more.\n"
+        f"Current count: {len(calls)}; limit: {POSTPROCESS_REPAIR_CALL_LIMIT}"
+    )
+
+
+def test_postprocess_receipt_repeated_mutators_are_explicitly_allowlisted():
+    counts = Counter(name for name, _line in _postprocess_repair_calls())
+    repeated = {name: count for name, count in counts.items() if count >= 3}
+    unexpected = sorted(set(repeated) - set(POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST))
+    grown = sorted(
+        (name, repeated[name], allowed)
+        for name, allowed in POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST.items()
+        if repeated.get(name, 0) > allowed
+    )
+
+    assert not unexpected and not grown, (
+        "Repeated mutator calls in postprocess_receipt must be explained as "
+        "temporary debt and must not grow.\n"
+        f"Unexpected repeated mutators: {unexpected}\n"
+        f"Allowlisted mutators whose call counts grew: {grown}"
+    )
+
+
+def test_final_receipt_output_repairs_are_explicit_traced_stages():
+    stages = _final_output_repair_stage_calls()
+    stage_names = tuple(stage for stage, _line in stages)
+    justifications = _final_output_repair_justifications()
+    justification_keys = set(justifications)
+    phase_names = _postprocess_phase_names()
+
+    assert stage_names == FINAL_OUTPUT_REPAIR_STAGES, (
+        "_apply_final_receipt_output_repairs changed. Late semantic repairs "
+        "must stay behind the trace-recording run(stage, repair) wrapper and "
+        "must update FINAL_OUTPUT_REPAIR_STAGES with a reviewable stage label.\n"
+        f"Current stages: {stage_names}"
+    )
+    assert len(stage_names) == len(set(stage_names)), (
+        "Late repair stage labels must be unique so mutation traces are useful."
+    )
+    assert justification_keys == set(stage_names), (
+        "Every late final-output repair must have an explicit owner-phase "
+        "justification in FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS.\n"
+        f"Missing: {sorted(set(stage_names) - justification_keys)}\n"
+        f"Stale: {sorted(justification_keys - set(stage_names))}"
+    )
+    malformed = {
+        stage: value
+        for stage, value in justifications.items()
+        if (
+            not isinstance(value, tuple)
+            or len(value) != 2
+            or value[0] not in phase_names
+            or not isinstance(value[1], str)
+            or not value[1].strip()
+        )
+    }
+    assert not malformed, (
+        "Every late repair justification must name a valid postprocess owner "
+        "phase and a non-empty reason.\n"
+        f"Malformed: {malformed}"
+    )
+
+
+def test_no_new_suspicious_japanese_product_or_location_literals():
+    baseline = _baseline_japanese_string_counts()
+    current = _current_japanese_string_counts()
+    new_literals = []
+    for signature, count in current.items():
+        extra = count - baseline.get(signature, 0)
+        if extra <= 0:
+            continue
+        path, value = signature
+        if _looks_structural_japanese_literal(value):
+            continue
+        new_literals.append((path, value, extra))
+
+    assert not new_literals, (
+        "Production parser code gained Japanese literals that do not look like "
+        "structural receipt labels. Do not add product, merchant, location, or "
+        "answer-key strings to parser code; derive behavior from OCR structure "
+        "and arithmetic invariants instead.\n"
+        + "\n".join(
+            f"  - {path}: {value!r} (+{extra})"
+            for path, value, extra in new_literals[:40]
+        )
+    )
+
+
+def test_postprocess_receipt_is_idempotent_at_guardrail_level():
+    from receipt_parser.pipeline_receipt import (
+        _snapshot_receipt_mutation_fields,
+        postprocess_receipt,
+    )
+
+    extracted = {
+        "document_type": "receipt",
+        "merchant": "テスト店",
+        "currency": "JPY",
+        "total": 1100,
+        "subtotal": 1000,
+        "taxes": [{"rate": "10%", "label": "外税", "amount": 100}],
+        "line_items": [
+            {
+                "description": "テスト商品",
+                "qty": 1,
+                "unit_price": 1000,
+                "total": 1000,
+                "tax_category": "10%",
+            },
+        ],
+        "points_used": 0,
+    }
+    text = "テスト店\nテスト商品\n¥1,000\n小計\n¥1,000\n外税\n¥100\n合計\n¥1,100"
+
+    postprocess_receipt(extracted, text, 0.9, {}, {}, "test-model")
+    once = copy.deepcopy(_snapshot_receipt_mutation_fields(extracted))
+    postprocess_receipt(extracted, text, 0.9, {}, {}, "test-model")
+    twice = _snapshot_receipt_mutation_fields(extracted)
+
+    assert twice == once

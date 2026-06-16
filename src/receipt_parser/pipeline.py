@@ -56,7 +56,6 @@ from .pipeline_receipt import (
     _fix_bag_item_prices_from_rate_bases,
     _fix_code_table_descriptions_by_order,
     _fix_unlabeled_cash_tender_change_block,
-    _drop_numeric_marker_description_rows,
     _clear_discount_when_negative_line_precedes_own_price,
     _prefer_printed_item_sum_total_when_balanced,
     _replace_campaign_discount_stream_when_balanced,
@@ -68,7 +67,6 @@ from .pipeline_receipt import (
     _restore_printed_external_tax_amounts,
     _restore_printed_summary_total_when_tax_balanced,
     _restore_external_tax_total_from_printed_subtotal,
-    _restore_zero_points_when_no_redemption,
     _replace_barcode_qty_price_rows_when_balanced,
     _replace_item_price_qty_rows_when_balanced,
     _recover_repeated_item_from_gap,
@@ -78,6 +76,7 @@ from .pipeline_receipt import (
     _replace_stacked_name_price_rows_when_balanced,
     _restore_stacked_inclusive_tax_block,
     _restore_single_rate_inclusive_tax_block,
+    POSTPROCESS_PHASE_BY_NAME,
     _record_receipt_mutation,
     _snapshot_receipt_mutation_fields,
 )
@@ -815,7 +814,223 @@ def _record_final_receipt_output_repair(
         else None
     )
     repair()
+    trace_len = len(mutation_trace) if mutation_trace is not None else 0
     _record_receipt_mutation(mutation_trace, stage, before, result)
+    if mutation_trace is not None and len(mutation_trace) > trace_len:
+        owner_phase, justification = FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS[stage]
+        mutation_trace[-1]["owner_phase"] = owner_phase
+        mutation_trace[-1]["owner_invariant"] = POSTPROCESS_PHASE_BY_NAME[owner_phase][
+            "invariant"
+        ]
+        mutation_trace[-1]["justification"] = justification
+
+
+FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
+    "barcode_unit_qty_amount_stack": (
+        "structural_item_reconstruction",
+        "Retained late until barcode stack projection is fully owned by postprocess output parity tests.",
+    ),
+    "barcode_qty_price_rows": (
+        "structural_item_reconstruction",
+        "Retained late for row projection consistency after schema serialization.",
+    ),
+    "item_price_qty_rows": (
+        "structural_item_reconstruction",
+        "Late-only parser for item/price/quantity rows pending phase migration.",
+    ),
+    "labeled_purchase_site_location": (
+        "header_identity_repair",
+        "Retained late until location resolution no longer needs post-serialization correction.",
+    ),
+    "store_in_store_header_location": (
+        "header_identity_repair",
+        "Late-only location cleanup for mixed brand and host-store headers.",
+    ),
+    "header_branch_store_location": (
+        "header_identity_repair",
+        "Late-only branch recovery after generic location resolution.",
+    ),
+    "phone_area_city_location": (
+        "header_identity_repair",
+        "Late-only location recovery from phone-area evidence.",
+    ),
+    "short_branch_over_phone_area_city": (
+        "header_identity_repair",
+        "Late-only correction when a visible branch is more specific than phone-area city.",
+    ),
+    "noisy_city_location": (
+        "header_identity_repair",
+        "Late-only cleanup for OCR-expanded city locations.",
+    ),
+    "single_rate_inclusive_tax_block": (
+        "tax_category_assignment",
+        "Retained late for serialized tax block consistency.",
+    ),
+    "following_discount_lines": (
+        "structural_item_reconstruction",
+        "Retained late for discount-line totals exposed by final item layout repair.",
+    ),
+    "coupon_discount_blocks": (
+        "structural_item_reconstruction",
+        "Retained late for coupon rows exposed by final item layout repair.",
+    ),
+    "drop_applied_coupon_line_items": (
+        "item_cleanup",
+        "Retained late to remove coupon rows introduced or exposed by reconstruction.",
+    ),
+    "tiny_item_prices_from_following_ocr": (
+        "structural_item_reconstruction",
+        "Retained late for tiny item price projection after serialization.",
+    ),
+    "split_price_block": (
+        "structural_item_reconstruction",
+        "Retained late for split price blocks pending full postprocess ownership.",
+    ),
+    "split_item_price_body_total": (
+        "structural_item_reconstruction",
+        "Retained late to keep body-total split layouts balanced after final cleanup.",
+    ),
+    "stacked_name_price_rows": (
+        "structural_item_reconstruction",
+        "Retained late for stacked row projection pending phase migration.",
+    ),
+    "stacked_inclusive_tax_block": (
+        "tax_category_assignment",
+        "Retained late for stacked inclusive tax summaries after item reconstruction.",
+    ),
+    "printed_summary_total_tax_balanced": (
+        "financial_totals_repair",
+        "Retained late to restore printed totals when final tax balance proves them.",
+    ),
+    "printed_item_sum_total": (
+        "financial_totals_repair",
+        "Retained late to prefer visible printed item-sum totals when balanced.",
+    ),
+    "o_ring_descriptions": (
+        "item_cleanup",
+        "Retained late because JAN/barcode reconstruction can expose O-ring descriptions.",
+    ),
+    "company_name_merchant": (
+        "header_identity_repair",
+        "Temporary debt: direct final-output callers still need invoice/registration merchant cleanup.",
+    ),
+    "adjacent_ocr_price_shift": (
+        "structural_item_reconstruction",
+        "Retained late for adjacent OCR price shifts before final item cleanup.",
+    ),
+    "repeated_item_gap": (
+        "initial_item_recovery",
+        "Retained late for repeated item gaps exposed by final row projections.",
+    ),
+    "drop_duplicate_embedded_price": (
+        "item_cleanup",
+        "Retained late to remove embedded-price duplicates after final reconstruction.",
+    ),
+    "dense_sequence_rows": (
+        "structural_item_reconstruction",
+        "Retained late for dense sequence reconstruction pending single phase ownership.",
+    ),
+    "campaign_discount_stream": (
+        "structural_item_reconstruction",
+        "Retained late for campaign discount streams before final discount cleanup.",
+    ),
+    "jan_pos_items": (
+        "structural_item_reconstruction",
+        "Retained late for JAN/POS row projection pending postprocess-only ownership.",
+    ),
+    "qty_totals_from_unit_lines": (
+        "structural_item_reconstruction",
+        "Retained late to restore quantity totals after final row projection.",
+    ),
+    "bag_item_prices_from_rate_bases": (
+        "tax_category_assignment",
+        "Retained late for bag price/category consistency with final rate bases.",
+    ),
+    "code_table_descriptions": (
+        "item_cleanup",
+        "Retained late for code-table descriptions exposed by final item projection.",
+    ),
+    "printed_external_tax_amounts": (
+        "tax_category_assignment",
+        "Retained late for external tax summaries after final total repair.",
+    ),
+    "bare_number_tax_summary": (
+        "tax_category_assignment",
+        "Retained late for bare-number tax summaries after item reconstruction.",
+    ),
+    "external_tax_total_from_printed_subtotal": (
+        "financial_totals_repair",
+        "Retained late to restore externally taxed totals from printed subtotal arithmetic.",
+    ),
+    "drop_small_target_only_taxes": (
+        "tax_category_assignment",
+        "Retained late to remove unprinted small target-only taxes after rate repair.",
+    ),
+    "printed_summary_total_tax_balanced_2": (
+        "financial_totals_repair",
+        "Temporary debt: repeated after later tax repairs can change total balance.",
+    ),
+    "unlabeled_cash_tender_change": (
+        "payment_points_reconciliation",
+        "Retained late for cash tender/change blocks after final total repair.",
+    ),
+    "points_payment": (
+        "payment_points_reconciliation",
+        "Retained late to reconcile points and payment after final total changes.",
+    ),
+    "clear_discount_before_own_price": (
+        "item_cleanup",
+        "Late-only cleanup for negative discount lines before their owner price.",
+    ),
+    "campaign_discount_stream_2": (
+        "structural_item_reconstruction",
+        "Temporary debt: repeated after discount cleanup can expose balanced campaign streams.",
+    ),
+    "following_discount_lines_after_layout": (
+        "structural_item_reconstruction",
+        "Temporary debt: repeated after layout repair can expose discount lines.",
+    ),
+    "discounted_line_item_totals": (
+        "final_consistency_pass",
+        "Retained late for discounted line totals after all row reconstruction.",
+    ),
+    "adjacent_ocr_price_shift_final": (
+        "structural_item_reconstruction",
+        "Temporary debt: repeated after discount cleanup can expose adjacent price shifts.",
+    ),
+    "prefixed_tax_marker_item_rows": (
+        "structural_item_reconstruction",
+        "Retained late for prefixed tax marker rows after final cleanup.",
+    ),
+    "missing_items_from_gap": (
+        "initial_item_recovery",
+        "Retained late for item gaps exposed by final row cleanup.",
+    ),
+    "discounted_ocr_pair_descriptions": (
+        "item_cleanup",
+        "Retained late to repair descriptions after discounted rows settle.",
+    ),
+    "pre_price_stack_descriptions": (
+        "item_cleanup",
+        "Retained late to repair stacked descriptions after price rows settle.",
+    ),
+    "drop_duplicate_rows_when_subtotal_balances": (
+        "item_cleanup",
+        "Retained late to remove duplicates only after final subtotal balance is known.",
+    ),
+    "basket_marker_rows": (
+        "structural_item_reconstruction",
+        "Retained late for basket marker projection after discount repairs.",
+    ),
+    "tax_categories_from_rate_bases": (
+        "tax_category_assignment",
+        "Late-only tax category reconciliation from final rate bases.",
+    ),
+    "external_tax_total_from_printed_subtotal_final": (
+        "financial_totals_repair",
+        "Temporary debt: final reassertion after item/tax category repairs.",
+    ),
+}
 
 
 def _apply_final_receipt_output_repairs(
@@ -842,14 +1057,12 @@ def _apply_final_receipt_output_repairs(
         "item_price_qty_rows",
         lambda: _replace_item_price_qty_rows_when_balanced(result, ocr_text),
     )
-    run("numeric_marker_description_rows", lambda: _drop_numeric_marker_description_rows(result, ocr_text))
     run("labeled_purchase_site_location", lambda: _recover_labeled_purchase_site_location(result, ocr_text))
     run("store_in_store_header_location", lambda: _trim_store_in_store_header_location(result, ocr_text))
     run("header_branch_store_location", lambda: _recover_header_branch_store_location(result, ocr_text))
     run("phone_area_city_location", lambda: _recover_phone_area_city_location(result, ocr_text))
     run("short_branch_over_phone_area_city", lambda: _recover_short_branch_over_phone_area_city(result, ocr_text))
     run("noisy_city_location", lambda: _normalize_noisy_city_location(result, ocr_text))
-    run("zero_points_no_redemption", lambda: _restore_zero_points_when_no_redemption(result, ocr_text))
     run("single_rate_inclusive_tax_block", lambda: _restore_single_rate_inclusive_tax_block(result, ocr_text))
     run("following_discount_lines", lambda: _fix_item_totals_from_following_discount_lines(result, ocr_text))
     run("coupon_discount_blocks", lambda: _apply_coupon_discount_blocks(result, ocr_text))
@@ -915,16 +1128,20 @@ def _apply_final_receipt_output_repairs(
     run("external_tax_total_from_printed_subtotal_final", lambda: _restore_external_tax_total_from_printed_subtotal(result, ocr_text))
 
 
-def _prepare_receipt_output_payload(receipt, ocr_text: str | None = None) -> dict:
+def _prepare_receipt_output_payload(
+    receipt,
+    ocr_text: str | None = None,
+    mutation_trace: list[dict] | None = None,
+) -> dict:
     result = receipt.model_dump()
-    _apply_final_receipt_output_repairs(result, ocr_text)
+    _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=mutation_trace)
     return result
 
 
 def _build_result(receipt_payload, final_warnings, pass_history, model, debug=False, trace=None,
-                   ocr_confidence=None, llm_confidence=None,
-                   ocr_source=None, ocr_retried=None, ocr_retry_reason=None,
-                   ocr_text=None):
+                  ocr_confidence=None, llm_confidence=None,
+                  ocr_source=None, ocr_retried=None, ocr_retry_reason=None,
+                  ocr_text=None, mutation_trace: list[dict] | None = None):
     result = deepcopy(receipt_payload)
     result["_warnings"] = final_warnings
     result["_pass_count"] = len(pass_history)
@@ -948,6 +1165,8 @@ def _build_result(receipt_payload, final_warnings, pass_history, model, debug=Fa
     if debug and trace:
         result["_debug_dir"] = str(trace.debug_dir)
         result["_trace"] = trace.summary()
+    if debug and mutation_trace:
+        result["_receipt_mutation_trace"] = mutation_trace
     return result
 
 
@@ -1163,12 +1382,14 @@ def process_document(
             block_with_page = dict(block)
             block_with_page["page"] = page_idx
             all_layout_blocks.append(block_with_page)
+    receipt_mutation_trace: list[dict] | None = [] if debug else None
     extracted, pass_history, final_warnings = _run_extraction_pipeline(
         unified_text=unified_text, raw_text=raw_text,
         ocr_conf=ocr_conf, doc_type=doc_type,
         model=model, passes=passes,
         ocr_layout_blocks=all_layout_blocks,
         on_stage=on_stage,
+        mutation_trace=receipt_mutation_trace,
     )
 
     if "_error" in extracted:
@@ -1198,7 +1419,11 @@ def process_document(
         receipt = Receipt()
     primary_ocr = all_ocr_results[0] if all_ocr_results else None
     repair_ocr_text = primary_ocr.chosen_text if primary_ocr else None
-    receipt_payload = _prepare_receipt_output_payload(receipt, repair_ocr_text)
+    receipt_payload = _prepare_receipt_output_payload(
+        receipt,
+        repair_ocr_text,
+        mutation_trace=receipt_mutation_trace,
+    )
     result = _build_result(
         receipt_payload, final_warnings, pass_history, model, debug=debug, trace=trace,
         ocr_confidence=ocr_conf, llm_confidence=posthoc_conf,
@@ -1206,6 +1431,7 @@ def process_document(
         ocr_retried=primary_ocr.retried if primary_ocr else None,
         ocr_retry_reason=primary_ocr.retry_reason if primary_ocr else None,
         ocr_text=repair_ocr_text,
+        mutation_trace=receipt_mutation_trace,
     )
     if apply_user_rules:
         result = _apply_user_rules(result)
@@ -1317,6 +1543,7 @@ def _select_receipt_postprocessed_candidate(
     ocr_totals: dict,
     model: str,
     ocr_layout_blocks: list[dict] | None,
+    mutation_trace: list[dict] | None = None,
 ) -> dict:
     """Post-process all captured receipt candidates and keep the cleanest one.
 
@@ -1331,10 +1558,11 @@ def _select_receipt_postprocessed_candidate(
             continue
         candidate_refs.append((idx, candidate))
 
-    best: tuple[tuple, int, dict, list[str], int | None] | None = None
+    best: tuple[tuple, int, dict, list[str], int | None, list[dict] | None] | None = None
     for order, (history_idx, candidate) in enumerate(candidate_refs):
         postprocessed = deepcopy(candidate)
         llm_conf = postprocessed.get("_confidence")
+        candidate_trace: list[dict] | None = [] if mutation_trace is not None else None
         postprocessed = postprocess_receipt(
             postprocessed,
             unified_text,
@@ -1343,6 +1571,7 @@ def _select_receipt_postprocessed_candidate(
             llm_conf,
             model,
             ocr_layout_blocks=ocr_layout_blocks,
+            mutation_trace=candidate_trace,
         )
         try:
             receipt = Receipt(**postprocessed)
@@ -1361,16 +1590,18 @@ def _select_receipt_postprocessed_candidate(
             entry["postprocess_warnings"] = warnings
             entry["postprocess_selected"] = False
 
-        ranked = (score, order, postprocessed, warnings, history_idx)
+        ranked = (score, order, postprocessed, warnings, history_idx, candidate_trace)
         if best is None or ranked[:2] < best[:2]:
             best = ranked
 
     if best is None:
         return extracted
 
-    _score, _order, best_extracted, _warnings, best_history_idx = best
+    _score, _order, best_extracted, _warnings, best_history_idx, best_trace = best
     if best_history_idx is not None:
         pass_history[best_history_idx]["postprocess_selected"] = True
+    if mutation_trace is not None and best_trace:
+        mutation_trace.extend(best_trace)
     return best_extracted
 
 
@@ -1383,6 +1614,7 @@ def _run_extraction_pipeline(
     passes: int,
     ocr_layout_blocks: list[dict] | None = None,
     on_stage: StageCallback = None,
+    mutation_trace: list[dict] | None = None,
 ) -> tuple[dict, list[dict], list[str]]:
     """Shared extraction logic: LLM extraction → post-processing → location → validation.
 
@@ -1445,6 +1677,7 @@ def _run_extraction_pipeline(
             ocr_totals,
             model,
             ocr_layout_blocks,
+            mutation_trace=mutation_trace,
         )
     elif doc_type == "utility_bill" and "error" not in extracted:
         extracted = postprocess_utility_bill(extracted, unified_text)
@@ -1569,6 +1802,7 @@ def process_ocr_text(
     passes: int = 1,
     apply_user_rules: bool = True,
     on_stage: StageCallback = None,
+    debug: bool = False,
 ) -> dict:
     """Run the pipeline from OCR text onwards (skip image loading + OCR).
 
@@ -1605,11 +1839,13 @@ def process_ocr_text(
         payload=_build_classify_payload(doc_type, source="ocr_text_input"),
     )
     _notify(on_stage, "extract", "LLM extraction", 0.40)
+    receipt_mutation_trace: list[dict] | None = [] if debug else None
     extracted, pass_history, final_warnings = _run_extraction_pipeline(
         unified_text=unified_text, raw_text=ocr_text,
         ocr_conf=ocr_conf, doc_type=doc_type,
         model=model, passes=passes,
         on_stage=on_stage,
+        mutation_trace=receipt_mutation_trace,
     )
 
     if "_error" in extracted:
@@ -1619,11 +1855,17 @@ def process_ocr_text(
 
     _notify(on_stage, "done", "Complete", 1.0)
     receipt = Receipt(**extracted) if "error" not in extracted else Receipt()
-    receipt_payload = _prepare_receipt_output_payload(receipt, ocr_text)
+    receipt_payload = _prepare_receipt_output_payload(
+        receipt,
+        ocr_text,
+        mutation_trace=receipt_mutation_trace,
+    )
     result = _build_result(
         receipt_payload, final_warnings, pass_history, model,
+        debug=debug,
         ocr_confidence=ocr_conf, ocr_source="injected",
         ocr_text=ocr_text,
+        mutation_trace=receipt_mutation_trace,
     )
     if apply_user_rules:
         result = _apply_user_rules(result)

@@ -196,7 +196,7 @@ def _parse_yen_match(m) -> float | None:
     if m is None:
         return None
     val = m.group(1) or m.group(2)
-    return float(val.replace(',', '')) if val else None
+    return _parse_amount_fragment(val) if val else None
 
 
 _STOP_FINANCIAL = re.compile(
@@ -2518,7 +2518,7 @@ def _amount_from_yen_text(text: str) -> float | None:
     m = re.search(r'[¥￥]\s*([\d,]+)|([\d,]+)\s*円', text or "")
     if not m:
         return None
-    return float((m.group(1) or m.group(2)).replace(',', ''))
+    return _parse_amount_fragment(m.group(1) or m.group(2))
 
 
 def _nontaxable_base_matches_total(unified_text: str, total: float) -> bool:
@@ -12835,6 +12835,12 @@ def _fix_implausible_tax_amounts(extracted, unified_text, ocr_totals):
 
 
 def _parse_amount_fragment(text: str) -> float | None:
+    """Parse an OCR amount token before arithmetic validation.
+
+    Structural trigger: callers have already isolated a yen/amount-shaped OCR
+    token. Invariant: this helper only normalizes numeric syntax; the caller
+    must still prove the amount with receipt arithmetic or field consistency.
+    """
     text = (text or "").strip().replace(',', '')
     if re.match(r'^\d+\.\d{3}$', text):
         text = text.replace('.', '')
@@ -14389,7 +14395,10 @@ def _restore_zero_points_when_no_redemption(extracted, unified_text):
 
 
 POSTPROCESS_MUTATION_FIELDS = (
+    "date",
     "line_items",
+    "location",
+    "merchant",
     "taxes",
     "tax_entries",
     "subtotal",
@@ -14398,6 +14407,58 @@ POSTPROCESS_MUTATION_FIELDS = (
     "points_used",
     "payment_method",
 )
+
+POSTPROCESS_PHASES = (
+    {
+        "name": "header_identity_repair",
+        "reads": ("merchant", "date", "time", "location", "ocr_text"),
+        "writes": ("merchant", "date", "time", "location"),
+        "invariant": "Header fields must be backed by visible OCR header/address/date evidence.",
+    },
+    {
+        "name": "financial_totals_repair",
+        "reads": ("subtotal", "total", "amount_paid", "taxes", "ocr_totals", "ocr_text"),
+        "writes": ("subtotal", "total", "amount_paid", "taxes", "payment_method"),
+        "invariant": "Totals must remain consistent with printed cash/tax/summary arithmetic.",
+    },
+    {
+        "name": "initial_item_recovery",
+        "reads": ("line_items", "subtotal", "total", "ocr_text", "ocr_layout_blocks"),
+        "writes": ("line_items",),
+        "invariant": "Recovered rows must improve item-total consistency or match visible item layout.",
+    },
+    {
+        "name": "item_cleanup",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Cleanup may remove or rename rows only when OCR evidence and row sums stay coherent.",
+    },
+    {
+        "name": "tax_category_assignment",
+        "reads": ("line_items", "taxes", "subtotal", "total", "ocr_totals", "ocr_text"),
+        "writes": ("line_items", "taxes"),
+        "invariant": "Item tax categories and tax entries must agree with printed rate bases or tax summaries.",
+    },
+    {
+        "name": "payment_points_reconciliation",
+        "reads": ("amount_paid", "payment_method", "points_used", "subtotal", "total", "taxes", "ocr_text"),
+        "writes": ("amount_paid", "payment_method", "points_used", "subtotal"),
+        "invariant": "Payment, points, and subtotal changes must preserve total/tax arithmetic.",
+    },
+    {
+        "name": "structural_item_reconstruction",
+        "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text", "ocr_totals"),
+        "writes": ("line_items", "taxes", "subtotal", "total", "amount_paid"),
+        "invariant": "Structural reconstruction must be triggered by OCR row layout and validated by sums.",
+    },
+    {
+        "name": "final_consistency_pass",
+        "reads": ("line_items", "taxes", "subtotal", "total", "amount_paid", "points_used", "ocr_text"),
+        "writes": ("line_items", "taxes", "subtotal", "total", "amount_paid", "points_used"),
+        "invariant": "Final mutations must restore field consistency without fixture or known-answer logic.",
+    },
+)
+POSTPROCESS_PHASE_BY_NAME = {phase["name"]: phase for phase in POSTPROCESS_PHASES}
 
 
 def _copy_mutation_value(value):
@@ -14444,6 +14505,24 @@ def _record_receipt_mutation(
     return after
 
 
+def _record_receipt_phase_mutation(
+    mutation_trace: list[dict] | None,
+    phase_name: str,
+    before: dict | None,
+    extracted: dict,
+) -> dict | None:
+    if phase_name not in POSTPROCESS_PHASE_BY_NAME:
+        raise ValueError(f"Unknown receipt postprocess phase: {phase_name}")
+    trace_len = len(mutation_trace) if mutation_trace is not None else 0
+    after = _record_receipt_mutation(mutation_trace, phase_name, before, extracted)
+    if mutation_trace is not None and len(mutation_trace) > trace_len:
+        phase = POSTPROCESS_PHASE_BY_NAME[phase_name]
+        mutation_trace[-1]["reads"] = phase["reads"]
+        mutation_trace[-1]["writes"] = phase["writes"]
+        mutation_trace[-1]["invariant"] = phase["invariant"]
+    return after
+
+
 def postprocess_receipt(
     extracted: dict,
     unified_text: str,
@@ -14471,9 +14550,21 @@ def postprocess_receipt(
     _fix_header_store_line_location(extracted, unified_text)
     _fix_split_address_location_from_ocr(extracted, unified_text)
     _recover_labeled_purchase_site_location(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "header_identity_repair",
+        trace_snapshot,
+        extracted,
+    )
     _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
     _fix_toll_payment_reference(extracted, unified_text)
     _fix_bare_service_receipt_without_itemization(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "financial_totals_repair",
+        trace_snapshot,
+        extracted,
+    )
     _fix_line_items(extracted, unified_text, ocr_layout_blocks=ocr_layout_blocks)
     _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text)
     _drop_phantom_from_tax_amount(extracted)
@@ -14486,9 +14577,9 @@ def postprocess_receipt(
     _recover_missing_items_from_gap(extracted, unified_text)
     _replace_prefixed_tax_marker_item_rows_when_balanced(extracted, unified_text)
     _fix_bare_service_receipt_without_itemization(extracted, unified_text)
-    trace_snapshot = _record_receipt_mutation(
+    trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
-        "header_financial_initial_items",
+        "initial_item_recovery",
         trace_snapshot,
         extracted,
     )
@@ -14562,9 +14653,9 @@ def postprocess_receipt(
     if extracted.get("line_items"):
         _drop_duplicate_with_embedded_price(extracted["line_items"])
     _drop_numeric_marker_description_rows(extracted, unified_text)
-    trace_snapshot = _record_receipt_mutation(
+    trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
-        "item_recovery_cleanup",
+        "item_cleanup",
         trace_snapshot,
         extracted,
     )
@@ -14715,9 +14806,9 @@ def postprocess_receipt(
             or t.get("rate") == "0%"
             or "非課税" in (t.get("label") or "")
         ]
-    trace_snapshot = _record_receipt_mutation(
+    trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
-        "tax_assignment_cleanup",
+        "tax_category_assignment",
         trace_snapshot,
         extracted,
     )
@@ -14841,9 +14932,9 @@ def postprocess_receipt(
                 pass  # keep the printed/extracted value
             else:
                 extracted["subtotal"] = computed_sub
-    trace_snapshot = _record_receipt_mutation(
+    trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
-        "points_and_subtotal",
+        "payment_points_reconciliation",
         trace_snapshot,
         extracted,
     )
@@ -14955,6 +15046,12 @@ def postprocess_receipt(
     _fix_bag_item_prices_from_rate_bases(extracted, extract_rate_bases(unified_text), unified_text)
     _fix_split_item_price_body_total_layout(extracted, unified_text)
     _clean_code_prefixed_item_descriptions(extracted)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "structural_item_reconstruction",
+        trace_snapshot,
+        extracted,
+    )
     if extracted.get("total") is not None:
         tax_sum = _sum_taxable_amounts(extracted.get("taxes") or [])
         computed_sub = float(extracted["total"]) - tax_sum
@@ -14969,9 +15066,9 @@ def postprocess_receipt(
     _restore_external_tax_total_from_printed_subtotal(extracted, unified_text)
     if extracted.get("line_items"):
         _fill_single_qty_unit_prices_from_totals(extracted["line_items"])
-    _record_receipt_mutation(
+    _record_receipt_phase_mutation(
         mutation_trace,
-        "final_item_tax_consistency",
+        "final_consistency_pass",
         trace_snapshot,
         extracted,
     )
