@@ -14664,6 +14664,41 @@ def _run_cash_tender_reconciliation_phase(
             raise ValueError(f"Unknown cash tender reconciliation repair: {repair}")
 
 
+def _run_payment_points_reconciliation_phase(
+    extracted: dict,
+    unified_text: str,
+    ocr_conf: float,
+    llm_conf: dict | None,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR points-use lines or points tender/payment rows are visible.
+
+    Invariant: points_used, amount_paid, payment_method, and subtotal changes
+    must preserve total minus points payment arithmetic and printed evidence.
+    """
+    for repair in repairs:
+        if repair == "points_used":
+            points = extract_points_used(unified_text)
+            if points is not None:
+                existing_points = extracted.get("points_used")
+                if (
+                    should_override_field("points_used", ocr_conf, llm_conf)
+                    or existing_points is None
+                    or (points > 0 and float(existing_points or 0) == 0)
+                ):
+                    extracted["points_used"] = points
+            elif extracted.get("points_used") is not None:
+                has_points_evidence = bool(re.search(r'ポイント利用|ポイント値引', unified_text))
+                if not has_points_evidence:
+                    extracted["points_used"] = 0
+            else:
+                extracted["points_used"] = 0
+        elif repair == "points_payment":
+            reconcile_points_payment_from_ocr(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown payment points reconciliation repair: {repair}")
+
+
 def _tax_assignment_rate_bases(unified_text: str, ocr_totals: dict | None) -> dict:
     rate_bases = extract_rate_bases(unified_text)
     for rate, base in ((ocr_totals or {}).get('_breakdown_rate_bases') or {}).items():
@@ -15122,23 +15157,13 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    # Points used
-    points = extract_points_used(unified_text)
-    if points is not None:
-        existing_points = extracted.get("points_used")
-        if (
-            should_override_field("points_used", ocr_conf, llm_conf)
-            or existing_points is None
-            or (points > 0 and float(existing_points or 0) == 0)
-        ):
-            extracted["points_used"] = points
-    elif extracted.get("points_used") is not None:
-        has_points_evidence = bool(re.search(r'ポイント利用|ポイント値引', unified_text))
-        if not has_points_evidence:
-            extracted["points_used"] = 0
-    else:
-        extracted["points_used"] = 0
-    reconcile_points_payment_from_ocr(extracted, unified_text)
+    _run_payment_points_reconciliation_phase(
+        extracted,
+        unified_text,
+        ocr_conf,
+        llm_conf,
+        ("points_used", "points_payment"),
+    )
 
     # Fix pre-tax item totals for inclusive-tax receipts
     if extracted.get("line_items") and extracted.get("total"):
@@ -15447,7 +15472,13 @@ def postprocess_receipt(
     _repair_pre_price_stack_descriptions_from_ocr(extracted, unified_text)
     _drop_duplicate_rows_when_subtotal_balances(extracted, unified_text)
     _replace_basket_marker_rows_when_balanced(extracted, unified_text)
-    reconcile_points_payment_from_ocr(extracted, unified_text)
+    _run_payment_points_reconciliation_phase(
+        extracted,
+        unified_text,
+        ocr_conf,
+        llm_conf,
+        ("points_payment",),
+    )
     _restore_external_tax_total_from_printed_subtotal(extracted, unified_text)
     if extracted.get("line_items"):
         _fill_single_qty_unit_prices_from_totals(extracted["line_items"])

@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 128
+POSTPROCESS_REPAIR_CALL_LIMIT = 126
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -156,6 +156,12 @@ CASH_TENDER_RECONCILIATION_REPAIRS = {
 }
 CASH_TENDER_RECONCILIATION_PHASE_HELPER = "_run_cash_tender_reconciliation_phase"
 CASH_TENDER_RECONCILIATION_PHASE_CALL_LIMIT = 2
+PAYMENT_POINTS_RECONCILIATION_REPAIRS = {
+    "extract_points_used",
+    "reconcile_points_payment_from_ocr",
+}
+PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER = "_run_payment_points_reconciliation_phase"
+PAYMENT_POINTS_RECONCILIATION_PHASE_CALL_LIMIT = 2
 LINE_ITEM_CLEANUP_REPAIRS = {
     "_drop_duplicate_with_embedded_price",
     "_drop_non_product_line_items",
@@ -866,6 +872,51 @@ def test_postprocess_cash_tender_reconciliation_debt_is_phase_owned():
         "Cash tender reconciliation phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {CASH_TENDER_RECONCILIATION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_payment_points_reconciliation_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        PAYMENT_POINTS_RECONCILIATION_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Payment/points repairs must be owned by the named "
+        f"{PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER} must document the OCR "
+        "points/payment trigger and total/payment consistency invariant."
+    )
+
+
+def test_postprocess_payment_points_reconciliation_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_payment_points_calls = [
+        name for name in postprocess_calls if name in PAYMENT_POINTS_RECONCILIATION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER
+    ]
+
+    assert not direct_payment_points_calls, (
+        "Payment/points repairs should run through the named phase helper so "
+        "OCR point-use evidence and total minus points payment arithmetic have "
+        "one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_payment_points_calls}"
+    )
+    assert 0 < len(phase_calls) <= PAYMENT_POINTS_RECONCILIATION_PHASE_CALL_LIMIT, (
+        "Payment/points reconciliation phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {PAYMENT_POINTS_RECONCILIATION_PHASE_CALL_LIMIT}"
     )
 
 
