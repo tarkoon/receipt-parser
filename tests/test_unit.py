@@ -4418,6 +4418,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "single_rate_inclusive_tax_restoration",
         "tax_excluded_rate_block_restoration",
         "explicit_tax_amount_restoration",
+        "external_tax_total_restoration",
         "tax_category_assignment",
         "payment_points_reconciliation",
         "structural_item_reconstruction",
@@ -4442,6 +4443,8 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "taxes" in phases["single_rate_inclusive_tax_restoration"]["writes"]
     assert "taxes" in phases["tax_excluded_rate_block_restoration"]["writes"]
     assert "taxes" in phases["explicit_tax_amount_restoration"]["writes"]
+    assert "total" in phases["external_tax_total_restoration"]["writes"]
+    assert "amount_paid" in phases["external_tax_total_restoration"]["writes"]
     assert "line_items" in phases["structural_item_reconstruction"]["writes"]
     assert "taxes" in phases["tax_category_assignment"]["writes"]
     assert "amount_paid" in phases["cash_tender_reconciliation"]["writes"]
@@ -4479,6 +4482,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         },
         "subtotal": {
             "body_total_layout_reconstruction",
+            "external_tax_total_restoration",
             "financial_totals_repair",
             "payment_points_reconciliation",
             "service_receipt_recovery",
@@ -4487,12 +4491,14 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "final_consistency_pass",
         },
         "total": {
+            "external_tax_total_restoration",
             "financial_totals_repair",
             "cash_tender_reconciliation",
             "structural_item_reconstruction",
             "final_consistency_pass",
         },
         "amount_paid": {
+            "external_tax_total_restoration",
             "financial_totals_repair",
             "cash_tender_reconciliation",
             "payment_points_reconciliation",

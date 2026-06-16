@@ -14569,6 +14569,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Explicit tax amount restoration requires visible 税率N%税額 rows and tax amounts bounded by item/tax-rate arithmetic.",
     },
     {
+        "name": "external_tax_total_restoration",
+        "reads": ("line_items", "subtotal", "total", "amount_paid", "points_used", "taxes", "ocr_text"),
+        "writes": ("subtotal", "total", "amount_paid"),
+        "invariant": "External tax total restoration requires printed subtotal plus external-tax arithmetic and a visible summary/payment total.",
+    },
+    {
         "name": "tax_category_assignment",
         "reads": ("line_items", "taxes", "subtotal", "total", "ocr_totals", "ocr_text"),
         "writes": ("line_items", "taxes"),
@@ -14966,6 +14972,26 @@ def _run_explicit_tax_amount_restoration_phase(
         else:
             raise ValueError(
                 f"Unknown explicit tax amount restoration repair: {repair}"
+            )
+
+
+def _run_external_tax_total_restoration_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: printed subtotal plus external-tax entries imply a total.
+
+    Invariant: subtotal + external taxes must match a visible summary/payment
+    total, and amount_paid may change only to preserve total minus points_used
+    arithmetic.
+    """
+    for repair in repairs:
+        if repair == "external_tax_total_from_printed_subtotal":
+            _restore_external_tax_total_from_printed_subtotal(extracted, unified_text)
+        else:
+            raise ValueError(
+                f"Unknown external tax total restoration repair: {repair}"
             )
 
 
@@ -15965,7 +15991,11 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _restore_external_tax_total_from_printed_subtotal(extracted, unified_text)
+    _run_external_tax_total_restoration_phase(
+        extracted,
+        unified_text,
+        ("external_tax_total_from_printed_subtotal",),
+    )
     if extracted.get("total") is not None:
         tax_sum = _sum_taxable_amounts(extracted.get("taxes") or [])
         computed_sub = extracted["total"] - tax_sum
@@ -16088,7 +16118,11 @@ def postprocess_receipt(
         extracted,
     )
     _restore_bare_number_tax_summary(extracted, unified_text)
-    _restore_external_tax_total_from_printed_subtotal(extracted, unified_text)
+    _run_external_tax_total_restoration_phase(
+        extracted,
+        unified_text,
+        ("external_tax_total_from_printed_subtotal",),
+    )
     _drop_unprinted_small_target_only_taxes(extracted, unified_text)
     _run_line_item_cleanup_phase(
         extracted,
@@ -16153,7 +16187,11 @@ def postprocess_receipt(
         llm_conf,
         ("points_payment",),
     )
-    _restore_external_tax_total_from_printed_subtotal(extracted, unified_text)
+    _run_external_tax_total_restoration_phase(
+        extracted,
+        unified_text,
+        ("external_tax_total_from_printed_subtotal",),
+    )
     if extracted.get("line_items"):
         _fill_single_qty_unit_prices_from_totals(extracted["line_items"])
     _record_receipt_phase_mutation(
