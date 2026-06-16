@@ -1068,6 +1068,26 @@ def _run_final_printed_item_sum_total_repair_phase(
             )
 
 
+def _run_final_cash_tender_reconciliation_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: visible cash tender and change rows after total repairs.
+
+    Invariant: amount_paid changes must preserve printed total, tendered
+    amount, and change arithmetic.
+    """
+    for repair in repairs:
+        if repair == "unlabeled_cash_tender_change":
+            _fix_unlabeled_cash_tender_change_block(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final cash tender reconciliation repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1215,7 +1235,8 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "unlabeled_cash_tender_change": (
         "payment_points_reconciliation",
-        "Retained late for cash tender/change blocks after final total repair.",
+        "Owned by the final cash tender reconciliation helper until cash "
+        "tender/change repair moves out of post-serialization repair.",
     ),
     "points_payment": (
         "payment_points_reconciliation",
@@ -1475,7 +1496,14 @@ def _apply_final_receipt_output_repairs(
             ("printed_summary_total_tax_balanced_2",),
         ),
     )
-    run("unlabeled_cash_tender_change", lambda: _fix_unlabeled_cash_tender_change_block(result, ocr_text))
+    run(
+        "unlabeled_cash_tender_change",
+        lambda: _run_final_cash_tender_reconciliation_phase(
+            result,
+            ocr_text,
+            ("unlabeled_cash_tender_change",),
+        ),
+    )
     run("points_payment", lambda: reconcile_points_payment_from_ocr(result, ocr_text))
     run(
         "clear_discount_before_own_price",
