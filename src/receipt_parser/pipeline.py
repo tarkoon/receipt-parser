@@ -1025,6 +1025,29 @@ def _run_final_stacked_inclusive_tax_restoration_phase(
             )
 
 
+def _run_final_printed_summary_total_tax_repair_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: visible printed summary total and tax-balance rows.
+
+    Invariant: total/subtotal changes must be backed by printed summary
+    evidence and preserve total, tax, payment, and points arithmetic.
+    """
+    for repair in repairs:
+        if repair in {
+            "printed_summary_total_tax_balanced",
+            "printed_summary_total_tax_balanced_2",
+        }:
+            _restore_printed_summary_total_when_tax_balanced(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final printed summary total repair: "
+                f"{repair}"
+            )
+
+
 def _run_final_printed_item_sum_total_repair_phase(
     result: dict,
     ocr_text: str,
@@ -1120,7 +1143,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "printed_summary_total_tax_balanced": (
         "financial_totals_repair",
-        "Retained late to restore printed totals when final tax balance proves them.",
+        "Owned by the final printed summary total/tax repair helper until printed summary total correction moves out of post-serialization repair.",
     ),
     "printed_item_sum_total": (
         "financial_totals_repair",
@@ -1188,7 +1211,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "printed_summary_total_tax_balanced_2": (
         "financial_totals_repair",
-        "Temporary debt: repeated after later tax repairs can change total balance.",
+        "Owned by the final printed summary total/tax repair helper; repeated after later tax repairs can change total balance.",
     ),
     "unlabeled_cash_tender_change": (
         "payment_points_reconciliation",
@@ -1381,7 +1404,14 @@ def _apply_final_receipt_output_repairs(
             ("stacked_inclusive_tax_block",),
         ),
     )
-    run("printed_summary_total_tax_balanced", lambda: _restore_printed_summary_total_when_tax_balanced(result, ocr_text))
+    run(
+        "printed_summary_total_tax_balanced",
+        lambda: _run_final_printed_summary_total_tax_repair_phase(
+            result,
+            ocr_text,
+            ("printed_summary_total_tax_balanced",),
+        ),
+    )
     run(
         "printed_item_sum_total",
         lambda: _run_final_printed_item_sum_total_repair_phase(
@@ -1437,7 +1467,14 @@ def _apply_final_receipt_output_repairs(
     run("bare_number_tax_summary", lambda: _restore_bare_number_tax_summary(result, ocr_text))
     run("external_tax_total_from_printed_subtotal", lambda: _restore_external_tax_total_from_printed_subtotal(result, ocr_text))
     run("drop_small_target_only_taxes", lambda: _drop_unprinted_small_target_only_taxes(result, ocr_text))
-    run("printed_summary_total_tax_balanced_2", lambda: _restore_printed_summary_total_when_tax_balanced(result, ocr_text))
+    run(
+        "printed_summary_total_tax_balanced_2",
+        lambda: _run_final_printed_summary_total_tax_repair_phase(
+            result,
+            ocr_text,
+            ("printed_summary_total_tax_balanced_2",),
+        ),
+    )
     run("unlabeled_cash_tender_change", lambda: _fix_unlabeled_cash_tender_change_block(result, ocr_text))
     run("points_payment", lambda: reconcile_points_payment_from_ocr(result, ocr_text))
     run(
