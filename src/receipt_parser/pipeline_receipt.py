@@ -14551,6 +14551,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Quantity-detail repairs require visible OCR qty/unit rows and qty * unit or discount-adjusted item arithmetic.",
     },
     {
+        "name": "single_rate_inclusive_tax_restoration",
+        "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
+        "writes": ("line_items", "taxes", "subtotal"),
+        "invariant": "Single-rate inclusive tax restoration requires a visible printed target/tax block and total/tax arithmetic consistency.",
+    },
+    {
         "name": "tax_category_assignment",
         "reads": ("line_items", "taxes", "subtotal", "total", "ocr_totals", "ocr_text"),
         "writes": ("line_items", "taxes"),
@@ -14891,6 +14897,25 @@ def _run_payment_points_reconciliation_phase(
             reconcile_points_payment_from_ocr(extracted, unified_text)
         else:
             raise ValueError(f"Unknown payment points reconciliation repair: {repair}")
+
+
+def _run_single_rate_inclusive_tax_restoration_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: printed single-rate inclusive target/tax summary rows.
+
+    Invariant: restored tax entry, subtotal, and item tax categories must agree
+    with the receipt total and visible inclusive tax arithmetic.
+    """
+    for repair in repairs:
+        if repair == "single_rate_inclusive_tax_block":
+            _restore_single_rate_inclusive_tax_block(extracted, unified_text)
+        else:
+            raise ValueError(
+                f"Unknown single-rate inclusive tax restoration repair: {repair}"
+            )
 
 
 def _tax_assignment_rate_bases(unified_text: str, ocr_totals: dict | None) -> dict:
@@ -15434,7 +15459,17 @@ def postprocess_receipt(
     )
     _fix_printed_tax_amounts_from_structural_blocks(extracted, unified_text)
     _restore_tax_excluded_per_rate_blocks(extracted, unified_text)
-    _restore_single_rate_inclusive_tax_block(extracted, unified_text)
+    _run_single_rate_inclusive_tax_restoration_phase(
+        extracted,
+        unified_text,
+        ("single_rate_inclusive_tax_block",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "single_rate_inclusive_tax_restoration",
+        trace_snapshot,
+        extracted,
+    )
 
     # Ensure tax entries exist for all assigned item categories
     if extracted.get("line_items") and extracted.get("taxes"):
@@ -15822,7 +15857,17 @@ def postprocess_receipt(
     _normalize_taxes(extracted, unified_text, ocr_totals)
     _restore_explicit_tax_rate_amount_lines(extracted, unified_text)
     _restore_tax_excluded_per_rate_blocks(extracted, unified_text)
-    _restore_single_rate_inclusive_tax_block(extracted, unified_text)
+    _run_single_rate_inclusive_tax_restoration_phase(
+        extracted,
+        unified_text,
+        ("single_rate_inclusive_tax_block",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "single_rate_inclusive_tax_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _restore_external_tax_total_from_printed_subtotal(extracted, unified_text)
     if extracted.get("total") is not None:
         tax_sum = _sum_taxable_amounts(extracted.get("taxes") or [])
@@ -15912,7 +15957,17 @@ def postprocess_receipt(
     _replace_stacked_name_price_rows_when_balanced(extracted, unified_text)
     _restore_stacked_inclusive_tax_block(extracted, unified_text)
     _restore_tax_excluded_per_rate_blocks(extracted, unified_text)
-    _restore_single_rate_inclusive_tax_block(extracted, unified_text)
+    _run_single_rate_inclusive_tax_restoration_phase(
+        extracted,
+        unified_text,
+        ("single_rate_inclusive_tax_block",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "single_rate_inclusive_tax_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _restore_printed_external_tax_amounts(extracted, unified_text)
     _restore_explicit_tax_rate_amount_lines(extracted, unified_text)
     _restore_bare_number_tax_summary(extracted, unified_text)
