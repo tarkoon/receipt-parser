@@ -58,7 +58,7 @@ from .pipeline_receipt import (
     _fix_unlabeled_cash_tender_change_block,
     _clear_discount_when_negative_line_precedes_own_price,
     _prefer_printed_item_sum_total_when_balanced,
-    _replace_campaign_discount_stream_when_balanced,
+    _run_campaign_discount_projection_phase,
     _replace_dense_sequence_rows_when_balanced,
     _replace_prefixed_tax_marker_item_rows_when_balanced,
     _replace_jan_pos_items_when_balanced,
@@ -1046,7 +1046,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "campaign_discount_stream": (
         "structural_item_reconstruction",
-        "Retained late for campaign discount streams before final discount cleanup.",
+        "Owned by the campaign discount projection phase before final discount cleanup.",
     ),
     "jan_pos_items": (
         "structural_item_reconstruction",
@@ -1098,7 +1098,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "campaign_discount_stream_2": (
         "structural_item_reconstruction",
-        "Temporary debt: repeated after discount cleanup can expose balanced campaign streams.",
+        "Temporary debt: repeated campaign discount projection phase after discount cleanup can expose balanced streams.",
     ),
     "following_discount_lines_after_layout": (
         "structural_item_reconstruction",
@@ -1231,7 +1231,14 @@ def _apply_final_receipt_output_repairs(
             lambda: _drop_duplicate_with_embedded_price(result["line_items"]),
         )
     run("dense_sequence_rows", lambda: _replace_dense_sequence_rows_when_balanced(result, ocr_text))
-    run("campaign_discount_stream", lambda: _replace_campaign_discount_stream_when_balanced(result, ocr_text))
+    run(
+        "campaign_discount_stream",
+        lambda: _run_campaign_discount_projection_phase(
+            result,
+            ocr_text,
+            ("campaign_discount_stream",),
+        ),
+    )
     run(
         "jan_pos_items",
         lambda: _replace_jan_pos_items_when_balanced(
@@ -1261,7 +1268,14 @@ def _apply_final_receipt_output_repairs(
         "clear_discount_before_own_price",
         lambda: _clear_discount_when_negative_line_precedes_own_price(result, ocr_text),
     )
-    run("campaign_discount_stream_2", lambda: _replace_campaign_discount_stream_when_balanced(result, ocr_text))
+    run(
+        "campaign_discount_stream_2",
+        lambda: _run_campaign_discount_projection_phase(
+            result,
+            ocr_text,
+            ("campaign_discount_stream",),
+        ),
+    )
     run("following_discount_lines_after_layout", lambda: _fix_item_totals_from_following_discount_lines(result, ocr_text))
     run("discounted_line_item_totals", lambda: _repair_discounted_line_item_totals_when_balanced(result, ocr_text))
     run("adjacent_ocr_price_shift_final", lambda: _fix_adjacent_ocr_price_shift_when_balanced(result, ocr_text))

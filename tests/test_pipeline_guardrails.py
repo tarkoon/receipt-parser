@@ -112,6 +112,14 @@ STRUCTURAL_ITEM_PROJECTION_REPAIRS = {
 }
 STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER = "_run_structural_item_projection_phase"
 STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT = 6
+CAMPAIGN_DISCOUNT_PROJECTION_REPAIRS = {
+    "_replace_campaign_discount_stream_when_balanced",
+}
+CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER = (
+    "_run_campaign_discount_projection_phase"
+)
+CAMPAIGN_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT = 1
+FINAL_CAMPAIGN_DISCOUNT_PROJECTION_STAGE_LIMIT = 2
 FINAL_STRUCTURAL_ITEM_PROJECTION_REPAIRS = {
     "_replace_barcode_unit_qty_amount_stack_when_balanced",
 }
@@ -830,6 +838,84 @@ def test_postprocess_structural_item_projection_debt_is_phase_owned():
         "Structural item projection phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_campaign_discount_projection_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        CAMPAIGN_DISCOUNT_PROJECTION_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Campaign discount stream projection must be owned by the named "
+        f"{CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER} must document the "
+        "campaign discount OCR trigger and subtotal/discount invariant."
+    )
+
+
+def test_postprocess_campaign_discount_projection_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_projection_calls = [
+        name
+        for name in postprocess_calls
+        if name in CAMPAIGN_DISCOUNT_PROJECTION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER
+    ]
+
+    assert not direct_projection_calls, (
+        "Campaign discount projection should run through the named phase "
+        "helper so campaign discount OCR triggers and subtotal/discount "
+        "invariants have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_projection_calls}"
+    )
+    assert 0 < len(phase_calls) <= CAMPAIGN_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT, (
+        "Campaign discount projection phase calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {CAMPAIGN_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_final_campaign_discount_projection_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_projection_calls = [
+        name
+        for name in final_calls
+        if name in CAMPAIGN_DISCOUNT_PROJECTION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in final_calls
+        if name == CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER
+    ]
+
+    assert not direct_projection_calls, (
+        "Late campaign discount projection should run through the named phase "
+        "helper so repeated final stages share the same OCR trigger and "
+        "subtotal/discount invariant owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_projection_calls}"
+    )
+    assert 0 < len(phase_calls) <= FINAL_CAMPAIGN_DISCOUNT_PROJECTION_STAGE_LIMIT, (
+        "Late campaign discount projection phase calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {FINAL_CAMPAIGN_DISCOUNT_PROJECTION_STAGE_LIMIT}"
     )
 
 

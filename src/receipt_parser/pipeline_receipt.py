@@ -14690,6 +14690,23 @@ def _run_structural_item_projection_phase(
             raise ValueError(f"Unknown structural item projection repair: {repair}")
 
 
+def _run_campaign_discount_projection_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR item streams interleave campaign discount marker rows.
+
+    Invariant: projected discounted rows may replace current items only when
+    visible campaign discount amounts reconcile to the printed subtotal.
+    """
+    for repair in repairs:
+        if repair == "campaign_discount_stream":
+            _replace_campaign_discount_stream_when_balanced(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown campaign discount projection repair: {repair}")
+
+
 def _run_quantity_detail_reconciliation_phase(
     extracted: dict,
     unified_text: str,
@@ -15275,7 +15292,6 @@ def postprocess_receipt(
         unified_text,
         ("following_qty_detail",),
     )
-    _replace_campaign_discount_stream_when_balanced(extracted, unified_text)
     _replace_prefixed_tax_marker_item_rows_when_balanced(extracted, unified_text)
     _run_quantity_detail_reconciliation_phase(
         extracted,
@@ -16140,7 +16156,11 @@ def postprocess_receipt(
         unified_text,
         ("following_qty_detail",),
     )
-    _replace_campaign_discount_stream_when_balanced(extracted, unified_text)
+    _run_campaign_discount_projection_phase(
+        extracted,
+        unified_text,
+        ("campaign_discount_stream",),
+    )
     _run_service_receipt_recovery_phase(
         extracted,
         unified_text,
