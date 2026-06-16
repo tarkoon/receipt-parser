@@ -1088,6 +1088,26 @@ def _run_final_cash_tender_reconciliation_phase(
             )
 
 
+def _run_final_payment_points_reconciliation_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR points-use rows after final total/payment repairs.
+
+    Invariant: amount_paid changes must preserve total minus points-used
+    payment arithmetic.
+    """
+    for repair in repairs:
+        if repair == "points_payment":
+            reconcile_points_payment_from_ocr(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final payment/points reconciliation repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1240,7 +1260,8 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "points_payment": (
         "payment_points_reconciliation",
-        "Retained late to reconcile points and payment after final total changes.",
+        "Owned by the final payment/points reconciliation helper until "
+        "points payment repair moves out of post-serialization repair.",
     ),
     "clear_discount_before_own_price": (
         "item_cleanup",
@@ -1504,7 +1525,14 @@ def _apply_final_receipt_output_repairs(
             ("unlabeled_cash_tender_change",),
         ),
     )
-    run("points_payment", lambda: reconcile_points_payment_from_ocr(result, ocr_text))
+    run(
+        "points_payment",
+        lambda: _run_final_payment_points_reconciliation_phase(
+            result,
+            ocr_text,
+            ("points_payment",),
+        ),
+    )
     run(
         "clear_discount_before_own_price",
         lambda: _clear_discount_when_negative_line_precedes_own_price(result, ocr_text),
