@@ -863,6 +863,25 @@ def _run_final_barcode_qty_price_projection_phase(
             )
 
 
+def _run_final_item_price_qty_projection_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: description rows paired with price and quantity-detail rows.
+
+    Invariant: projected items may replace current rows only when OCR-derived
+    totals match the printed subtotal and, when present, printed item count.
+    """
+    for repair in repairs:
+        if repair == "item_price_qty_rows":
+            _replace_item_price_qty_rows_when_balanced(result, ocr_text)
+        else:
+            raise ValueError(
+                f"Unknown final item price quantity projection repair: {repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -874,7 +893,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "item_price_qty_rows": (
         "structural_item_reconstruction",
-        "Late-only parser for item/price/quantity rows pending phase migration.",
+        "Owned by the final item price/quantity projection helper until row projection moves out of post-serialization repair.",
     ),
     "labeled_purchase_site_location": (
         "header_identity_repair",
@@ -1101,7 +1120,11 @@ def _apply_final_receipt_output_repairs(
     )
     run(
         "item_price_qty_rows",
-        lambda: _replace_item_price_qty_rows_when_balanced(result, ocr_text),
+        lambda: _run_final_item_price_qty_projection_phase(
+            result,
+            ocr_text,
+            ("item_price_qty_rows",),
+        ),
     )
     run("labeled_purchase_site_location", lambda: _recover_labeled_purchase_site_location(result, ocr_text))
     run("store_in_store_header_location", lambda: _trim_store_in_store_header_location(result, ocr_text))
