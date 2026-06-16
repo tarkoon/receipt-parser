@@ -14521,6 +14521,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Adjacent price-shift reconciliation requires neighboring OCR item/price rows and subtotal/total item-sum arithmetic.",
     },
     {
+        "name": "bag_amount_shift_reconciliation",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Paid-bag/product amount-shift reconciliation requires adjacent OCR name/bag/amount rows, printed rate bases, and subtotal item-sum arithmetic.",
+    },
+    {
         "name": "item_cleanup",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -14803,6 +14809,26 @@ def _run_adjacent_price_shift_reconciliation_phase(
         else:
             raise ValueError(
                 f"Unknown adjacent price-shift reconciliation repair: {repair}"
+            )
+
+
+def _run_bag_amount_shift_reconciliation_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: adjacent OCR product name, paid-bag price, and product amount rows.
+
+    Invariant: bag/product amount shifts may mutate rows only when printed rate
+    bases identify bag/product tax categories and subtotal item-sum arithmetic
+    remains balanced.
+    """
+    for repair in repairs:
+        if repair == "name_bag_amount_shift":
+            _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
+        else:
+            raise ValueError(
+                f"Unknown bag amount-shift reconciliation repair: {repair}"
             )
 
 
@@ -15118,7 +15144,17 @@ def postprocess_receipt(
         unified_text,
         ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
     )
-    _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
+    _run_bag_amount_shift_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("name_bag_amount_shift",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "bag_amount_shift_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
@@ -15214,7 +15250,17 @@ def postprocess_receipt(
         unified_text,
         ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
     )
-    _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
+    _run_bag_amount_shift_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("name_bag_amount_shift",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "bag_amount_shift_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
@@ -15649,7 +15695,17 @@ def postprocess_receipt(
         unified_text,
         ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
     )
-    _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
+    _run_bag_amount_shift_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("name_bag_amount_shift",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "bag_amount_shift_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,

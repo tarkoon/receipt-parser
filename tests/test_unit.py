@@ -4410,6 +4410,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "gap_item_recovery",
         "low_value_bag_recovery",
         "adjacent_price_shift_reconciliation",
+        "bag_amount_shift_reconciliation",
         "item_cleanup",
         "ocr_description_reconciliation",
         "quantity_detail_reconciliation",
@@ -4424,6 +4425,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["gap_item_recovery"]["writes"]
     assert "line_items" in phases["low_value_bag_recovery"]["writes"]
     assert "line_items" in phases["adjacent_price_shift_reconciliation"]["writes"]
+    assert "line_items" in phases["bag_amount_shift_reconciliation"]["writes"]
     assert "line_items" in phases["item_cleanup"]["writes"]
     assert "line_items" in phases["ocr_description_reconciliation"]["writes"]
     assert "line_items" in phases["service_receipt_recovery"]["writes"]
@@ -4438,6 +4440,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     expected_owners = {
         "line_items": {
             "adjacent_price_shift_reconciliation",
+            "bag_amount_shift_reconciliation",
             "gap_item_recovery",
             "initial_item_recovery",
             "low_value_bag_recovery",

@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 77
+POSTPROCESS_REPAIR_CALL_LIMIT = 74
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -105,7 +105,6 @@ REPAIR_CALL_PREFIXES = (
 POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     # Temporary debt: the current stack re-runs item row cleanup after recovery
     # phases expose new candidate rows. Counts may shrink, but must not grow.
-    "_fix_name_bag_amount_shift_from_ocr": 3,
     "_fix_split_item_price_body_total_layout": 3,
     "_restore_explicit_tax_rate_amount_lines": 3,
     "_restore_external_tax_total_from_printed_subtotal": 3,
@@ -188,6 +187,11 @@ ADJACENT_PRICE_SHIFT_REPAIRS = {
 }
 ADJACENT_PRICE_SHIFT_PHASE_HELPER = "_run_adjacent_price_shift_reconciliation_phase"
 ADJACENT_PRICE_SHIFT_PHASE_CALL_LIMIT = 4
+BAG_AMOUNT_SHIFT_REPAIRS = {
+    "_fix_name_bag_amount_shift_from_ocr",
+}
+BAG_AMOUNT_SHIFT_PHASE_HELPER = "_run_bag_amount_shift_reconciliation_phase"
+BAG_AMOUNT_SHIFT_PHASE_CALL_LIMIT = 3
 LINE_ITEM_CLEANUP_REPAIRS = {
     "_drop_duplicate_with_embedded_price",
     "_drop_non_product_line_items",
@@ -1167,6 +1171,51 @@ def test_postprocess_adjacent_price_shift_debt_is_phase_owned():
         "Adjacent OCR price-shift phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {ADJACENT_PRICE_SHIFT_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_bag_amount_shift_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, BAG_AMOUNT_SHIFT_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        BAG_AMOUNT_SHIFT_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Paid-bag/product amount-shift repairs must be owned by the named "
+        f"{BAG_AMOUNT_SHIFT_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{BAG_AMOUNT_SHIFT_PHASE_HELPER} must document the OCR paid-bag "
+        "row trigger and subtotal/rate-base arithmetic invariant."
+    )
+
+
+def test_postprocess_bag_amount_shift_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_bag_shift_calls = [
+        name for name in postprocess_calls if name in BAG_AMOUNT_SHIFT_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == BAG_AMOUNT_SHIFT_PHASE_HELPER
+    ]
+
+    assert not direct_bag_shift_calls, (
+        "Paid-bag/product amount-shift repairs should run through the named "
+        "phase helper so OCR row order, rate bases, and subtotal arithmetic "
+        "have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_bag_shift_calls}"
+    )
+    assert 0 < len(phase_calls) <= BAG_AMOUNT_SHIFT_PHASE_CALL_LIMIT, (
+        "Paid-bag/product amount-shift phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {BAG_AMOUNT_SHIFT_PHASE_CALL_LIMIT}"
     )
 
 
