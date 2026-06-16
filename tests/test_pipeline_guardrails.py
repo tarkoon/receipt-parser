@@ -186,6 +186,13 @@ FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_HELPER = (
     "_run_final_single_rate_inclusive_tax_restoration_phase"
 )
 FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT = 1
+FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS = {
+    "_restore_stacked_inclusive_tax_block",
+}
+FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_HELPER = (
+    "_run_final_stacked_inclusive_tax_restoration_phase"
+)
+FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT = 1
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -1397,6 +1404,59 @@ def test_final_single_rate_inclusive_tax_restoration_debt_is_helper_owned():
         "explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT}"
+    )
+
+
+def test_final_stacked_inclusive_tax_restoration_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late stacked inclusive tax restoration must be owned by the named "
+        f"{FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_HELPER} must document the "
+        "stacked printed inclusive tax trigger and tax summary arithmetic "
+        "invariant."
+    )
+
+
+def test_final_stacked_inclusive_tax_restoration_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_tax_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_HELPER
+    ]
+
+    assert not direct_tax_calls, (
+        "Late stacked inclusive tax restoration should run through the named "
+        "helper so stacked summary triggers and tax arithmetic invariants have "
+        "one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_tax_calls}"
+    )
+    assert (
+        0 < len(helper_calls) <= FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT
+    ), (
+        "Late stacked inclusive tax restoration helper calls must be explicit "
+        "and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT}"
     )
 
 

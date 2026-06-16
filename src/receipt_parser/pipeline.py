@@ -1005,6 +1005,26 @@ def _run_final_single_rate_inclusive_tax_restoration_phase(
             )
 
 
+def _run_final_stacked_inclusive_tax_restoration_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: stacked printed inclusive target/tax summary rows.
+
+    Invariant: restored tax entries must be backed by visible stacked summary
+    labels and preserve target amount plus inclusive tax arithmetic.
+    """
+    for repair in repairs:
+        if repair == "stacked_inclusive_tax_block":
+            _restore_stacked_inclusive_tax_block(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final stacked inclusive tax restoration repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1076,7 +1096,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "stacked_inclusive_tax_block": (
         "tax_category_assignment",
-        "Retained late for stacked inclusive tax summaries after item reconstruction.",
+        "Owned by the final stacked inclusive tax restoration helper until stacked tax summaries move out of post-serialization repair.",
     ),
     "printed_summary_total_tax_balanced": (
         "financial_totals_repair",
@@ -1333,7 +1353,14 @@ def _apply_final_receipt_output_repairs(
             ("stacked_name_price_rows",),
         ),
     )
-    run("stacked_inclusive_tax_block", lambda: _restore_stacked_inclusive_tax_block(result, ocr_text))
+    run(
+        "stacked_inclusive_tax_block",
+        lambda: _run_final_stacked_inclusive_tax_restoration_phase(
+            result,
+            ocr_text,
+            ("stacked_inclusive_tax_block",),
+        ),
+    )
     run("printed_summary_total_tax_balanced", lambda: _restore_printed_summary_total_when_tax_balanced(result, ocr_text))
     run("printed_item_sum_total", lambda: _prefer_printed_item_sum_total_when_balanced(result, ocr_text))
     run("o_ring_descriptions", lambda: _fix_o_ring_descriptions_from_ocr(result, ocr_text))
