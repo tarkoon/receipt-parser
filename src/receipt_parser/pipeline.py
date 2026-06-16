@@ -939,6 +939,25 @@ def _run_final_stacked_name_price_projection_phase(
             )
 
 
+def _run_final_dense_sequence_projection_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: dense OCR item/price rows with queued descriptions or markers.
+
+    Invariant: projected rows may replace current items only when row totals
+    balance against the printed subtotal and, when present, printed item count.
+    """
+    for repair in repairs:
+        if repair == "dense_sequence_rows":
+            _replace_dense_sequence_rows_when_balanced(result, ocr_text)
+        else:
+            raise ValueError(
+                f"Unknown final dense sequence projection repair: {repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1042,7 +1061,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "dense_sequence_rows": (
         "structural_item_reconstruction",
-        "Retained late for dense sequence reconstruction pending single phase ownership.",
+        "Owned by the final dense sequence projection helper until dense sequence projection moves out of post-serialization repair.",
     ),
     "campaign_discount_stream": (
         "structural_item_reconstruction",
@@ -1230,7 +1249,14 @@ def _apply_final_receipt_output_repairs(
             "drop_duplicate_embedded_price",
             lambda: _drop_duplicate_with_embedded_price(result["line_items"]),
         )
-    run("dense_sequence_rows", lambda: _replace_dense_sequence_rows_when_balanced(result, ocr_text))
+    run(
+        "dense_sequence_rows",
+        lambda: _run_final_dense_sequence_projection_phase(
+            result,
+            ocr_text,
+            ("dense_sequence_rows",),
+        ),
+    )
     run(
         "campaign_discount_stream",
         lambda: _run_campaign_discount_projection_phase(

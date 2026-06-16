@@ -162,6 +162,13 @@ FINAL_STACKED_NAME_PRICE_PROJECTION_HELPER = (
     "_run_final_stacked_name_price_projection_phase"
 )
 FINAL_STACKED_NAME_PRICE_PROJECTION_STAGE_LIMIT = 1
+FINAL_DENSE_SEQUENCE_PROJECTION_REPAIRS = {
+    "_replace_dense_sequence_rows_when_balanced",
+}
+FINAL_DENSE_SEQUENCE_PROJECTION_HELPER = (
+    "_run_final_dense_sequence_projection_phase"
+)
+FINAL_DENSE_SEQUENCE_PROJECTION_STAGE_LIMIT = 1
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -1219,6 +1226,56 @@ def test_final_stacked_name_price_projection_debt_is_helper_owned():
         "bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_STACKED_NAME_PRICE_PROJECTION_STAGE_LIMIT}"
+    )
+
+
+def test_final_dense_sequence_projection_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_DENSE_SEQUENCE_PROJECTION_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_DENSE_SEQUENCE_PROJECTION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late dense sequence projection must be owned by the named "
+        f"{FINAL_DENSE_SEQUENCE_PROJECTION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_DENSE_SEQUENCE_PROJECTION_HELPER} must document the dense "
+        "OCR item/price sequence trigger and subtotal/count invariant."
+    )
+
+
+def test_final_dense_sequence_projection_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_projection_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_DENSE_SEQUENCE_PROJECTION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_DENSE_SEQUENCE_PROJECTION_HELPER
+    ]
+
+    assert not direct_projection_calls, (
+        "Late dense sequence projection should run through the named helper "
+        "so dense OCR row triggers and subtotal/count invariants have one "
+        "owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_projection_calls}"
+    )
+    assert 0 < len(helper_calls) <= FINAL_DENSE_SEQUENCE_PROJECTION_STAGE_LIMIT, (
+        "Late dense sequence projection helper calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_DENSE_SEQUENCE_PROJECTION_STAGE_LIMIT}"
     )
 
 
