@@ -958,6 +958,33 @@ def _run_final_dense_sequence_projection_phase(
             )
 
 
+def _run_final_header_location_repair_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR header, branch/address, purchase-site, or phone-area rows.
+
+    Invariant: location changes must preserve visible header/address evidence
+    and prefer the most specific printed branch or city token over noisy text.
+    """
+    for repair in repairs:
+        if repair == "labeled_purchase_site_location":
+            _recover_labeled_purchase_site_location(result, ocr_text)
+        elif repair == "store_in_store_header_location":
+            _trim_store_in_store_header_location(result, ocr_text)
+        elif repair == "header_branch_store_location":
+            _recover_header_branch_store_location(result, ocr_text)
+        elif repair == "phone_area_city_location":
+            _recover_phone_area_city_location(result, ocr_text)
+        elif repair == "short_branch_over_phone_area_city":
+            _recover_short_branch_over_phone_area_city(result, ocr_text)
+        elif repair == "noisy_city_location":
+            _normalize_noisy_city_location(result, ocr_text)
+        else:
+            raise ValueError(f"Unknown final header location repair: {repair}")
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -973,27 +1000,27 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "labeled_purchase_site_location": (
         "header_identity_repair",
-        "Retained late until location resolution no longer needs post-serialization correction.",
+        "Owned by the final header location repair helper until purchase-site location recovery moves out of post-serialization repair.",
     ),
     "store_in_store_header_location": (
         "header_identity_repair",
-        "Late-only location cleanup for mixed brand and host-store headers.",
+        "Owned by the final header location repair helper until mixed brand and host-store cleanup moves out of post-serialization repair.",
     ),
     "header_branch_store_location": (
         "header_identity_repair",
-        "Late-only branch recovery after generic location resolution.",
+        "Owned by the final header location repair helper until branch recovery moves out of post-serialization repair.",
     ),
     "phone_area_city_location": (
         "header_identity_repair",
-        "Late-only location recovery from phone-area evidence.",
+        "Owned by the final header location repair helper until phone-area recovery moves out of post-serialization repair.",
     ),
     "short_branch_over_phone_area_city": (
         "header_identity_repair",
-        "Late-only correction when a visible branch is more specific than phone-area city.",
+        "Owned by the final header location repair helper until short-branch correction moves out of post-serialization repair.",
     ),
     "noisy_city_location": (
         "header_identity_repair",
-        "Late-only cleanup for OCR-expanded city locations.",
+        "Owned by the final header location repair helper until noisy city cleanup moves out of post-serialization repair.",
     ),
     "single_rate_inclusive_tax_block": (
         "tax_category_assignment",
@@ -1202,12 +1229,54 @@ def _apply_final_receipt_output_repairs(
             ("item_price_qty_rows",),
         ),
     )
-    run("labeled_purchase_site_location", lambda: _recover_labeled_purchase_site_location(result, ocr_text))
-    run("store_in_store_header_location", lambda: _trim_store_in_store_header_location(result, ocr_text))
-    run("header_branch_store_location", lambda: _recover_header_branch_store_location(result, ocr_text))
-    run("phone_area_city_location", lambda: _recover_phone_area_city_location(result, ocr_text))
-    run("short_branch_over_phone_area_city", lambda: _recover_short_branch_over_phone_area_city(result, ocr_text))
-    run("noisy_city_location", lambda: _normalize_noisy_city_location(result, ocr_text))
+    run(
+        "labeled_purchase_site_location",
+        lambda: _run_final_header_location_repair_phase(
+            result,
+            ocr_text,
+            ("labeled_purchase_site_location",),
+        ),
+    )
+    run(
+        "store_in_store_header_location",
+        lambda: _run_final_header_location_repair_phase(
+            result,
+            ocr_text,
+            ("store_in_store_header_location",),
+        ),
+    )
+    run(
+        "header_branch_store_location",
+        lambda: _run_final_header_location_repair_phase(
+            result,
+            ocr_text,
+            ("header_branch_store_location",),
+        ),
+    )
+    run(
+        "phone_area_city_location",
+        lambda: _run_final_header_location_repair_phase(
+            result,
+            ocr_text,
+            ("phone_area_city_location",),
+        ),
+    )
+    run(
+        "short_branch_over_phone_area_city",
+        lambda: _run_final_header_location_repair_phase(
+            result,
+            ocr_text,
+            ("short_branch_over_phone_area_city",),
+        ),
+    )
+    run(
+        "noisy_city_location",
+        lambda: _run_final_header_location_repair_phase(
+            result,
+            ocr_text,
+            ("noisy_city_location",),
+        ),
+    )
     run("single_rate_inclusive_tax_block", lambda: _restore_single_rate_inclusive_tax_block(result, ocr_text))
     run("following_discount_lines", lambda: _fix_item_totals_from_following_discount_lines(result, ocr_text))
     run("coupon_discount_blocks", lambda: _apply_coupon_discount_blocks(result, ocr_text))

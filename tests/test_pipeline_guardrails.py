@@ -169,6 +169,16 @@ FINAL_DENSE_SEQUENCE_PROJECTION_HELPER = (
     "_run_final_dense_sequence_projection_phase"
 )
 FINAL_DENSE_SEQUENCE_PROJECTION_STAGE_LIMIT = 1
+FINAL_HEADER_LOCATION_REPAIR_HELPERS = {
+    "_recover_labeled_purchase_site_location",
+    "_trim_store_in_store_header_location",
+    "_recover_header_branch_store_location",
+    "_recover_phone_area_city_location",
+    "_recover_short_branch_over_phone_area_city",
+    "_normalize_noisy_city_location",
+}
+FINAL_HEADER_LOCATION_REPAIR_HELPER = "_run_final_header_location_repair_phase"
+FINAL_HEADER_LOCATION_REPAIR_STAGE_LIMIT = 6
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -1276,6 +1286,55 @@ def test_final_dense_sequence_projection_debt_is_helper_owned():
         "bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_DENSE_SEQUENCE_PROJECTION_STAGE_LIMIT}"
+    )
+
+
+def test_final_header_location_repair_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_HEADER_LOCATION_REPAIR_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_HEADER_LOCATION_REPAIR_HELPERS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late header/location repairs must be owned by the named "
+        f"{FINAL_HEADER_LOCATION_REPAIR_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_HEADER_LOCATION_REPAIR_HELPER} must document OCR header, "
+        "address, or phone-area triggers and a location field-consistency "
+        "invariant."
+    )
+
+
+def test_final_header_location_repair_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_location_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_HEADER_LOCATION_REPAIR_HELPERS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_HEADER_LOCATION_REPAIR_HELPER
+    ]
+
+    assert not direct_location_calls, (
+        "Late header/location repairs should run through the named helper so "
+        "OCR header/address/phone triggers and location consistency have one "
+        "owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_location_calls}"
+    )
+    assert 0 < len(helper_calls) <= FINAL_HEADER_LOCATION_REPAIR_STAGE_LIMIT, (
+        "Late header/location repair helper calls must be explicit and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_HEADER_LOCATION_REPAIR_STAGE_LIMIT}"
     )
 
 
