@@ -4406,6 +4406,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "financial_totals_repair",
         "initial_item_recovery",
         "item_cleanup",
+        "quantity_detail_reconciliation",
         "tax_category_assignment",
         "payment_points_reconciliation",
         "structural_item_reconstruction",
@@ -4415,6 +4416,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "date" in phases["header_identity_repair"]["writes"]
     assert "line_items" in phases["initial_item_recovery"]["writes"]
     assert "line_items" in phases["item_cleanup"]["writes"]
+    assert "line_items" in phases["quantity_detail_reconciliation"]["writes"]
     assert "line_items" in phases["structural_item_reconstruction"]["writes"]
     assert "taxes" in phases["tax_category_assignment"]["writes"]
     assert "total" in phases["financial_totals_repair"]["writes"]
@@ -4425,6 +4427,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "line_items": {
             "initial_item_recovery",
             "item_cleanup",
+            "quantity_detail_reconciliation",
             "tax_category_assignment",
             "structural_item_reconstruction",
             "final_consistency_pass",
@@ -6804,6 +6807,129 @@ def test_qty_detail_repair_applies_discount_when_total_was_reset_to_gross():
     assert extracted["line_items"][0]["qty"] == 2
     assert extracted["line_items"][0]["unit_price"] == 925
     assert extracted["line_items"][0]["total"] == 1294
+
+
+def test_qty_detail_repair_uses_unit_first_ocr_row_when_total_invariant_matches():
+    """Trigger: unit-first OCR qty detail; invariant: qty * unit equals item total."""
+    from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "line_items": [
+            {
+                "description": "商品A",
+                "qty": 1,
+                "unit_price": 1258,
+                "total": 1258,
+                "tax_category": "10%",
+            }
+        ]
+    }
+    ocr_text = "\n".join([
+        "20060SA商品A",
+        "単629×2個",
+        "外 ¥1,258",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["qty"] == 2
+    assert extracted["line_items"][0]["unit_price"] == 629
+    assert extracted["line_items"][0]["total"] == 1258
+
+
+def test_qty_detail_repair_ignores_unit_first_ocr_row_when_total_invariant_fails():
+    """Trigger: unit-first OCR qty detail; invariant failure leaves row unchanged."""
+    from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "line_items": [
+            {
+                "description": "商品A",
+                "qty": 1,
+                "unit_price": 1200,
+                "total": 1200,
+                "tax_category": "10%",
+            }
+        ]
+    }
+    ocr_text = "\n".join([
+        "20060SA商品A",
+        "単629×2個",
+        "外 ¥1,258",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["qty"] == 1
+    assert extracted["line_items"][0]["unit_price"] == 1200
+    assert extracted["line_items"][0]["total"] == 1200
+
+
+def test_qty_detail_repair_names_unit_first_detail_row_from_nearest_owner_when_total_matches():
+    """Trigger: item row is OCR qty detail; invariant: nearest owner and qty * unit total."""
+    from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "line_items": [
+            {
+                "description": "単629×2個",
+                "qty": 2,
+                "unit_price": 629,
+                "total": 1258,
+                "tax_category": "10%",
+            }
+        ]
+    }
+    ocr_text = "\n".join([
+        "20060SA商品A",
+        "単629×2個",
+        "外 ¥1,258",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["description"] == "商品A"
+    assert extracted["line_items"][0]["qty"] == 2
+    assert extracted["line_items"][0]["unit_price"] == 629
+    assert extracted["line_items"][0]["total"] == 1258
+
+
+def test_qty_detail_repair_uses_matching_owner_before_intervening_noise_when_total_matches():
+    """Trigger: unit-first qty row after OCR noise; invariant: matching owner and total."""
+    from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "line_items": [
+            {
+                "description": "商品A",
+                "qty": 1,
+                "unit_price": 1258,
+                "total": 1258,
+                "tax_category": "10%",
+            }
+        ]
+    }
+    ocr_text = "\n".join([
+        "20060SA商品A",
+        "取引情報",
+        "明細情報",
+        "登録情報",
+        "処理情報",
+        "確認情報",
+        "印字情報",
+        "受付情報",
+        "端末情報",
+        "管理情報",
+        "単629×2個",
+        "外 ¥1,258",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["description"] == "商品A"
+    assert extracted["line_items"][0]["qty"] == 2
+    assert extracted["line_items"][0]["unit_price"] == 629
+    assert extracted["line_items"][0]["total"] == 1258
 
 
 def test_ocr_neighborhood_total_repair_resets_unsupported_carried_quantity():

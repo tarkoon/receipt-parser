@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 155
+POSTPROCESS_REPAIR_CALL_LIMIT = 152
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -120,7 +120,6 @@ POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     "_recover_discounted_item_from_gap": 3,
     "_recover_missing_bag_items_from_ocr": 3,
     "_recover_repeated_item_from_gap": 3,
-    "_repair_previous_item_from_following_qty_detail": 3,
     "_replace_overage_item_with_low_value_bag": 3,
     "_restore_explicit_tax_rate_amount_lines": 3,
     "_restore_external_tax_total_from_printed_subtotal": 3,
@@ -129,15 +128,20 @@ POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     "_apply_single_bag_standard_rate_split": 4,
 }
 STRUCTURAL_ITEM_PROJECTION_REPAIRS = {
-    "_fix_qty_context_and_reduced_rate_from_ocr",
-    "_fix_qty_totals_from_ocr_unit_lines",
     "_replace_barcode_qty_price_rows_when_balanced",
     "_replace_barcode_unit_qty_amount_stack_when_balanced",
     "_replace_dense_sequence_rows_when_balanced",
     "_replace_jan_pos_items_when_balanced",
 }
 STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER = "_run_structural_item_projection_phase"
-STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT = 11
+STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT = 6
+QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
+    "_fix_qty_context_and_reduced_rate_from_ocr",
+    "_fix_qty_totals_from_ocr_unit_lines",
+    "_repair_previous_item_from_following_qty_detail",
+}
+QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER = "_run_quantity_detail_reconciliation_phase"
+QUANTITY_DETAIL_RECONCILIATION_PHASE_CALL_LIMIT = 10
 LINE_ITEM_CLEANUP_REPAIRS = {
     "_drop_duplicate_with_embedded_price",
     "_drop_non_product_line_items",
@@ -706,6 +710,60 @@ def test_postprocess_structural_item_projection_debt_is_phase_owned():
         "Structural item projection phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_quantity_detail_reconciliation_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        QUANTITY_DETAIL_RECONCILIATION_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Quantity detail repairs must be owned by the named "
+        f"{QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER} must document the OCR "
+        "quantity-detail trigger and arithmetic or field-consistency invariant."
+    )
+
+
+def test_postprocess_quantity_detail_reconciliation_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    structural_projection = _function_def(tree, STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER)
+    postprocess_calls = _call_names_in_function(postprocess)
+    structural_calls = _call_names_in_function(structural_projection)
+    direct_quantity_calls = [
+        name for name in postprocess_calls if name in QUANTITY_DETAIL_RECONCILIATION_REPAIRS
+    ]
+    structural_quantity_calls = [
+        name for name in structural_calls if name in QUANTITY_DETAIL_RECONCILIATION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER
+    ]
+
+    assert not direct_quantity_calls, (
+        "Quantity detail repairs should run through the named phase helper so "
+        "OCR quantity triggers and qty * unit invariants have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_quantity_calls}"
+    )
+    assert not structural_quantity_calls, (
+        "Quantity detail reconciliation should not be hidden inside the broader "
+        "structural projection phase.\n"
+        f"Structural helper still owns: {structural_quantity_calls}"
+    )
+    assert 0 < len(phase_calls) <= QUANTITY_DETAIL_RECONCILIATION_PHASE_CALL_LIMIT, (
+        "Quantity detail reconciliation phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {QUANTITY_DETAIL_RECONCILIATION_PHASE_CALL_LIMIT}"
     )
 
 

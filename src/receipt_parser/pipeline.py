@@ -939,8 +939,8 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "Retained late for JAN/POS row projection pending postprocess-only ownership.",
     ),
     "qty_totals_from_unit_lines": (
-        "structural_item_reconstruction",
-        "Retained late to restore quantity totals after final row projection.",
+        "quantity_detail_reconciliation",
+        "Retained late to restore quantity totals exposed by final row projection.",
     ),
     "bag_item_prices_from_rate_bases": (
         "tax_category_assignment",

@@ -4409,7 +4409,12 @@ def _replace_hallucinated_dup_with_ocr_item(items, unified_text, target_subtotal
 
 _OCR_TRAILING_PRICE_RE = re.compile(r'(?:^|[\s(（])([¥￥]?\s*\d[\d,]*)\s*(?:[%％][*※除軽]|[*※除軽])?\s*$')
 _OCR_ZONE_END_RE = re.compile(r'^(小計|合計|現計|外税|内税|消費税|お預り|お釣り|釣銭|WAON|クレジット|お会計)')
-_OCR_QTY_NOTATION_RE = re.compile(r'\d+\s*個\s*[xX×Ⅹ]\s*(?:単|@)?\s*\d')
+_OCR_QTY_NOTATION_RE = re.compile(
+    r'(?:'
+    r'\d+\s*[コ個点]\s*[xX×Ⅹ]\s*(?:単|@)?\s*\d|'
+    r'(?:単|@)\s*\d[\d,]*\s*[xX×Ⅹ]\s*\d+\s*[コ個点]'
+    r')'
+)
 
 
 def _parse_qty_detail_total(line: str) -> tuple[float, float] | None:
@@ -10366,8 +10371,9 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
             return False
         return bool(re.search(r'[ぁ-んァ-ン一-龥]', text))
 
-    def _nearest_name_before(idx: int, expected_total: float | None = None) -> str | None:
-        for j in range(idx - 1, max(idx - 8, -1), -1):
+    def _candidate_names_before(idx: int, expected_total: float | None = None) -> list[str]:
+        candidates: list[str] = []
+        for j in range(idx - 1, max(idx - 14, -1), -1):
             s = lines[j].strip()
             if not s:
                 continue
@@ -10379,14 +10385,25 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                     price = None
                 cand = _clean_ocr_price_line_desc(s)
                 if price is not None and abs(price - expected_total) <= 2 and _valid_desc(cand):
-                    return re.sub(r'^\d{3,}[A-Za-z0-9-]*\)?\s*', '', cand).strip()
+                    candidates.append(
+                        re.sub(r'^\d{3,}[A-Za-z0-9-]*\)?\s*', '', cand).strip()
+                    )
+                    continue
             if _SKIP_PRICE_LINE.search(s) or _OCR_TRAILING_PRICE_RE.search(s):
                 continue
             if _OCR_QTY_NOTATION_RE.search(s) or re.search(r'[xX×Ⅹ]\s*単?\s*\d', s):
                 continue
             if _valid_desc(s):
-                return re.sub(r'^\d{3,}[A-Za-z0-9-]*\)?\s*', '', s).strip()
-        return None
+                candidates.append(re.sub(r'^\d{3,}[A-Za-z0-9-]*\)?\s*', '', s).strip())
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = _norm(candidate)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(candidate)
+        return deduped
 
     def _has_direct_unit_price_row(item: dict, unit: float, detail_idx: int) -> bool:
         line_idx = _ocr_line_index_for_item(lines, item)
@@ -10447,10 +10464,34 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                 return True
         return False
 
+    def _parse_unit_line_qty_detail(line: str) -> tuple[float, float] | None:
+        unit_first = re.search(
+            r'\(?\s*単\s*(\d[\d,]*)\s*[xX×Ⅹ]\s*(\d+)\s*[個コ点]\s*\)?',
+            line,
+        )
+        if unit_first:
+            unit = float(unit_first.group(1).replace(',', ''))
+            qty = float(unit_first.group(2))
+        else:
+            if re.search(r'[@＠]', line):
+                return None
+            qty_first = re.search(
+                r'\(?\s*(\d+)\s*[個コ点]?\s*[xX×Ⅹ]\s*単?\s*(\d[\d,]*)\s*\)?',
+                line,
+            )
+            if not qty_first:
+                return None
+            qty = float(qty_first.group(1))
+            unit = float(qty_first.group(2).replace(',', ''))
+        if qty < 2 or unit <= 0:
+            return None
+        return qty, unit
+
     for idx, line in enumerate(lines):
-        m = re.search(r'\(?\s*(\d+)\s*[個コ]?\s*[xX×Ⅹ]\s*単?\s*(\d{2,4})\s*\)?', line)
+        detail = _parse_unit_line_qty_detail(line)
         split_total = None
-        if not m:
+        split_unit = None
+        if detail is None:
             qty_m = re.search(r'\(?\s*(\d+)\s*[個コ]\s*$', line)
             unit_m = (
                 re.search(r'単\s*(\d{2,4})\s*\)?', lines[idx + 1])
@@ -10461,111 +10502,133 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                 if unit_m and idx + 2 < len(lines) else None
             )
             if qty_m and unit_m:
-                m = qty_m
+                qty = float(qty_m.group(1))
                 split_unit = float(unit_m.group(1))
                 split_total = float(total_m.group(1)) if total_m else None
-        if not m:
+            else:
+                continue
+        else:
+            qty, split_unit = detail
+        if split_unit is None:
             continue
-        qty = float(m.group(1))
-        unit = split_unit if split_total is not None or 'split_unit' in locals() else float(m.group(2))
-        if 'split_unit' in locals():
-            del split_unit
+        unit = split_unit
         if qty <= 1 or unit <= 0:
             continue
         expected_total = split_total if split_total is not None else qty * unit
-        desc = _nearest_name_before(idx, expected_total)
-        if not desc:
+        desc_candidates = _candidate_names_before(idx, expected_total)
+        if not desc_candidates:
             continue
-        ndesc = _norm(desc)
         matched_item = None
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            item_total = float(item.get("total") or 0)
-            item_discount = float(item.get("discount") or 0)
-            if (
-                abs(item_total - unit) > 2
-                and abs(item_total - expected_total) > 2
-                and abs(item_total + item_discount - expected_total) > 2
-            ):
-                continue
-            item_desc = _norm(item.get("description") or "")
-            if not item_desc:
-                continue
-            if ndesc in item_desc or item_desc in ndesc or SequenceMatcher(None, ndesc, item_desc).ratio() >= 0.72:
-                discount = float(item.get("discount") or 0)
-                current_unit = float(item.get("unit_price") or 0)
-                current_total = float(item.get("total") or 0)
-                gross_is_standalone_before_qty_detail = _has_standalone_gross_before_qty_detail(
-                    item, expected_total, idx
+        for desc in desc_candidates:
+            ndesc = _norm(desc)
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_total = float(item.get("total") or 0)
+                item_discount = float(item.get("discount") or 0)
+                if (
+                    abs(item_total - unit) > 2
+                    and abs(item_total - expected_total) > 2
+                    and abs(item_total + item_discount - expected_total) > 2
+                ):
+                    continue
+                item_desc = _norm(item.get("description") or "")
+                if not item_desc:
+                    continue
+                item_desc_is_qty_detail = bool(
+                    _OCR_QTY_NOTATION_RE.search(str(item.get("description") or ""))
                 )
                 if (
-                    discount > 0
-                    and gross_is_standalone_before_qty_detail
-                    and abs(current_unit - unit) <= 2
-                    and abs(current_total - (expected_total - discount)) <= 2
+                    item_desc_is_qty_detail
+                    and desc == desc_candidates[-1]
+                    and abs(item_total - expected_total) <= 2
                 ):
-                    half_off_gross_line = (
-                        abs(discount - unit) <= 2
-                        and abs(current_total - unit) <= 2
-                    )
-                    item["qty"] = qty
-                    item["unit_price"] = expected_total if half_off_gross_line else unit
-                    item["total"] = current_total
-                    matched_item = item
-                    break
-                if (
-                    discount > 0
-                    and abs(current_unit - unit) <= 2
-                    and abs(current_total - expected_total) <= 2
-                ):
+                    item["description"] = desc
                     item["qty"] = qty
                     item["unit_price"] = unit
-                    item["total"] = qty * unit - discount
+                    item["total"] = (
+                        split_total
+                        if split_total and abs(split_total - expected_total) <= 2
+                        else expected_total
+                    )
                     matched_item = item
                     break
-                if (
-                    discount > 0
-                    and abs(current_unit - expected_total) <= 2
-                    and abs(current_total - (current_unit - discount)) <= 2
-                ):
-                    current_qty = float(item.get("qty") or 1)
-                    desc_has_gross = _amount_appears_in_text(item.get("description") or "", expected_total)
-                    ocr_line_idx = _ocr_line_index_for_item(lines, item)
-                    gross_is_inline_with_name = (
-                        ocr_line_idx is not None
-                        and _amount_appears_in_text(lines[ocr_line_idx], expected_total)
-                        and item_desc in _norm(lines[ocr_line_idx])
-                    )
-                    item["qty"] = qty
-                    half_off_gross_line = (
-                        abs(discount - unit) <= 2
-                        and abs(current_total - unit) <= 2
+                if ndesc in item_desc or item_desc in ndesc or SequenceMatcher(None, ndesc, item_desc).ratio() >= 0.72:
+                    discount = float(item.get("discount") or 0)
+                    current_unit = float(item.get("unit_price") or 0)
+                    current_total = float(item.get("total") or 0)
+                    gross_is_standalone_before_qty_detail = _has_standalone_gross_before_qty_detail(
+                        item, expected_total, idx
                     )
                     if (
-                        current_qty > 1
+                        discount > 0
                         and gross_is_standalone_before_qty_detail
-                        and not half_off_gross_line
-                        and abs(current_total - (qty * unit - discount)) <= 2
+                        and abs(current_unit - unit) <= 2
+                        and abs(current_total - (expected_total - discount)) <= 2
                     ):
-                        item["unit_price"] = unit
+                        half_off_gross_line = (
+                            abs(discount - unit) <= 2
+                            and abs(current_total - unit) <= 2
+                        )
+                        item["qty"] = qty
+                        item["unit_price"] = expected_total if half_off_gross_line else unit
                         item["total"] = current_total
-                    if current_qty <= 1 and gross_is_standalone_before_qty_detail:
-                        item["unit_price"] = expected_total
-                        item["total"] = current_unit - discount
-                    elif current_qty <= 1 or desc_has_gross or gross_is_inline_with_name:
+                        matched_item = item
+                        break
+                    if (
+                        discount > 0
+                        and abs(current_unit - unit) <= 2
+                        and abs(current_total - expected_total) <= 2
+                    ):
+                        item["qty"] = qty
                         item["unit_price"] = unit
                         item["total"] = qty * unit - discount
-                        cleaned_desc = _clean_ocr_price_line_desc(item.get("description") or "")
-                        if cleaned_desc and _valid_desc(cleaned_desc):
-                            item["description"] = cleaned_desc
+                        matched_item = item
+                        break
+                    if (
+                        discount > 0
+                        and abs(current_unit - expected_total) <= 2
+                        and abs(current_total - (current_unit - discount)) <= 2
+                    ):
+                        current_qty = float(item.get("qty") or 1)
+                        desc_has_gross = _amount_appears_in_text(item.get("description") or "", expected_total)
+                        ocr_line_idx = _ocr_line_index_for_item(lines, item)
+                        gross_is_inline_with_name = (
+                            ocr_line_idx is not None
+                            and _amount_appears_in_text(lines[ocr_line_idx], expected_total)
+                            and item_desc in _norm(lines[ocr_line_idx])
+                        )
+                        item["qty"] = qty
+                        half_off_gross_line = (
+                            abs(discount - unit) <= 2
+                            and abs(current_total - unit) <= 2
+                        )
+                        if (
+                            current_qty > 1
+                            and gross_is_standalone_before_qty_detail
+                            and not half_off_gross_line
+                            and abs(current_total - (qty * unit - discount)) <= 2
+                        ):
+                            item["unit_price"] = unit
+                            item["total"] = current_total
+                        if current_qty <= 1 and gross_is_standalone_before_qty_detail:
+                            item["unit_price"] = expected_total
+                            item["total"] = current_unit - discount
+                        elif current_qty <= 1 or desc_has_gross or gross_is_inline_with_name:
+                            item["unit_price"] = unit
+                            item["total"] = qty * unit - discount
+                            cleaned_desc = _clean_ocr_price_line_desc(item.get("description") or "")
+                            if cleaned_desc and _valid_desc(cleaned_desc):
+                                item["description"] = cleaned_desc
+                        matched_item = item
+                        break
+                    item["qty"] = qty
+                    item["unit_price"] = unit
+                    expected_total = qty * unit
+                    item["total"] = split_total if split_total and abs(split_total - expected_total) <= 2 else expected_total
                     matched_item = item
                     break
-                item["qty"] = qty
-                item["unit_price"] = unit
-                expected_total = qty * unit
-                item["total"] = split_total if split_total and abs(split_total - expected_total) <= 2 else expected_total
-                matched_item = item
+            if matched_item is not None:
                 break
         if matched_item is None:
             continue
@@ -14434,6 +14497,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Cleanup may remove or rename rows only when OCR evidence and row sums stay coherent.",
     },
     {
+        "name": "quantity_detail_reconciliation",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Quantity-detail repairs require visible OCR qty/unit rows and qty * unit or discount-adjusted item arithmetic.",
+    },
+    {
         "name": "tax_category_assignment",
         "reads": ("line_items", "taxes", "subtotal", "total", "ocr_totals", "ocr_text"),
         "writes": ("line_items", "taxes"),
@@ -14545,12 +14614,29 @@ def _run_structural_item_projection_phase(
             _replace_dense_sequence_rows_when_balanced(extracted, unified_text)
         elif repair == "jan_pos_items":
             _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals or {})
-        elif repair == "qty_context_and_reduced_rate":
-            _fix_qty_context_and_reduced_rate_from_ocr(extracted, unified_text)
-        elif repair == "qty_totals_from_unit_lines":
-            _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text)
         else:
             raise ValueError(f"Unknown structural item projection repair: {repair}")
+
+
+def _run_quantity_detail_reconciliation_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR qty detail rows adjacent to item names or price rows.
+
+    Invariant: qty/unit mutations require visible quantity notation and
+    qty * unit, printed total, or discount-adjusted item arithmetic.
+    """
+    for repair in repairs:
+        if repair == "following_qty_detail":
+            _repair_previous_item_from_following_qty_detail(extracted, unified_text)
+        elif repair == "qty_totals_from_unit_lines":
+            _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text)
+        elif repair == "qty_context_and_reduced_rate":
+            _fix_qty_context_and_reduced_rate_from_ocr(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown quantity detail reconciliation repair: {repair}")
 
 
 def _run_line_item_cleanup_phase(
@@ -14666,13 +14752,16 @@ def postprocess_receipt(
             "dense_sequence_rows",
         ),
     )
-    _repair_previous_item_from_following_qty_detail(extracted, unified_text)
-    _replace_campaign_discount_stream_when_balanced(extracted, unified_text)
-    _replace_prefixed_tax_marker_item_rows_when_balanced(extracted, unified_text)
-    _run_structural_item_projection_phase(
+    _run_quantity_detail_reconciliation_phase(
         extracted,
         unified_text,
-        ocr_totals,
+        ("following_qty_detail",),
+    )
+    _replace_campaign_discount_stream_when_balanced(extracted, unified_text)
+    _replace_prefixed_tax_marker_item_rows_when_balanced(extracted, unified_text)
+    _run_quantity_detail_reconciliation_phase(
+        extracted,
+        unified_text,
         ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
     )
     _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
@@ -14718,7 +14807,11 @@ def postprocess_receipt(
             "dense_sequence_rows",
         ),
     )
-    _repair_previous_item_from_following_qty_detail(extracted, unified_text)
+    _run_quantity_detail_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("following_qty_detail",),
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
@@ -14729,10 +14822,9 @@ def postprocess_receipt(
         unified_text,
         ("drop_duplicate_embedded_price",),
     )
-    _run_structural_item_projection_phase(
+    _run_quantity_detail_reconciliation_phase(
         extracted,
         unified_text,
-        ocr_totals,
         ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
     )
     _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
@@ -15075,9 +15167,12 @@ def postprocess_receipt(
             "barcode_qty_price_rows",
             "dense_item_rows",
             "dense_sequence_rows",
-            "qty_totals_from_unit_lines",
-            "qty_context_and_reduced_rate",
         ),
+    )
+    _run_quantity_detail_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
     )
     _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
     _run_line_item_cleanup_phase(
@@ -15131,7 +15226,12 @@ def postprocess_receipt(
         extracted,
         unified_text,
         ocr_totals,
-        ("dense_sequence_rows", "qty_totals_from_unit_lines"),
+        ("dense_sequence_rows",),
+    )
+    _run_quantity_detail_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("qty_totals_from_unit_lines",),
     )
     _run_line_item_cleanup_phase(
         extracted,
@@ -15154,10 +15254,9 @@ def postprocess_receipt(
         _rebalance_tax_categories_to_rate_bases(
             extracted["line_items"], unified_text, extracted.get("taxes"), final_rate_bases
         )
-        _run_structural_item_projection_phase(
+        _run_quantity_detail_reconciliation_phase(
             extracted,
             unified_text,
-            ocr_totals,
             ("qty_context_and_reduced_rate",),
         )
     _fix_o_ring_descriptions_from_ocr(extracted, unified_text)
@@ -15170,10 +15269,9 @@ def postprocess_receipt(
     _drop_applied_coupon_line_items(extracted, unified_text)
     _repair_tiny_item_prices_from_following_ocr(extracted, unified_text)
     _replace_split_price_block_when_balanced(extracted, unified_text)
-    _run_structural_item_projection_phase(
+    _run_quantity_detail_reconciliation_phase(
         extracted,
         unified_text,
-        ocr_totals,
         ("qty_context_and_reduced_rate",),
     )
     _replace_stacked_name_price_rows_when_balanced(extracted, unified_text)
@@ -15196,13 +15294,16 @@ def postprocess_receipt(
         ocr_totals,
         ("dense_sequence_rows",),
     )
-    _repair_previous_item_from_following_qty_detail(extracted, unified_text)
-    _replace_campaign_discount_stream_when_balanced(extracted, unified_text)
-    _fix_bare_service_receipt_without_itemization(extracted, unified_text)
-    _run_structural_item_projection_phase(
+    _run_quantity_detail_reconciliation_phase(
         extracted,
         unified_text,
-        ocr_totals,
+        ("following_qty_detail",),
+    )
+    _replace_campaign_discount_stream_when_balanced(extracted, unified_text)
+    _fix_bare_service_receipt_without_itemization(extracted, unified_text)
+    _run_quantity_detail_reconciliation_phase(
+        extracted,
+        unified_text,
         ("qty_totals_from_unit_lines",),
     )
     _fix_bag_item_prices_from_rate_bases(extracted, extract_rate_bases(unified_text), unified_text)
