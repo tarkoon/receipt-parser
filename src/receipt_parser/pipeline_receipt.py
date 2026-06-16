@@ -14553,6 +14553,28 @@ def _run_structural_item_projection_phase(
             raise ValueError(f"Unknown structural item projection repair: {repair}")
 
 
+def _run_line_item_cleanup_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR cleanup exposes duplicate, numeric-marker, or non-product rows.
+
+    Invariant: cleanup may drop rows only when visible OCR context or duplicate
+    structure supports removal without breaking item-total consistency.
+    """
+    for repair in repairs:
+        if repair == "drop_duplicate_embedded_price":
+            if extracted.get("line_items"):
+                _drop_duplicate_with_embedded_price(extracted["line_items"])
+        elif repair == "drop_non_product_line_items":
+            _drop_non_product_line_items(extracted, unified_text)
+        elif repair == "drop_numeric_marker_description_rows":
+            _drop_numeric_marker_description_rows(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown line-item cleanup repair: {repair}")
+
+
 def postprocess_receipt(
     extracted: dict,
     unified_text: str,
@@ -14624,8 +14646,11 @@ def postprocess_receipt(
     # Run embedded-price dedup AGAIN after recovery — recovery can pick up
     # OCR-merged 'X  N' lines as new phantom items even when 'X' already
     # exists in the extraction at the same price.
-    if extracted.get("line_items"):
-        _drop_duplicate_with_embedded_price(extracted["line_items"])
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_duplicate_embedded_price",),
+    )
     _fix_qty_code_row_descriptions_from_ocr(extracted, unified_text)
     _fix_code_table_descriptions_by_order(extracted, unified_text)
     _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
@@ -14651,21 +14676,32 @@ def postprocess_receipt(
         ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
     )
     _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
-    _drop_numeric_marker_description_rows(extracted, unified_text)
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_numeric_marker_description_rows",),
+    )
     _run_structural_item_projection_phase(
         extracted,
         unified_text,
         ocr_totals,
         ("jan_pos_items",),
     )
-    if extracted.get("line_items"):
-        _drop_duplicate_with_embedded_price(extracted["line_items"])
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_duplicate_embedded_price",),
+    )
     _fix_qty_code_row_descriptions_from_ocr(extracted, unified_text)
     _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
     _fix_colon_split_product_names_from_ocr(extracted, unified_text)
     _fix_bag_description_from_ocr_code_context(extracted, unified_text)
     _fix_tax_categories_from_price_line_markers(extracted, unified_text)
-    _drop_non_product_line_items(extracted, unified_text)
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_non_product_line_items",),
+    )
     _replace_repeated_ocr_item_block_when_balanced(extracted, unified_text)
     _fix_non_bag_items_named_as_bag(extracted, unified_text)
     _fix_embedded_price_suffix_totals(extracted, unified_text)
@@ -14683,9 +14719,16 @@ def postprocess_receipt(
         ),
     )
     _repair_previous_item_from_following_qty_detail(extracted, unified_text)
-    _drop_numeric_marker_description_rows(extracted, unified_text)
-    if extracted.get("line_items"):
-        _drop_duplicate_with_embedded_price(extracted["line_items"])
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_numeric_marker_description_rows",),
+    )
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_duplicate_embedded_price",),
+    )
     _run_structural_item_projection_phase(
         extracted,
         unified_text,
@@ -14693,7 +14736,11 @@ def postprocess_receipt(
         ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
     )
     _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
-    _drop_numeric_marker_description_rows(extracted, unified_text)
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_numeric_marker_description_rows",),
+    )
     _recover_discounted_item_from_gap(extracted, unified_text)
     _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text)
     _recover_repeated_item_from_gap(extracted, unified_text)
@@ -14702,14 +14749,21 @@ def postprocess_receipt(
     _fix_numeric_desc_from_ocr_price_context(extracted, unified_text)
     _fix_o_ring_descriptions_from_ocr(extracted, unified_text)
     _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
-    _drop_non_product_line_items(extracted, unified_text)
-    if extracted.get("line_items"):
-        _drop_duplicate_with_embedded_price(extracted["line_items"])
-    _drop_numeric_marker_description_rows(extracted, unified_text)
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        (
+            "drop_non_product_line_items",
+            "drop_duplicate_embedded_price",
+            "drop_numeric_marker_description_rows",
+        ),
+    )
     _replace_service_table_items_when_balanced(extracted, unified_text)
-    if extracted.get("line_items"):
-        _drop_duplicate_with_embedded_price(extracted["line_items"])
-    _drop_numeric_marker_description_rows(extracted, unified_text)
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_duplicate_embedded_price", "drop_numeric_marker_description_rows"),
+    )
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
         "item_cleanup",
@@ -15026,7 +15080,11 @@ def postprocess_receipt(
         ),
     )
     _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
-    _drop_numeric_marker_description_rows(extracted, unified_text)
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_numeric_marker_description_rows",),
+    )
     _fix_total_from_stacked_cash_tender_block(extracted, unified_text)
     _fix_unlabeled_cash_tender_change_block(extracted, unified_text)
     _replace_overage_item_with_low_value_bag(extracted, unified_text)
@@ -15036,7 +15094,11 @@ def postprocess_receipt(
     _fix_colon_split_product_names_from_ocr(extracted, unified_text)
     _fix_bag_description_from_ocr_code_context(extracted, unified_text)
     _fix_tax_categories_from_price_line_markers(extracted, unified_text)
-    _drop_non_product_line_items(extracted, unified_text)
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_non_product_line_items",),
+    )
     _replace_service_table_items_when_balanced(extracted, unified_text)
     _append_missing_low_value_bag_from_gap(extracted, unified_text)
     _recover_missing_bag_items_from_ocr(extracted, unified_text)
@@ -15059,7 +15121,11 @@ def postprocess_receipt(
     _append_missing_low_value_bag_from_gap(extracted, unified_text)
     if extracted.get("line_items"):
         _apply_single_bag_standard_rate_split(extracted["line_items"], extract_rate_bases(unified_text))
-    _drop_non_product_line_items(extracted, unified_text)
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_non_product_line_items",),
+    )
     _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text)
     _run_structural_item_projection_phase(
         extracted,
@@ -15067,7 +15133,11 @@ def postprocess_receipt(
         ocr_totals,
         ("dense_sequence_rows", "qty_totals_from_unit_lines"),
     )
-    _drop_numeric_marker_description_rows(extracted, unified_text)
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_numeric_marker_description_rows",),
+    )
     if extracted.get("line_items"):
         final_rate_bases = extract_rate_bases(unified_text)
         _fix_tax_categories_from_ocr_markers(extracted["line_items"], unified_text)
@@ -15115,7 +15185,11 @@ def postprocess_receipt(
     _restore_bare_number_tax_summary(extracted, unified_text)
     _restore_external_tax_total_from_printed_subtotal(extracted, unified_text)
     _drop_unprinted_small_target_only_taxes(extracted, unified_text)
-    _drop_numeric_marker_description_rows(extracted, unified_text)
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_numeric_marker_description_rows",),
+    )
     _run_structural_item_projection_phase(
         extracted,
         unified_text,

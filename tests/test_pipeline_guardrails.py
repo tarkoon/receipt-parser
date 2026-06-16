@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 172
+POSTPROCESS_REPAIR_CALL_LIMIT = 155
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -105,9 +105,6 @@ REPAIR_CALL_PREFIXES = (
 POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     # Temporary debt: the current stack re-runs item row cleanup after recovery
     # phases expose new candidate rows. Counts may shrink, but must not grow.
-    "_drop_duplicate_with_embedded_price": 5,
-    "_drop_non_product_line_items": 4,
-    "_drop_numeric_marker_description_rows": 8,
     "_fix_adjacent_ocr_price_shift_when_balanced": 4,
     "_fix_bag_description_from_ocr_code_context": 3,
     "_fix_bare_service_receipt_without_itemization": 3,
@@ -141,6 +138,13 @@ STRUCTURAL_ITEM_PROJECTION_REPAIRS = {
 }
 STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER = "_run_structural_item_projection_phase"
 STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT = 11
+LINE_ITEM_CLEANUP_REPAIRS = {
+    "_drop_duplicate_with_embedded_price",
+    "_drop_non_product_line_items",
+    "_drop_numeric_marker_description_rows",
+}
+LINE_ITEM_CLEANUP_PHASE_HELPER = "_run_line_item_cleanup_phase"
+LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT = 14
 FINAL_OUTPUT_REPAIR_STAGES = (
     "barcode_unit_qty_amount_stack",
     "barcode_qty_price_rows",
@@ -702,6 +706,45 @@ def test_postprocess_structural_item_projection_debt_is_phase_owned():
         "Structural item projection phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_line_item_cleanup_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, LINE_ITEM_CLEANUP_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(LINE_ITEM_CLEANUP_REPAIRS - set(_call_names_in_function(helper)))
+    assert not missing_repairs, (
+        "Line-item cleanup/drop repairs must be owned by the named "
+        f"{LINE_ITEM_CLEANUP_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{LINE_ITEM_CLEANUP_PHASE_HELPER} must document the OCR/layout trigger "
+        "and arithmetic or field-consistency invariant it enforces."
+    )
+
+
+def test_postprocess_line_item_cleanup_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_cleanup_calls = [
+        name for name in postprocess_calls if name in LINE_ITEM_CLEANUP_REPAIRS
+    ]
+    phase_calls = [
+        name for name in postprocess_calls if name == LINE_ITEM_CLEANUP_PHASE_HELPER
+    ]
+
+    assert not direct_cleanup_calls, (
+        "Line-item cleanup/drop repairs should run through the named phase "
+        "helper so OCR/layout triggers and item-total invariants have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_cleanup_calls}"
+    )
+    assert 0 < len(phase_calls) <= LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT, (
+        "Line-item cleanup phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; limit: {LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT}"
     )
 
 
