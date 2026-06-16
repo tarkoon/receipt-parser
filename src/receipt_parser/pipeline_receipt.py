@@ -14503,6 +14503,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Recovered rows must improve item-total consistency or match visible item layout.",
     },
     {
+        "name": "gap_item_recovery",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Gap item recovery requires visible missing, discounted, or repeated OCR rows and subtotal/total item-sum arithmetic.",
+    },
+    {
         "name": "item_cleanup",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -14724,6 +14730,29 @@ def _run_ocr_description_reconciliation_phase(
             raise ValueError(f"Unknown OCR description reconciliation repair: {repair}")
 
 
+def _run_gap_item_recovery_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR rows expose missing, discounted, or repeated item gaps.
+
+    Invariant: recovered or replaced rows must be visible in OCR and close a
+    subtotal/total item-sum gap without fixture, merchant, or product answers.
+    """
+    for repair in repairs:
+        if repair == "missing_items":
+            _recover_missing_items_from_gap(extracted, unified_text)
+        elif repair == "discounted_gap":
+            _recover_discounted_item_from_gap(extracted, unified_text)
+        elif repair == "repeated_gap":
+            _recover_repeated_item_from_gap(extracted, unified_text)
+        elif repair == "repeated_ocr_block":
+            _replace_repeated_ocr_item_block_when_balanced(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown gap item recovery repair: {repair}")
+
+
 def _run_payment_points_reconciliation_phase(
     extracted: dict,
     unified_text: str,
@@ -14920,7 +14949,13 @@ def postprocess_receipt(
     _fix_split_bag_price_from_nearby_single_digit(extracted, unified_text)
     _fix_small_bag_description_from_ocr_entry(extracted, unified_text)
     _fix_items_from_subtotal(extracted, unified_text, ocr_totals)
-    _recover_missing_items_from_gap(extracted, unified_text)
+    _run_gap_item_recovery_phase(extracted, unified_text, ("missing_items",))
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "gap_item_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _replace_prefixed_tax_marker_item_rows_when_balanced(extracted, unified_text)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
@@ -14954,9 +14989,17 @@ def postprocess_receipt(
         extracted,
     )
     _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text)
-    _recover_discounted_item_from_gap(extracted, unified_text)
-    _recover_repeated_item_from_gap(extracted, unified_text)
-    _replace_repeated_ocr_item_block_when_balanced(extracted, unified_text)
+    _run_gap_item_recovery_phase(
+        extracted,
+        unified_text,
+        ("discounted_gap", "repeated_gap", "repeated_ocr_block"),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "gap_item_recovery",
+        trace_snapshot,
+        extracted,
+    )
     # Run embedded-price dedup AGAIN after recovery — recovery can pick up
     # OCR-merged 'X  N' lines as new phantom items even when 'X' already
     # exists in the extraction at the same price.
@@ -15048,7 +15091,13 @@ def postprocess_receipt(
         unified_text,
         ("drop_non_product_line_items",),
     )
-    _replace_repeated_ocr_item_block_when_balanced(extracted, unified_text)
+    _run_gap_item_recovery_phase(extracted, unified_text, ("repeated_ocr_block",))
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "gap_item_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _fix_non_bag_items_named_as_bag(extracted, unified_text)
     _fix_embedded_price_suffix_totals(extracted, unified_text)
     _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text)
@@ -15090,9 +15139,21 @@ def postprocess_receipt(
         unified_text,
         ("drop_numeric_marker_description_rows",),
     )
-    _recover_discounted_item_from_gap(extracted, unified_text)
+    _run_gap_item_recovery_phase(extracted, unified_text, ("discounted_gap",))
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "gap_item_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text)
-    _recover_repeated_item_from_gap(extracted, unified_text)
+    _run_gap_item_recovery_phase(extracted, unified_text, ("repeated_gap",))
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "gap_item_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _recover_missing_bag_items_from_ocr(extracted, unified_text)
     _replace_overage_item_with_low_value_bag(extracted, unified_text)
     _fix_numeric_desc_from_ocr_price_context(extracted, unified_text)
@@ -15433,16 +15494,34 @@ def postprocess_receipt(
     if extracted.get("line_items"):
         _fix_single_item_qty_from_ocr(extracted, unified_text)
     _fix_split_item_price_body_total_layout(extracted, unified_text)
-    _recover_discounted_item_from_gap(extracted, unified_text)
+    _run_gap_item_recovery_phase(extracted, unified_text, ("discounted_gap",))
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "gap_item_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text)
-    _recover_repeated_item_from_gap(extracted, unified_text)
+    _run_gap_item_recovery_phase(extracted, unified_text, ("repeated_gap",))
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "gap_item_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _fix_discounted_item_gross_prices_from_ocr(extracted, unified_text)
     _fix_item_totals_from_following_discount_lines(extracted, unified_text)
     _apply_coupon_discount_blocks(extracted, unified_text)
     _drop_applied_coupon_line_items(extracted, unified_text)
     _repair_tiny_item_prices_from_following_ocr(extracted, unified_text)
     _ensure_discounted_ocr_pairs_present(extracted, unified_text)
-    _recover_missing_items_from_gap(extracted, unified_text)
+    _run_gap_item_recovery_phase(extracted, unified_text, ("missing_items",))
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "gap_item_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _replace_vertical_price_qty_total_rows_when_balanced(extracted, unified_text)
     _run_structural_item_projection_phase(
         extracted,

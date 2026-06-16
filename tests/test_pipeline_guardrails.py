@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 100
+POSTPROCESS_REPAIR_CALL_LIMIT = 90
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -109,9 +109,7 @@ POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
     "_fix_name_bag_amount_shift_from_ocr": 3,
     "_fix_numeric_desc_from_ocr_price_context": 3,
     "_fix_split_item_price_body_total_layout": 3,
-    "_recover_discounted_item_from_gap": 3,
     "_recover_missing_bag_items_from_ocr": 3,
-    "_recover_repeated_item_from_gap": 3,
     "_replace_overage_item_with_low_value_bag": 3,
     "_restore_explicit_tax_rate_amount_lines": 3,
     "_restore_external_tax_total_from_printed_subtotal": 3,
@@ -174,6 +172,14 @@ OCR_DESCRIPTION_RECONCILIATION_REPAIRS = {
 }
 OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER = "_run_ocr_description_reconciliation_phase"
 OCR_DESCRIPTION_RECONCILIATION_PHASE_CALL_LIMIT = 7
+GAP_ITEM_RECOVERY_REPAIRS = {
+    "_recover_discounted_item_from_gap",
+    "_recover_missing_items_from_gap",
+    "_recover_repeated_item_from_gap",
+    "_replace_repeated_ocr_item_block_when_balanced",
+}
+GAP_ITEM_RECOVERY_PHASE_HELPER = "_run_gap_item_recovery_phase"
+GAP_ITEM_RECOVERY_PHASE_CALL_LIMIT = 8
 LINE_ITEM_CLEANUP_REPAIRS = {
     "_drop_duplicate_with_embedded_price",
     "_drop_non_product_line_items",
@@ -1019,6 +1025,51 @@ def test_postprocess_ocr_description_reconciliation_debt_is_phase_owned():
         "OCR description reconciliation phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {OCR_DESCRIPTION_RECONCILIATION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_gap_item_recovery_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, GAP_ITEM_RECOVERY_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        GAP_ITEM_RECOVERY_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Gap item recovery repairs must be owned by the named "
+        f"{GAP_ITEM_RECOVERY_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{GAP_ITEM_RECOVERY_PHASE_HELPER} must document the OCR row-gap "
+        "trigger and subtotal/total arithmetic invariant."
+    )
+
+
+def test_postprocess_gap_item_recovery_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_gap_calls = [
+        name for name in postprocess_calls if name in GAP_ITEM_RECOVERY_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == GAP_ITEM_RECOVERY_PHASE_HELPER
+    ]
+
+    assert not direct_gap_calls, (
+        "Gap item recovery repairs should run through the named phase helper "
+        "so missing, discounted, repeated, and repeated-block row recovery "
+        "share one OCR/arithmetic owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_gap_calls}"
+    )
+    assert 0 < len(phase_calls) <= GAP_ITEM_RECOVERY_PHASE_CALL_LIMIT, (
+        "Gap item recovery phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {GAP_ITEM_RECOVERY_PHASE_CALL_LIMIT}"
     )
 
 
