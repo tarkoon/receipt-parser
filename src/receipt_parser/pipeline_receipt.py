@@ -14515,6 +14515,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Low-value bag recovery requires visible small-bag or numeric OCR context and subtotal/total item-sum arithmetic.",
     },
     {
+        "name": "adjacent_price_shift_reconciliation",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Adjacent price-shift reconciliation requires neighboring OCR item/price rows and subtotal/total item-sum arithmetic.",
+    },
+    {
         "name": "item_cleanup",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -14781,6 +14787,25 @@ def _run_low_value_bag_recovery_phase(
             raise ValueError(f"Unknown low-value bag recovery repair: {repair}")
 
 
+def _run_adjacent_price_shift_reconciliation_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: adjacent OCR item/price rows expose a shifted amount.
+
+    Invariant: price shifts may mutate rows only when visible OCR adjacency and
+    subtotal/total item-sum arithmetic stay balanced.
+    """
+    for repair in repairs:
+        if repair == "adjacent_ocr_price_shift":
+            _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text)
+        else:
+            raise ValueError(
+                f"Unknown adjacent price-shift reconciliation repair: {repair}"
+            )
+
+
 def _run_payment_points_reconciliation_phase(
     extracted: dict,
     unified_text: str,
@@ -15024,7 +15049,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text)
+    _run_adjacent_price_shift_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("adjacent_ocr_price_shift",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "adjacent_price_shift_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_gap_item_recovery_phase(
         extracted,
         unified_text,
@@ -15136,7 +15171,17 @@ def postprocess_receipt(
     )
     _fix_non_bag_items_named_as_bag(extracted, unified_text)
     _fix_embedded_price_suffix_totals(extracted, unified_text)
-    _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text)
+    _run_adjacent_price_shift_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("adjacent_ocr_price_shift",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "adjacent_price_shift_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_structural_item_projection_phase(
         extracted,
         unified_text,
@@ -15182,7 +15227,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text)
+    _run_adjacent_price_shift_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("adjacent_ocr_price_shift",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "adjacent_price_shift_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_gap_item_recovery_phase(extracted, unified_text, ("repeated_gap",))
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
@@ -15545,7 +15600,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text)
+    _run_adjacent_price_shift_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("adjacent_ocr_price_shift",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "adjacent_price_shift_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_gap_item_recovery_phase(extracted, unified_text, ("repeated_gap",))
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
