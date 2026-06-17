@@ -4546,6 +4546,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "adjacent_price_shift_reconciliation",
         "bag_amount_shift_reconciliation",
         "item_cleanup",
+        "discount_consistency_reconciliation",
         "ocr_description_reconciliation",
         "quantity_detail_reconciliation",
         "single_rate_inclusive_tax_restoration",
@@ -4572,6 +4573,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["adjacent_price_shift_reconciliation"]["writes"]
     assert "line_items" in phases["bag_amount_shift_reconciliation"]["writes"]
     assert "line_items" in phases["item_cleanup"]["writes"]
+    assert "line_items" in phases["discount_consistency_reconciliation"]["writes"]
     assert "line_items" in phases["ocr_description_reconciliation"]["writes"]
     assert "line_items" in phases["service_receipt_recovery"]["writes"]
     assert "line_items" in phases["quantity_detail_reconciliation"]["writes"]
@@ -4604,6 +4606,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "initial_item_recovery",
             "low_value_bag_recovery",
             "item_cleanup",
+            "discount_consistency_reconciliation",
             "ocr_description_reconciliation",
             "quantity_detail_reconciliation",
             "service_receipt_recovery",
@@ -10330,11 +10333,21 @@ def test_final_receipt_output_repairs_clear_discount_before_items_own_price():
         "小計",
         "¥4,985",
     ])
+    trace = []
 
-    _apply_final_receipt_output_repairs(result, ocr_text)
+    _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=trace)
 
     assert [item["discount"] for item in result["line_items"]] == [383, 0]
     assert [item["total"] for item in result["line_items"]] == [3445, 1540]
+    discount_events = [
+        event
+        for event in trace
+        if event["stage"] == "clear_discount_before_own_price"
+    ]
+    assert discount_events
+    assert discount_events[0]["owner_phase"] == "discount_consistency_reconciliation"
+    assert discount_events[0]["owner_invariant"]
+    assert discount_events[0]["justification"]
 
 
 def test_final_receipt_output_repairs_restore_names_before_stacked_price_block():

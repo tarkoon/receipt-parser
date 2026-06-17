@@ -1411,6 +1411,27 @@ def _run_final_duplicate_row_cleanup_phase(
             )
 
 
+def _run_final_discount_consistency_reconciliation_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR negative discount lines before their owning item price.
+
+    Invariant: discount fields may be cleared only when the item's own total
+    is already printed and preserving the discount would contradict item
+    total/discount arithmetic.
+    """
+    for repair in repairs:
+        if repair == "clear_discount_before_own_price":
+            _clear_discount_when_negative_line_precedes_own_price(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final discount consistency reconciliation repair: "
+                f"{repair}"
+            )
+
+
 def _run_final_quantity_detail_reconciliation_phase(
     result: dict,
     ocr_text: str,
@@ -1614,8 +1635,10 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "points payment repair moves out of post-serialization repair.",
     ),
     "clear_discount_before_own_price": (
-        "item_cleanup",
-        "Late-only cleanup for negative discount lines before their owner price.",
+        "discount_consistency_reconciliation",
+        "Owned by the final discount consistency reconciliation helper until "
+        "negative discount placement cleanup moves out of post-serialization "
+        "repair.",
     ),
     "campaign_discount_stream_2": (
         "structural_item_reconstruction",
@@ -1972,7 +1995,11 @@ def _apply_final_receipt_output_repairs(
     )
     run(
         "clear_discount_before_own_price",
-        lambda: _clear_discount_when_negative_line_precedes_own_price(result, ocr_text),
+        lambda: _run_final_discount_consistency_reconciliation_phase(
+            result,
+            ocr_text,
+            ("clear_discount_before_own_price",),
+        ),
     )
     run(
         "campaign_discount_stream_2",

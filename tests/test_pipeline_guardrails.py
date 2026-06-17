@@ -290,6 +290,13 @@ FINAL_DUPLICATE_ROW_CLEANUP_REPAIRS = {
 }
 FINAL_DUPLICATE_ROW_CLEANUP_HELPER = "_run_final_duplicate_row_cleanup_phase"
 FINAL_DUPLICATE_ROW_CLEANUP_STAGE_LIMIT = 1
+FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS = {
+    "_clear_discount_when_negative_line_precedes_own_price",
+}
+FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_HELPER = (
+    "_run_final_discount_consistency_reconciliation_phase"
+)
+FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_STAGE_LIMIT = 1
 FINAL_QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_totals_from_ocr_unit_lines",
 }
@@ -2335,6 +2342,64 @@ def test_final_duplicate_row_cleanup_debt_is_helper_owned():
         "bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_DUPLICATE_ROW_CLEANUP_STAGE_LIMIT}"
+    )
+
+
+def test_final_discount_consistency_reconciliation_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(
+        tree,
+        FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_HELPER,
+    )
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late discount consistency reconciliation must be owned by the named "
+        f"{FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_HELPER} must document "
+        "the negative-line-before-own-price trigger and item total/discount "
+        "field consistency invariant."
+    )
+
+
+def test_final_discount_consistency_reconciliation_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_discount_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_HELPER
+    ]
+
+    assert not direct_discount_calls, (
+        "Late discount consistency reconciliation should run through the "
+        "named helper so OCR discount placement and item discount arithmetic "
+        "have one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_discount_calls}"
+    )
+    assert (
+        0
+        < len(helper_calls)
+        <= FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_STAGE_LIMIT
+    ), (
+        "Late discount consistency reconciliation helper calls must be "
+        "explicit and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_STAGE_LIMIT}"
     )
 
 

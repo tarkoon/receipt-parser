@@ -14572,6 +14572,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Cleanup may remove or rename rows only when OCR evidence and row sums stay coherent.",
     },
     {
+        "name": "discount_consistency_reconciliation",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Discount consistency reconciliation requires visible negative discount placement and item total/discount field arithmetic.",
+    },
+    {
         "name": "ocr_description_reconciliation",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
