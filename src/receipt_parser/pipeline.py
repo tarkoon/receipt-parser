@@ -1151,6 +1151,35 @@ def _run_final_external_tax_total_restoration_phase(
             )
 
 
+def _run_final_coupon_discount_projection_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR-visible following discount, coupon, or CPN rows.
+
+    Invariant: item totals must equal gross minus OCR-visible discount, or
+    adjusted discounted totals must balance the printed subtotal.
+    """
+    for repair in repairs:
+        if repair in {
+            "following_discount_lines",
+            "following_discount_lines_after_layout",
+        }:
+            _fix_item_totals_from_following_discount_lines(result, ocr_text)
+        elif repair == "coupon_discount_blocks":
+            _apply_coupon_discount_blocks(result, ocr_text)
+        elif repair == "drop_applied_coupon_line_items":
+            _drop_applied_coupon_line_items(result, ocr_text)
+        elif repair == "discounted_line_item_totals":
+            _repair_discounted_line_item_totals_when_balanced(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final coupon/discount projection repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1192,17 +1221,11 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "tax_category_assignment",
         "Owned by the final single-rate inclusive tax restoration helper until this serialized tax block repair moves out of post-serialization repair.",
     ),
-    "following_discount_lines": (
+    "coupon_discount_projection": (
         "structural_item_reconstruction",
-        "Retained late for discount-line totals exposed by final item layout repair.",
-    ),
-    "coupon_discount_blocks": (
-        "structural_item_reconstruction",
-        "Retained late for coupon rows exposed by final item layout repair.",
-    ),
-    "drop_applied_coupon_line_items": (
-        "item_cleanup",
-        "Retained late to remove coupon rows introduced or exposed by reconstruction.",
+        "Owned by the final coupon/discount projection helper until "
+        "OCR-visible coupon and following-discount rows move out of "
+        "post-serialization repair.",
     ),
     "tiny_item_prices_from_following_ocr": (
         "structural_item_reconstruction",
@@ -1316,13 +1339,10 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "structural_item_reconstruction",
         "Temporary debt: repeated campaign discount projection phase after discount cleanup can expose balanced streams.",
     ),
-    "following_discount_lines_after_layout": (
+    "coupon_discount_projection_after_layout": (
         "structural_item_reconstruction",
-        "Temporary debt: repeated after layout repair can expose discount lines.",
-    ),
-    "discounted_line_item_totals": (
-        "final_consistency_pass",
-        "Retained late for discounted line totals after all row reconstruction.",
+        "Owned by the final coupon/discount projection helper as the bounded "
+        "post-layout reassertion of discount arithmetic.",
     ),
     "adjacent_ocr_price_shift_final": (
         "structural_item_reconstruction",
@@ -1457,9 +1477,18 @@ def _apply_final_receipt_output_repairs(
             ("single_rate_inclusive_tax_block",),
         ),
     )
-    run("following_discount_lines", lambda: _fix_item_totals_from_following_discount_lines(result, ocr_text))
-    run("coupon_discount_blocks", lambda: _apply_coupon_discount_blocks(result, ocr_text))
-    run("drop_applied_coupon_line_items", lambda: _drop_applied_coupon_line_items(result, ocr_text))
+    run(
+        "coupon_discount_projection",
+        lambda: _run_final_coupon_discount_projection_phase(
+            result,
+            ocr_text,
+            (
+                "following_discount_lines",
+                "coupon_discount_blocks",
+                "drop_applied_coupon_line_items",
+            ),
+        ),
+    )
     run("tiny_item_prices_from_following_ocr", lambda: _repair_tiny_item_prices_from_following_ocr(result, ocr_text))
     run(
         "split_price_block",
@@ -1599,8 +1628,17 @@ def _apply_final_receipt_output_repairs(
             ("campaign_discount_stream",),
         ),
     )
-    run("following_discount_lines_after_layout", lambda: _fix_item_totals_from_following_discount_lines(result, ocr_text))
-    run("discounted_line_item_totals", lambda: _repair_discounted_line_item_totals_when_balanced(result, ocr_text))
+    run(
+        "coupon_discount_projection_after_layout",
+        lambda: _run_final_coupon_discount_projection_phase(
+            result,
+            ocr_text,
+            (
+                "following_discount_lines_after_layout",
+                "discounted_line_item_totals",
+            ),
+        ),
+    )
     run("adjacent_ocr_price_shift_final", lambda: _fix_adjacent_ocr_price_shift_when_balanced(result, ocr_text))
     run("prefixed_tax_marker_item_rows", lambda: _replace_prefixed_tax_marker_item_rows_when_balanced(result, ocr_text))
     run("missing_items_from_gap", lambda: _recover_missing_items_from_gap(result, ocr_text))

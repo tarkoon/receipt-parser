@@ -235,6 +235,16 @@ FINAL_EXTERNAL_TAX_TOTAL_RESTORATION_HELPER = (
     "_run_final_external_tax_total_restoration_phase"
 )
 FINAL_EXTERNAL_TAX_TOTAL_RESTORATION_STAGE_LIMIT = 2
+FINAL_COUPON_DISCOUNT_PROJECTION_REPAIRS = {
+    "_fix_item_totals_from_following_discount_lines",
+    "_apply_coupon_discount_blocks",
+    "_drop_applied_coupon_line_items",
+    "_repair_discounted_line_item_totals_when_balanced",
+}
+FINAL_COUPON_DISCOUNT_PROJECTION_HELPER = (
+    "_run_final_coupon_discount_projection_phase"
+)
+FINAL_COUPON_DISCOUNT_PROJECTION_STAGE_LIMIT = 2
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -361,9 +371,7 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "short_branch_over_phone_area_city",
     "noisy_city_location",
     "single_rate_inclusive_tax_block",
-    "following_discount_lines",
-    "coupon_discount_blocks",
-    "drop_applied_coupon_line_items",
+    "coupon_discount_projection",
     "tiny_item_prices_from_following_ocr",
     "split_price_block",
     "split_item_price_body_total",
@@ -391,8 +399,7 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "points_payment",
     "clear_discount_before_own_price",
     "campaign_discount_stream_2",
-    "following_discount_lines_after_layout",
-    "discounted_line_item_totals",
+    "coupon_discount_projection_after_layout",
     "adjacent_ocr_price_shift_final",
     "prefixed_tax_marker_item_rows",
     "missing_items_from_gap",
@@ -1810,6 +1817,55 @@ def test_final_external_tax_total_restoration_debt_is_helper_owned():
         "Late external tax total helper calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_EXTERNAL_TAX_TOTAL_RESTORATION_STAGE_LIMIT}"
+    )
+
+
+def test_final_coupon_discount_projection_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_COUPON_DISCOUNT_PROJECTION_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_COUPON_DISCOUNT_PROJECTION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late coupon/discount projection must be owned by the named "
+        f"{FINAL_COUPON_DISCOUNT_PROJECTION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_COUPON_DISCOUNT_PROJECTION_HELPER} must document the "
+        "OCR discount/coupon trigger and item gross minus discount or "
+        "subtotal-balance invariant."
+    )
+
+
+def test_final_coupon_discount_projection_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_discount_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_COUPON_DISCOUNT_PROJECTION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_COUPON_DISCOUNT_PROJECTION_HELPER
+    ]
+
+    assert not direct_discount_calls, (
+        "Late coupon/discount projection should run through the named helper "
+        "so OCR discount markers and item/subtotal arithmetic have one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_discount_calls}"
+    )
+    assert 0 < len(helper_calls) <= FINAL_COUPON_DISCOUNT_PROJECTION_STAGE_LIMIT, (
+        "Late coupon/discount helper calls must be explicit and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_COUPON_DISCOUNT_PROJECTION_STAGE_LIMIT}"
     )
 
 
