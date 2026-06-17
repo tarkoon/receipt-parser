@@ -14555,6 +14555,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Gap item recovery requires visible missing, discounted, or repeated OCR rows and subtotal/total item-sum arithmetic.",
     },
     {
+        "name": "prefixed_tax_marker_item_rows",
+        "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
+        "writes": ("line_items", "subtotal"),
+        "invariant": "Prefixed tax-marker row projection requires visible marker-prefixed OCR item rows and subtotal/rate-base arithmetic consistency.",
+    },
+    {
         "name": "low_value_bag_recovery",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -14976,6 +14982,29 @@ def _run_gap_item_recovery_phase(
             _replace_repeated_ocr_item_block_when_balanced(extracted, unified_text)
         else:
             raise ValueError(f"Unknown gap item recovery repair: {repair}")
+
+
+def _run_prefixed_tax_marker_item_rows_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR item rows prefixed by tax markers in the item block.
+
+    Invariant: projected marker-prefixed rows must balance to the printed
+    subtotal or total and preserve rate-base totals implied by the markers.
+    """
+    for repair in repairs:
+        if repair == "prefixed_tax_marker_item_rows":
+            _replace_prefixed_tax_marker_item_rows_when_balanced(
+                extracted,
+                unified_text,
+            )
+        else:
+            raise ValueError(
+                "Unknown prefixed tax-marker item row repair: "
+                f"{repair}"
+            )
 
 
 def _run_low_value_bag_recovery_phase(
@@ -15400,10 +15429,14 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _replace_prefixed_tax_marker_item_rows_when_balanced(extracted, unified_text)
+    _run_prefixed_tax_marker_item_rows_phase(
+        extracted,
+        unified_text,
+        ("prefixed_tax_marker_item_rows",),
+    )
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
-        "initial_item_recovery",
+        "prefixed_tax_marker_item_rows",
         trace_snapshot,
         extracted,
     )
@@ -15517,7 +15550,17 @@ def postprocess_receipt(
         unified_text,
         ("following_qty_detail",),
     )
-    _replace_prefixed_tax_marker_item_rows_when_balanced(extracted, unified_text)
+    _run_prefixed_tax_marker_item_rows_phase(
+        extracted,
+        unified_text,
+        ("prefixed_tax_marker_item_rows",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "prefixed_tax_marker_item_rows",
+        trace_snapshot,
+        extracted,
+    )
     _run_quantity_detail_reconciliation_phase(
         extracted,
         unified_text,

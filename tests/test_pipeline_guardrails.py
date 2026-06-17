@@ -363,6 +363,13 @@ FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER = (
     "_run_final_prefixed_tax_marker_item_rows_phase"
 )
 FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_STAGE_LIMIT = 1
+PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS = {
+    "_replace_prefixed_tax_marker_item_rows_when_balanced",
+}
+PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_HELPER = (
+    "_run_prefixed_tax_marker_item_rows_phase"
+)
+PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_CALL_LIMIT = 2
 FINAL_GAP_ITEM_RECOVERY_REPAIRS = {
     "_recover_missing_items_from_gap",
 }
@@ -3719,6 +3726,54 @@ def test_postprocess_gap_item_recovery_debt_is_phase_owned():
         "Gap item recovery phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {GAP_ITEM_RECOVERY_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_prefixed_tax_marker_item_rows_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Prefixed tax-marker item row projection must be owned by the named "
+        f"{PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_HELPER} must document the OCR "
+        "tax-marker row trigger and subtotal/rate-base balance invariant."
+    )
+
+
+def test_postprocess_prefixed_tax_marker_item_rows_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_marker_calls = [
+        name
+        for name in postprocess_calls
+        if name in PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_HELPER
+    ]
+
+    assert not direct_marker_calls, (
+        "Prefixed tax-marker item row projection should run through the named "
+        "phase helper so marker-prefixed OCR rows and subtotal/rate-base "
+        "arithmetic have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_marker_calls}"
+    )
+    assert 0 < len(phase_calls) <= PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_CALL_LIMIT, (
+        "Prefixed tax-marker item row phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_CALL_LIMIT}"
     )
 
 

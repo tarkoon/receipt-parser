@@ -4542,6 +4542,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "body_total_layout_reconstruction",
         "initial_item_recovery",
         "gap_item_recovery",
+        "prefixed_tax_marker_item_rows",
         "low_value_bag_recovery",
         "adjacent_price_shift_reconciliation",
         "bag_amount_shift_reconciliation",
@@ -4574,6 +4575,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["initial_item_recovery"]["writes"]
     assert "line_items" in phases["body_total_layout_reconstruction"]["writes"]
     assert "line_items" in phases["gap_item_recovery"]["writes"]
+    assert "line_items" in phases["prefixed_tax_marker_item_rows"]["writes"]
     assert "line_items" in phases["low_value_bag_recovery"]["writes"]
     assert "line_items" in phases["adjacent_price_shift_reconciliation"]["writes"]
     assert "line_items" in phases["bag_amount_shift_reconciliation"]["writes"]
@@ -4614,6 +4616,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "body_total_layout_reconstruction",
             "gap_item_recovery",
             "initial_item_recovery",
+            "prefixed_tax_marker_item_rows",
             "bag_item_rate_base_reconciliation",
             "low_value_bag_recovery",
             "item_cleanup",
@@ -4652,6 +4655,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "external_tax_total_restoration",
             "financial_totals_repair",
             "payment_points_reconciliation",
+            "prefixed_tax_marker_item_rows",
             "service_receipt_recovery",
             "single_rate_inclusive_tax_restoration",
             "small_target_only_tax_pruning",
@@ -6537,6 +6541,67 @@ def test_prefixed_tax_marker_item_rows_recover_inline_and_queued_amounts():
     assert ume["qty"] == 2.0
     assert ume["unit_price"] == 99.0
     assert ume["total"] == 198.0
+
+
+def test_prefixed_tax_marker_item_rows_phase_runs_owned_repair():
+    from receipt_parser.pipeline_receipt import _run_prefixed_tax_marker_item_rows_phase
+
+    extracted = {
+        "total": 8963,
+        "subtotal": 8183,
+        "taxes": [
+            {"rate": "10%", "label": "内税", "amount": 632},
+            {"rate": "8%", "label": "内税", "amount": 148},
+        ],
+        "line_items": [],
+    }
+    ocr_text = "\n".join([
+        "領収証",
+        "2026年04月24日 (金) 10時33分",
+        "¥8,963-",
+        "(10%対象",
+        "¥6,962 内税",
+        "¥632)",
+        "(08%対象",
+        "¥2,001 内税 ¥148)",
+        "上記正に領収しました",
+        "担当者 No828",
+        "内クーリストアセダレーヌ",
+        "¥880",
+        "内フィーノ プレミアムタッチ 濃厚美容 ¥648",
+        "内マシェリ ヘアオイル EX",
+        "¥948",
+        "内ルルルンオーラブライトマスクW",
+        "¥770",
+        "内YOLU カームナイト",
+        "¥308",
+        "内ベアディープモイスチャーリップ ハ ¥448",
+        "内ビオレUVアクアリッチアクアプロテクトミス ¥980",
+        "内じゃがりこサラダ 4連 ¥158",
+        "内*ピュレグミプレミアム 白桃",
+        "内*やかんの麦茶",
+        "¥158",
+        "¥79",
+        "内キットカット オトナの ¥278",
+        "内エクセラふわラテ まったり深 ¥498",
+        "内スキットルズオリジナル ¥118",
+        "内モッチュ シャインマスカット味 ¥128",
+        "内*ぷっちょ袋 4種アソー ¥148",
+        "内*ブラックサンダーミニ アーモンド&1 ¥238",
+        "内*タネなしほしウメ ¥198",
+        "23 X #199",
+        "内アンラリージェEX サンプロテクター ¥1,980",
+        "(10%対象 ¥6,962 内税 ¥632)",
+        "*は軽減税率8%適用商品",
+    ])
+
+    _run_prefixed_tax_marker_item_rows_phase(
+        extracted,
+        ocr_text,
+        ("prefixed_tax_marker_item_rows",),
+    )
+
+    assert sum(item["total"] for item in extracted["line_items"]) == 8963.0
 
 
 def test_dense_sequence_rows_splits_ambiguous_quantity_ocr_by_printed_amount():
