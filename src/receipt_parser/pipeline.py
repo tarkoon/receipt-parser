@@ -1190,6 +1190,26 @@ def _run_final_printed_external_tax_amount_restoration_phase(
             )
 
 
+def _run_final_bare_number_tax_summary_restoration_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: bare numeric per-rate tax summary stacks.
+
+    Invariant: restored taxes and subtotal must agree with visible rate
+    labels, tax amounts, and printed total arithmetic.
+    """
+    for repair in repairs:
+        if repair == "bare_number_tax_summary":
+            _restore_bare_number_tax_summary(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final bare-number tax summary restoration repair: "
+                f"{repair}"
+            )
+
+
 def _run_final_coupon_discount_projection_phase(
     result: dict,
     ocr_text: str,
@@ -1521,8 +1541,10 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "post-serialization repair.",
     ),
     "bare_number_tax_summary": (
-        "tax_category_assignment",
-        "Retained late for bare-number tax summaries after item reconstruction.",
+        "bare_number_tax_summary_restoration",
+        "Owned by the final bare-number tax summary restoration helper until "
+        "numeric tax-summary stack recovery moves out of post-serialization "
+        "repair.",
     ),
     "external_tax_total_from_printed_subtotal": (
         "financial_totals_repair",
@@ -1856,7 +1878,14 @@ def _apply_final_receipt_output_repairs(
             ("printed_external_tax_amounts",),
         ),
     )
-    run("bare_number_tax_summary", lambda: _restore_bare_number_tax_summary(result, ocr_text))
+    run(
+        "bare_number_tax_summary",
+        lambda: _run_final_bare_number_tax_summary_restoration_phase(
+            result,
+            ocr_text,
+            ("bare_number_tax_summary",),
+        ),
+    )
     run(
         "external_tax_total_from_printed_subtotal",
         lambda: _run_final_external_tax_total_restoration_phase(

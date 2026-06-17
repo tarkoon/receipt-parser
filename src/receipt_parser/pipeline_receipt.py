@@ -14608,6 +14608,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Printed external-tax amount restoration requires visible per-rate external tax amount rows and tax/base/total consistency.",
     },
     {
+        "name": "bare_number_tax_summary_restoration",
+        "reads": ("line_items", "taxes", "subtotal", "total", "ocr_text"),
+        "writes": ("taxes", "subtotal"),
+        "invariant": "Bare-number tax summary restoration requires visible rate labels, numeric tax amounts, and printed total arithmetic.",
+    },
+    {
         "name": "external_tax_total_restoration",
         "reads": ("line_items", "subtotal", "total", "amount_paid", "points_used", "taxes", "ocr_text"),
         "writes": ("subtotal", "total", "amount_paid"),
