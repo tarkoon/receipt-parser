@@ -4469,6 +4469,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "single_rate_inclusive_tax_restoration",
         "tax_excluded_rate_block_restoration",
         "explicit_tax_amount_restoration",
+        "printed_external_tax_amount_restoration",
         "external_tax_total_restoration",
         "tax_category_assignment",
         "payment_points_reconciliation",
@@ -4494,6 +4495,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "taxes" in phases["single_rate_inclusive_tax_restoration"]["writes"]
     assert "taxes" in phases["tax_excluded_rate_block_restoration"]["writes"]
     assert "taxes" in phases["explicit_tax_amount_restoration"]["writes"]
+    assert "taxes" in phases["printed_external_tax_amount_restoration"]["writes"]
     assert "total" in phases["external_tax_total_restoration"]["writes"]
     assert "amount_paid" in phases["external_tax_total_restoration"]["writes"]
     assert "line_items" in phases["structural_item_reconstruction"]["writes"]
@@ -4526,6 +4528,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "single_rate_inclusive_tax_restoration",
             "tax_excluded_rate_block_restoration",
             "explicit_tax_amount_restoration",
+            "printed_external_tax_amount_restoration",
             "tax_category_assignment",
             "structural_item_reconstruction",
             "final_consistency_pass",
@@ -9743,6 +9746,59 @@ def test_split_external_tax_amount_labels_restore_financial_summary():
     assert extracted["subtotal"] == 4816.0
     assert extracted["total"] == 5248.0
     assert extracted["amount_paid"] == 5248.0
+
+
+def test_final_receipt_output_repairs_apply_printed_external_tax_amount_restoration():
+    from receipt_parser.pipeline import _apply_final_receipt_output_repairs
+
+    result = {
+        "document_type": "receipt",
+        "merchant": "TEST",
+        "subtotal": 4816,
+        "total": 5248,
+        "amount_paid": 5248,
+        "taxes": [
+            {"rate": "10%", "label": "外税", "amount": 848},
+            {"rate": "8%", "label": "外税", "amount": 196},
+        ],
+        "line_items": [
+            {"description": "A", "total": 2361, "tax_category": "10%"},
+            {"description": "B", "total": 2455, "tax_category": "8%"},
+        ],
+    }
+    ocr_text = "\n".join([
+        "TEST STORE",
+        "小計",
+        "¥4,816",
+        "外税10%対象額",
+        "¥2,361",
+        "10%外税額",
+        "¥236",
+        "外税8%対象額",
+        "¥2,455",
+        "8%外税額",
+        "¥196",
+        "合計",
+        "¥5,248",
+    ])
+    trace = []
+
+    _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=trace)
+
+    assert result["taxes"] == [
+        {"rate": "10%", "label": "外税", "amount": 236.0},
+        {"rate": "8%", "label": "外税", "amount": 196},
+    ]
+    tax_events = [
+        event for event in trace if event["stage"] == "printed_external_tax_amounts"
+    ]
+    assert tax_events
+    assert (
+        tax_events[0]["owner_phase"]
+        == "printed_external_tax_amount_restoration"
+    )
+    assert tax_events[0]["owner_invariant"]
+    assert tax_events[0]["justification"]
 
 
 def test_printed_summary_total_repairs_subtotal_when_total_already_matches():

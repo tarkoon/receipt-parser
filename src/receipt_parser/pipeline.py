@@ -1170,6 +1170,26 @@ def _run_final_external_tax_total_restoration_phase(
             )
 
 
+def _run_final_printed_external_tax_amount_restoration_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: printed per-rate external tax amount rows.
+
+    Invariant: restored tax amounts must remain consistent with printed
+    taxable bases and subtotal plus external tax total arithmetic.
+    """
+    for repair in repairs:
+        if repair == "printed_external_tax_amounts":
+            _restore_printed_external_tax_amounts(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final printed external-tax amount restoration repair: "
+                f"{repair}"
+            )
+
+
 def _run_final_coupon_discount_projection_phase(
     result: dict,
     ocr_text: str,
@@ -1495,8 +1515,10 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "repair.",
     ),
     "printed_external_tax_amounts": (
-        "tax_category_assignment",
-        "Retained late for external tax summaries after final total repair.",
+        "printed_external_tax_amount_restoration",
+        "Owned by the final printed external-tax amount restoration helper "
+        "until printed per-rate tax amount recovery moves out of "
+        "post-serialization repair.",
     ),
     "bare_number_tax_summary": (
         "tax_category_assignment",
@@ -1826,7 +1848,14 @@ def _apply_final_receipt_output_repairs(
             ("code_table_descriptions",),
         ),
     )
-    run("printed_external_tax_amounts", lambda: _restore_printed_external_tax_amounts(result, ocr_text))
+    run(
+        "printed_external_tax_amounts",
+        lambda: _run_final_printed_external_tax_amount_restoration_phase(
+            result,
+            ocr_text,
+            ("printed_external_tax_amounts",),
+        ),
+    )
     run("bare_number_tax_summary", lambda: _restore_bare_number_tax_summary(result, ocr_text))
     run(
         "external_tax_total_from_printed_subtotal",

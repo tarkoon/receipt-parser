@@ -235,6 +235,13 @@ FINAL_EXTERNAL_TAX_TOTAL_RESTORATION_HELPER = (
     "_run_final_external_tax_total_restoration_phase"
 )
 FINAL_EXTERNAL_TAX_TOTAL_RESTORATION_STAGE_LIMIT = 2
+FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_REPAIRS = {
+    "_restore_printed_external_tax_amounts",
+}
+FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_HELPER = (
+    "_run_final_printed_external_tax_amount_restoration_phase"
+)
+FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_STAGE_LIMIT = 1
 FINAL_COUPON_DISCOUNT_PROJECTION_REPAIRS = {
     "_fix_item_totals_from_following_discount_lines",
     "_apply_coupon_discount_blocks",
@@ -1877,6 +1884,64 @@ def test_final_external_tax_total_restoration_debt_is_helper_owned():
         "Late external tax total helper calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_EXTERNAL_TAX_TOTAL_RESTORATION_STAGE_LIMIT}"
+    )
+
+
+def test_final_printed_external_tax_amount_restoration_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(
+        tree,
+        FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_HELPER,
+    )
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late printed external-tax amount restoration must be owned by the "
+        f"named {FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_HELPER} must document "
+        "the printed external-tax amount trigger and tax/base/total consistency "
+        "invariant."
+    )
+
+
+def test_final_printed_external_tax_amount_restoration_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_tax_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_HELPER
+    ]
+
+    assert not direct_tax_calls, (
+        "Late printed external-tax amount restoration should run through the "
+        "named helper so OCR tax amount evidence and tax/base/total consistency "
+        "have one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_tax_calls}"
+    )
+    assert (
+        0
+        < len(helper_calls)
+        <= FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_STAGE_LIMIT
+    ), (
+        "Late printed external-tax amount helper calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_STAGE_LIMIT}"
     )
 
 

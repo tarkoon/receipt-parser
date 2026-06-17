@@ -14602,6 +14602,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Explicit tax amount restoration requires visible 税率N%税額 rows and tax amounts bounded by item/tax-rate arithmetic.",
     },
     {
+        "name": "printed_external_tax_amount_restoration",
+        "reads": ("line_items", "taxes", "subtotal", "total", "ocr_text"),
+        "writes": ("taxes",),
+        "invariant": "Printed external-tax amount restoration requires visible per-rate external tax amount rows and tax/base/total consistency.",
+    },
+    {
         "name": "external_tax_total_restoration",
         "reads": ("line_items", "subtotal", "total", "amount_paid", "points_used", "taxes", "ocr_text"),
         "writes": ("subtotal", "total", "amount_paid"),
