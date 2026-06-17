@@ -275,6 +275,11 @@ FINAL_GAP_ITEM_RECOVERY_REPAIRS = {
 }
 FINAL_GAP_ITEM_RECOVERY_HELPER = "_run_final_gap_item_recovery_phase"
 FINAL_GAP_ITEM_RECOVERY_STAGE_LIMIT = 2
+FINAL_BASKET_MARKER_ROWS_REPAIRS = {
+    "_replace_basket_marker_rows_when_balanced",
+}
+FINAL_BASKET_MARKER_ROWS_HELPER = "_run_final_basket_marker_rows_phase"
+FINAL_BASKET_MARKER_ROWS_STAGE_LIMIT = 1
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -2103,6 +2108,50 @@ def test_final_gap_item_recovery_debt_is_helper_owned():
         "Late gap item recovery helper calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_GAP_ITEM_RECOVERY_STAGE_LIMIT}"
+    )
+
+
+def test_final_basket_marker_rows_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_BASKET_MARKER_ROWS_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_BASKET_MARKER_ROWS_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late basket marker row projection must be owned by the named "
+        f"{FINAL_BASKET_MARKER_ROWS_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_BASKET_MARKER_ROWS_HELPER} must document the OCR basket "
+        "marker trigger and subtotal/rate-base arithmetic invariant."
+    )
+
+
+def test_final_basket_marker_rows_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_basket_calls = [
+        name for name in final_calls if name in FINAL_BASKET_MARKER_ROWS_REPAIRS
+    ]
+    helper_calls = [
+        name for name in final_calls if name == FINAL_BASKET_MARKER_ROWS_HELPER
+    ]
+
+    assert not direct_basket_calls, (
+        "Late basket marker row projection should run through the named helper "
+        "so OCR basket marker evidence and subtotal/rate-base arithmetic have "
+        "one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_basket_calls}"
+    )
+    assert 0 < len(helper_calls) <= FINAL_BASKET_MARKER_ROWS_STAGE_LIMIT, (
+        "Late basket marker row helper calls must be explicit and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_BASKET_MARKER_ROWS_STAGE_LIMIT}"
     )
 
 

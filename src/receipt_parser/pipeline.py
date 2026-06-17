@@ -1271,6 +1271,26 @@ def _run_final_gap_item_recovery_phase(
             )
 
 
+def _run_final_basket_marker_rows_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: explicit basket-marker OCR sections after discount repairs.
+
+    Invariant: rebuilt rows must match the printed item count and balance to
+    printed subtotal or rate-base totals, including coupon discounts.
+    """
+    for repair in repairs:
+        if repair == "basket_marker_rows":
+            _replace_basket_marker_rows_when_balanced(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final basket marker row repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1465,7 +1485,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "basket_marker_rows": (
         "structural_item_reconstruction",
-        "Retained late for basket marker projection after discount repairs.",
+        "Owned by the final basket-marker row helper until explicit basket marker projection moves out of post-serialization repair.",
     ),
     "tax_categories_from_rate_bases": (
         "tax_category_assignment",
@@ -1798,7 +1818,14 @@ def _apply_final_receipt_output_repairs(
         ),
     )
     run("drop_duplicate_rows_when_subtotal_balances", lambda: _drop_duplicate_rows_when_subtotal_balances(result, ocr_text))
-    run("basket_marker_rows", lambda: _replace_basket_marker_rows_when_balanced(result, ocr_text))
+    run(
+        "basket_marker_rows",
+        lambda: _run_final_basket_marker_rows_phase(
+            result,
+            ocr_text,
+            ("basket_marker_rows",),
+        ),
+    )
     run(
         "tax_categories_from_rate_bases",
         lambda: _run_final_tax_category_reconciliation_phase(
