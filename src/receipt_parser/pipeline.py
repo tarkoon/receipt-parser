@@ -1249,6 +1249,28 @@ def _run_final_prefixed_tax_marker_item_rows_phase(
             )
 
 
+def _run_final_gap_item_recovery_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: visible OCR row gaps after final item projection cleanup.
+
+    Invariant: recovered missing or repeated rows must improve item-sum
+    agreement with printed subtotal or total without inventing hidden items.
+    """
+    for repair in repairs:
+        if repair == "repeated_item_gap":
+            _recover_repeated_item_from_gap(result, ocr_text)
+        elif repair == "missing_items_from_gap":
+            _recover_missing_items_from_gap(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final gap item recovery repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1341,7 +1363,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "repeated_item_gap": (
         "initial_item_recovery",
-        "Retained late for repeated item gaps exposed by final row projections.",
+        "Owned by the final gap item recovery helper until repeated OCR row-gap recovery moves out of post-serialization repair.",
     ),
     "drop_duplicate_embedded_price": (
         "item_cleanup",
@@ -1429,7 +1451,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "missing_items_from_gap": (
         "initial_item_recovery",
-        "Retained late for item gaps exposed by final row cleanup.",
+        "Owned by the final gap item recovery helper until missing OCR row-gap recovery moves out of post-serialization repair.",
     ),
     "ocr_description_reconciliation_after_layout": (
         "item_cleanup",
@@ -1628,7 +1650,14 @@ def _apply_final_receipt_output_repairs(
             ("adjacent_ocr_price_shift",),
         ),
     )
-    run("repeated_item_gap", lambda: _recover_repeated_item_from_gap(result, ocr_text))
+    run(
+        "repeated_item_gap",
+        lambda: _run_final_gap_item_recovery_phase(
+            result,
+            ocr_text,
+            ("repeated_item_gap",),
+        ),
+    )
     if result.get("line_items"):
         run(
             "drop_duplicate_embedded_price",
@@ -1749,7 +1778,14 @@ def _apply_final_receipt_output_repairs(
             ("prefixed_tax_marker_item_rows",),
         ),
     )
-    run("missing_items_from_gap", lambda: _recover_missing_items_from_gap(result, ocr_text))
+    run(
+        "missing_items_from_gap",
+        lambda: _run_final_gap_item_recovery_phase(
+            result,
+            ocr_text,
+            ("missing_items_from_gap",),
+        ),
+    )
     run(
         "ocr_description_reconciliation_after_layout",
         lambda: _run_final_ocr_description_reconciliation_phase(

@@ -269,6 +269,12 @@ FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER = (
     "_run_final_prefixed_tax_marker_item_rows_phase"
 )
 FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_STAGE_LIMIT = 1
+FINAL_GAP_ITEM_RECOVERY_REPAIRS = {
+    "_recover_missing_items_from_gap",
+    "_recover_repeated_item_from_gap",
+}
+FINAL_GAP_ITEM_RECOVERY_HELPER = "_run_final_gap_item_recovery_phase"
+FINAL_GAP_ITEM_RECOVERY_STAGE_LIMIT = 2
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -2054,6 +2060,49 @@ def test_final_prefixed_tax_marker_item_rows_debt_is_helper_owned():
         "bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_STAGE_LIMIT}"
+    )
+
+
+def test_final_gap_item_recovery_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_GAP_ITEM_RECOVERY_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_GAP_ITEM_RECOVERY_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late gap item recovery must be owned by the named "
+        f"{FINAL_GAP_ITEM_RECOVERY_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_GAP_ITEM_RECOVERY_HELPER} must document the OCR gap trigger "
+        "and item-sum/subtotal balance invariant."
+    )
+
+
+def test_final_gap_item_recovery_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_gap_calls = [
+        name for name in final_calls if name in FINAL_GAP_ITEM_RECOVERY_REPAIRS
+    ]
+    helper_calls = [
+        name for name in final_calls if name == FINAL_GAP_ITEM_RECOVERY_HELPER
+    ]
+
+    assert not direct_gap_calls, (
+        "Late gap item recovery should run through the named helper so OCR "
+        "gap evidence and item-sum arithmetic have one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_gap_calls}"
+    )
+    assert 0 < len(helper_calls) <= FINAL_GAP_ITEM_RECOVERY_STAGE_LIMIT, (
+        "Late gap item recovery helper calls must be explicit and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_GAP_ITEM_RECOVERY_STAGE_LIMIT}"
     )
 
 
