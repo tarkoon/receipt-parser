@@ -14620,6 +14620,12 @@ POSTPROCESS_PHASES = (
         "invariant": "External tax total restoration requires printed subtotal plus external-tax arithmetic and a visible summary/payment total.",
     },
     {
+        "name": "small_target_only_tax_pruning",
+        "reads": ("taxes", "subtotal", "total", "ocr_text"),
+        "writes": ("taxes", "subtotal"),
+        "invariant": "Small target-only tax pruning requires visible rate bases, no matching printed tax amount, and total-minus-tax subtotal arithmetic.",
+    },
+    {
         "name": "tax_category_assignment",
         "reads": ("line_items", "taxes", "subtotal", "total", "ocr_totals", "ocr_text"),
         "writes": ("line_items", "taxes"),
@@ -15054,6 +15060,26 @@ def _run_external_tax_total_restoration_phase(
         else:
             raise ValueError(
                 f"Unknown external tax total restoration repair: {repair}"
+            )
+
+
+def _run_small_target_only_tax_pruning_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: rate-base-only tax rows with tiny unprinted tax amounts.
+
+    Invariant: any removed tax entry must lack a printed tax amount, have a
+    visible target base for the same rate, and leave subtotal consistent with
+    total minus the remaining tax entries.
+    """
+    for repair in repairs:
+        if repair == "drop_small_target_only_taxes":
+            _drop_unprinted_small_target_only_taxes(extracted, unified_text)
+        else:
+            raise ValueError(
+                f"Unknown small target-only tax pruning repair: {repair}"
             )
 
 
@@ -16184,7 +16210,17 @@ def postprocess_receipt(
         unified_text,
         ("external_tax_total_from_printed_subtotal",),
     )
-    _drop_unprinted_small_target_only_taxes(extracted, unified_text)
+    _run_small_target_only_tax_pruning_phase(
+        extracted,
+        unified_text,
+        ("drop_small_target_only_taxes",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "small_target_only_tax_pruning",
+        trace_snapshot,
+        extracted,
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,

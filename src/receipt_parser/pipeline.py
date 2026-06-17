@@ -1210,6 +1210,27 @@ def _run_final_bare_number_tax_summary_restoration_phase(
             )
 
 
+def _run_final_small_target_only_tax_pruning_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: rate-base-only tax rows with tiny unprinted tax amounts.
+
+    Invariant: pruned tax entries must be absent from printed tax summaries,
+    backed by visible rate bases, and keep subtotal equal to total minus the
+    remaining printed tax amount.
+    """
+    for repair in repairs:
+        if repair == "drop_small_target_only_taxes":
+            _drop_unprinted_small_target_only_taxes(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final small target-only tax pruning repair: "
+                f"{repair}"
+            )
+
+
 def _run_final_coupon_discount_projection_phase(
     result: dict,
     ocr_text: str,
@@ -1553,8 +1574,10 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "repair.",
     ),
     "drop_small_target_only_taxes": (
-        "tax_category_assignment",
-        "Retained late to remove unprinted small target-only taxes after rate repair.",
+        "small_target_only_tax_pruning",
+        "Owned by the final small target-only tax pruning helper until "
+        "unprinted target-only tax cleanup moves out of post-serialization "
+        "repair.",
     ),
     "printed_summary_total_tax_balanced_2": (
         "financial_totals_repair",
@@ -1894,7 +1917,14 @@ def _apply_final_receipt_output_repairs(
             ("external_tax_total_from_printed_subtotal",),
         ),
     )
-    run("drop_small_target_only_taxes", lambda: _drop_unprinted_small_target_only_taxes(result, ocr_text))
+    run(
+        "drop_small_target_only_taxes",
+        lambda: _run_final_small_target_only_tax_pruning_phase(
+            result,
+            ocr_text,
+            ("drop_small_target_only_taxes",),
+        ),
+    )
     run(
         "printed_summary_total_tax_balanced_2",
         lambda: _run_final_printed_summary_total_tax_repair_phase(

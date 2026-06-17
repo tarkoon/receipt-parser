@@ -2461,6 +2461,46 @@ def test_final_receipt_output_repairs_apply_bare_number_tax_summary_restoration(
     assert tax_events[0]["justification"]
 
 
+def test_final_receipt_output_repairs_apply_small_target_only_tax_pruning():
+    from receipt_parser.pipeline import _apply_final_receipt_output_repairs
+
+    ocr_text = "\n".join([
+        "8%対象",
+        "100",
+        "10%対象",
+        "25",
+        "合計",
+        "¥125",
+    ])
+    result = {
+        "document_type": "receipt",
+        "merchant": "TEST",
+        "total": 125,
+        "subtotal": 100,
+        "taxes": [
+            {"rate": "8%", "label": "外税", "amount": 24},
+            {"rate": "10%", "label": "外税", "amount": 1},
+        ],
+        "line_items": [
+            {"description": "A", "total": 100, "tax_category": "8%"},
+            {"description": "B", "total": 25, "tax_category": "10%"},
+        ],
+    }
+    trace = []
+
+    _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=trace)
+
+    assert result["taxes"] == [{"rate": "8%", "label": "外税", "amount": 24}]
+    assert result["subtotal"] == 101.0
+    tax_events = [
+        event for event in trace if event["stage"] == "drop_small_target_only_taxes"
+    ]
+    assert tax_events
+    assert tax_events[0]["owner_phase"] == "small_target_only_tax_pruning"
+    assert tax_events[0]["owner_invariant"]
+    assert tax_events[0]["justification"]
+
+
 def test_code_prefixed_table_restores_item_descriptions_by_order():
     from receipt_parser.pipeline_receipt import _fix_code_table_descriptions_by_order
 
@@ -4514,6 +4554,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "printed_external_tax_amount_restoration",
         "bare_number_tax_summary_restoration",
         "external_tax_total_restoration",
+        "small_target_only_tax_pruning",
         "tax_category_assignment",
         "payment_points_reconciliation",
         "structural_item_reconstruction",
@@ -4541,6 +4582,8 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "taxes" in phases["printed_external_tax_amount_restoration"]["writes"]
     assert "taxes" in phases["bare_number_tax_summary_restoration"]["writes"]
     assert "subtotal" in phases["bare_number_tax_summary_restoration"]["writes"]
+    assert "taxes" in phases["small_target_only_tax_pruning"]["writes"]
+    assert "subtotal" in phases["small_target_only_tax_pruning"]["writes"]
     assert "total" in phases["external_tax_total_restoration"]["writes"]
     assert "amount_paid" in phases["external_tax_total_restoration"]["writes"]
     assert "line_items" in phases["structural_item_reconstruction"]["writes"]
@@ -4575,6 +4618,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "explicit_tax_amount_restoration",
             "printed_external_tax_amount_restoration",
             "bare_number_tax_summary_restoration",
+            "small_target_only_tax_pruning",
             "tax_category_assignment",
             "structural_item_reconstruction",
             "final_consistency_pass",
@@ -4588,6 +4632,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "payment_points_reconciliation",
             "service_receipt_recovery",
             "single_rate_inclusive_tax_restoration",
+            "small_target_only_tax_pruning",
             "structural_item_reconstruction",
             "final_consistency_pass",
         },

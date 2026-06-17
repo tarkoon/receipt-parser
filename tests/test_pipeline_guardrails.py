@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 59
+POSTPROCESS_REPAIR_CALL_LIMIT = 56
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -249,6 +249,13 @@ FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_HELPER = (
     "_run_final_bare_number_tax_summary_restoration_phase"
 )
 FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_STAGE_LIMIT = 1
+FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_REPAIRS = {
+    "_drop_unprinted_small_target_only_taxes",
+}
+FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_HELPER = (
+    "_run_final_small_target_only_tax_pruning_phase"
+)
+FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_STAGE_LIMIT = 1
 FINAL_COUPON_DISCOUNT_PROJECTION_REPAIRS = {
     "_fix_item_totals_from_following_discount_lines",
     "_apply_coupon_discount_blocks",
@@ -2007,6 +2014,64 @@ def test_final_bare_number_tax_summary_restoration_debt_is_helper_owned():
         "bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_STAGE_LIMIT}"
+    )
+
+
+def test_final_small_target_only_tax_pruning_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(
+        tree,
+        FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_HELPER,
+    )
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late small target-only tax pruning must be owned by the named "
+        f"{FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_HELPER} must document the "
+        "unprinted target-only tax trigger and printed tax/subtotal arithmetic "
+        "invariant."
+    )
+
+
+def test_final_small_target_only_tax_pruning_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_tax_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_HELPER
+    ]
+
+    assert not direct_tax_calls, (
+        "Late small target-only tax pruning should run through the named "
+        "helper so printed rate-base evidence and tax/subtotal consistency "
+        "have one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_tax_calls}"
+    )
+    assert (
+        0
+        < len(helper_calls)
+        <= FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_STAGE_LIMIT
+    ), (
+        "Late small target-only tax pruning helper calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_STAGE_LIMIT}"
     )
 
 
