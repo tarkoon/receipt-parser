@@ -245,6 +245,13 @@ FINAL_COUPON_DISCOUNT_PROJECTION_HELPER = (
     "_run_final_coupon_discount_projection_phase"
 )
 FINAL_COUPON_DISCOUNT_PROJECTION_STAGE_LIMIT = 2
+FINAL_FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS = {
+    "_repair_tiny_item_prices_from_following_ocr",
+}
+FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER = (
+    "_run_final_following_ocr_price_projection_phase"
+)
+FINAL_FOLLOWING_OCR_PRICE_PROJECTION_STAGE_LIMIT = 1
 FINAL_OCR_DESCRIPTION_RECONCILIATION_REPAIRS = {
     "_fix_code_table_descriptions_by_order",
     "_fix_o_ring_descriptions_from_ocr",
@@ -1900,6 +1907,60 @@ def test_final_coupon_discount_projection_debt_is_helper_owned():
         "Late coupon/discount helper calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_COUPON_DISCOUNT_PROJECTION_STAGE_LIMIT}"
+    )
+
+
+def test_final_following_ocr_price_projection_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late following-OCR price projection must be owned by the named "
+        f"{FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER} must document the "
+        "following OCR amount trigger and item-sum/rate-base invariant."
+    )
+
+
+def test_final_following_ocr_price_projection_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_price_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER
+    ]
+
+    assert not direct_price_calls, (
+        "Late following-OCR price projection should run through the named "
+        "helper so repeated OCR amount evidence and subtotal/rate-base "
+        "arithmetic have one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_price_calls}"
+    )
+    assert (
+        0
+        < len(helper_calls)
+        <= FINAL_FOLLOWING_OCR_PRICE_PROJECTION_STAGE_LIMIT
+    ), (
+        "Late following-OCR price projection helper calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_FOLLOWING_OCR_PRICE_PROJECTION_STAGE_LIMIT}"
     )
 
 

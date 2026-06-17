@@ -1180,6 +1180,26 @@ def _run_final_coupon_discount_projection_phase(
             )
 
 
+def _run_final_following_ocr_price_projection_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: repeated following OCR amount rows near item descriptions.
+
+    Invariant: projected item prices must improve the item sum against printed
+    subtotal, total, or rate-base targets without changing discounted rows.
+    """
+    for repair in repairs:
+        if repair == "tiny_item_prices_from_following_ocr":
+            _repair_tiny_item_prices_from_following_ocr(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final following OCR price projection repair: "
+                f"{repair}"
+            )
+
+
 def _run_final_ocr_description_reconciliation_phase(
     result: dict,
     ocr_text: str,
@@ -1340,7 +1360,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "tiny_item_prices_from_following_ocr": (
         "structural_item_reconstruction",
-        "Retained late for tiny item price projection after serialization.",
+        "Owned by the final following-OCR price projection helper until repeated following amount projection moves out of post-serialization repair.",
     ),
     "split_price_block": (
         "structural_item_reconstruction",
@@ -1604,7 +1624,14 @@ def _apply_final_receipt_output_repairs(
             ),
         ),
     )
-    run("tiny_item_prices_from_following_ocr", lambda: _repair_tiny_item_prices_from_following_ocr(result, ocr_text))
+    run(
+        "tiny_item_prices_from_following_ocr",
+        lambda: _run_final_following_ocr_price_projection_phase(
+            result,
+            ocr_text,
+            ("tiny_item_prices_from_following_ocr",),
+        ),
+    )
     run(
         "split_price_block",
         lambda: _run_final_split_price_block_projection_phase(
