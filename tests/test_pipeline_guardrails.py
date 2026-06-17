@@ -252,6 +252,11 @@ FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER = (
     "_run_final_following_ocr_price_projection_phase"
 )
 FINAL_FOLLOWING_OCR_PRICE_PROJECTION_STAGE_LIMIT = 1
+FINAL_MERCHANT_IDENTITY_REPAIR_REPAIRS = {
+    "_fix_company_name_merchant",
+}
+FINAL_MERCHANT_IDENTITY_REPAIR_HELPER = "_run_final_merchant_identity_repair_phase"
+FINAL_MERCHANT_IDENTITY_REPAIR_STAGE_LIMIT = 1
 FINAL_OCR_DESCRIPTION_RECONCILIATION_REPAIRS = {
     "_fix_code_table_descriptions_by_order",
     "_fix_o_ring_descriptions_from_ocr",
@@ -1961,6 +1966,53 @@ def test_final_following_ocr_price_projection_debt_is_helper_owned():
         "bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_FOLLOWING_OCR_PRICE_PROJECTION_STAGE_LIMIT}"
+    )
+
+
+def test_final_merchant_identity_repair_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_MERCHANT_IDENTITY_REPAIR_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_MERCHANT_IDENTITY_REPAIR_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late merchant identity repair must be owned by the named "
+        f"{FINAL_MERCHANT_IDENTITY_REPAIR_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_MERCHANT_IDENTITY_REPAIR_HELPER} must document the "
+        "header/legal-name trigger and merchant field-consistency invariant."
+    )
+
+
+def test_final_merchant_identity_repair_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_merchant_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_MERCHANT_IDENTITY_REPAIR_REPAIRS
+    ]
+    helper_calls = [
+        name for name in final_calls if name == FINAL_MERCHANT_IDENTITY_REPAIR_HELPER
+    ]
+
+    assert not direct_merchant_calls, (
+        "Late merchant identity repair should run through the named helper "
+        "so header/company-name evidence and merchant field consistency have "
+        "one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_merchant_calls}"
+    )
+    assert 0 < len(helper_calls) <= FINAL_MERCHANT_IDENTITY_REPAIR_STAGE_LIMIT, (
+        "Late merchant identity helper calls must be explicit and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_MERCHANT_IDENTITY_REPAIR_STAGE_LIMIT}"
     )
 
 

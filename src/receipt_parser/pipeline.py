@@ -985,6 +985,25 @@ def _run_final_header_location_repair_phase(
             raise ValueError(f"Unknown final header location repair: {repair}")
 
 
+def _run_final_merchant_identity_repair_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: header legal-name, authority, or brand/company-name evidence.
+
+    Invariant: merchant changes must be backed by visible header text and keep
+    the merchant field consistent with valid receipt identity candidates.
+    """
+    for repair in repairs:
+        if repair == "company_name_merchant":
+            _fix_company_name_merchant(result, ocr_text)
+        else:
+            raise ValueError(
+                f"Unknown final merchant identity repair: {repair}"
+            )
+
+
 def _run_final_single_rate_inclusive_tax_restoration_phase(
     result: dict,
     ocr_text: str,
@@ -1394,7 +1413,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "company_name_merchant": (
         "header_identity_repair",
-        "Temporary debt: direct final-output callers still need invoice/registration merchant cleanup.",
+        "Owned by the final merchant identity helper until legal-name/header merchant cleanup moves out of post-serialization repair.",
     ),
     "adjacent_price_shift_reconciliation": (
         "structural_item_reconstruction",
@@ -1688,7 +1707,14 @@ def _apply_final_receipt_output_repairs(
             ("o_ring_descriptions",),
         ),
     )
-    run("company_name_merchant", lambda: _fix_company_name_merchant(result, ocr_text))
+    run(
+        "company_name_merchant",
+        lambda: _run_final_merchant_identity_repair_phase(
+            result,
+            ocr_text,
+            ("company_name_merchant",),
+        ),
+    )
     run(
         "adjacent_price_shift_reconciliation",
         lambda: _run_final_adjacent_price_shift_reconciliation_phase(
