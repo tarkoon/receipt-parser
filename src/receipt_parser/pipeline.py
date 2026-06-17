@@ -1229,6 +1229,26 @@ def _run_final_adjacent_price_shift_reconciliation_phase(
             )
 
 
+def _run_final_prefixed_tax_marker_item_rows_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR item rows prefixed by tax markers after final cleanup.
+
+    Invariant: projected rows must balance to the printed subtotal or total
+    while preserving rate-base totals implied by the marker prefixes.
+    """
+    for repair in repairs:
+        if repair == "prefixed_tax_marker_item_rows":
+            _replace_prefixed_tax_marker_item_rows_when_balanced(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final prefixed tax-marker item row repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1405,7 +1425,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "prefixed_tax_marker_item_rows": (
         "structural_item_reconstruction",
-        "Retained late for prefixed tax marker rows after final cleanup.",
+        "Owned by the final prefixed tax-marker item row helper until marker-prefixed row projection moves out of post-serialization repair.",
     ),
     "missing_items_from_gap": (
         "initial_item_recovery",
@@ -1721,7 +1741,14 @@ def _apply_final_receipt_output_repairs(
             ("adjacent_ocr_price_shift_final",),
         ),
     )
-    run("prefixed_tax_marker_item_rows", lambda: _replace_prefixed_tax_marker_item_rows_when_balanced(result, ocr_text))
+    run(
+        "prefixed_tax_marker_item_rows",
+        lambda: _run_final_prefixed_tax_marker_item_rows_phase(
+            result,
+            ocr_text,
+            ("prefixed_tax_marker_item_rows",),
+        ),
+    )
     run("missing_items_from_gap", lambda: _recover_missing_items_from_gap(result, ocr_text))
     run(
         "ocr_description_reconciliation_after_layout",

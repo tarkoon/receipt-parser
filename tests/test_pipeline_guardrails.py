@@ -262,6 +262,13 @@ FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_HELPER = (
     "_run_final_adjacent_price_shift_reconciliation_phase"
 )
 FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_STAGE_LIMIT = 2
+FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS = {
+    "_replace_prefixed_tax_marker_item_rows_when_balanced",
+}
+FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER = (
+    "_run_final_prefixed_tax_marker_item_rows_phase"
+)
+FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_STAGE_LIMIT = 1
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -1990,6 +1997,63 @@ def test_final_adjacent_price_shift_reconciliation_debt_is_helper_owned():
         "bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_STAGE_LIMIT}"
+    )
+
+
+def test_final_prefixed_tax_marker_item_rows_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(
+        tree,
+        FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER,
+    )
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late prefixed tax-marker item row projection must be owned by the "
+        f"named {FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER} must document the OCR "
+        "tax-marker row trigger and subtotal/rate-base balance invariant."
+    )
+
+
+def test_final_prefixed_tax_marker_item_rows_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_marker_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER
+    ]
+
+    assert not direct_marker_calls, (
+        "Late prefixed tax-marker item row projection should run through the "
+        "named helper so OCR marker evidence and subtotal/rate-base arithmetic "
+        "have one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_marker_calls}"
+    )
+    assert (
+        0
+        < len(helper_calls)
+        <= FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_STAGE_LIMIT
+    ), (
+        "Late prefixed tax-marker item row helper calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_STAGE_LIMIT}"
     )
 
 
