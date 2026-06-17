@@ -255,6 +255,13 @@ FINAL_OCR_DESCRIPTION_RECONCILIATION_HELPER = (
     "_run_final_ocr_description_reconciliation_phase"
 )
 FINAL_OCR_DESCRIPTION_RECONCILIATION_STAGE_LIMIT = 3
+FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_REPAIRS = {
+    "_fix_adjacent_ocr_price_shift_when_balanced",
+}
+FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_HELPER = (
+    "_run_final_adjacent_price_shift_reconciliation_phase"
+)
+FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_STAGE_LIMIT = 2
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -391,7 +398,7 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "printed_item_sum_total",
     "ocr_description_reconciliation",
     "company_name_merchant",
-    "adjacent_ocr_price_shift",
+    "adjacent_price_shift_reconciliation",
     "repeated_item_gap",
     "drop_duplicate_embedded_price",
     "dense_sequence_rows",
@@ -410,7 +417,7 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "clear_discount_before_own_price",
     "campaign_discount_stream_2",
     "coupon_discount_projection_after_layout",
-    "adjacent_ocr_price_shift_final",
+    "adjacent_price_shift_reconciliation_after_layout",
     "prefixed_tax_marker_item_rows",
     "missing_items_from_gap",
     "ocr_description_reconciliation_after_layout",
@@ -1926,6 +1933,63 @@ def test_final_ocr_description_reconciliation_debt_is_helper_owned():
         "Late OCR description helper calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_OCR_DESCRIPTION_RECONCILIATION_STAGE_LIMIT}"
+    )
+
+
+def test_final_adjacent_price_shift_reconciliation_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(
+        tree,
+        FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_HELPER,
+    )
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late adjacent OCR price-shift reconciliation must be owned by the "
+        f"named {FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_HELPER} must document "
+        "the adjacent OCR price trigger and subtotal-balance invariant."
+    )
+
+
+def test_final_adjacent_price_shift_reconciliation_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_price_shift_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_HELPER
+    ]
+
+    assert not direct_price_shift_calls, (
+        "Late adjacent OCR price-shift reconciliation should run through the "
+        "named helper so OCR neighbor evidence and subtotal arithmetic have "
+        "one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_price_shift_calls}"
+    )
+    assert (
+        0
+        < len(helper_calls)
+        <= FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_STAGE_LIMIT
+    ), (
+        "Late adjacent OCR price-shift helper calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_STAGE_LIMIT}"
     )
 
 

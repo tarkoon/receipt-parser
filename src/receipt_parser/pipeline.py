@@ -1206,6 +1206,29 @@ def _run_final_ocr_description_reconciliation_phase(
             )
 
 
+def _run_final_adjacent_price_shift_reconciliation_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: adjacent OCR item and price rows after row projection.
+
+    Invariant: shifted price changes must preserve item totals that balance
+    against the printed subtotal.
+    """
+    for repair in repairs:
+        if repair in {
+            "adjacent_ocr_price_shift",
+            "adjacent_ocr_price_shift_final",
+        }:
+            _fix_adjacent_ocr_price_shift_when_balanced(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final adjacent price-shift reconciliation repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1291,9 +1314,10 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "header_identity_repair",
         "Temporary debt: direct final-output callers still need invoice/registration merchant cleanup.",
     ),
-    "adjacent_ocr_price_shift": (
+    "adjacent_price_shift_reconciliation": (
         "structural_item_reconstruction",
-        "Retained late for adjacent OCR price shifts before final item cleanup.",
+        "Owned by the final adjacent price-shift reconciliation helper until "
+        "adjacent OCR price repairs move out of post-serialization repair.",
     ),
     "repeated_item_gap": (
         "initial_item_recovery",
@@ -1374,9 +1398,10 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "Owned by the final coupon/discount projection helper as the bounded "
         "post-layout reassertion of discount arithmetic.",
     ),
-    "adjacent_ocr_price_shift_final": (
+    "adjacent_price_shift_reconciliation_after_layout": (
         "structural_item_reconstruction",
-        "Temporary debt: repeated after discount cleanup can expose adjacent price shifts.",
+        "Owned by the final adjacent price-shift reconciliation helper as the "
+        "bounded post-layout reassertion after discount cleanup.",
     ),
     "prefixed_tax_marker_item_rows": (
         "structural_item_reconstruction",
@@ -1575,7 +1600,14 @@ def _apply_final_receipt_output_repairs(
         ),
     )
     run("company_name_merchant", lambda: _fix_company_name_merchant(result, ocr_text))
-    run("adjacent_ocr_price_shift", lambda: _fix_adjacent_ocr_price_shift_when_balanced(result, ocr_text))
+    run(
+        "adjacent_price_shift_reconciliation",
+        lambda: _run_final_adjacent_price_shift_reconciliation_phase(
+            result,
+            ocr_text,
+            ("adjacent_ocr_price_shift",),
+        ),
+    )
     run("repeated_item_gap", lambda: _recover_repeated_item_from_gap(result, ocr_text))
     if result.get("line_items"):
         run(
@@ -1681,7 +1713,14 @@ def _apply_final_receipt_output_repairs(
             ),
         ),
     )
-    run("adjacent_ocr_price_shift_final", lambda: _fix_adjacent_ocr_price_shift_when_balanced(result, ocr_text))
+    run(
+        "adjacent_price_shift_reconciliation_after_layout",
+        lambda: _run_final_adjacent_price_shift_reconciliation_phase(
+            result,
+            ocr_text,
+            ("adjacent_ocr_price_shift_final",),
+        ),
+    )
     run("prefixed_tax_marker_item_rows", lambda: _replace_prefixed_tax_marker_item_rows_when_balanced(result, ocr_text))
     run("missing_items_from_gap", lambda: _recover_missing_items_from_gap(result, ocr_text))
     run(
