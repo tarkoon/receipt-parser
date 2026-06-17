@@ -4560,6 +4560,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "tax_category_assignment",
         "payment_points_reconciliation",
         "dense_item_row_projection",
+        "dense_sequence_row_projection",
         "structural_item_reconstruction",
         "duplicate_row_cleanup",
         "final_consistency_pass",
@@ -4600,6 +4601,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "amount_paid" in phases["payment_points_reconciliation"]["reads"]
     assert "payment_method" in phases["payment_points_reconciliation"]["writes"]
     assert "line_items" in phases["dense_item_row_projection"]["writes"]
+    assert "line_items" in phases["dense_sequence_row_projection"]["writes"]
     assert "total" in phases["final_consistency_pass"]["writes"]
     expected_owners = {
         "line_items": {
@@ -4618,6 +4620,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "single_rate_inclusive_tax_restoration",
             "tax_category_assignment",
             "dense_item_row_projection",
+            "dense_sequence_row_projection",
             "structural_item_reconstruction",
             "duplicate_row_cleanup",
             "final_consistency_pass",
@@ -4632,6 +4635,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "bare_number_tax_summary_restoration",
             "small_target_only_tax_pruning",
             "tax_category_assignment",
+            "dense_sequence_row_projection",
             "structural_item_reconstruction",
             "final_consistency_pass",
             "body_total_layout_reconstruction",

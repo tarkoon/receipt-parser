@@ -14656,6 +14656,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Dense item row projection requires visible dense OCR item/price rows and item-sum arithmetic consistent with printed totals.",
     },
     {
+        "name": "dense_sequence_row_projection",
+        "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
+        "writes": ("line_items", "taxes"),
+        "invariant": "Dense sequence row projection requires visible dense OCR row sequences and item/tax arithmetic consistent with printed totals.",
+    },
+    {
         "name": "structural_item_reconstruction",
         "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text", "ocr_totals"),
         "writes": ("line_items", "taxes", "subtotal", "total", "amount_paid"),
@@ -14756,6 +14762,23 @@ def _run_dense_item_row_projection_phase(
             raise ValueError(f"Unknown dense item row projection repair: {repair}")
 
 
+def _run_dense_sequence_row_projection_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR exposes dense item/quantity/price row sequences.
+
+    Invariant: projected dense sequences may replace rows only when visible OCR
+    row totals and tax categories remain coherent with printed receipt amounts.
+    """
+    for repair in repairs:
+        if repair == "dense_sequence_rows":
+            _replace_dense_sequence_rows_when_balanced(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown dense sequence row projection repair: {repair}")
+
+
 def _run_structural_item_projection_phase(
     extracted: dict,
     unified_text: str,
@@ -14772,8 +14795,6 @@ def _run_structural_item_projection_phase(
             _replace_barcode_unit_qty_amount_stack_when_balanced(extracted, unified_text)
         elif repair == "barcode_qty_price_rows":
             _replace_barcode_qty_price_rows_when_balanced(extracted, unified_text)
-        elif repair == "dense_sequence_rows":
-            _replace_dense_sequence_rows_when_balanced(extracted, unified_text)
         elif repair == "jan_pos_items":
             _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals or {})
         else:
@@ -15435,8 +15456,18 @@ def postprocess_receipt(
         (
             "barcode_unit_qty_amount_stack",
             "barcode_qty_price_rows",
-            "dense_sequence_rows",
         ),
+    )
+    _run_dense_sequence_row_projection_phase(
+        extracted,
+        unified_text,
+        ("dense_sequence_rows",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "dense_sequence_row_projection",
+        trace_snapshot,
+        extracted,
     )
     _run_quantity_detail_reconciliation_phase(
         extracted,
@@ -15544,11 +15575,16 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _run_structural_item_projection_phase(
+    _run_dense_sequence_row_projection_phase(
         extracted,
         unified_text,
-        ocr_totals,
         ("dense_sequence_rows",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "dense_sequence_row_projection",
+        trace_snapshot,
+        extracted,
     )
     _run_quantity_detail_reconciliation_phase(
         extracted,
@@ -16076,11 +16112,16 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _run_structural_item_projection_phase(
+    _run_dense_sequence_row_projection_phase(
         extracted,
         unified_text,
-        ocr_totals,
         ("dense_sequence_rows",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "dense_sequence_row_projection",
+        trace_snapshot,
+        extracted,
     )
     _run_quantity_detail_reconciliation_phase(
         extracted,
@@ -16223,11 +16264,16 @@ def postprocess_receipt(
         ("drop_non_product_line_items",),
     )
     _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text)
-    _run_structural_item_projection_phase(
+    _run_dense_sequence_row_projection_phase(
         extracted,
         unified_text,
-        ocr_totals,
         ("dense_sequence_rows",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "dense_sequence_row_projection",
+        trace_snapshot,
+        extracted,
     )
     _run_quantity_detail_reconciliation_phase(
         extracted,
@@ -16347,11 +16393,16 @@ def postprocess_receipt(
         unified_text,
         ("drop_numeric_marker_description_rows",),
     )
-    _run_structural_item_projection_phase(
+    _run_dense_sequence_row_projection_phase(
         extracted,
         unified_text,
-        ocr_totals,
         ("dense_sequence_rows",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "dense_sequence_row_projection",
+        trace_snapshot,
+        extracted,
     )
     _run_quantity_detail_reconciliation_phase(
         extracted,
