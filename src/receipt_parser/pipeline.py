@@ -1180,6 +1180,32 @@ def _run_final_coupon_discount_projection_phase(
             )
 
 
+def _run_final_ocr_description_reconciliation_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR item-code, JAN, discount-pair, or pre-price context.
+
+    Invariant: description changes must remain backed by visible OCR
+    neighbors while preserving each item's amount and quantity fields.
+    """
+    for repair in repairs:
+        if repair == "o_ring_descriptions":
+            _fix_o_ring_descriptions_from_ocr(result, ocr_text)
+        elif repair == "code_table_descriptions":
+            _fix_code_table_descriptions_by_order(result, ocr_text)
+        elif repair == "discounted_ocr_pair_descriptions":
+            _repair_discounted_ocr_pair_descriptions(result, ocr_text)
+        elif repair == "pre_price_stack_descriptions":
+            _repair_pre_price_stack_descriptions_from_ocr(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final OCR description reconciliation repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1255,9 +1281,11 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "financial_totals_repair",
         "Owned by the final printed item-sum total helper until this printed total correction moves out of post-serialization repair.",
     ),
-    "o_ring_descriptions": (
+    "ocr_description_reconciliation": (
         "item_cleanup",
-        "Retained late because JAN/barcode reconstruction can expose O-ring descriptions.",
+        "Owned by the final OCR description reconciliation helper until "
+        "JAN/barcode-adjacent description cleanup moves out of "
+        "post-serialization repair.",
     ),
     "company_name_merchant": (
         "header_identity_repair",
@@ -1295,9 +1323,11 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "tax_category_assignment",
         "Retained late for bag price/category consistency with final rate bases.",
     ),
-    "code_table_descriptions": (
+    "code_table_description_reconciliation": (
         "item_cleanup",
-        "Retained late for code-table descriptions exposed by final item projection.",
+        "Owned by the final OCR description reconciliation helper until "
+        "code-table description cleanup moves out of post-serialization "
+        "repair.",
     ),
     "printed_external_tax_amounts": (
         "tax_category_assignment",
@@ -1356,13 +1386,11 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "initial_item_recovery",
         "Retained late for item gaps exposed by final row cleanup.",
     ),
-    "discounted_ocr_pair_descriptions": (
+    "ocr_description_reconciliation_after_layout": (
         "item_cleanup",
-        "Retained late to repair descriptions after discounted rows settle.",
-    ),
-    "pre_price_stack_descriptions": (
-        "item_cleanup",
-        "Retained late to repair stacked descriptions after price rows settle.",
+        "Owned by the final OCR description reconciliation helper as the "
+        "bounded post-layout pass for discount-pair and pre-price stack "
+        "description context.",
     ),
     "drop_duplicate_rows_when_subtotal_balances": (
         "item_cleanup",
@@ -1538,7 +1566,14 @@ def _apply_final_receipt_output_repairs(
             ("printed_item_sum_total",),
         ),
     )
-    run("o_ring_descriptions", lambda: _fix_o_ring_descriptions_from_ocr(result, ocr_text))
+    run(
+        "ocr_description_reconciliation",
+        lambda: _run_final_ocr_description_reconciliation_phase(
+            result,
+            ocr_text,
+            ("o_ring_descriptions",),
+        ),
+    )
     run("company_name_merchant", lambda: _fix_company_name_merchant(result, ocr_text))
     run("adjacent_ocr_price_shift", lambda: _fix_adjacent_ocr_price_shift_when_balanced(result, ocr_text))
     run("repeated_item_gap", lambda: _recover_repeated_item_from_gap(result, ocr_text))
@@ -1580,7 +1615,14 @@ def _apply_final_receipt_output_repairs(
             ocr_text,
         ),
     )
-    run("code_table_descriptions", lambda: _fix_code_table_descriptions_by_order(result, ocr_text))
+    run(
+        "code_table_description_reconciliation",
+        lambda: _run_final_ocr_description_reconciliation_phase(
+            result,
+            ocr_text,
+            ("code_table_descriptions",),
+        ),
+    )
     run("printed_external_tax_amounts", lambda: _restore_printed_external_tax_amounts(result, ocr_text))
     run("bare_number_tax_summary", lambda: _restore_bare_number_tax_summary(result, ocr_text))
     run(
@@ -1642,8 +1684,17 @@ def _apply_final_receipt_output_repairs(
     run("adjacent_ocr_price_shift_final", lambda: _fix_adjacent_ocr_price_shift_when_balanced(result, ocr_text))
     run("prefixed_tax_marker_item_rows", lambda: _replace_prefixed_tax_marker_item_rows_when_balanced(result, ocr_text))
     run("missing_items_from_gap", lambda: _recover_missing_items_from_gap(result, ocr_text))
-    run("discounted_ocr_pair_descriptions", lambda: _repair_discounted_ocr_pair_descriptions(result, ocr_text))
-    run("pre_price_stack_descriptions", lambda: _repair_pre_price_stack_descriptions_from_ocr(result, ocr_text))
+    run(
+        "ocr_description_reconciliation_after_layout",
+        lambda: _run_final_ocr_description_reconciliation_phase(
+            result,
+            ocr_text,
+            (
+                "discounted_ocr_pair_descriptions",
+                "pre_price_stack_descriptions",
+            ),
+        ),
+    )
     run("drop_duplicate_rows_when_subtotal_balances", lambda: _drop_duplicate_rows_when_subtotal_balances(result, ocr_text))
     run("basket_marker_rows", lambda: _replace_basket_marker_rows_when_balanced(result, ocr_text))
     run(

@@ -245,6 +245,16 @@ FINAL_COUPON_DISCOUNT_PROJECTION_HELPER = (
     "_run_final_coupon_discount_projection_phase"
 )
 FINAL_COUPON_DISCOUNT_PROJECTION_STAGE_LIMIT = 2
+FINAL_OCR_DESCRIPTION_RECONCILIATION_REPAIRS = {
+    "_fix_code_table_descriptions_by_order",
+    "_fix_o_ring_descriptions_from_ocr",
+    "_repair_discounted_ocr_pair_descriptions",
+    "_repair_pre_price_stack_descriptions_from_ocr",
+}
+FINAL_OCR_DESCRIPTION_RECONCILIATION_HELPER = (
+    "_run_final_ocr_description_reconciliation_phase"
+)
+FINAL_OCR_DESCRIPTION_RECONCILIATION_STAGE_LIMIT = 3
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -379,7 +389,7 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "stacked_inclusive_tax_block",
     "printed_summary_total_tax_balanced",
     "printed_item_sum_total",
-    "o_ring_descriptions",
+    "ocr_description_reconciliation",
     "company_name_merchant",
     "adjacent_ocr_price_shift",
     "repeated_item_gap",
@@ -389,7 +399,7 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "jan_pos_items",
     "qty_totals_from_unit_lines",
     "bag_item_prices_from_rate_bases",
-    "code_table_descriptions",
+    "code_table_description_reconciliation",
     "printed_external_tax_amounts",
     "bare_number_tax_summary",
     "external_tax_total_from_printed_subtotal",
@@ -403,8 +413,7 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "adjacent_ocr_price_shift_final",
     "prefixed_tax_marker_item_rows",
     "missing_items_from_gap",
-    "discounted_ocr_pair_descriptions",
-    "pre_price_stack_descriptions",
+    "ocr_description_reconciliation_after_layout",
     "drop_duplicate_rows_when_subtotal_balances",
     "basket_marker_rows",
     "tax_categories_from_rate_bases",
@@ -1866,6 +1875,57 @@ def test_final_coupon_discount_projection_debt_is_helper_owned():
         "Late coupon/discount helper calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_COUPON_DISCOUNT_PROJECTION_STAGE_LIMIT}"
+    )
+
+
+def test_final_ocr_description_reconciliation_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_OCR_DESCRIPTION_RECONCILIATION_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_OCR_DESCRIPTION_RECONCILIATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late OCR description reconciliation must be owned by the named "
+        f"{FINAL_OCR_DESCRIPTION_RECONCILIATION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_OCR_DESCRIPTION_RECONCILIATION_HELPER} must document the "
+        "OCR description-context trigger and item field-consistency invariant."
+    )
+
+
+def test_final_ocr_description_reconciliation_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_description_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_OCR_DESCRIPTION_RECONCILIATION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_OCR_DESCRIPTION_RECONCILIATION_HELPER
+    ]
+
+    assert not direct_description_calls, (
+        "Late OCR description reconciliation should run through the named "
+        "helper so OCR description context and field consistency have one "
+        "owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_description_calls}"
+    )
+    assert (
+        0 < len(helper_calls) <= FINAL_OCR_DESCRIPTION_RECONCILIATION_STAGE_LIMIT
+    ), (
+        "Late OCR description helper calls must be explicit and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_OCR_DESCRIPTION_RECONCILIATION_STAGE_LIMIT}"
     )
 
 
