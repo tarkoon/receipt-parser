@@ -844,6 +844,29 @@ def _run_final_structural_item_projection_phase(
             )
 
 
+def _run_final_jan_pos_item_projection_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: visible JAN/POS item rows with prices, quantities, or discounts.
+
+    Invariant: projected JAN/POS rows must balance against the printed
+    subtotal and preserve printed rate-base or tax summary arithmetic.
+    """
+    for repair in repairs:
+        if repair == "jan_pos_items":
+            _replace_jan_pos_items_when_balanced(
+                result,
+                ocr_text,
+                extract_financial_totals(ocr_text),
+            )
+        else:
+            raise ValueError(
+                f"Unknown final JAN/POS item projection repair: {repair}"
+            )
+
+
 def _run_final_barcode_qty_price_projection_phase(
     result: dict,
     ocr_text: str,
@@ -1580,7 +1603,8 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "jan_pos_items": (
         "structural_item_reconstruction",
-        "Retained late for JAN/POS row projection pending postprocess-only ownership.",
+        "Owned by the final JAN/POS item projection helper until JAN/POS "
+        "row projection moves out of post-serialization repair.",
     ),
     "qty_totals_from_unit_lines": (
         "quantity_detail_reconciliation",
@@ -1907,10 +1931,10 @@ def _apply_final_receipt_output_repairs(
     )
     run(
         "jan_pos_items",
-        lambda: _replace_jan_pos_items_when_balanced(
+        lambda: _run_final_jan_pos_item_projection_phase(
             result,
             ocr_text,
-            extract_financial_totals(ocr_text),
+            ("jan_pos_items",),
         ),
     )
     run(
