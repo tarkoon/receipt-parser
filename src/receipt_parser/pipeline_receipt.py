@@ -15161,6 +15161,26 @@ def _run_explicit_tax_amount_restoration_phase(
             )
 
 
+def _run_printed_external_tax_amount_restoration_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: printed per-rate external tax amount rows.
+
+    Invariant: restored tax amounts must remain consistent with printed
+    taxable bases and subtotal plus external tax total arithmetic.
+    """
+    for repair in repairs:
+        if repair == "printed_external_tax_amounts":
+            _restore_printed_external_tax_amounts(extracted, unified_text)
+        else:
+            raise ValueError(
+                "Unknown printed external-tax amount restoration repair: "
+                f"{repair}"
+            )
+
+
 def _run_external_tax_total_restoration_phase(
     extracted: dict,
     unified_text: str,
@@ -16468,7 +16488,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _restore_printed_external_tax_amounts(extracted, unified_text)
+    _run_printed_external_tax_amount_restoration_phase(
+        extracted,
+        unified_text,
+        ("printed_external_tax_amounts",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "printed_external_tax_amount_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _run_explicit_tax_amount_restoration_phase(
         extracted,
         unified_text,
