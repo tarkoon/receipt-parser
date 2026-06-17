@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 49
+POSTPROCESS_REPAIR_CALL_LIMIT = 48
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -277,6 +277,13 @@ FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_HELPER = (
     "_run_final_bare_number_tax_summary_restoration_phase"
 )
 FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_STAGE_LIMIT = 1
+BARE_NUMBER_TAX_SUMMARY_RESTORATION_REPAIRS = {
+    "_restore_bare_number_tax_summary",
+}
+BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_HELPER = (
+    "_run_bare_number_tax_summary_restoration_phase"
+)
+BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_CALL_LIMIT = 1
 FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_REPAIRS = {
     "_drop_unprinted_small_target_only_taxes",
 }
@@ -2348,6 +2355,63 @@ def test_final_bare_number_tax_summary_restoration_debt_is_helper_owned():
         "bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_STAGE_LIMIT}"
+    )
+
+
+def test_bare_number_tax_summary_restoration_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(
+        tree,
+        BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_HELPER,
+    )
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        BARE_NUMBER_TAX_SUMMARY_RESTORATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Postprocess bare-number tax summary restoration must be owned by the "
+        f"named {BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_HELPER} must document the "
+        "bare-number rate/tax trigger and tax/subtotal/total consistency "
+        "invariant."
+    )
+
+
+def test_postprocess_bare_number_tax_summary_restoration_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_tax_calls = [
+        name
+        for name in postprocess_calls
+        if name in BARE_NUMBER_TAX_SUMMARY_RESTORATION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_HELPER
+    ]
+
+    assert not direct_tax_calls, (
+        "Postprocess bare-number tax summary restoration should run through "
+        "the named phase helper so bare numeric tax rows and "
+        "tax/subtotal/total consistency have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
+    )
+    assert (
+        0
+        < len(phase_calls)
+        <= BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_CALL_LIMIT
+    ), (
+        "Postprocess bare-number tax summary phase calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_CALL_LIMIT}"
     )
 
 

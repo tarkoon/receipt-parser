@@ -15181,6 +15181,26 @@ def _run_printed_external_tax_amount_restoration_phase(
             )
 
 
+def _run_bare_number_tax_summary_restoration_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: bare numeric rate labels and tax amount rows.
+
+    Invariant: restored tax entries and subtotal must remain consistent with
+    visible rate labels, printed tax amounts, and receipt total arithmetic.
+    """
+    for repair in repairs:
+        if repair == "bare_number_tax_summary":
+            _restore_bare_number_tax_summary(extracted, unified_text)
+        else:
+            raise ValueError(
+                "Unknown bare-number tax summary restoration repair: "
+                f"{repair}"
+            )
+
+
 def _run_external_tax_total_restoration_phase(
     extracted: dict,
     unified_text: str,
@@ -16510,7 +16530,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _restore_bare_number_tax_summary(extracted, unified_text)
+    _run_bare_number_tax_summary_restoration_phase(
+        extracted,
+        unified_text,
+        ("bare_number_tax_summary",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "bare_number_tax_summary_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _run_external_tax_total_restoration_phase(
         extracted,
         unified_text,
