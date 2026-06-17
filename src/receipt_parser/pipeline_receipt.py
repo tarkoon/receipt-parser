@@ -14632,6 +14632,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Small target-only tax pruning requires visible rate bases, no matching printed tax amount, and total-minus-tax subtotal arithmetic.",
     },
     {
+        "name": "bag_item_rate_base_reconciliation",
+        "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Bag item price/rate-base reconciliation requires a tiny printed 10% rate base and paid-bag totals that can be reconciled to it.",
+    },
+    {
         "name": "tax_category_assignment",
         "reads": ("line_items", "taxes", "subtotal", "total", "ocr_totals", "ocr_text"),
         "writes": ("line_items", "taxes"),
@@ -15164,6 +15170,30 @@ def _run_tax_category_assignment_phase(
     return merged_rate_bases
 
 
+def _run_bag_item_rate_base_reconciliation_phase(
+    extracted: dict,
+    unified_text: str,
+    rate_bases: dict | None,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: tiny printed 10% rate base with paid bag item rows.
+
+    Invariant: paid-bag qty, unit_price, and total may change only when their
+    combined total reconciles to the visible 10% rate base.
+    """
+    for repair in repairs:
+        if repair == "bag_item_prices_from_rate_bases":
+            _fix_bag_item_prices_from_rate_bases(
+                extracted,
+                rate_bases or {},
+                unified_text,
+            )
+        else:
+            raise ValueError(
+                f"Unknown bag item rate-base reconciliation repair: {repair}"
+            )
+
+
 def _run_line_item_cleanup_phase(
     extracted: dict,
     unified_text: str,
@@ -15613,7 +15643,18 @@ def postprocess_receipt(
     # Tax categories
     if extracted.get("line_items"):
         rate_bases = _tax_assignment_rate_bases(unified_text, ocr_totals)
-        _fix_bag_item_prices_from_rate_bases(extracted, rate_bases, unified_text)
+        _run_bag_item_rate_base_reconciliation_phase(
+            extracted,
+            unified_text,
+            rate_bases,
+            ("bag_item_prices_from_rate_bases",),
+        )
+        trace_snapshot = _record_receipt_phase_mutation(
+            mutation_trace,
+            "bag_item_rate_base_reconciliation",
+            trace_snapshot,
+            extracted,
+        )
         _run_tax_category_assignment_phase(
             extracted,
             unified_text,
@@ -16281,7 +16322,18 @@ def postprocess_receipt(
         unified_text,
         ("qty_totals_from_unit_lines",),
     )
-    _fix_bag_item_prices_from_rate_bases(extracted, extract_rate_bases(unified_text), unified_text)
+    _run_bag_item_rate_base_reconciliation_phase(
+        extracted,
+        unified_text,
+        extract_rate_bases(unified_text),
+        ("bag_item_prices_from_rate_bases",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "bag_item_rate_base_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_body_total_layout_reconstruction_phase(
         extracted,
         unified_text,

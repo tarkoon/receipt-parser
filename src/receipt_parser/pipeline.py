@@ -1170,6 +1170,30 @@ def _run_final_tax_category_reconciliation_phase(
             )
 
 
+def _run_final_bag_item_rate_base_reconciliation_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: tiny printed 10% rate base with paid bag item rows.
+
+    Invariant: paid-bag qty, unit_price, and total may change only when their
+    combined total reconciles to the visible 10% rate base.
+    """
+    for repair in repairs:
+        if repair == "bag_item_prices_from_rate_bases":
+            _fix_bag_item_prices_from_rate_bases(
+                result,
+                extract_rate_bases(ocr_text),
+                ocr_text,
+            )
+        else:
+            raise ValueError(
+                "Unknown final bag item rate-base reconciliation repair: "
+                f"{repair}"
+            )
+
+
 def _run_final_external_tax_total_restoration_phase(
     result: dict,
     ocr_text: str,
@@ -1611,8 +1635,10 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "Owned by the final quantity-detail reconciliation helper until OCR unit-line quantity repair moves out of post-serialization repair.",
     ),
     "bag_item_prices_from_rate_bases": (
-        "tax_category_assignment",
-        "Retained late for bag price/category consistency with final rate bases.",
+        "bag_item_rate_base_reconciliation",
+        "Owned by the final bag item rate-base reconciliation helper until "
+        "paid-bag price/rate-base repair moves out of post-serialization "
+        "repair.",
     ),
     "code_table_description_reconciliation": (
         "item_cleanup",
@@ -1947,10 +1973,10 @@ def _apply_final_receipt_output_repairs(
     )
     run(
         "bag_item_prices_from_rate_bases",
-        lambda: _fix_bag_item_prices_from_rate_bases(
+        lambda: _run_final_bag_item_rate_base_reconciliation_phase(
             result,
-            extract_rate_bases(ocr_text),
             ocr_text,
+            ("bag_item_prices_from_rate_bases",),
         ),
     )
     run(

@@ -4556,6 +4556,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "bare_number_tax_summary_restoration",
         "external_tax_total_restoration",
         "small_target_only_tax_pruning",
+        "bag_item_rate_base_reconciliation",
         "tax_category_assignment",
         "payment_points_reconciliation",
         "structural_item_reconstruction",
@@ -4587,6 +4588,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "subtotal" in phases["bare_number_tax_summary_restoration"]["writes"]
     assert "taxes" in phases["small_target_only_tax_pruning"]["writes"]
     assert "subtotal" in phases["small_target_only_tax_pruning"]["writes"]
+    assert "line_items" in phases["bag_item_rate_base_reconciliation"]["writes"]
     assert "total" in phases["external_tax_total_restoration"]["writes"]
     assert "amount_paid" in phases["external_tax_total_restoration"]["writes"]
     assert "line_items" in phases["structural_item_reconstruction"]["writes"]
@@ -4604,6 +4606,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "body_total_layout_reconstruction",
             "gap_item_recovery",
             "initial_item_recovery",
+            "bag_item_rate_base_reconciliation",
             "low_value_bag_recovery",
             "item_cleanup",
             "discount_consistency_reconciliation",
@@ -10519,3 +10522,50 @@ def test_final_receipt_output_repairs_preserve_visible_bag_standard_rate():
     _apply_final_receipt_output_repairs(result, ocr_text)
 
     assert [item["tax_category"] for item in result["line_items"]] == ["8%", "10%"]
+
+
+def test_final_receipt_output_repairs_trace_bag_item_rate_base_reconciliation():
+    from receipt_parser.pipeline import _apply_final_receipt_output_repairs
+
+    result = {
+        "document_type": "receipt",
+        "subtotal": 2111,
+        "total": 2279,
+        "taxes": [{"rate": "8%", "label": "外税", "amount": 168}],
+        "line_items": [
+            {"description": "食品A", "qty": 1, "unit_price": 2106, "total": 2106, "tax_category": "8%"},
+            {"description": "レジ袋", "qty": 2, "unit_price": 5, "total": 10, "tax_category": "10%"},
+        ],
+    }
+    ocr_text = "\n".join([
+        "食品A",
+        "¥2,106",
+        "000226 レジ袋5円",
+        "小計",
+        "税率 8% 課税対象額",
+        "¥2,111",
+        "税率 8%税額",
+        "¥168",
+        "計",
+        "税率10%課税対象額",
+        "合計",
+        "¥5",
+        "¥2,279",
+    ])
+    trace = []
+
+    _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=trace)
+
+    bag = next(item for item in result["line_items"] if item["description"] == "レジ袋")
+    assert bag["qty"] == 1.0
+    assert bag["unit_price"] == 5.0
+    assert bag["total"] == 5.0
+    bag_events = [
+        event
+        for event in trace
+        if event["stage"] == "bag_item_prices_from_rate_bases"
+    ]
+    assert bag_events
+    assert bag_events[0]["owner_phase"] == "bag_item_rate_base_reconciliation"
+    assert bag_events[0]["owner_invariant"]
+    assert bag_events[0]["justification"]

@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 55
+POSTPROCESS_REPAIR_CALL_LIMIT = 53
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -363,6 +363,20 @@ TAX_CATEGORY_ASSIGNMENT_REPAIRS = {
 }
 TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER = "_run_tax_category_assignment_phase"
 TAX_CATEGORY_ASSIGNMENT_PHASE_CALL_LIMIT = 6
+BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS = {
+    "_fix_bag_item_prices_from_rate_bases",
+}
+BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_HELPER = (
+    "_run_bag_item_rate_base_reconciliation_phase"
+)
+BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_CALL_LIMIT = 2
+FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS = {
+    "_fix_bag_item_prices_from_rate_bases",
+}
+FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_HELPER = (
+    "_run_final_bag_item_rate_base_reconciliation_phase"
+)
+FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_STAGE_LIMIT = 1
 SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_REPAIRS = {
     "_restore_single_rate_inclusive_tax_block",
 }
@@ -2860,6 +2874,113 @@ def test_postprocess_tax_category_assignment_debt_is_phase_owned():
         "Tax category assignment phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {TAX_CATEGORY_ASSIGNMENT_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_bag_item_rate_base_reconciliation_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Bag item price/rate-base reconciliation must be owned by the named "
+        f"{BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_HELPER} must document "
+        "the tiny printed 10% rate-base trigger and paid-bag total invariant."
+    )
+
+
+def test_postprocess_bag_item_rate_base_reconciliation_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_bag_calls = [
+        name
+        for name in postprocess_calls
+        if name in BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_HELPER
+    ]
+
+    assert not direct_bag_calls, (
+        "Bag item price/rate-base reconciliation should run through the "
+        "named phase helper so paid-bag evidence and printed 10% rate-base "
+        "arithmetic have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_bag_calls}"
+    )
+    assert (
+        0
+        < len(phase_calls)
+        <= BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_CALL_LIMIT
+    ), (
+        "Bag item price/rate-base reconciliation phase calls must be "
+        "explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_final_bag_item_rate_base_reconciliation_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late bag item price/rate-base reconciliation must be owned by the "
+        f"named {FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_HELPER} must document "
+        "the tiny printed 10% rate-base trigger and paid-bag total invariant."
+    )
+
+
+def test_final_bag_item_rate_base_reconciliation_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_bag_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_HELPER
+    ]
+
+    assert not direct_bag_calls, (
+        "Late bag item price/rate-base reconciliation should run through the "
+        "named helper so paid-bag evidence and printed 10% rate-base "
+        "arithmetic have one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_bag_calls}"
+    )
+    assert (
+        0
+        < len(helper_calls)
+        <= FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_STAGE_LIMIT
+    ), (
+        "Late bag item price/rate-base reconciliation helper calls must be "
+        "explicit and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_STAGE_LIMIT}"
     )
 
 
