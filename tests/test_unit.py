@@ -8433,6 +8433,52 @@ def test_final_receipt_output_repairs_recover_visible_repeated_item_gap():
     assert [item["total"] for item in result["line_items"]] == [550, 550, 550]
 
 
+def test_final_receipt_output_repairs_drop_embedded_price_duplicate():
+    from receipt_parser.pipeline import _apply_final_receipt_output_repairs
+
+    result = {
+        "document_type": "receipt",
+        "merchant": "TEST",
+        "total": 198,
+        "subtotal": 198,
+        "taxes": [],
+        "line_items": [
+            {
+                "description": "テスト商品",
+                "qty": 1,
+                "unit_price": 198,
+                "total": 198,
+                "tax_category": "10%",
+            },
+            {
+                "description": "テスト商品 198",
+                "qty": 1,
+                "unit_price": 198,
+                "total": 198,
+                "tax_category": "10%",
+            },
+        ],
+    }
+    ocr_text = "\n".join([
+        "TEST STORE",
+        "テスト商品 198",
+        "小計",
+        "¥198",
+    ])
+    trace = []
+
+    _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=trace)
+
+    assert [item["description"] for item in result["line_items"]] == ["テスト商品"]
+    duplicate_events = [
+        event for event in trace if event["stage"] == "drop_duplicate_embedded_price"
+    ]
+    assert duplicate_events
+    assert duplicate_events[0]["owner_phase"] == "item_cleanup"
+    assert duplicate_events[0]["owner_invariant"]
+    assert duplicate_events[0]["justification"]
+
+
 def test_parent_company_header_prefers_consumer_katakana_store_brand():
     from receipt_parser.pipeline_receipt import _fix_company_name_merchant
 

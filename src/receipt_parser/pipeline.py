@@ -1310,6 +1310,26 @@ def _run_final_gap_item_recovery_phase(
             )
 
 
+def _run_final_embedded_price_duplicate_cleanup_phase(
+    result: dict,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: duplicate item rows with a trailing embedded price suffix.
+
+    Invariant: cleanup may drop only a suffixed duplicate whose suffix matches
+    its own total and whose clean twin has the same item total.
+    """
+    for repair in repairs:
+        if repair == "drop_duplicate_embedded_price":
+            if result.get("line_items"):
+                _drop_duplicate_with_embedded_price(result["line_items"])
+        else:
+            raise ValueError(
+                "Unknown final embedded-price duplicate cleanup repair: "
+                f"{repair}"
+            )
+
+
 def _run_final_basket_marker_rows_phase(
     result: dict,
     ocr_text: str,
@@ -1426,7 +1446,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "drop_duplicate_embedded_price": (
         "item_cleanup",
-        "Retained late to remove embedded-price duplicates after final reconstruction.",
+        "Owned by the final embedded-price duplicate cleanup helper until suffixed duplicate rows move out of post-serialization repair.",
     ),
     "dense_sequence_rows": (
         "structural_item_reconstruction",
@@ -1731,11 +1751,13 @@ def _apply_final_receipt_output_repairs(
             ("repeated_item_gap",),
         ),
     )
-    if result.get("line_items"):
-        run(
-            "drop_duplicate_embedded_price",
-            lambda: _drop_duplicate_with_embedded_price(result["line_items"]),
-        )
+    run(
+        "drop_duplicate_embedded_price",
+        lambda: _run_final_embedded_price_duplicate_cleanup_phase(
+            result,
+            ("drop_duplicate_embedded_price",),
+        ),
+    )
     run(
         "dense_sequence_rows",
         lambda: _run_final_dense_sequence_projection_phase(

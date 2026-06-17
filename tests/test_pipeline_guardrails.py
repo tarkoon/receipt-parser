@@ -257,6 +257,13 @@ FINAL_MERCHANT_IDENTITY_REPAIR_REPAIRS = {
 }
 FINAL_MERCHANT_IDENTITY_REPAIR_HELPER = "_run_final_merchant_identity_repair_phase"
 FINAL_MERCHANT_IDENTITY_REPAIR_STAGE_LIMIT = 1
+FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_REPAIRS = {
+    "_drop_duplicate_with_embedded_price",
+}
+FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER = (
+    "_run_final_embedded_price_duplicate_cleanup_phase"
+)
+FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE_LIMIT = 1
 FINAL_OCR_DESCRIPTION_RECONCILIATION_REPAIRS = {
     "_fix_code_table_descriptions_by_order",
     "_fix_o_ring_descriptions_from_ocr",
@@ -2013,6 +2020,59 @@ def test_final_merchant_identity_repair_debt_is_helper_owned():
         "Late merchant identity helper calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_MERCHANT_IDENTITY_REPAIR_STAGE_LIMIT}"
+    )
+
+
+def test_final_embedded_price_duplicate_cleanup_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late embedded-price duplicate cleanup must be owned by the named "
+        f"{FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER} must document the "
+        "embedded price suffix trigger and duplicate item consistency invariant."
+    )
+
+
+def test_final_embedded_price_duplicate_cleanup_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_duplicate_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER
+    ]
+
+    assert not direct_duplicate_calls, (
+        "Late embedded-price duplicate cleanup should run through the named "
+        "helper so duplicate row evidence and item consistency have one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_duplicate_calls}"
+    )
+    assert (
+        0
+        < len(helper_calls)
+        <= FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE_LIMIT
+    ), (
+        "Late embedded-price duplicate cleanup helper calls must be explicit "
+        "and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE_LIMIT}"
     )
 
 
