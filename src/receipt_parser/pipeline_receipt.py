@@ -14650,6 +14650,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Payment, points, and subtotal changes must preserve total/tax arithmetic.",
     },
     {
+        "name": "dense_item_row_projection",
+        "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Dense item row projection requires visible dense OCR item/price rows and item-sum arithmetic consistent with printed totals.",
+    },
+    {
         "name": "structural_item_reconstruction",
         "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text", "ocr_totals"),
         "writes": ("line_items", "taxes", "subtotal", "total", "amount_paid"),
@@ -14733,6 +14739,23 @@ def _record_receipt_phase_mutation(
     return after
 
 
+def _run_dense_item_row_projection_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: dense OCR item rows expose adjacent item names and prices.
+
+    Invariant: projected dense rows may replace current items only when visible
+    OCR row totals remain coherent with printed receipt amounts.
+    """
+    for repair in repairs:
+        if repair == "dense_item_rows":
+            _replace_dense_item_rows_when_balanced(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown dense item row projection repair: {repair}")
+
+
 def _run_structural_item_projection_phase(
     extracted: dict,
     unified_text: str,
@@ -14749,8 +14772,6 @@ def _run_structural_item_projection_phase(
             _replace_barcode_unit_qty_amount_stack_when_balanced(extracted, unified_text)
         elif repair == "barcode_qty_price_rows":
             _replace_barcode_qty_price_rows_when_balanced(extracted, unified_text)
-        elif repair == "dense_item_rows":
-            _replace_dense_item_rows_when_balanced(extracted, unified_text)
         elif repair == "dense_sequence_rows":
             _replace_dense_sequence_rows_when_balanced(extracted, unified_text)
         elif repair == "jan_pos_items":
@@ -15510,9 +15531,24 @@ def postprocess_receipt(
             "jan_pos_items",
             "barcode_unit_qty_amount_stack",
             "barcode_qty_price_rows",
-            "dense_item_rows",
-            "dense_sequence_rows",
         ),
+    )
+    _run_dense_item_row_projection_phase(
+        extracted,
+        unified_text,
+        ("dense_item_rows",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "dense_item_row_projection",
+        trace_snapshot,
+        extracted,
+    )
+    _run_structural_item_projection_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("dense_sequence_rows",),
     )
     _run_quantity_detail_reconciliation_phase(
         extracted,
@@ -16027,9 +16063,24 @@ def postprocess_receipt(
             "jan_pos_items",
             "barcode_unit_qty_amount_stack",
             "barcode_qty_price_rows",
-            "dense_item_rows",
-            "dense_sequence_rows",
         ),
+    )
+    _run_dense_item_row_projection_phase(
+        extracted,
+        unified_text,
+        ("dense_item_rows",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "dense_item_row_projection",
+        trace_snapshot,
+        extracted,
+    )
+    _run_structural_item_projection_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("dense_sequence_rows",),
     )
     _run_quantity_detail_reconciliation_phase(
         extracted,

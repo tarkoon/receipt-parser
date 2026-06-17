@@ -111,7 +111,12 @@ STRUCTURAL_ITEM_PROJECTION_REPAIRS = {
     "_replace_jan_pos_items_when_balanced",
 }
 STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER = "_run_structural_item_projection_phase"
-STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT = 6
+STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT = 8
+DENSE_ITEM_ROW_PROJECTION_REPAIRS = {
+    "_replace_dense_item_rows_when_balanced",
+}
+DENSE_ITEM_ROW_PROJECTION_PHASE_HELPER = "_run_dense_item_row_projection_phase"
+DENSE_ITEM_ROW_PROJECTION_PHASE_CALL_LIMIT = 2
 CAMPAIGN_DISCOUNT_PROJECTION_REPAIRS = {
     "_replace_campaign_discount_stream_when_balanced",
 }
@@ -1030,6 +1035,60 @@ def test_postprocess_structural_item_projection_debt_is_phase_owned():
         "Structural item projection phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_dense_item_row_projection_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, DENSE_ITEM_ROW_PROJECTION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        DENSE_ITEM_ROW_PROJECTION_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Dense item row projection must be owned by the named "
+        f"{DENSE_ITEM_ROW_PROJECTION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{DENSE_ITEM_ROW_PROJECTION_PHASE_HELPER} must document the OCR/layout "
+        "trigger and arithmetic or field-consistency invariant it enforces."
+    )
+
+
+def test_postprocess_dense_item_row_projection_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    structural_helper = _function_def(tree, STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER)
+    postprocess_calls = _call_names_in_function(postprocess)
+    structural_calls = _call_names_in_function(structural_helper)
+    direct_dense_calls = [
+        name for name in postprocess_calls if name in DENSE_ITEM_ROW_PROJECTION_REPAIRS
+    ]
+    structural_dense_calls = [
+        name for name in structural_calls if name in DENSE_ITEM_ROW_PROJECTION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == DENSE_ITEM_ROW_PROJECTION_PHASE_HELPER
+    ]
+
+    assert not direct_dense_calls, (
+        "Dense item row projection repairs should run through the named phase "
+        "helper so dense OCR row triggers and arithmetic invariants have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_dense_calls}"
+    )
+    assert not structural_dense_calls, (
+        "Dense item row projection should no longer be hidden inside the broad "
+        f"{STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER} helper.\n"
+        f"Structural helper calls still owning dense rows: {structural_dense_calls}"
+    )
+    assert 0 < len(phase_calls) <= DENSE_ITEM_ROW_PROJECTION_PHASE_CALL_LIMIT, (
+        "Dense item row projection phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {DENSE_ITEM_ROW_PROJECTION_PHASE_CALL_LIMIT}"
     )
 
 
