@@ -1128,6 +1128,29 @@ def _run_final_tax_category_reconciliation_phase(
             )
 
 
+def _run_final_external_tax_total_restoration_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: printed subtotal and external tax rows after item repairs.
+
+    Invariant: total changes must preserve subtotal plus external tax
+    arithmetic from the printed summary.
+    """
+    for repair in repairs:
+        if repair in {
+            "external_tax_total_from_printed_subtotal",
+            "external_tax_total_from_printed_subtotal_final",
+        }:
+            _restore_external_tax_total_from_printed_subtotal(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final external tax total restoration repair: "
+                f"{repair}"
+            )
+
+
 FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "barcode_unit_qty_amount_stack": (
         "structural_item_reconstruction",
@@ -1263,7 +1286,9 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "external_tax_total_from_printed_subtotal": (
         "financial_totals_repair",
-        "Retained late to restore externally taxed totals from printed subtotal arithmetic.",
+        "Owned by the final external tax total restoration helper until "
+        "printed subtotal/tax total repair moves out of post-serialization "
+        "repair.",
     ),
     "drop_small_target_only_taxes": (
         "tax_category_assignment",
@@ -1334,7 +1359,8 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "external_tax_total_from_printed_subtotal_final": (
         "financial_totals_repair",
-        "Temporary debt: final reassertion after item/tax category repairs.",
+        "Owned by the final external tax total restoration helper as the "
+        "bounded reassertion after item/tax category repairs.",
     ),
 }
 
@@ -1528,7 +1554,14 @@ def _apply_final_receipt_output_repairs(
     run("code_table_descriptions", lambda: _fix_code_table_descriptions_by_order(result, ocr_text))
     run("printed_external_tax_amounts", lambda: _restore_printed_external_tax_amounts(result, ocr_text))
     run("bare_number_tax_summary", lambda: _restore_bare_number_tax_summary(result, ocr_text))
-    run("external_tax_total_from_printed_subtotal", lambda: _restore_external_tax_total_from_printed_subtotal(result, ocr_text))
+    run(
+        "external_tax_total_from_printed_subtotal",
+        lambda: _run_final_external_tax_total_restoration_phase(
+            result,
+            ocr_text,
+            ("external_tax_total_from_printed_subtotal",),
+        ),
+    )
     run("drop_small_target_only_taxes", lambda: _drop_unprinted_small_target_only_taxes(result, ocr_text))
     run(
         "printed_summary_total_tax_balanced_2",
@@ -1583,7 +1616,14 @@ def _apply_final_receipt_output_repairs(
             ("tax_categories_from_rate_bases",),
         ),
     )
-    run("external_tax_total_from_printed_subtotal_final", lambda: _restore_external_tax_total_from_printed_subtotal(result, ocr_text))
+    run(
+        "external_tax_total_from_printed_subtotal_final",
+        lambda: _run_final_external_tax_total_restoration_phase(
+            result,
+            ocr_text,
+            ("external_tax_total_from_printed_subtotal_final",),
+        ),
+    )
 
 
 def _prepare_receipt_output_payload(
