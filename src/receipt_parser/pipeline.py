@@ -1330,6 +1330,26 @@ def _run_final_embedded_price_duplicate_cleanup_phase(
             )
 
 
+def _run_final_quantity_detail_reconciliation_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR quantity detail rows with unit price and item total.
+
+    Invariant: qty and unit_price repairs must preserve the printed item total
+    so quantity times unit price agrees with the OCR quantity detail evidence.
+    """
+    for repair in repairs:
+        if repair == "qty_totals_from_unit_lines":
+            _fix_qty_totals_from_ocr_unit_lines(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final quantity-detail reconciliation repair: "
+                f"{repair}"
+            )
+
+
 def _run_final_basket_marker_rows_phase(
     result: dict,
     ocr_text: str,
@@ -1462,7 +1482,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     ),
     "qty_totals_from_unit_lines": (
         "quantity_detail_reconciliation",
-        "Retained late to restore quantity totals exposed by final row projection.",
+        "Owned by the final quantity-detail reconciliation helper until OCR unit-line quantity repair moves out of post-serialization repair.",
     ),
     "bag_item_prices_from_rate_bases": (
         "tax_category_assignment",
@@ -1782,7 +1802,14 @@ def _apply_final_receipt_output_repairs(
             extract_financial_totals(ocr_text),
         ),
     )
-    run("qty_totals_from_unit_lines", lambda: _fix_qty_totals_from_ocr_unit_lines(result, ocr_text))
+    run(
+        "qty_totals_from_unit_lines",
+        lambda: _run_final_quantity_detail_reconciliation_phase(
+            result,
+            ocr_text,
+            ("qty_totals_from_unit_lines",),
+        ),
+    )
     run(
         "bag_item_prices_from_rate_bases",
         lambda: _fix_bag_item_prices_from_rate_bases(

@@ -3256,6 +3256,57 @@ def test_qty_detail_owner_repairs_duplicate_total_without_changing_unrelated_ite
     }
 
 
+def test_final_receipt_output_repairs_apply_quantity_detail_reconciliation():
+    from receipt_parser.pipeline import _apply_final_receipt_output_repairs
+
+    result = {
+        "document_type": "receipt",
+        "merchant": "TEST",
+        "total": 796,
+        "subtotal": 796,
+        "taxes": [],
+        "line_items": [
+            {
+                "description": "マイクロファイバークロス30P",
+                "qty": 2,
+                "unit_price": 199,
+                "total": 398,
+            },
+            {
+                "description": "無添加ココナッツミルク",
+                "qty": 1,
+                "unit_price": 398,
+                "total": 398,
+            },
+        ],
+    }
+    ocr_text = "\n".join([
+        "TEST STORE",
+        "マイクロファイバークロス30P",
+        "¥398",
+        "無添加ココナッツミルク",
+        "2コX単199",
+        "¥398",
+        "小計",
+        "¥796",
+    ])
+    trace = []
+
+    _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=trace)
+
+    assert result["line_items"][0]["qty"] == 1.0
+    assert result["line_items"][0]["unit_price"] == 398.0
+    assert result["line_items"][1]["qty"] == 2.0
+    assert result["line_items"][1]["unit_price"] == 199.0
+    quantity_events = [
+        event for event in trace if event["stage"] == "qty_totals_from_unit_lines"
+    ]
+    assert quantity_events
+    assert quantity_events[0]["owner_phase"] == "quantity_detail_reconciliation"
+    assert quantity_events[0]["owner_invariant"]
+    assert quantity_events[0]["justification"]
+
+
 def test_rate_base_rebalance_uses_qty_detail_owner_to_break_duplicate_amount_tie():
     from receipt_parser.pipeline_receipt import _rebalance_tax_categories_to_rate_bases
 
@@ -6918,6 +6969,34 @@ def test_qty_detail_repair_ignores_unit_first_ocr_row_when_total_invariant_fails
     assert extracted["line_items"][0]["qty"] == 1
     assert extracted["line_items"][0]["unit_price"] == 1200
     assert extracted["line_items"][0]["total"] == 1200
+
+
+def test_qty_detail_repair_recovers_ocr_compacted_qty_when_printed_total_matches():
+    """Trigger: OCR compacted qty glyph; invariant: leading qty digit * unit equals printed total."""
+    from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "line_items": [
+            {
+                "description": "商品A",
+                "qty": 1,
+                "unit_price": 276,
+                "total": 276,
+                "tax_category": "8%",
+            }
+        ]
+    }
+    ocr_text = "\n".join([
+        "商品A",
+        "276",
+        "(218) X 138)",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["qty"] == 2
+    assert extracted["line_items"][0]["unit_price"] == 138
+    assert extracted["line_items"][0]["total"] == 276
 
 
 def test_qty_detail_repair_names_unit_first_detail_row_from_nearest_owner_when_total_matches():

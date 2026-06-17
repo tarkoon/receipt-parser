@@ -10464,7 +10464,23 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                 return True
         return False
 
-    def _parse_unit_line_qty_detail(line: str) -> tuple[float, float] | None:
+    def _nearby_standalone_amount(detail_idx: int) -> float | None:
+        for nearby_idx in (detail_idx - 1, detail_idx + 1, detail_idx - 2, detail_idx + 2):
+            if nearby_idx < 0 or nearby_idx >= len(lines):
+                continue
+            nearby = lines[nearby_idx].strip()
+            if not nearby or any(ch.isalpha() for ch in nearby):
+                continue
+            digits = "".join(ch for ch in nearby if ch.isdigit() or ch == ",")
+            if not digits:
+                continue
+            try:
+                return float(digits.replace(',', ''))
+            except ValueError:
+                continue
+        return None
+
+    def _parse_unit_line_qty_detail(line: str, detail_idx: int) -> tuple[float, float] | None:
         unit_first = re.search(
             r'\(?\s*単\s*(\d[\d,]*)\s*[xX×Ⅹ]\s*(\d+)\s*[個コ点]\s*\)?',
             line,
@@ -10480,7 +10496,24 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                 line,
             )
             if not qty_first:
-                return None
+                compact_qty = re.search(
+                    r'\(?\s*(\d{2,4})\)?\s*[xX]\s*(\d[\d,]*)\s*\)?',
+                    line,
+                )
+                if not compact_qty:
+                    return None
+                compact_digits = compact_qty.group(1)
+                unit = float(compact_qty.group(2).replace(',', ''))
+                nearby_total = _nearby_standalone_amount(detail_idx)
+                qty = float(compact_digits[0])
+                if (
+                    qty < 2
+                    or unit <= 0
+                    or nearby_total is None
+                    or abs(qty * unit - nearby_total) > 2
+                ):
+                    return None
+                return qty, unit
             qty = float(qty_first.group(1))
             unit = float(qty_first.group(2).replace(',', ''))
         if qty < 2 or unit <= 0:
@@ -10488,7 +10521,7 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
         return qty, unit
 
     for idx, line in enumerate(lines):
-        detail = _parse_unit_line_qty_detail(line)
+        detail = _parse_unit_line_qty_detail(line, idx)
         split_total = None
         split_unit = None
         if detail is None:

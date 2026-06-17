@@ -264,6 +264,13 @@ FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER = (
     "_run_final_embedded_price_duplicate_cleanup_phase"
 )
 FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE_LIMIT = 1
+FINAL_QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
+    "_fix_qty_totals_from_ocr_unit_lines",
+}
+FINAL_QUANTITY_DETAIL_RECONCILIATION_HELPER = (
+    "_run_final_quantity_detail_reconciliation_phase"
+)
+FINAL_QUANTITY_DETAIL_RECONCILIATION_STAGE_LIMIT = 1
 FINAL_OCR_DESCRIPTION_RECONCILIATION_REPAIRS = {
     "_fix_code_table_descriptions_by_order",
     "_fix_o_ring_descriptions_from_ocr",
@@ -2073,6 +2080,59 @@ def test_final_embedded_price_duplicate_cleanup_debt_is_helper_owned():
         "and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE_LIMIT}"
+    )
+
+
+def test_final_quantity_detail_reconciliation_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_QUANTITY_DETAIL_RECONCILIATION_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_QUANTITY_DETAIL_RECONCILIATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late quantity-detail reconciliation must be owned by the named "
+        f"{FINAL_QUANTITY_DETAIL_RECONCILIATION_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_QUANTITY_DETAIL_RECONCILIATION_HELPER} must document the "
+        "OCR quantity/unit-line trigger and qty times unit equals total invariant."
+    )
+
+
+def test_final_quantity_detail_reconciliation_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_qty_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_QUANTITY_DETAIL_RECONCILIATION_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_QUANTITY_DETAIL_RECONCILIATION_HELPER
+    ]
+
+    assert not direct_qty_calls, (
+        "Late quantity-detail reconciliation should run through the named "
+        "helper so OCR unit-line evidence and qty/unit/total consistency have "
+        "one owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_qty_calls}"
+    )
+    assert (
+        0
+        < len(helper_calls)
+        <= FINAL_QUANTITY_DETAIL_RECONCILIATION_STAGE_LIMIT
+    ), (
+        "Late quantity-detail helper calls must be explicit and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_QUANTITY_DETAIL_RECONCILIATION_STAGE_LIMIT}"
     )
 
 
