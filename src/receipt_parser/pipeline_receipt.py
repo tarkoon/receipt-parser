@@ -14644,6 +14644,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Structural reconstruction must be triggered by OCR row layout and validated by sums.",
     },
     {
+        "name": "duplicate_row_cleanup",
+        "reads": ("line_items", "subtotal", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Duplicate row cleanup requires an OCR singleton item occurrence and subtotal-overage arithmetic matching exactly one duplicate row total.",
+    },
+    {
         "name": "final_consistency_pass",
         "reads": ("line_items", "taxes", "subtotal", "total", "amount_paid", "points_used", "ocr_text"),
         "writes": ("line_items", "taxes", "subtotal", "total", "amount_paid", "points_used"),
@@ -15172,6 +15178,23 @@ def _run_line_item_cleanup_phase(
             _drop_numeric_marker_description_rows(extracted, unified_text)
         else:
             raise ValueError(f"Unknown line-item cleanup repair: {repair}")
+
+
+def _run_duplicate_row_cleanup_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: duplicated parsed rows whose item text appears once in OCR.
+
+    Invariant: removing one row is allowed only when subtotal overage matches
+    that row total, proving the remaining item sum reconciles to subtotal.
+    """
+    for repair in repairs:
+        if repair == "drop_duplicate_rows_when_subtotal_balances":
+            _drop_duplicate_rows_when_subtotal_balances(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown duplicate row cleanup repair: {repair}")
 
 
 def postprocess_receipt(
@@ -16279,7 +16302,17 @@ def postprocess_receipt(
     _repair_discounted_line_item_totals_when_balanced(extracted, unified_text)
     _repair_discounted_ocr_pair_descriptions(extracted, unified_text)
     _repair_pre_price_stack_descriptions_from_ocr(extracted, unified_text)
-    _drop_duplicate_rows_when_subtotal_balances(extracted, unified_text)
+    _run_duplicate_row_cleanup_phase(
+        extracted,
+        unified_text,
+        ("drop_duplicate_rows_when_subtotal_balances",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "duplicate_row_cleanup",
+        trace_snapshot,
+        extracted,
+    )
     _replace_basket_marker_rows_when_balanced(extracted, unified_text)
     _run_payment_points_reconciliation_phase(
         extracted,

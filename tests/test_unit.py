@@ -4558,6 +4558,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "tax_category_assignment",
         "payment_points_reconciliation",
         "structural_item_reconstruction",
+        "duplicate_row_cleanup",
         "final_consistency_pass",
     )
     assert "location" in phases["header_identity_repair"]["writes"]
@@ -4587,6 +4588,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "total" in phases["external_tax_total_restoration"]["writes"]
     assert "amount_paid" in phases["external_tax_total_restoration"]["writes"]
     assert "line_items" in phases["structural_item_reconstruction"]["writes"]
+    assert "line_items" in phases["duplicate_row_cleanup"]["writes"]
     assert "taxes" in phases["tax_category_assignment"]["writes"]
     assert "amount_paid" in phases["cash_tender_reconciliation"]["writes"]
     assert "total" in phases["financial_totals_repair"]["writes"]
@@ -4608,6 +4610,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "single_rate_inclusive_tax_restoration",
             "tax_category_assignment",
             "structural_item_reconstruction",
+            "duplicate_row_cleanup",
             "final_consistency_pass",
         },
         "taxes": {
@@ -8649,6 +8652,44 @@ def test_final_receipt_output_repairs_drop_embedded_price_duplicate():
     ]
     assert duplicate_events
     assert duplicate_events[0]["owner_phase"] == "item_cleanup"
+    assert duplicate_events[0]["owner_invariant"]
+    assert duplicate_events[0]["justification"]
+
+
+def test_final_receipt_output_repairs_trace_duplicate_row_cleanup_owner():
+    from receipt_parser.pipeline import _apply_final_receipt_output_repairs
+
+    result = {
+        "document_type": "receipt",
+        "merchant": "TEST",
+        "total": 300,
+        "subtotal": 300,
+        "taxes": [],
+        "line_items": [
+            {"description": "ITEM A", "qty": 1, "unit_price": 100, "total": 100, "discount": 0},
+            {"description": "ITEM B", "qty": 1, "unit_price": 200, "total": 200, "discount": 0},
+            {"description": "ITEM B", "qty": 1, "unit_price": 200, "total": 200, "discount": 0},
+        ],
+    }
+    ocr_text = "\n".join([
+        "ITEM A 100",
+        "ITEM B 200",
+        "SUBTOTAL",
+        "300",
+    ])
+    trace = []
+
+    _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=trace)
+
+    assert [item["description"] for item in result["line_items"]] == ["ITEM A", "ITEM B"]
+    assert sum(item["total"] for item in result["line_items"]) == 300
+    duplicate_events = [
+        event
+        for event in trace
+        if event["stage"] == "drop_duplicate_rows_when_subtotal_balances"
+    ]
+    assert duplicate_events
+    assert duplicate_events[0]["owner_phase"] == "duplicate_row_cleanup"
     assert duplicate_events[0]["owner_invariant"]
     assert duplicate_events[0]["justification"]
 

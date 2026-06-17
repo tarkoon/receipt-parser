@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 56
+POSTPROCESS_REPAIR_CALL_LIMIT = 55
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -285,6 +285,11 @@ FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER = (
     "_run_final_embedded_price_duplicate_cleanup_phase"
 )
 FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE_LIMIT = 1
+FINAL_DUPLICATE_ROW_CLEANUP_REPAIRS = {
+    "_drop_duplicate_rows_when_subtotal_balances",
+}
+FINAL_DUPLICATE_ROW_CLEANUP_HELPER = "_run_final_duplicate_row_cleanup_phase"
+FINAL_DUPLICATE_ROW_CLEANUP_STAGE_LIMIT = 1
 FINAL_QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_totals_from_ocr_unit_lines",
 }
@@ -2275,6 +2280,61 @@ def test_final_embedded_price_duplicate_cleanup_debt_is_helper_owned():
         "and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE_LIMIT}"
+    )
+
+
+def test_final_duplicate_row_cleanup_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, FINAL_DUPLICATE_ROW_CLEANUP_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINAL_DUPLICATE_ROW_CLEANUP_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Late duplicate row cleanup must be owned by the named "
+        f"{FINAL_DUPLICATE_ROW_CLEANUP_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINAL_DUPLICATE_ROW_CLEANUP_HELPER} must document the "
+        "OCR occurrence-count trigger and subtotal-overage duplicate-row "
+        "arithmetic invariant."
+    )
+
+
+def test_final_duplicate_row_cleanup_debt_is_helper_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_calls = _call_names_in_function(final_repairs)
+    direct_duplicate_calls = [
+        name
+        for name in final_calls
+        if name in FINAL_DUPLICATE_ROW_CLEANUP_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in final_calls
+        if name == FINAL_DUPLICATE_ROW_CLEANUP_HELPER
+    ]
+
+    assert not direct_duplicate_calls, (
+        "Late duplicate row cleanup should run through the named helper so "
+        "OCR occurrence counts and subtotal-overage arithmetic have one "
+        "owner.\n"
+        "Direct calls still in _apply_final_receipt_output_repairs: "
+        f"{direct_duplicate_calls}"
+    )
+    assert (
+        0
+        < len(helper_calls)
+        <= FINAL_DUPLICATE_ROW_CLEANUP_STAGE_LIMIT
+    ), (
+        "Late duplicate row cleanup helper calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {FINAL_DUPLICATE_ROW_CLEANUP_STAGE_LIMIT}"
     )
 
 

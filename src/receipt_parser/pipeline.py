@@ -1391,6 +1391,26 @@ def _run_final_embedded_price_duplicate_cleanup_phase(
             )
 
 
+def _run_final_duplicate_row_cleanup_phase(
+    result: dict,
+    ocr_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: duplicate parsed rows whose item text appears once in OCR.
+
+    Invariant: the subtotal overage must equal one duplicate row total, so
+    removing that row reconciles item sum to the printed subtotal.
+    """
+    for repair in repairs:
+        if repair == "drop_duplicate_rows_when_subtotal_balances":
+            _drop_duplicate_rows_when_subtotal_balances(result, ocr_text)
+        else:
+            raise ValueError(
+                "Unknown final duplicate row cleanup repair: "
+                f"{repair}"
+            )
+
+
 def _run_final_quantity_detail_reconciliation_phase(
     result: dict,
     ocr_text: str,
@@ -1626,8 +1646,9 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "description context.",
     ),
     "drop_duplicate_rows_when_subtotal_balances": (
-        "item_cleanup",
-        "Retained late to remove duplicates only after final subtotal balance is known.",
+        "duplicate_row_cleanup",
+        "Owned by the final duplicate-row cleanup helper until singleton OCR "
+        "duplicate pruning moves out of post-serialization repair.",
     ),
     "basket_marker_rows": (
         "structural_item_reconstruction",
@@ -2007,7 +2028,14 @@ def _apply_final_receipt_output_repairs(
             ),
         ),
     )
-    run("drop_duplicate_rows_when_subtotal_balances", lambda: _drop_duplicate_rows_when_subtotal_balances(result, ocr_text))
+    run(
+        "drop_duplicate_rows_when_subtotal_balances",
+        lambda: _run_final_duplicate_row_cleanup_phase(
+            result,
+            ocr_text,
+            ("drop_duplicate_rows_when_subtotal_balances",),
+        ),
+    )
     run(
         "basket_marker_rows",
         lambda: _run_final_basket_marker_rows_phase(
