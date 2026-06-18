@@ -14650,6 +14650,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Payment, points, and subtotal changes must preserve total/tax arithmetic.",
     },
     {
+        "name": "barcode_row_projection",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Barcode row projection requires visible barcode/quantity/price OCR rows and item-sum arithmetic consistent with printed totals.",
+    },
+    {
         "name": "dense_item_row_projection",
         "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
         "writes": ("line_items",),
@@ -14745,6 +14751,25 @@ def _record_receipt_phase_mutation(
     return after
 
 
+def _run_barcode_row_projection_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR exposes barcode-adjacent quantity, unit, or price rows.
+
+    Invariant: barcode projections may replace rows only when barcode row
+    totals remain coherent with printed receipt amounts.
+    """
+    for repair in repairs:
+        if repair == "barcode_unit_qty_amount_stack":
+            _replace_barcode_unit_qty_amount_stack_when_balanced(extracted, unified_text)
+        elif repair == "barcode_qty_price_rows":
+            _replace_barcode_qty_price_rows_when_balanced(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown barcode row projection repair: {repair}")
+
+
 def _run_dense_item_row_projection_phase(
     extracted: dict,
     unified_text: str,
@@ -14791,11 +14816,7 @@ def _run_structural_item_projection_phase(
     arithmetic checks keep item totals coherent with printed receipt amounts.
     """
     for repair in repairs:
-        if repair == "barcode_unit_qty_amount_stack":
-            _replace_barcode_unit_qty_amount_stack_when_balanced(extracted, unified_text)
-        elif repair == "barcode_qty_price_rows":
-            _replace_barcode_qty_price_rows_when_balanced(extracted, unified_text)
-        elif repair == "jan_pos_items":
+        if repair == "jan_pos_items":
             _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals or {})
         else:
             raise ValueError(f"Unknown structural item projection repair: {repair}")
@@ -15449,14 +15470,19 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _run_structural_item_projection_phase(
+    _run_barcode_row_projection_phase(
         extracted,
         unified_text,
-        ocr_totals,
         (
             "barcode_unit_qty_amount_stack",
             "barcode_qty_price_rows",
         ),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "barcode_row_projection",
+        trace_snapshot,
+        extracted,
     )
     _run_dense_sequence_row_projection_phase(
         extracted,
@@ -15558,11 +15584,21 @@ def postprocess_receipt(
         extracted,
         unified_text,
         ocr_totals,
+        ("jan_pos_items",),
+    )
+    _run_barcode_row_projection_phase(
+        extracted,
+        unified_text,
         (
-            "jan_pos_items",
             "barcode_unit_qty_amount_stack",
             "barcode_qty_price_rows",
         ),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "barcode_row_projection",
+        trace_snapshot,
+        extracted,
     )
     _run_dense_item_row_projection_phase(
         extracted,
@@ -16095,11 +16131,21 @@ def postprocess_receipt(
         extracted,
         unified_text,
         ocr_totals,
+        ("jan_pos_items",),
+    )
+    _run_barcode_row_projection_phase(
+        extracted,
+        unified_text,
         (
-            "jan_pos_items",
             "barcode_unit_qty_amount_stack",
             "barcode_qty_price_rows",
         ),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "barcode_row_projection",
+        trace_snapshot,
+        extracted,
     )
     _run_dense_item_row_projection_phase(
         extracted,
