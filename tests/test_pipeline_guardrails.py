@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 43
+POSTPROCESS_REPAIR_CALL_LIMIT = 40
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -361,6 +361,14 @@ FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_HELPER = (
     "_run_final_discount_consistency_reconciliation_phase"
 )
 FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_STAGE_LIMIT = 1
+DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS = {
+    "_fix_discounted_item_gross_prices_from_ocr",
+    "_fix_item_totals_from_following_discount_lines",
+}
+DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER = (
+    "_run_discount_consistency_reconciliation_phase"
+)
+DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_CALL_LIMIT = 2
 FINAL_QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_totals_from_ocr_unit_lines",
 }
@@ -2974,6 +2982,60 @@ def test_final_discount_consistency_reconciliation_debt_is_helper_owned():
         "explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_STAGE_LIMIT}"
+    )
+
+
+def test_discount_consistency_reconciliation_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Postprocess discount consistency reconciliation must be owned by the "
+        f"named {DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER} must document "
+        "the adjacent negative discount row trigger and item gross-minus-"
+        "discount consistency invariant."
+    )
+
+
+def test_postprocess_discount_consistency_reconciliation_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_discount_calls = [
+        name
+        for name in postprocess_calls
+        if name in DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER
+    ]
+
+    assert not direct_discount_calls, (
+        "Postprocess discount consistency reconciliation should run through a "
+        "named phase helper so OCR discount placement and item arithmetic have "
+        "one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_discount_calls}"
+    )
+    assert (
+        0
+        < len(phase_calls)
+        <= DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_CALL_LIMIT
+    ), (
+        "Postprocess discount consistency phase calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_CALL_LIMIT}"
     )
 
 

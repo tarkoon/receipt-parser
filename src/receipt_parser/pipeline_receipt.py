@@ -14968,6 +14968,27 @@ def _run_coupon_discount_projection_phase(
             )
 
 
+def _run_discount_consistency_reconciliation_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR-visible negative discount rows adjacent to item prices.
+
+    Invariant: item totals must reconcile to the printed gross item price minus
+    the visible discount amount, preserving subtotal consistency.
+    """
+    for repair in repairs:
+        if repair == "discounted_item_gross_prices":
+            _fix_discounted_item_gross_prices_from_ocr(extracted, unified_text)
+        elif repair == "following_discount_lines":
+            _fix_item_totals_from_following_discount_lines(extracted, unified_text)
+        else:
+            raise ValueError(
+                f"Unknown discount consistency reconciliation repair: {repair}"
+            )
+
+
 def _run_ocr_description_reconciliation_phase(
     extracted: dict,
     unified_text: str,
@@ -16268,8 +16289,20 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _fix_discounted_item_gross_prices_from_ocr(extracted, unified_text)
-    _fix_item_totals_from_following_discount_lines(extracted, unified_text)
+    _run_discount_consistency_reconciliation_phase(
+        extracted,
+        unified_text,
+        (
+            "discounted_item_gross_prices",
+            "following_discount_lines",
+        ),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "discount_consistency_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_coupon_discount_projection_phase(
         extracted,
         unified_text,
@@ -16539,7 +16572,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _fix_item_totals_from_following_discount_lines(extracted, unified_text)
+    _run_discount_consistency_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("following_discount_lines",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "discount_consistency_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_coupon_discount_projection_phase(
         extracted,
         unified_text,
