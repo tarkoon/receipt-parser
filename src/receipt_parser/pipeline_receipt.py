@@ -15113,13 +15113,15 @@ def _run_low_value_bag_recovery_phase(
 ) -> None:
     """Trigger: OCR exposes low-value bag rows or numeric bag price context.
 
-    Invariant: missing bag rows, overage replacement, and numeric-description
-    repair must be visible in OCR and keep item sums consistent with subtotal
-    or total arithmetic.
+    Invariant: missing bag rows, gap-closing bag appends, overage replacement,
+    and numeric-description repair must be visible in OCR and keep item sums
+    consistent with subtotal or total arithmetic.
     """
     for repair in repairs:
         if repair == "missing_bag_items":
             _recover_missing_bag_items_from_ocr(extracted, unified_text)
+        elif repair == "missing_low_value_bag_gap":
+            _append_missing_low_value_bag_from_gap(extracted, unified_text)
         elif repair == "overage_low_value_bag":
             _replace_overage_item_with_low_value_bag(extracted, unified_text)
         elif repair == "numeric_description_context":
@@ -16474,8 +16476,11 @@ def postprocess_receipt(
         unified_text,
         ("service_table_items",),
     )
-    _append_missing_low_value_bag_from_gap(extracted, unified_text)
-    _run_low_value_bag_recovery_phase(extracted, unified_text, ("missing_bag_items",))
+    _run_low_value_bag_recovery_phase(
+        extracted,
+        unified_text,
+        ("missing_low_value_bag_gap", "missing_bag_items"),
+    )
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
         "low_value_bag_recovery",
@@ -16532,7 +16537,17 @@ def postprocess_receipt(
         computed_sub = extracted["total"] - tax_sum
         if computed_sub >= 0:
             extracted["subtotal"] = computed_sub
-    _append_missing_low_value_bag_from_gap(extracted, unified_text)
+    _run_low_value_bag_recovery_phase(
+        extracted,
+        unified_text,
+        ("missing_low_value_bag_gap",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "low_value_bag_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _run_tax_category_assignment_phase(
         extracted,
         unified_text,

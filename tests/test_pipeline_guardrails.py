@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 38
+POSTPROCESS_REPAIR_CALL_LIMIT = 36
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -532,12 +532,13 @@ GAP_ITEM_RECOVERY_REPAIRS = {
 GAP_ITEM_RECOVERY_PHASE_HELPER = "_run_gap_item_recovery_phase"
 GAP_ITEM_RECOVERY_PHASE_CALL_LIMIT = 8
 LOW_VALUE_BAG_RECOVERY_REPAIRS = {
+    "_append_missing_low_value_bag_from_gap",
     "_fix_numeric_desc_from_ocr_price_context",
     "_recover_missing_bag_items_from_ocr",
     "_replace_overage_item_with_low_value_bag",
 }
 LOW_VALUE_BAG_RECOVERY_PHASE_HELPER = "_run_low_value_bag_recovery_phase"
-LOW_VALUE_BAG_RECOVERY_PHASE_CALL_LIMIT = 4
+LOW_VALUE_BAG_RECOVERY_PHASE_CALL_LIMIT = 5
 ADJACENT_PRICE_SHIFT_REPAIRS = {
     "_fix_adjacent_ocr_price_shift_when_balanced",
 }
