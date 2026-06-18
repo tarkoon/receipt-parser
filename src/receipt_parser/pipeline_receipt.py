@@ -14597,6 +14597,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Description reconciliation requires visible OCR code/name context and must preserve item counts, prices, and totals.",
     },
     {
+        "name": "split_price_block_projection",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Split-price block projection requires visible separated OCR name and price blocks and subtotal/total item-sum arithmetic.",
+    },
+    {
         "name": "quantity_detail_reconciliation",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -14959,6 +14965,25 @@ def _run_ocr_description_reconciliation_phase(
             _fix_bag_description_from_ocr_code_context(extracted, unified_text)
         else:
             raise ValueError(f"Unknown OCR description reconciliation repair: {repair}")
+
+
+def _run_split_price_block_projection_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR separates item names from a nearby price block.
+
+    Invariant: projected prices may replace item rows only when the visible
+    split name/price blocks balance against printed subtotal or total.
+    """
+    for repair in repairs:
+        if repair == "split_price_block":
+            _replace_split_price_block_when_balanced(extracted, unified_text)
+        else:
+            raise ValueError(
+                f"Unknown split-price block projection repair: {repair}"
+            )
 
 
 def _run_gap_item_recovery_phase(
@@ -16478,7 +16503,17 @@ def postprocess_receipt(
     _apply_coupon_discount_blocks(extracted, unified_text)
     _drop_applied_coupon_line_items(extracted, unified_text)
     _repair_tiny_item_prices_from_following_ocr(extracted, unified_text)
-    _replace_split_price_block_when_balanced(extracted, unified_text)
+    _run_split_price_block_projection_phase(
+        extracted,
+        unified_text,
+        ("split_price_block",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "split_price_block_projection",
+        trace_snapshot,
+        extracted,
+    )
     _run_quantity_detail_reconciliation_phase(
         extracted,
         unified_text,
