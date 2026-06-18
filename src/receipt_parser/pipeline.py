@@ -39,7 +39,6 @@ from .pipeline_receipt import (
     reconcile_points_payment_from_ocr,
     _drop_unprinted_small_target_only_taxes,
     _restore_bare_number_tax_summary,
-    _drop_duplicate_with_embedded_price,
     _fix_company_name_merchant,
     _fix_item_totals_from_following_discount_lines,
     _apply_coupon_discount_blocks,
@@ -1418,26 +1417,6 @@ def _run_final_gap_item_recovery_phase(
             )
 
 
-def _run_final_embedded_price_duplicate_cleanup_phase(
-    result: dict,
-    repairs: tuple[str, ...],
-) -> None:
-    """Trigger: duplicate item rows with a trailing embedded price suffix.
-
-    Invariant: cleanup may drop only a suffixed duplicate whose suffix matches
-    its own total and whose clean twin has the same item total.
-    """
-    for repair in repairs:
-        if repair == "drop_duplicate_embedded_price":
-            if result.get("line_items"):
-                _drop_duplicate_with_embedded_price(result["line_items"])
-        else:
-            raise ValueError(
-                "Unknown final embedded-price duplicate cleanup repair: "
-                f"{repair}"
-            )
-
-
 def _run_final_duplicate_row_cleanup_phase(
     result: dict,
     ocr_text: str,
@@ -1612,10 +1591,6 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "repeated_item_gap": (
         "initial_item_recovery",
         "Owned by the final gap item recovery helper until repeated OCR row-gap recovery moves out of post-serialization repair.",
-    ),
-    "drop_duplicate_embedded_price": (
-        "item_cleanup",
-        "Owned by the final embedded-price duplicate cleanup helper until suffixed duplicate rows move out of post-serialization repair.",
     ),
     "dense_sequence_rows": (
         "structural_item_reconstruction",
@@ -1930,13 +1905,6 @@ def _apply_final_receipt_output_repairs(
             result,
             ocr_text,
             ("repeated_item_gap",),
-        ),
-    )
-    run(
-        "drop_duplicate_embedded_price",
-        lambda: _run_final_embedded_price_duplicate_cleanup_phase(
-            result,
-            ("drop_duplicate_embedded_price",),
         ),
     )
     run(

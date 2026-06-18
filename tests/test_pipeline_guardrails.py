@@ -302,10 +302,12 @@ FINAL_MERCHANT_IDENTITY_REPAIR_STAGE_LIMIT = 1
 FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_REPAIRS = {
     "_drop_duplicate_with_embedded_price",
 }
-FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER = (
+RETIRED_FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER = (
     "_run_final_embedded_price_duplicate_cleanup_phase"
 )
-FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE_LIMIT = 1
+RETIRED_FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE = (
+    "drop_duplicate_embedded_price"
+)
 FINAL_DUPLICATE_ROW_CLEANUP_REPAIRS = {
     "_drop_duplicate_rows_when_subtotal_balances",
 }
@@ -512,7 +514,6 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "company_name_merchant",
     "adjacent_price_shift_reconciliation",
     "repeated_item_gap",
-    "drop_duplicate_embedded_price",
     "dense_sequence_rows",
     "campaign_discount_stream",
     "jan_pos_items",
@@ -2475,27 +2476,29 @@ def test_final_merchant_identity_repair_debt_is_helper_owned():
     )
 
 
-def test_final_embedded_price_duplicate_cleanup_helper_is_named_and_invariant_backed():
+def test_final_embedded_price_duplicate_cleanup_is_retired_to_postprocess():
     tree = _parse_file(PARSER_DIR / "pipeline.py")
-    helper = _function_def(tree, FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER)
-    docstring = ast.get_docstring(helper) or ""
+    receipt_tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    item_cleanup_helper = _function_def(receipt_tree, LINE_ITEM_CLEANUP_PHASE_HELPER)
 
-    missing_repairs = sorted(
+    assert (
         FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_REPAIRS
-        - set(_call_names_in_function(helper))
+        <= set(_call_names_in_function(item_cleanup_helper))
+    ), (
+        "Embedded-price duplicate cleanup should be owned by postprocess item "
+        "cleanup so the suffix trigger and duplicate consistency invariant run "
+        "before final model serialization."
     )
-    assert not missing_repairs, (
-        "Late embedded-price duplicate cleanup must be owned by the named "
-        f"{FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER} must document the "
-        "embedded price suffix trigger and duplicate item consistency invariant."
+    assert not _has_function_def(
+        tree,
+        RETIRED_FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER,
+    ), (
+        "The late embedded-price duplicate cleanup helper should be retired "
+        "once postprocess item cleanup owns the behavior."
     )
 
 
-def test_final_embedded_price_duplicate_cleanup_debt_is_helper_owned():
+def test_final_embedded_price_duplicate_cleanup_debt_is_removed():
     tree = _parse_file(PARSER_DIR / "pipeline.py")
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
@@ -2504,27 +2507,25 @@ def test_final_embedded_price_duplicate_cleanup_debt_is_helper_owned():
         for name in final_calls
         if name in FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_REPAIRS
     ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER
-    ]
 
     assert not direct_duplicate_calls, (
-        "Late embedded-price duplicate cleanup should run through the named "
-        "helper so duplicate row evidence and item consistency have one owner.\n"
+        "Embedded-price duplicate cleanup should not run directly in late final "
+        "output repairs after postprocess item cleanup owns the behavior.\n"
         "Direct calls still in _apply_final_receipt_output_repairs: "
         f"{direct_duplicate_calls}"
     )
     assert (
-        0
-        < len(helper_calls)
-        <= FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE_LIMIT
+        RETIRED_FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_HELPER not in final_calls
     ), (
-        "Late embedded-price duplicate cleanup helper calls must be explicit "
-        "and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE_LIMIT}"
+        "The late embedded-price duplicate cleanup helper should not be called "
+        "from _apply_final_receipt_output_repairs."
+    )
+    assert (
+        RETIRED_FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE
+        not in FINAL_OUTPUT_REPAIR_STAGES
+    ), (
+        "The embedded-price duplicate final-output stage should be removed "
+        "from the tracked late repair list."
     )
 
 

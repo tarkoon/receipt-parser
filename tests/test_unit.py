@@ -8629,7 +8629,57 @@ def test_final_receipt_output_repairs_recover_visible_repeated_item_gap():
     assert [item["total"] for item in result["line_items"]] == [550, 550, 550]
 
 
-def test_final_receipt_output_repairs_drop_embedded_price_duplicate():
+def test_postprocess_receipt_item_cleanup_drops_embedded_price_duplicate():
+    from receipt_parser.pipeline_receipt import postprocess_receipt
+
+    extracted = {
+        "document_type": "receipt",
+        "merchant": "TEST",
+        "total": 198,
+        "subtotal": 198,
+        "taxes": [],
+        "line_items": [
+            {
+                "description": "テスト商品",
+                "qty": 1,
+                "unit_price": 198,
+                "total": 198,
+                "tax_category": "10%",
+            },
+            {
+                "description": "テスト商品 198",
+                "qty": 1,
+                "unit_price": 198,
+                "total": 198,
+                "tax_category": "10%",
+            },
+        ],
+    }
+    ocr_text = "\n".join([
+        "TEST STORE",
+        "テスト商品 198",
+        "小計",
+        "¥198",
+    ])
+    trace = []
+
+    postprocess_receipt(
+        extracted,
+        ocr_text,
+        0.9,
+        {},
+        {},
+        "test-model",
+        mutation_trace=trace,
+    )
+
+    assert [item["description"] for item in extracted["line_items"]] == ["テスト商品"]
+    assert not [
+        event for event in trace if event["stage"] == "drop_duplicate_embedded_price"
+    ]
+
+
+def test_final_receipt_output_repairs_do_not_drop_embedded_price_duplicate():
     from receipt_parser.pipeline import _apply_final_receipt_output_repairs
 
     result = {
@@ -8665,14 +8715,14 @@ def test_final_receipt_output_repairs_drop_embedded_price_duplicate():
 
     _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=trace)
 
-    assert [item["description"] for item in result["line_items"]] == ["テスト商品"]
+    assert [item["description"] for item in result["line_items"]] == [
+        "テスト商品",
+        "テスト商品 198",
+    ]
     duplicate_events = [
         event for event in trace if event["stage"] == "drop_duplicate_embedded_price"
     ]
-    assert duplicate_events
-    assert duplicate_events[0]["owner_phase"] == "item_cleanup"
-    assert duplicate_events[0]["owner_invariant"]
-    assert duplicate_events[0]["justification"]
+    assert not duplicate_events
 
 
 def test_final_receipt_output_repairs_trace_duplicate_row_cleanup_owner():

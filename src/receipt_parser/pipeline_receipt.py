@@ -3079,7 +3079,6 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
         return
 
     _drop_banner_phantom_items(extracted["line_items"], unified_text)
-    _drop_duplicate_with_embedded_price(extracted["line_items"])
     _fix_item_desc_from_ocr_price_line(extracted["line_items"], unified_text)
     _merge_qty_detail_into_previous(extracted["line_items"], unified_text)
     _repair_previous_item_from_following_qty_detail(extracted, unified_text)
