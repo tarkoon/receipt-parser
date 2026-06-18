@@ -15209,14 +15209,16 @@ def _run_single_rate_inclusive_tax_restoration_phase(
     unified_text: str,
     repairs: tuple[str, ...],
 ) -> None:
-    """Trigger: printed single-rate inclusive target/tax summary rows.
+    """Trigger: printed inclusive target/tax summary rows and amount blocks.
 
-    Invariant: restored tax entry, subtotal, and item tax categories must agree
-    with the receipt total and visible inclusive tax arithmetic.
+    Invariant: restored tax entries, subtotal, and item tax categories must
+    agree with the receipt total and visible inclusive tax arithmetic.
     """
     for repair in repairs:
         if repair == "single_rate_inclusive_tax_block":
             _restore_single_rate_inclusive_tax_block(extracted, unified_text)
+        elif repair == "printed_inclusive_tax_structural_blocks":
+            _fix_printed_tax_amounts_from_structural_blocks(extracted, unified_text)
         else:
             raise ValueError(
                 f"Unknown single-rate inclusive tax restoration repair: {repair}"
@@ -16002,7 +16004,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _fix_printed_tax_amounts_from_structural_blocks(extracted, unified_text)
+    _run_single_rate_inclusive_tax_restoration_phase(
+        extracted,
+        unified_text,
+        ("printed_inclusive_tax_structural_blocks",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "single_rate_inclusive_tax_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _run_tax_excluded_rate_block_restoration_phase(
         extracted,
         unified_text,
@@ -16241,7 +16253,17 @@ def postprocess_receipt(
                 if abs(t.get("amount", 0) - computed) > 2:
                     t["amount"] = computed
 
-    _fix_printed_tax_amounts_from_structural_blocks(extracted, unified_text)
+    _run_single_rate_inclusive_tax_restoration_phase(
+        extracted,
+        unified_text,
+        ("printed_inclusive_tax_structural_blocks",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "single_rate_inclusive_tax_restoration",
+        trace_snapshot,
+        extracted,
+    )
 
     # Universal subtotal rule: subtotal = total - sum(taxes), regardless of
     # 内税 / 外税. Pre-tax base is the canonical definition; for 内税 receipts
