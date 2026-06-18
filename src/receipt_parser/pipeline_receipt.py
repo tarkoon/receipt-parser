@@ -14639,6 +14639,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Explicit tax amount restoration requires visible 税率N%税額 rows and tax amounts bounded by item/tax-rate arithmetic.",
     },
     {
+        "name": "printed_summary_total_tax_repair",
+        "reads": ("line_items", "subtotal", "total", "amount_paid", "points_used", "taxes", "ocr_text"),
+        "writes": ("subtotal", "total", "amount_paid"),
+        "invariant": "Printed summary total repair requires visible 小計/合計 rows whose subtotal plus tax equals the printed total and preserves payment minus points arithmetic.",
+    },
+    {
         "name": "printed_external_tax_amount_restoration",
         "reads": ("line_items", "taxes", "subtotal", "total", "ocr_text"),
         "writes": ("taxes",),
@@ -15264,6 +15270,26 @@ def _run_explicit_tax_amount_restoration_phase(
         else:
             raise ValueError(
                 f"Unknown explicit tax amount restoration repair: {repair}"
+            )
+
+
+def _run_printed_summary_total_tax_repair_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: visible printed 小計/合計 rows and tax-balance summary lines.
+
+    Invariant: subtotal plus tax must match a visible printed total, and
+    amount_paid may change only to preserve total minus points_used arithmetic.
+    """
+    for repair in repairs:
+        if repair == "printed_summary_total_tax_balanced":
+            _restore_printed_summary_total_when_tax_balanced(extracted, unified_text)
+        else:
+            raise ValueError(
+                "Unknown printed summary total/tax repair: "
+                f"{repair}"
             )
 
 
@@ -16226,7 +16252,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _restore_printed_summary_total_when_tax_balanced(extracted, unified_text)
+    _run_printed_summary_total_tax_repair_phase(
+        extracted,
+        unified_text,
+        ("printed_summary_total_tax_balanced",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "printed_summary_total_tax_repair",
+        trace_snapshot,
+        extracted,
+    )
     _prefer_printed_item_sum_total_when_balanced(extracted, unified_text)
 
     # Fix tax amounts when OCR taxes are missing

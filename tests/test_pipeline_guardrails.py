@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 30
+POSTPROCESS_REPAIR_CALL_LIMIT = 29
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -228,6 +228,13 @@ FINAL_PRINTED_SUMMARY_TOTAL_REPAIR_HELPER = (
     "_run_final_printed_summary_total_tax_repair_phase"
 )
 FINAL_PRINTED_SUMMARY_TOTAL_REPAIR_STAGE_LIMIT = 2
+PRINTED_SUMMARY_TOTAL_REPAIR_REPAIRS = {
+    "_restore_printed_summary_total_when_tax_balanced",
+}
+PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_HELPER = (
+    "_run_printed_summary_total_tax_repair_phase"
+)
+PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_CALL_LIMIT = 1
 FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPERS = {
     "_prefer_printed_item_sum_total_when_balanced",
 }
@@ -2006,6 +2013,54 @@ def test_final_printed_summary_total_repair_debt_is_helper_owned():
         "and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_PRINTED_SUMMARY_TOTAL_REPAIR_STAGE_LIMIT}"
+    )
+
+
+def test_postprocess_printed_summary_total_repair_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        PRINTED_SUMMARY_TOTAL_REPAIR_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Postprocess printed summary total repair must be owned by the named "
+        f"{PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_HELPER} must document the "
+        "printed summary total/tax-balance trigger and total/tax/payment "
+        "arithmetic invariant."
+    )
+
+
+def test_postprocess_printed_summary_total_repair_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_total_calls = [
+        name
+        for name in postprocess_calls
+        if name in PRINTED_SUMMARY_TOTAL_REPAIR_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_total_calls, (
+        "Postprocess printed summary total repair should run through the named "
+        "phase helper so printed total/tax triggers and total/tax/payment "
+        "invariants have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_total_calls}"
+    )
+    assert 0 < len(phase_calls) <= PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_CALL_LIMIT, (
+        "Printed summary total repair phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_CALL_LIMIT}"
     )
 
 
