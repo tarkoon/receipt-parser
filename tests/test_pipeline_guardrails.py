@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 34
+POSTPROCESS_REPAIR_CALL_LIMIT = 32
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -429,10 +429,11 @@ FINAL_BASKET_MARKER_ROWS_STAGE_LIMIT = 1
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
+    "_recover_qty_unit_total_item_from_empty_extraction",
     "_repair_previous_item_from_following_qty_detail",
 }
 QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER = "_run_quantity_detail_reconciliation_phase"
-QUANTITY_DETAIL_RECONCILIATION_PHASE_CALL_LIMIT = 10
+QUANTITY_DETAIL_RECONCILIATION_PHASE_CALL_LIMIT = 12
 TAX_CATEGORY_ASSIGNMENT_REPAIRS = {
     "_apply_single_bag_standard_rate_split",
     "_assign_single_standard_rate_from_small_base",

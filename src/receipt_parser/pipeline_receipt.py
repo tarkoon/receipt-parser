@@ -8008,7 +8008,7 @@ def _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text):
         return bool(re.search(r'[ぁ-んァ-ン一-龥]', text))
 
     for idx, line in enumerate(lines):
-        m = re.search(r'(\d+(?:\.\d+)?)\s*個\s*[xX×]\s*単\s*([\d,]+)', line)
+        m = re.search(r'(\d+(?:\.\d+)?)\s*個\s*[xX×]\s*[単单]\s*([\d,]+)', line)
         if not m:
             continue
         qty = float(m.group(1))
@@ -14878,8 +14878,9 @@ def _run_quantity_detail_reconciliation_phase(
 ) -> None:
     """Trigger: OCR qty detail rows adjacent to item names or price rows.
 
-    Invariant: qty/unit mutations require visible quantity notation and
-    qty * unit, printed total, or discount-adjusted item arithmetic.
+    Invariant: qty/unit mutations and empty-item recovery require visible
+    quantity notation and qty * unit, printed total, or discount-adjusted item
+    arithmetic.
     """
     for repair in repairs:
         if repair == "following_qty_detail":
@@ -14888,6 +14889,8 @@ def _run_quantity_detail_reconciliation_phase(
             _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text)
         elif repair == "qty_context_and_reduced_rate":
             _fix_qty_context_and_reduced_rate_from_ocr(extracted, unified_text)
+        elif repair == "empty_qty_unit_total_block":
+            _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text)
         else:
             raise ValueError(f"Unknown quantity detail reconciliation repair: {repair}")
 
@@ -15557,7 +15560,17 @@ def postprocess_receipt(
         extracted,
     )
     _fix_line_items(extracted, unified_text, ocr_layout_blocks=ocr_layout_blocks)
-    _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text)
+    _run_quantity_detail_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("empty_qty_unit_total_block",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "quantity_detail_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _drop_phantom_from_tax_amount(extracted)
     _fix_priced_in_name_items(extracted, unified_text)
     _fix_small_non_bag_item_prices_from_ocr(extracted, unified_text)
@@ -16582,7 +16595,17 @@ def postprocess_receipt(
         unified_text,
         ("drop_non_product_line_items",),
     )
-    _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text)
+    _run_quantity_detail_reconciliation_phase(
+        extracted,
+        unified_text,
+        ("empty_qty_unit_total_block",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "quantity_detail_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_dense_sequence_row_projection_phase(
         extracted,
         unified_text,

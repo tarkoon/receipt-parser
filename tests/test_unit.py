@@ -9640,7 +9640,8 @@ def test_line_item_cleanup_anchors_duplicates_before_price_repair():
     assert sashi["total"] == 599
 
 
-def test_qty_unit_total_block_recovers_empty_salon_item():
+@pytest.mark.parametrize("unit_marker", ["単", "单"])
+def test_qty_unit_total_block_recovers_empty_salon_item(unit_marker):
     from receipt_parser.pipeline_receipt import _recover_qty_unit_total_item_from_empty_extraction
 
     extracted = {
@@ -9651,7 +9652,7 @@ def test_qty_unit_total_block_recovers_empty_salon_item():
     ocr_text = "\n".join([
         "Grand Joul",
         "ヘ",
-        "2個 x 単550",
+        f"2個 x {unit_marker}550",
         "¥1,100円",
         "小計",
         "¥1,100",
