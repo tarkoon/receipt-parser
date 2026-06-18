@@ -9305,6 +9305,41 @@ def test_repeated_item_from_gap_recovers_visible_duplicate():
     assert sum(item["total"] for item in extracted["line_items"]) == 1650
 
 
+def test_repeated_item_from_gap_skips_discounted_quantity_detail_row():
+    from receipt_parser.pipeline_receipt import _recover_repeated_item_from_gap
+
+    extracted = {
+        "total": 616,
+        "subtotal": 616,
+        "line_items": [
+            {
+                "description": "ちょっと贅沢 ぶどう",
+                "qty": 2,
+                "unit_price": 158,
+                "total": 308,
+                "tax_category": "8%",
+                "discount": 8,
+                "discount_rate": "",
+            },
+        ],
+    }
+    ocr_text = "\n".join([
+        "ちょっと贅沢 ぶどう",
+        "316 A",
+        "(2個 X 単158)",
+        "まとめ値引",
+        "-8",
+        "A: 2個 ¥300 の商品です",
+        "ちょっと贅沢 ぶどう",
+    ])
+
+    _recover_repeated_item_from_gap(extracted, ocr_text)
+
+    assert len(extracted["line_items"]) == 1
+    assert extracted["line_items"][0]["qty"] == 2
+    assert extracted["line_items"][0]["total"] == 308
+
+
 def test_duplicate_description_repair_ignores_inline_price_suffix_candidate():
     from receipt_parser.pipeline_receipt import _fix_duplicate_descriptions_from_ocr
 

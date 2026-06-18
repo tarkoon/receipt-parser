@@ -7899,7 +7899,11 @@ def _replace_vertical_price_qty_total_rows_when_balanced(extracted, unified_text
 
 
 def _recover_repeated_item_from_gap(extracted, unified_text):
-    """Recover one missing duplicate when OCR repeats an existing item line."""
+    """Trigger: OCR repeats an atomic item row and item sum is short by its total.
+
+    Invariant: recovery may clone only single-quantity, undiscounted rows when
+    the cloned total closes a positive subtotal/total gap.
+    """
     items = extracted.get("line_items") or []
     if not items:
         return
@@ -7928,6 +7932,10 @@ def _recover_repeated_item_from_gap(extracted, unified_text):
             continue
         price = float(item.get("total") or 0)
         if price <= 0 or not any(abs(gap - price) <= 2 for gap in gaps):
+            continue
+        qty = float(item.get("qty") or 1)
+        discount = float(item.get("discount") or 0)
+        if abs(qty - 1) > 0.01 or abs(discount) > 0.01:
             continue
         desc = item.get("description") or ""
         ndesc = _norm(desc)
