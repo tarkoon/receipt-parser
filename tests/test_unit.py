@@ -4536,6 +4536,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
 
     assert tuple(phases) == (
         "header_identity_repair",
+        "transaction_datetime_repair",
         "financial_totals_repair",
         "cash_tender_reconciliation",
         "service_receipt_recovery",
@@ -4705,7 +4706,8 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "body_total_layout_reconstruction",
             "header_identity_repair",
         },
-        "date": {"header_identity_repair"},
+        "date": {"header_identity_repair", "transaction_datetime_repair"},
+        "time": {"header_identity_repair", "transaction_datetime_repair"},
     }
     actual_owners = {
         field: {

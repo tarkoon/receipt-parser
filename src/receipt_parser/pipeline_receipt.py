@@ -14519,6 +14519,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Header fields must be backed by visible OCR header/address/date evidence.",
     },
     {
+        "name": "transaction_datetime_repair",
+        "reads": ("date", "time", "ocr_text"),
+        "writes": ("date", "time"),
+        "invariant": "Transaction date/time repair requires visible OCR transaction date labels or date-line anchored time evidence and preserves plausible date/time fields.",
+    },
+    {
         "name": "financial_totals_repair",
         "reads": ("subtotal", "total", "amount_paid", "taxes", "ocr_totals", "ocr_text"),
         "writes": ("subtotal", "total", "amount_paid", "taxes", "payment_method"),
@@ -15543,6 +15549,26 @@ def _run_merchant_identity_repair_phase(extracted: dict, unified_text: str) -> N
     _fix_company_name_merchant(extracted, unified_text)
 
 
+def _run_transaction_datetime_repair_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR-visible transaction date labels or date-line time anchors.
+
+    Invariant: date/time changes must come from plausible transaction date
+    evidence or date-line anchored time evidence, avoiding expiry and business
+    hours contexts.
+    """
+    for repair in repairs:
+        if repair == "transaction_date":
+            _fix_date(extracted, unified_text)
+        elif repair == "transaction_time":
+            _fix_time(extracted, unified_text)
+        else:
+            raise ValueError(f"Unknown transaction datetime repair: {repair}")
+
+
 def postprocess_receipt(
     extracted: dict,
     unified_text: str,
@@ -15584,8 +15610,17 @@ def postprocess_receipt(
         extracted,
     )
     _fix_implausible_tax_amounts(extracted, unified_text, ocr_totals)
-    _fix_date(extracted, unified_text)
-    _fix_time(extracted, unified_text)
+    _run_transaction_datetime_repair_phase(
+        extracted,
+        unified_text,
+        ("transaction_date", "transaction_time"),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "transaction_datetime_repair",
+        trace_snapshot,
+        extracted,
+    )
     _fix_header_store_line_location(extracted, unified_text)
     _fix_split_address_location_from_ocr(extracted, unified_text)
     _recover_labeled_purchase_site_location(extracted, unified_text)

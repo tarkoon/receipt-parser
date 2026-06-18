@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 29
+POSTPROCESS_REPAIR_CALL_LIMIT = 27
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -349,6 +349,12 @@ MERCHANT_IDENTITY_REPAIR_REPAIRS = {
 }
 MERCHANT_IDENTITY_REPAIR_PHASE_HELPER = "_run_merchant_identity_repair_phase"
 MERCHANT_IDENTITY_REPAIR_PHASE_CALL_LIMIT = 1
+TRANSACTION_DATETIME_REPAIR_REPAIRS = {
+    "_fix_date",
+    "_fix_time",
+}
+TRANSACTION_DATETIME_REPAIR_PHASE_HELPER = "_run_transaction_datetime_repair_phase"
+TRANSACTION_DATETIME_REPAIR_PHASE_CALL_LIMIT = 1
 OUTPUT_MERCHANT_IDENTITY_REPAIR_PHASE_HELPER = (
     "_run_receipt_output_merchant_identity_phase"
 )
@@ -2913,6 +2919,53 @@ def test_postprocess_merchant_identity_repair_debt_is_phase_owned():
         "Merchant identity phase calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {MERCHANT_IDENTITY_REPAIR_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_transaction_datetime_repair_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, TRANSACTION_DATETIME_REPAIR_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        TRANSACTION_DATETIME_REPAIR_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Transaction date/time repairs must be owned by the named "
+        f"{TRANSACTION_DATETIME_REPAIR_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{TRANSACTION_DATETIME_REPAIR_PHASE_HELPER} must document the "
+        "OCR date/time trigger and date/time field-consistency invariant."
+    )
+
+
+def test_postprocess_transaction_datetime_repair_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_datetime_calls = [
+        name
+        for name in postprocess_calls
+        if name in TRANSACTION_DATETIME_REPAIR_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == TRANSACTION_DATETIME_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_datetime_calls, (
+        "Transaction date/time repairs should run through the named phase "
+        "helper so OCR transaction-date anchors and time consistency have one "
+        "owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_datetime_calls}"
+    )
+    assert 0 < len(phase_calls) <= TRANSACTION_DATETIME_REPAIR_PHASE_CALL_LIMIT, (
+        "Transaction datetime phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {TRANSACTION_DATETIME_REPAIR_PHASE_CALL_LIMIT}"
     )
 
 
