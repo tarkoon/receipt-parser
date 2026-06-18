@@ -15364,8 +15364,9 @@ def _run_tax_category_assignment_phase(
 ) -> dict:
     """Trigger: OCR rate markers, rate-base summaries, or price-line flags.
 
-    Invariant: item tax categories must remain consistent with visible rate
-    markers, printed rate bases, extracted tax entries, and single-bag splits.
+    Invariant: item tax categories and normalized tax entries must remain
+    consistent with visible rate markers, printed rate bases, subtotal/total
+    arithmetic, and single-bag splits.
     """
     items = extracted.get("line_items") or []
     merged_rate_bases = rate_bases if rate_bases is not None else _tax_assignment_rate_bases(
@@ -15411,6 +15412,8 @@ def _run_tax_category_assignment_phase(
         elif repair == "single_standard_from_small_base":
             if items:
                 _assign_single_standard_rate_from_small_base(items, merged_rate_bases)
+        elif repair == "normalize_tax_entries":
+            _normalize_taxes(extracted, unified_text, ocr_totals)
         else:
             raise ValueError(f"Unknown tax category assignment repair: {repair}")
     return merged_rate_bases
@@ -16200,7 +16203,18 @@ def postprocess_receipt(
                 item["total"] = receipt_total
                 if item.get("unit_price") and abs(item["unit_price"] - item_sum) < 1:
                     item["unit_price"] = receipt_total
-    _normalize_taxes(extracted, unified_text, ocr_totals)
+    _run_tax_category_assignment_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("normalize_tax_entries",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "tax_category_assignment",
+        trace_snapshot,
+        extracted,
+    )
     _run_explicit_tax_amount_restoration_phase(
         extracted,
         unified_text,
@@ -16528,7 +16542,18 @@ def postprocess_receipt(
         ocr_totals,
         ("single_standard_from_small_base",),
     )
-    _normalize_taxes(extracted, unified_text, ocr_totals)
+    _run_tax_category_assignment_phase(
+        extracted,
+        unified_text,
+        ocr_totals,
+        ("normalize_tax_entries",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "tax_category_assignment",
+        trace_snapshot,
+        extracted,
+    )
     _run_explicit_tax_amount_restoration_phase(
         extracted,
         unified_text,

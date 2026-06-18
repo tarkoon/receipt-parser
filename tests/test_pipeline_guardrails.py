@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 32
+POSTPROCESS_REPAIR_CALL_LIMIT = 30
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -440,12 +440,13 @@ TAX_CATEGORY_ASSIGNMENT_REPAIRS = {
     "_fix_nonfood_packaging_tax_categories",
     "_fix_tax_categories_from_ocr_markers",
     "_fix_tax_categories_from_price_line_markers",
+    "_normalize_taxes",
     "_rebalance_standard_categories_from_reduced_rate_markers",
     "_rebalance_tax_categories_to_rate_bases",
     "assign_tax_categories",
 }
 TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER = "_run_tax_category_assignment_phase"
-TAX_CATEGORY_ASSIGNMENT_PHASE_CALL_LIMIT = 6
+TAX_CATEGORY_ASSIGNMENT_PHASE_CALL_LIMIT = 8
 BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS = {
     "_fix_bag_item_prices_from_rate_bases",
 }
