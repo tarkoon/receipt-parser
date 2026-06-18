@@ -4095,6 +4095,23 @@ def test_split_address_location_recovers_street_line_without_merchant_gate():
     assert extracted["location"] == "福岡県宗像市赤間駅前2-6-10"
 
 
+def test_header_store_line_location_uses_visible_header_and_contact_context():
+    from receipt_parser.pipeline_receipt import _fix_header_store_line_location
+
+    extracted = {"merchant": "BRAND", "location": ""}
+    ocr_text = "\n".join([
+        "BRAND",
+        "ブランド サンリブ店",
+        "TEL",
+        "050-0000-0000",
+        "2026年05月16日",
+    ])
+
+    _fix_header_store_line_location(extracted, ocr_text)
+
+    assert extracted["location"] == "ブランド サンリブ店"
+
+
 def test_header_branch_store_location_recovers_visible_store_token():
     from receipt_parser.pipeline import _recover_header_branch_store_location
 

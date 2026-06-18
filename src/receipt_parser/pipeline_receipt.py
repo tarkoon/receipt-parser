@@ -15567,6 +15567,17 @@ def _run_merchant_identity_repair_phase(extracted: dict, unified_text: str) -> N
     _fix_company_name_merchant(extracted, unified_text)
 
 
+def _run_header_location_repair_phase(extracted: dict, unified_text: str) -> None:
+    """Trigger: OCR header, split address, or labeled purchase-site rows.
+
+    Invariant: location changes must be backed by visible header/address/site
+    evidence and preserve a more specific existing location when present.
+    """
+    _fix_header_store_line_location(extracted, unified_text)
+    _fix_split_address_location_from_ocr(extracted, unified_text)
+    _recover_labeled_purchase_site_location(extracted, unified_text)
+
+
 def _run_transaction_datetime_repair_phase(
     extracted: dict,
     unified_text: str,
@@ -15639,9 +15650,7 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _fix_header_store_line_location(extracted, unified_text)
-    _fix_split_address_location_from_ocr(extracted, unified_text)
-    _recover_labeled_purchase_site_location(extracted, unified_text)
+    _run_header_location_repair_phase(extracted, unified_text)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
         "header_identity_repair",

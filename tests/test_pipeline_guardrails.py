@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 26
+POSTPROCESS_REPAIR_CALL_LIMIT = 23
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -207,6 +207,13 @@ FINAL_HEADER_LOCATION_REPAIR_HELPERS = {
 }
 FINAL_HEADER_LOCATION_REPAIR_HELPER = "_run_final_header_location_repair_phase"
 FINAL_HEADER_LOCATION_REPAIR_STAGE_LIMIT = 6
+HEADER_LOCATION_REPAIR_REPAIRS = {
+    "_fix_header_store_line_location",
+    "_fix_split_address_location_from_ocr",
+    "_recover_labeled_purchase_site_location",
+}
+HEADER_LOCATION_REPAIR_PHASE_HELPER = "_run_header_location_repair_phase"
+HEADER_LOCATION_REPAIR_PHASE_CALL_LIMIT = 1
 FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_REPAIRS = {
     "_restore_single_rate_inclusive_tax_block",
 }
@@ -3022,6 +3029,54 @@ def test_postprocess_toll_payment_reference_repair_debt_is_phase_owned():
         "Toll payment-reference phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_header_location_repair_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, HEADER_LOCATION_REPAIR_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        HEADER_LOCATION_REPAIR_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Header/location repairs must be owned by the named "
+        f"{HEADER_LOCATION_REPAIR_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{HEADER_LOCATION_REPAIR_PHASE_HELPER} must document OCR header, "
+        "split-address, or purchase-site triggers and a location "
+        "field-consistency invariant."
+    )
+
+
+def test_postprocess_header_location_repair_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_location_calls = [
+        name
+        for name in postprocess_calls
+        if name in HEADER_LOCATION_REPAIR_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == HEADER_LOCATION_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_location_calls, (
+        "Header/location repairs should run through the named phase helper so "
+        "OCR header, address, and purchase-site location evidence have one "
+        "owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_location_calls}"
+    )
+    assert 0 < len(phase_calls) <= HEADER_LOCATION_REPAIR_PHASE_CALL_LIMIT, (
+        "Header/location repair phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {HEADER_LOCATION_REPAIR_PHASE_CALL_LIMIT}"
     )
 
 
