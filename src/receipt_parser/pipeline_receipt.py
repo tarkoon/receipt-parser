@@ -14531,6 +14531,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Totals must remain consistent with printed cash/tax/summary arithmetic.",
     },
     {
+        "name": "toll_payment_reference_repair",
+        "reads": ("payment_reference", "ocr_text"),
+        "writes": ("payment_reference",),
+        "invariant": "Toll payment-reference repair requires visible toll-road OCR context and a printed handling-number label, and preserves existing references.",
+    },
+    {
         "name": "cash_tender_reconciliation",
         "reads": ("total", "amount_paid", "payment_method", "points_used", "ocr_text"),
         "writes": ("total", "amount_paid", "payment_method"),
@@ -14930,6 +14936,18 @@ def _run_cash_tender_reconciliation_phase(
             _fix_unlabeled_cash_tender_change_block(extracted, unified_text)
         else:
             raise ValueError(f"Unknown cash tender reconciliation repair: {repair}")
+
+
+def _run_toll_payment_reference_repair_phase(
+    extracted: dict,
+    unified_text: str,
+) -> None:
+    """Trigger: toll-road OCR markers with a printed handling/reference number.
+
+    Invariant: only fill a missing payment_reference from a visible handling
+    number label, preserving any reference supplied by upstream extraction.
+    """
+    _fix_toll_payment_reference(extracted, unified_text)
 
 
 def _run_service_receipt_recovery_phase(
@@ -15631,7 +15649,13 @@ def postprocess_receipt(
         extracted,
     )
     _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
-    _fix_toll_payment_reference(extracted, unified_text)
+    _run_toll_payment_reference_repair_phase(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "toll_payment_reference_repair",
+        trace_snapshot,
+        extracted,
+    )
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
         "financial_totals_repair",

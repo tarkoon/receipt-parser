@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 27
+POSTPROCESS_REPAIR_CALL_LIMIT = 26
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -516,6 +516,13 @@ CASH_TENDER_RECONCILIATION_REPAIRS = {
 }
 CASH_TENDER_RECONCILIATION_PHASE_HELPER = "_run_cash_tender_reconciliation_phase"
 CASH_TENDER_RECONCILIATION_PHASE_CALL_LIMIT = 2
+TOLL_PAYMENT_REFERENCE_REPAIR_REPAIRS = {
+    "_fix_toll_payment_reference",
+}
+TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER = (
+    "_run_toll_payment_reference_repair_phase"
+)
+TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_CALL_LIMIT = 1
 PAYMENT_POINTS_RECONCILIATION_REPAIRS = {
     "extract_points_used",
     "reconcile_points_payment_from_ocr",
@@ -2966,6 +2973,55 @@ def test_postprocess_transaction_datetime_repair_debt_is_phase_owned():
         "Transaction datetime phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {TRANSACTION_DATETIME_REPAIR_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_toll_payment_reference_repair_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        TOLL_PAYMENT_REFERENCE_REPAIR_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Toll payment-reference repair must be owned by the named "
+        f"{TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER} must document the "
+        "toll OCR trigger and payment_reference preservation invariant."
+    )
+
+
+def test_postprocess_toll_payment_reference_repair_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_reference_calls = [
+        name
+        for name in postprocess_calls
+        if name in TOLL_PAYMENT_REFERENCE_REPAIR_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_reference_calls, (
+        "Toll payment-reference repair should run through the named phase "
+        "helper so toll OCR evidence and reference preservation have one "
+        "owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_reference_calls}"
+    )
+    assert (
+        0 < len(phase_calls) <= TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_CALL_LIMIT
+    ), (
+        "Toll payment-reference phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_CALL_LIMIT}"
     )
 
 

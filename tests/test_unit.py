@@ -1442,6 +1442,46 @@ def test_payment_method_credit_overrides_hallucinated_cash_without_cash_tender()
     assert extracted["payment_method"] == "credit"
 
 
+def test_toll_payment_reference_recovers_handling_number_from_toll_context():
+    from receipt_parser.pipeline_receipt import _fix_toll_payment_reference
+
+    extracted = {"payment_reference": None}
+    _fix_toll_payment_reference(
+        extracted,
+        "\n".join([
+            "NEXCO",
+            "料金所",
+            "取扱番号 203-00841206-00",
+        ]),
+    )
+
+    assert extracted["payment_reference"] == "203-00841206-00"
+
+
+def test_toll_payment_reference_requires_toll_context_and_preserves_existing():
+    from receipt_parser.pipeline_receipt import _fix_toll_payment_reference
+
+    missing_context = {"payment_reference": None}
+    _fix_toll_payment_reference(
+        missing_context,
+        "\n".join([
+            "領収証",
+            "取扱番号 203-00841206-00",
+        ]),
+    )
+    existing_reference = {"payment_reference": "UPSTREAM-REF"}
+    _fix_toll_payment_reference(
+        existing_reference,
+        "\n".join([
+            "ETC",
+            "取扱番号 203-00841206-00",
+        ]),
+    )
+
+    assert missing_context["payment_reference"] is None
+    assert existing_reference["payment_reference"] == "UPSTREAM-REF"
+
+
 def test_stacked_cash_tender_block_sets_total_not_tendered_cash():
     from receipt_parser.pipeline_receipt import _fix_total_from_stacked_cash_tender_block
 
@@ -4538,6 +4578,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "header_identity_repair",
         "transaction_datetime_repair",
         "financial_totals_repair",
+        "toll_payment_reference_repair",
         "cash_tender_reconciliation",
         "service_receipt_recovery",
         "body_total_layout_reconstruction",
@@ -4611,6 +4652,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "taxes" in phases["tax_category_assignment"]["writes"]
     assert "amount_paid" in phases["cash_tender_reconciliation"]["writes"]
     assert "total" in phases["financial_totals_repair"]["writes"]
+    assert "payment_reference" in phases["toll_payment_reference_repair"]["writes"]
     assert "amount_paid" in phases["payment_points_reconciliation"]["reads"]
     assert "payment_method" in phases["payment_points_reconciliation"]["writes"]
     assert "line_items" in phases["jan_pos_row_projection"]["writes"]
@@ -4701,6 +4743,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "payment_points_reconciliation",
             "service_receipt_recovery",
         },
+        "payment_reference": {"toll_payment_reference_repair"},
         "merchant": {"header_identity_repair"},
         "location": {
             "body_total_layout_reconstruction",
