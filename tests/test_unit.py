@@ -4631,6 +4631,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "dense_sequence_row_projection",
         "structural_item_reconstruction",
         "duplicate_row_cleanup",
+        "basket_marker_rows",
         "final_consistency_pass",
     )
     assert "location" in phases["header_identity_repair"]["writes"]
@@ -4668,6 +4669,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "amount_paid" in phases["external_tax_total_restoration"]["writes"]
     assert "line_items" in phases["structural_item_reconstruction"]["writes"]
     assert "line_items" in phases["duplicate_row_cleanup"]["writes"]
+    assert "line_items" in phases["basket_marker_rows"]["writes"]
     assert "taxes" in phases["tax_category_assignment"]["writes"]
     assert "amount_paid" in phases["cash_tender_reconciliation"]["writes"]
     assert "total" in phases["financial_totals_repair"]["writes"]
@@ -4706,6 +4708,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "dense_sequence_row_projection",
             "structural_item_reconstruction",
             "duplicate_row_cleanup",
+            "basket_marker_rows",
             "final_consistency_pass",
         },
         "taxes": {
@@ -7825,7 +7828,7 @@ def test_duplicate_row_drop_requires_subtotal_balance_and_single_ocr_occurrence(
 
 
 def test_basket_marker_rows_reconstruct_stacked_names_and_coupon_without_merchant_gate():
-    from receipt_parser.pipeline_receipt import _replace_basket_marker_rows_when_balanced
+    from receipt_parser.pipeline_receipt import _run_basket_marker_rows_phase
 
     ocr_text = "\n".join([
         "WAREHOUSE",
@@ -7890,7 +7893,7 @@ def test_basket_marker_rows_reconstruct_stacked_names_and_coupon_without_merchan
         ],
     }
 
-    _replace_basket_marker_rows_when_balanced(extracted, ocr_text)
+    _run_basket_marker_rows_phase(extracted, ocr_text)
 
     rows = extracted["line_items"]
     assert [row["description"] for row in rows] == [

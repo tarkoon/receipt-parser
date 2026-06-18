@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 16
+POSTPROCESS_REPAIR_CALL_LIMIT = 15
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -470,6 +470,11 @@ FINAL_BASKET_MARKER_ROWS_REPAIRS = {
 }
 FINAL_BASKET_MARKER_ROWS_HELPER = "_run_final_basket_marker_rows_phase"
 FINAL_BASKET_MARKER_ROWS_STAGE_LIMIT = 1
+BASKET_MARKER_ROWS_REPAIRS = {
+    "_replace_basket_marker_rows_when_balanced",
+}
+BASKET_MARKER_ROWS_PHASE_HELPER = "_run_basket_marker_rows_phase"
+BASKET_MARKER_ROWS_PHASE_CALL_LIMIT = 1
 QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
     "_fix_qty_context_and_reduced_rate_from_ocr",
     "_fix_qty_totals_from_ocr_unit_lines",
@@ -3816,6 +3821,51 @@ def test_final_basket_marker_rows_debt_is_helper_owned():
         "Late basket marker row helper calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_BASKET_MARKER_ROWS_STAGE_LIMIT}"
+    )
+
+
+def test_basket_marker_rows_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, BASKET_MARKER_ROWS_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        BASKET_MARKER_ROWS_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Postprocess basket marker row projection must be owned by the named "
+        f"{BASKET_MARKER_ROWS_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{BASKET_MARKER_ROWS_PHASE_HELPER} must document the OCR basket "
+        "marker/stacked price trigger and subtotal/rate-base arithmetic "
+        "invariant."
+    )
+
+
+def test_postprocess_basket_marker_rows_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_basket_calls = [
+        name for name in postprocess_calls if name in BASKET_MARKER_ROWS_REPAIRS
+    ]
+    phase_calls = [
+        name for name in postprocess_calls if name == BASKET_MARKER_ROWS_PHASE_HELPER
+    ]
+
+    assert not direct_basket_calls, (
+        "Postprocess basket marker row projection should run through a named "
+        "phase helper so basket marker OCR layout and subtotal/rate-base "
+        "arithmetic have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_basket_calls}"
+    )
+    assert 0 < len(phase_calls) <= BASKET_MARKER_ROWS_PHASE_CALL_LIMIT, (
+        "Postprocess basket marker row phase calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {BASKET_MARKER_ROWS_PHASE_CALL_LIMIT}"
     )
 
 

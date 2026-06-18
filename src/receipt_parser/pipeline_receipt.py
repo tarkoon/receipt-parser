@@ -14747,6 +14747,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Duplicate row cleanup requires an OCR singleton item occurrence and subtotal-overage arithmetic matching exactly one duplicate row total.",
     },
     {
+        "name": "basket_marker_rows",
+        "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Basket marker row projection requires visible basket-marker/stacked price OCR layout and subtotal/rate-base arithmetic consistency.",
+    },
+    {
         "name": "final_consistency_pass",
         "reads": ("line_items", "taxes", "subtotal", "total", "amount_paid", "points_used", "ocr_text"),
         "writes": ("line_items", "taxes", "subtotal", "total", "amount_paid", "points_used"),
@@ -15573,6 +15579,15 @@ def _run_duplicate_row_cleanup_phase(
             _drop_duplicate_rows_when_subtotal_balances(extracted, unified_text)
         else:
             raise ValueError(f"Unknown duplicate row cleanup repair: {repair}")
+
+
+def _run_basket_marker_rows_phase(extracted: dict, unified_text: str) -> None:
+    """Trigger: OCR basket markers and stacked name/price rows are visible.
+
+    Invariant: projected basket rows must balance against printed subtotal,
+    total, coupon, and rate-base arithmetic before replacing line items.
+    """
+    _replace_basket_marker_rows_when_balanced(extracted, unified_text)
 
 
 def _run_merchant_identity_repair_phase(extracted: dict, unified_text: str) -> None:
@@ -17072,7 +17087,13 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _replace_basket_marker_rows_when_balanced(extracted, unified_text)
+    _run_basket_marker_rows_phase(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "basket_marker_rows",
+        trace_snapshot,
+        extracted,
+    )
     _run_payment_points_reconciliation_phase(
         extracted,
         unified_text,
