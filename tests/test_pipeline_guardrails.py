@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 47
+POSTPROCESS_REPAIR_CALL_LIMIT = 43
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -308,6 +308,14 @@ FINAL_COUPON_DISCOUNT_PROJECTION_HELPER = (
     "_run_final_coupon_discount_projection_phase"
 )
 FINAL_COUPON_DISCOUNT_PROJECTION_STAGE_LIMIT = 2
+COUPON_DISCOUNT_PROJECTION_REPAIRS = {
+    "_apply_coupon_discount_blocks",
+    "_drop_applied_coupon_line_items",
+}
+COUPON_DISCOUNT_PROJECTION_PHASE_HELPER = (
+    "_run_coupon_discount_projection_phase"
+)
+COUPON_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT = 2
 FINAL_FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS = {
     "_repair_tiny_item_prices_from_following_ocr",
 }
@@ -2575,6 +2583,56 @@ def test_final_coupon_discount_projection_debt_is_helper_owned():
         "Late coupon/discount helper calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_COUPON_DISCOUNT_PROJECTION_STAGE_LIMIT}"
+    )
+
+
+def test_coupon_discount_projection_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, COUPON_DISCOUNT_PROJECTION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        COUPON_DISCOUNT_PROJECTION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Postprocess coupon discount projection must be owned by the named "
+        f"{COUPON_DISCOUNT_PROJECTION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{COUPON_DISCOUNT_PROJECTION_PHASE_HELPER} must document the OCR "
+        "coupon/CPN trigger and item gross-minus-discount or subtotal "
+        "consistency invariant."
+    )
+
+
+def test_postprocess_coupon_discount_projection_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_coupon_calls = [
+        name
+        for name in postprocess_calls
+        if name in COUPON_DISCOUNT_PROJECTION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == COUPON_DISCOUNT_PROJECTION_PHASE_HELPER
+    ]
+
+    assert not direct_coupon_calls, (
+        "Postprocess coupon discount projection should run through a named "
+        "phase helper so OCR coupon markers and item/subtotal arithmetic "
+        "have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_coupon_calls}"
+    )
+    assert 0 < len(phase_calls) <= COUPON_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT, (
+        "Postprocess coupon discount phase calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {COUPON_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT}"
     )
 
 

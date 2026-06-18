@@ -4548,6 +4548,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "bag_amount_shift_reconciliation",
         "item_cleanup",
         "discount_consistency_reconciliation",
+        "coupon_discount_projection",
         "ocr_description_reconciliation",
         "split_price_block_projection",
         "quantity_detail_reconciliation",
@@ -4582,6 +4583,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["bag_amount_shift_reconciliation"]["writes"]
     assert "line_items" in phases["item_cleanup"]["writes"]
     assert "line_items" in phases["discount_consistency_reconciliation"]["writes"]
+    assert "line_items" in phases["coupon_discount_projection"]["writes"]
     assert "line_items" in phases["ocr_description_reconciliation"]["writes"]
     assert "line_items" in phases["split_price_block_projection"]["writes"]
     assert "line_items" in phases["service_receipt_recovery"]["writes"]
@@ -4623,6 +4625,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "low_value_bag_recovery",
             "item_cleanup",
             "discount_consistency_reconciliation",
+            "coupon_discount_projection",
             "ocr_description_reconciliation",
             "split_price_block_projection",
             "quantity_detail_reconciliation",

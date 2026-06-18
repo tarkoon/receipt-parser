@@ -14591,6 +14591,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Discount consistency reconciliation requires visible negative discount placement and item total/discount field arithmetic.",
     },
     {
+        "name": "coupon_discount_projection",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Coupon discount projection requires visible coupon/CPN markers and item gross-minus-discount or subtotal arithmetic.",
+    },
+    {
         "name": "ocr_description_reconciliation",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -14937,6 +14943,28 @@ def _run_body_total_layout_reconstruction_phase(
         else:
             raise ValueError(
                 f"Unknown body-total layout reconstruction repair: {repair}"
+            )
+
+
+def _run_coupon_discount_projection_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: OCR-visible coupon, COUPON, or CPN rows.
+
+    Invariant: item totals must represent gross minus the printed coupon
+    amount, and standalone coupon rows may be dropped only after that discount
+    is present on an item row.
+    """
+    for repair in repairs:
+        if repair == "coupon_discount_blocks":
+            _apply_coupon_discount_blocks(extracted, unified_text)
+        elif repair == "drop_applied_coupon_line_items":
+            _drop_applied_coupon_line_items(extracted, unified_text)
+        else:
+            raise ValueError(
+                f"Unknown coupon discount projection repair: {repair}"
             )
 
 
@@ -16242,8 +16270,20 @@ def postprocess_receipt(
     )
     _fix_discounted_item_gross_prices_from_ocr(extracted, unified_text)
     _fix_item_totals_from_following_discount_lines(extracted, unified_text)
-    _apply_coupon_discount_blocks(extracted, unified_text)
-    _drop_applied_coupon_line_items(extracted, unified_text)
+    _run_coupon_discount_projection_phase(
+        extracted,
+        unified_text,
+        (
+            "coupon_discount_blocks",
+            "drop_applied_coupon_line_items",
+        ),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "coupon_discount_projection",
+        trace_snapshot,
+        extracted,
+    )
     _repair_tiny_item_prices_from_following_ocr(extracted, unified_text)
     _ensure_discounted_ocr_pairs_present(extracted, unified_text)
     _run_gap_item_recovery_phase(extracted, unified_text, ("missing_items",))
@@ -16500,8 +16540,20 @@ def postprocess_receipt(
         extracted,
     )
     _fix_item_totals_from_following_discount_lines(extracted, unified_text)
-    _apply_coupon_discount_blocks(extracted, unified_text)
-    _drop_applied_coupon_line_items(extracted, unified_text)
+    _run_coupon_discount_projection_phase(
+        extracted,
+        unified_text,
+        (
+            "coupon_discount_blocks",
+            "drop_applied_coupon_line_items",
+        ),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "coupon_discount_projection",
+        trace_snapshot,
+        extracted,
+    )
     _repair_tiny_item_prices_from_following_ocr(extracted, unified_text)
     _run_split_price_block_projection_phase(
         extracted,
