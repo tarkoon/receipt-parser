@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 23
+POSTPROCESS_REPAIR_CALL_LIMIT = 19
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -214,6 +214,14 @@ HEADER_LOCATION_REPAIR_REPAIRS = {
 }
 HEADER_LOCATION_REPAIR_PHASE_HELPER = "_run_header_location_repair_phase"
 HEADER_LOCATION_REPAIR_PHASE_CALL_LIMIT = 1
+BAG_ITEM_OCR_REPAIR_REPAIRS = {
+    "_fix_small_non_bag_item_prices_from_ocr",
+    "_fix_bag_item_prices_from_ocr",
+    "_fix_split_bag_price_from_nearby_single_digit",
+    "_fix_small_bag_description_from_ocr_entry",
+}
+BAG_ITEM_OCR_REPAIR_PHASE_HELPER = "_run_bag_item_ocr_repair_phase"
+BAG_ITEM_OCR_REPAIR_PHASE_CALL_LIMIT = 1
 FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_REPAIRS = {
     "_restore_single_rate_inclusive_tax_block",
 }
@@ -3077,6 +3085,52 @@ def test_postprocess_header_location_repair_debt_is_phase_owned():
         "Header/location repair phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {HEADER_LOCATION_REPAIR_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_bag_item_ocr_repair_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, BAG_ITEM_OCR_REPAIR_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        BAG_ITEM_OCR_REPAIR_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Bag/small-item OCR repairs must be owned by the named "
+        f"{BAG_ITEM_OCR_REPAIR_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{BAG_ITEM_OCR_REPAIR_PHASE_HELPER} must document visible item/bag "
+        "OCR price triggers and an item total consistency invariant."
+    )
+
+
+def test_postprocess_bag_item_ocr_repair_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_item_calls = [
+        name
+        for name in postprocess_calls
+        if name in BAG_ITEM_OCR_REPAIR_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == BAG_ITEM_OCR_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_item_calls, (
+        "Bag/small-item OCR repairs should run through the named phase helper "
+        "so item-price OCR evidence and total consistency have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_item_calls}"
+    )
+    assert 0 < len(phase_calls) <= BAG_ITEM_OCR_REPAIR_PHASE_CALL_LIMIT, (
+        "Bag/small-item OCR repair phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {BAG_ITEM_OCR_REPAIR_PHASE_CALL_LIMIT}"
     )
 
 

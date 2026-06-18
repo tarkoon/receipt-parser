@@ -5922,6 +5922,26 @@ def test_bag_price_repair_prefers_standalone_price_after_code_row():
     assert bag["total"] == 5.0
 
 
+def test_small_non_bag_item_price_uses_following_visible_ocr_price():
+    from receipt_parser.pipeline_receipt import _fix_small_non_bag_item_prices_from_ocr
+
+    extracted = {
+        "line_items": [
+            {"description": "プレミアムヨーグルト", "qty": 1, "unit_price": 1, "total": 1},
+        ],
+    }
+    ocr_text = "\n".join([
+        "プレミアムヨーグルト",
+        "188",
+        "小計",
+    ])
+
+    _fix_small_non_bag_item_prices_from_ocr(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["unit_price"] == 188.0
+    assert extracted["line_items"][0]["total"] == 188.0
+
+
 def test_split_bag_price_uses_nearby_single_digit_without_merchant_gate():
     from receipt_parser.pipeline_receipt import _fix_split_bag_price_from_nearby_single_digit
 

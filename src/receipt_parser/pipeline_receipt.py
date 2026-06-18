@@ -15578,6 +15578,18 @@ def _run_header_location_repair_phase(extracted: dict, unified_text: str) -> Non
     _recover_labeled_purchase_site_location(extracted, unified_text)
 
 
+def _run_bag_item_ocr_repair_phase(extracted: dict, unified_text: str) -> None:
+    """Trigger: visible small item/bag price rows in OCR layout.
+
+    Invariant: repaired unit prices, quantities, descriptions, and totals must
+    remain backed by nearby item/bag OCR evidence and item total consistency.
+    """
+    _fix_small_non_bag_item_prices_from_ocr(extracted, unified_text)
+    _fix_bag_item_prices_from_ocr(extracted, unified_text)
+    _fix_split_bag_price_from_nearby_single_digit(extracted, unified_text)
+    _fix_small_bag_description_from_ocr_entry(extracted, unified_text)
+
+
 def _run_transaction_datetime_repair_phase(
     extracted: dict,
     unified_text: str,
@@ -15696,10 +15708,7 @@ def postprocess_receipt(
     )
     _drop_phantom_from_tax_amount(extracted)
     _fix_priced_in_name_items(extracted, unified_text)
-    _fix_small_non_bag_item_prices_from_ocr(extracted, unified_text)
-    _fix_bag_item_prices_from_ocr(extracted, unified_text)
-    _fix_split_bag_price_from_nearby_single_digit(extracted, unified_text)
-    _fix_small_bag_description_from_ocr_entry(extracted, unified_text)
+    _run_bag_item_ocr_repair_phase(extracted, unified_text)
     _fix_items_from_subtotal(extracted, unified_text, ocr_totals)
     _run_gap_item_recovery_phase(extracted, unified_text, ("missing_items",))
     trace_snapshot = _record_receipt_phase_mutation(
