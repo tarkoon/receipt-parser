@@ -14597,6 +14597,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Coupon discount projection requires visible coupon/CPN markers and item gross-minus-discount or subtotal arithmetic.",
     },
     {
+        "name": "following_ocr_price_projection",
+        "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Following-OCR price projection requires repeated nearby OCR amount evidence and item-sum or rate-base arithmetic improvement.",
+    },
+    {
         "name": "ocr_description_reconciliation",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -14986,6 +14992,25 @@ def _run_discount_consistency_reconciliation_phase(
         else:
             raise ValueError(
                 f"Unknown discount consistency reconciliation repair: {repair}"
+            )
+
+
+def _run_following_ocr_price_projection_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: repeated following OCR amount rows near an item description.
+
+    Invariant: projected prices must improve item-sum or printed rate-base
+    arithmetic without changing unrelated items.
+    """
+    for repair in repairs:
+        if repair == "tiny_item_prices_from_following_ocr":
+            _repair_tiny_item_prices_from_following_ocr(extracted, unified_text)
+        else:
+            raise ValueError(
+                f"Unknown following OCR price projection repair: {repair}"
             )
 
 
@@ -16317,7 +16342,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _repair_tiny_item_prices_from_following_ocr(extracted, unified_text)
+    _run_following_ocr_price_projection_phase(
+        extracted,
+        unified_text,
+        ("tiny_item_prices_from_following_ocr",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "following_ocr_price_projection",
+        trace_snapshot,
+        extracted,
+    )
     _ensure_discounted_ocr_pairs_present(extracted, unified_text)
     _run_gap_item_recovery_phase(extracted, unified_text, ("missing_items",))
     trace_snapshot = _record_receipt_phase_mutation(
@@ -16597,7 +16632,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _repair_tiny_item_prices_from_following_ocr(extracted, unified_text)
+    _run_following_ocr_price_projection_phase(
+        extracted,
+        unified_text,
+        ("tiny_item_prices_from_following_ocr",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "following_ocr_price_projection",
+        trace_snapshot,
+        extracted,
+    )
     _run_split_price_block_projection_phase(
         extracted,
         unified_text,
