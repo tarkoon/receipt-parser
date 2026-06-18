@@ -8664,7 +8664,51 @@ def test_prepare_receipt_output_payload_repairs_merchant_before_final_stack():
     assert output_events[0]["justification"]
 
 
-def test_final_receipt_output_repairs_recover_visible_repeated_item_gap():
+def test_postprocess_receipt_recovers_visible_repeated_item_gap():
+    from receipt_parser.pipeline_receipt import postprocess_receipt
+
+    result = {
+        "document_type": "receipt",
+        "merchant": "TEST",
+        "total": 1650,
+        "subtotal": 1500,
+        "taxes": [{"rate": "10%", "label": "内税", "amount": 150}],
+        "line_items": [
+            {"description": "商品ア", "qty": 1, "unit_price": 550, "total": 550, "tax_category": "10%"},
+            {"description": "商品イ", "qty": 1, "unit_price": 550, "total": 550, "tax_category": "10%"},
+        ],
+    }
+    ocr_text = "\n".join([
+        "TEST STORE",
+        "商品ア",
+        "¥550",
+        "商品イ",
+        "¥550",
+        "商品ア",
+        "¥550",
+        "3点/合計",
+        "¥1,650",
+    ])
+    trace: list[dict] = []
+
+    postprocess_receipt(
+        result,
+        ocr_text,
+        0.9,
+        {},
+        {},
+        "test-model",
+        mutation_trace=trace,
+    )
+
+    assert [item["description"] for item in result["line_items"]] == ["商品ア", "商品ア", "商品イ"]
+    assert [item["total"] for item in result["line_items"]] == [550, 550, 550]
+    gap_events = [event for event in trace if event["stage"] == "gap_item_recovery"]
+    assert gap_events
+    assert any(event["changes"].get("line_items") for event in gap_events)
+
+
+def test_final_receipt_output_repairs_do_not_recover_visible_repeated_item_gap():
     from receipt_parser.pipeline import _apply_final_receipt_output_repairs
 
     result = {
@@ -8689,11 +8733,13 @@ def test_final_receipt_output_repairs_recover_visible_repeated_item_gap():
         "3点/合計",
         "¥1,650",
     ])
+    trace: list[dict] = []
 
-    _apply_final_receipt_output_repairs(result, ocr_text)
+    _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=trace)
 
-    assert [item["description"] for item in result["line_items"]] == ["商品ア", "商品ア", "商品イ"]
-    assert [item["total"] for item in result["line_items"]] == [550, 550, 550]
+    assert [item["description"] for item in result["line_items"]] == ["商品ア", "商品イ"]
+    assert [item["total"] for item in result["line_items"]] == [550, 550]
+    assert not [event for event in trace if event["stage"] == "repeated_item_gap"]
 
 
 def test_postprocess_receipt_item_cleanup_drops_embedded_price_duplicate():

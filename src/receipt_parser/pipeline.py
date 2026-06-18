@@ -67,7 +67,6 @@ from .pipeline_receipt import (
     _restore_external_tax_total_from_printed_subtotal,
     _replace_barcode_qty_price_rows_when_balanced,
     _replace_item_price_qty_rows_when_balanced,
-    _recover_repeated_item_from_gap,
     _recover_missing_items_from_gap,
     _replace_split_price_block_when_balanced,
     _fix_split_item_price_body_total_layout,
@@ -1426,13 +1425,11 @@ def _run_final_gap_item_recovery_phase(
 ) -> None:
     """Trigger: visible OCR row gaps after final item projection cleanup.
 
-    Invariant: recovered missing or repeated rows must improve item-sum
-    agreement with printed subtotal or total without inventing hidden items.
+    Invariant: recovered missing rows must improve item-sum agreement with
+    printed subtotal or total without inventing hidden items.
     """
     for repair in repairs:
-        if repair == "repeated_item_gap":
-            _recover_repeated_item_from_gap(result, ocr_text)
-        elif repair == "missing_items_from_gap":
+        if repair == "missing_items_from_gap":
             _recover_missing_items_from_gap(result, ocr_text)
         else:
             raise ValueError(
@@ -1587,10 +1584,6 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "structural_item_reconstruction",
         "Owned by the final adjacent price-shift reconciliation helper until "
         "adjacent OCR price repairs move out of post-serialization repair.",
-    ),
-    "repeated_item_gap": (
-        "initial_item_recovery",
-        "Owned by the final gap item recovery helper until repeated OCR row-gap recovery moves out of post-serialization repair.",
     ),
     "dense_sequence_rows": (
         "structural_item_reconstruction",
@@ -1884,14 +1877,6 @@ def _apply_final_receipt_output_repairs(
             result,
             ocr_text,
             ("adjacent_ocr_price_shift",),
-        ),
-    )
-    run(
-        "repeated_item_gap",
-        lambda: _run_final_gap_item_recovery_phase(
-            result,
-            ocr_text,
-            ("repeated_item_gap",),
         ),
     )
     run(

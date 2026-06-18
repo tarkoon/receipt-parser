@@ -365,10 +365,11 @@ FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER = (
 FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_STAGE_LIMIT = 1
 FINAL_GAP_ITEM_RECOVERY_REPAIRS = {
     "_recover_missing_items_from_gap",
-    "_recover_repeated_item_from_gap",
 }
 FINAL_GAP_ITEM_RECOVERY_HELPER = "_run_final_gap_item_recovery_phase"
-FINAL_GAP_ITEM_RECOVERY_STAGE_LIMIT = 2
+FINAL_GAP_ITEM_RECOVERY_STAGE_LIMIT = 1
+RETIRED_FINAL_REPEATED_GAP_ITEM_RECOVERY_REPAIR = "_recover_repeated_item_from_gap"
+RETIRED_FINAL_REPEATED_GAP_ITEM_RECOVERY_STAGE = "repeated_item_gap"
 FINAL_BASKET_MARKER_ROWS_REPAIRS = {
     "_replace_basket_marker_rows_when_balanced",
 }
@@ -525,7 +526,6 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "printed_item_sum_total",
     "ocr_description_reconciliation",
     "adjacent_price_shift_reconciliation",
-    "repeated_item_gap",
     "dense_sequence_rows",
     "campaign_discount_stream",
     "jan_pos_items",
@@ -2985,6 +2985,31 @@ def test_final_gap_item_recovery_debt_is_helper_owned():
         "Late gap item recovery helper calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_GAP_ITEM_RECOVERY_STAGE_LIMIT}"
+    )
+
+
+def test_final_repeated_gap_item_recovery_debt_is_removed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
+    final_helper = _function_def(tree, FINAL_GAP_ITEM_RECOVERY_HELPER)
+    final_calls = _call_names_in_function(final_repairs)
+
+    assert (
+        RETIRED_FINAL_REPEATED_GAP_ITEM_RECOVERY_REPAIR
+        not in _call_names_in_function(final_helper)
+    ), (
+        "Repeated item gap recovery should be owned by postprocess gap item "
+        "recovery, not by the late final gap helper."
+    )
+    assert FINAL_GAP_ITEM_RECOVERY_HELPER in final_calls, (
+        "The final gap helper should remain for missing item gap recovery only."
+    )
+    assert (
+        RETIRED_FINAL_REPEATED_GAP_ITEM_RECOVERY_STAGE
+        not in FINAL_OUTPUT_REPAIR_STAGES
+    ), (
+        "The repeated item gap final-output stage should be removed from the "
+        "tracked late repair list."
     )
 
 
