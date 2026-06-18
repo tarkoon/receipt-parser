@@ -14645,6 +14645,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Printed summary total repair requires visible 小計/合計 rows whose subtotal plus tax equals the printed total and preserves payment minus points arithmetic.",
     },
     {
+        "name": "printed_item_sum_total_repair",
+        "reads": ("line_items", "subtotal", "total", "amount_paid", "taxes", "ocr_text"),
+        "writes": ("subtotal", "total", "amount_paid"),
+        "invariant": "Printed item-sum total repair requires item rows whose sum matches a visible printed amount and preserves item, tax, and payment arithmetic.",
+    },
+    {
         "name": "printed_external_tax_amount_restoration",
         "reads": ("line_items", "taxes", "subtotal", "total", "ocr_text"),
         "writes": ("taxes",),
@@ -15289,6 +15295,26 @@ def _run_printed_summary_total_tax_repair_phase(
         else:
             raise ValueError(
                 "Unknown printed summary total/tax repair: "
+                f"{repair}"
+            )
+
+
+def _run_printed_item_sum_total_repair_phase(
+    extracted: dict,
+    unified_text: str,
+    repairs: tuple[str, ...],
+) -> None:
+    """Trigger: visible printed item-sum or summary total amount.
+
+    Invariant: total/subtotal changes must be backed by printed item sums and
+    preserve item, tax, payment, and amount_paid arithmetic consistency.
+    """
+    for repair in repairs:
+        if repair == "printed_item_sum_total":
+            _prefer_printed_item_sum_total_when_balanced(extracted, unified_text)
+        else:
+            raise ValueError(
+                "Unknown printed item-sum total repair: "
                 f"{repair}"
             )
 
@@ -16263,7 +16289,17 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _prefer_printed_item_sum_total_when_balanced(extracted, unified_text)
+    _run_printed_item_sum_total_repair_phase(
+        extracted,
+        unified_text,
+        ("printed_item_sum_total",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "printed_item_sum_total_repair",
+        trace_snapshot,
+        extracted,
+    )
 
     # Fix tax amounts when OCR taxes are missing
     if (extracted.get("taxes") and extracted.get("line_items")

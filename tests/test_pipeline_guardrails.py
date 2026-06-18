@@ -242,6 +242,13 @@ FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPER = (
     "_run_final_printed_item_sum_total_repair_phase"
 )
 FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_STAGE_LIMIT = 1
+PRINTED_ITEM_SUM_TOTAL_REPAIR_REPAIRS = {
+    "_prefer_printed_item_sum_total_when_balanced",
+}
+PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_HELPER = (
+    "_run_printed_item_sum_total_repair_phase"
+)
+PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_CALL_LIMIT = 1
 FINAL_CASH_TENDER_RECONCILIATION_HELPERS = {
     "_fix_unlabeled_cash_tender_change_block",
 }
@@ -2114,6 +2121,54 @@ def test_final_printed_item_sum_total_repair_debt_is_helper_owned():
         "and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_STAGE_LIMIT}"
+    )
+
+
+def test_postprocess_printed_item_sum_total_repair_helper_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        PRINTED_ITEM_SUM_TOTAL_REPAIR_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Postprocess printed item-sum total repair must be owned by the named "
+        f"{PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_HELPER} must document the "
+        "printed item-sum/summary total trigger and item, tax, and payment "
+        "arithmetic invariant."
+    )
+
+
+def test_postprocess_printed_item_sum_total_repair_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_total_calls = [
+        name
+        for name in postprocess_calls
+        if name in PRINTED_ITEM_SUM_TOTAL_REPAIR_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_total_calls, (
+        "Postprocess printed item-sum total repair should run through the named "
+        "phase helper so printed item/summary total triggers and item/tax/payment "
+        "invariants have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_total_calls}"
+    )
+    assert 0 < len(phase_calls) <= PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_CALL_LIMIT, (
+        "Printed item-sum total repair phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_CALL_LIMIT}"
     )
 
 
