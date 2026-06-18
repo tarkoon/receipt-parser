@@ -4609,6 +4609,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "discount_consistency_reconciliation",
         "coupon_discount_projection",
         "following_ocr_price_projection",
+        "discounted_ocr_item_repair",
         "ocr_description_reconciliation",
         "split_price_block_projection",
         "quantity_detail_reconciliation",
@@ -4647,6 +4648,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["discount_consistency_reconciliation"]["writes"]
     assert "line_items" in phases["coupon_discount_projection"]["writes"]
     assert "line_items" in phases["following_ocr_price_projection"]["writes"]
+    assert "line_items" in phases["discounted_ocr_item_repair"]["writes"]
     assert "line_items" in phases["ocr_description_reconciliation"]["writes"]
     assert "line_items" in phases["split_price_block_projection"]["writes"]
     assert "line_items" in phases["service_receipt_recovery"]["writes"]
@@ -4691,6 +4693,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "discount_consistency_reconciliation",
             "coupon_discount_projection",
             "following_ocr_price_projection",
+            "discounted_ocr_item_repair",
             "ocr_description_reconciliation",
             "split_price_block_projection",
             "quantity_detail_reconciliation",
@@ -7734,6 +7737,57 @@ def test_discounted_ocr_pair_repair_uses_visible_owner_for_duplicate_description
     assert extracted["line_items"][1]["description"] == "商品イ"
     assert extracted["line_items"][1]["unit_price"] == 158
     assert extracted["line_items"][1]["total"] == 150
+
+
+def test_discounted_ocr_item_repair_phase_uses_visible_discount_and_stack_invariants():
+    from receipt_parser.pipeline_receipt import _run_discounted_ocr_item_repair_phase
+
+    discounted_total = {
+        "subtotal": 1598,
+        "line_items": [
+            {"description": "商品ア", "qty": 1, "unit_price": 100, "total": 100, "discount": 0},
+            {"description": "商品イ", "qty": 1, "unit_price": 200, "total": 200, "discount": 0},
+            {"description": "商品ウ", "qty": 1, "unit_price": 300, "total": 300, "discount": 0},
+            {"description": "商品エ", "qty": 1, "unit_price": 400, "total": 400, "discount": 0},
+            {"description": "商品オ", "qty": 1, "unit_price": 500, "total": 500, "discount": 0},
+            {"description": "商品カ", "qty": 2, "unit_price": 58, "total": 116, "discount": 18},
+        ],
+    }
+    _run_discounted_ocr_item_repair_phase(
+        discounted_total,
+        "まとめ値引\n-18\n小計\n¥1,598",
+    )
+    assert discounted_total["line_items"][5]["total"] == 98.0
+    assert sum(item["total"] for item in discounted_total["line_items"]) == 1598.0
+
+    duplicate_description = {
+        "line_items": [
+            {"description": "商品ア", "qty": 1, "unit_price": 158, "total": 158, "discount": 0},
+            {"description": "商品ア", "qty": 1, "unit_price": 158, "total": 150, "discount": 8},
+        ],
+    }
+    _run_discounted_ocr_item_repair_phase(
+        duplicate_description,
+        "\n".join(["商品ア 158*", "商品イ 158 A", "まとめ値引", "-8"]),
+    )
+    assert duplicate_description["line_items"][1]["description"] == "商品イ"
+    assert duplicate_description["line_items"][1]["total"] == 150
+
+    stacked_descriptions = {
+        "subtotal": 300,
+        "line_items": [
+            {"description": "仮", "qty": 1, "unit_price": 100, "total": 100, "discount": 0},
+            {"description": "仮", "qty": 1, "unit_price": 200, "total": 200, "discount": 0},
+        ],
+    }
+    _run_discounted_ocr_item_repair_phase(
+        stacked_descriptions,
+        "\n".join(["商品ア", "商品イ", "¥100", "¥200", "小計", "¥300"]),
+    )
+    assert [item["description"] for item in stacked_descriptions["line_items"]] == [
+        "商品ア",
+        "商品イ",
+    ]
 
 
 def test_duplicate_row_drop_requires_subtotal_balance_and_single_ocr_occurrence():

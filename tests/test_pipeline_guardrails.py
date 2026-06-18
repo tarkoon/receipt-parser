@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 19
+POSTPROCESS_REPAIR_CALL_LIMIT = 16
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -428,6 +428,15 @@ FINAL_OCR_DESCRIPTION_RECONCILIATION_HELPER = (
     "_run_final_ocr_description_reconciliation_phase"
 )
 FINAL_OCR_DESCRIPTION_RECONCILIATION_STAGE_LIMIT = 3
+DISCOUNTED_OCR_ITEM_REPAIR_REPAIRS = {
+    "_repair_discounted_line_item_totals_when_balanced",
+    "_repair_discounted_ocr_pair_descriptions",
+    "_repair_pre_price_stack_descriptions_from_ocr",
+}
+DISCOUNTED_OCR_ITEM_REPAIR_PHASE_HELPER = (
+    "_run_discounted_ocr_item_repair_phase"
+)
+DISCOUNTED_OCR_ITEM_REPAIR_PHASE_CALL_LIMIT = 1
 FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_REPAIRS = {
     "_fix_adjacent_ocr_price_shift_when_balanced",
 }
@@ -3529,6 +3538,58 @@ def test_final_ocr_description_reconciliation_debt_is_helper_owned():
         "Late OCR description helper calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
         f"limit: {FINAL_OCR_DESCRIPTION_RECONCILIATION_STAGE_LIMIT}"
+    )
+
+
+def test_discounted_ocr_item_repair_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, DISCOUNTED_OCR_ITEM_REPAIR_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        DISCOUNTED_OCR_ITEM_REPAIR_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Postprocess discounted OCR item repair must be owned by the named "
+        f"{DISCOUNTED_OCR_ITEM_REPAIR_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{DISCOUNTED_OCR_ITEM_REPAIR_PHASE_HELPER} must document the "
+        "visible discount/stacked-price OCR trigger and item-sum or "
+        "description field-consistency invariant."
+    )
+
+
+def test_postprocess_discounted_ocr_item_repair_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_discounted_item_calls = [
+        name
+        for name in postprocess_calls
+        if name in DISCOUNTED_OCR_ITEM_REPAIR_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == DISCOUNTED_OCR_ITEM_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_discounted_item_calls, (
+        "Postprocess discounted OCR item repair should run through a named "
+        "phase helper so visible discount rows, stacked price descriptions, "
+        "and item-sum consistency have one owner.\n"
+        "Direct calls still in postprocess_receipt: "
+        f"{direct_discounted_item_calls}"
+    )
+    assert (
+        0 < len(phase_calls) <= DISCOUNTED_OCR_ITEM_REPAIR_PHASE_CALL_LIMIT
+    ), (
+        "Postprocess discounted OCR item repair phase calls must be explicit "
+        "and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {DISCOUNTED_OCR_ITEM_REPAIR_PHASE_CALL_LIMIT}"
     )
 
 

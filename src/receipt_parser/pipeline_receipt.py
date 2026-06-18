@@ -14615,6 +14615,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Following-OCR price projection requires repeated nearby OCR amount evidence and item-sum or rate-base arithmetic improvement.",
     },
     {
+        "name": "discounted_ocr_item_repair",
+        "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Discounted OCR item repair requires visible discount rows or stacked price/name blocks and item-sum or field-consistency arithmetic.",
+    },
+    {
         "name": "ocr_description_reconciliation",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -15051,6 +15057,17 @@ def _run_following_ocr_price_projection_phase(
             raise ValueError(
                 f"Unknown following OCR price projection repair: {repair}"
             )
+
+
+def _run_discounted_ocr_item_repair_phase(extracted: dict, unified_text: str) -> None:
+    """Trigger: visible discount rows or stacked price/name blocks in OCR.
+
+    Invariant: discounted totals must close the printed item sum, and
+    description repairs must remain backed by visible OCR field ownership.
+    """
+    _repair_discounted_line_item_totals_when_balanced(extracted, unified_text)
+    _repair_discounted_ocr_pair_descriptions(extracted, unified_text)
+    _repair_pre_price_stack_descriptions_from_ocr(extracted, unified_text)
 
 
 def _run_ocr_description_reconciliation_phase(
@@ -17037,9 +17054,13 @@ def postprocess_receipt(
         computed_sub = float(extracted["total"]) - tax_sum
         if computed_sub >= 0:
             extracted["subtotal"] = computed_sub
-    _repair_discounted_line_item_totals_when_balanced(extracted, unified_text)
-    _repair_discounted_ocr_pair_descriptions(extracted, unified_text)
-    _repair_pre_price_stack_descriptions_from_ocr(extracted, unified_text)
+    _run_discounted_ocr_item_repair_phase(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "discounted_ocr_item_repair",
+        trace_snapshot,
+        extracted,
+    )
     _run_duplicate_row_cleanup_phase(
         extracted,
         unified_text,
