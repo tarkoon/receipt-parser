@@ -4559,6 +4559,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "bag_item_rate_base_reconciliation",
         "tax_category_assignment",
         "payment_points_reconciliation",
+        "jan_pos_row_projection",
         "barcode_row_projection",
         "dense_item_row_projection",
         "dense_sequence_row_projection",
@@ -4601,6 +4602,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "total" in phases["financial_totals_repair"]["writes"]
     assert "amount_paid" in phases["payment_points_reconciliation"]["reads"]
     assert "payment_method" in phases["payment_points_reconciliation"]["writes"]
+    assert "line_items" in phases["jan_pos_row_projection"]["writes"]
     assert "line_items" in phases["barcode_row_projection"]["writes"]
     assert "line_items" in phases["dense_item_row_projection"]["writes"]
     assert "line_items" in phases["dense_sequence_row_projection"]["writes"]
@@ -4621,6 +4623,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "service_receipt_recovery",
             "single_rate_inclusive_tax_restoration",
             "tax_category_assignment",
+            "jan_pos_row_projection",
             "barcode_row_projection",
             "dense_item_row_projection",
             "dense_sequence_row_projection",

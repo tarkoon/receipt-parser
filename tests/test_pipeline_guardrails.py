@@ -104,11 +104,14 @@ REPAIR_CALL_PREFIXES = (
 )
 POSTPROCESS_MUTATOR_REPEAT_ALLOWLIST = {
 }
-STRUCTURAL_ITEM_PROJECTION_REPAIRS = {
+JAN_POS_ROW_PROJECTION_REPAIRS = {
     "_replace_jan_pos_items_when_balanced",
 }
-STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER = "_run_structural_item_projection_phase"
-STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT = 3
+JAN_POS_ROW_PROJECTION_PHASE_HELPER = "_run_jan_pos_row_projection_phase"
+JAN_POS_ROW_PROJECTION_PHASE_CALL_LIMIT = 3
+RETIRED_STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER = (
+    "_run_structural_item_projection_phase"
+)
 BARCODE_ROW_PROJECTION_REPAIRS = {
     "_replace_barcode_qty_price_rows_when_balanced",
     "_replace_barcode_unit_qty_amount_stack_when_balanced",
@@ -619,6 +622,13 @@ def _function_def(tree: ast.AST, name: str) -> ast.FunctionDef:
     raise AssertionError(f"Function not found: {name}")
 
 
+def _has_function_def(tree: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(node, ast.FunctionDef) and node.name == name
+        for node in ast.walk(tree)
+    )
+
+
 def _call_names_in_function(function: ast.FunctionDef) -> list[str]:
     names = []
     for node in ast.walk(function):
@@ -1002,47 +1012,55 @@ def test_postprocess_receipt_repeated_mutators_are_explicitly_allowlisted():
     )
 
 
-def test_structural_item_projection_phase_is_named_and_invariant_backed():
+def test_jan_pos_row_projection_phase_is_named_and_invariant_backed():
     tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER)
+    helper = _function_def(tree, JAN_POS_ROW_PROJECTION_PHASE_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
     missing_repairs = sorted(
-        STRUCTURAL_ITEM_PROJECTION_REPAIRS - set(_call_names_in_function(helper))
+        JAN_POS_ROW_PROJECTION_REPAIRS - set(_call_names_in_function(helper))
     )
     assert not missing_repairs, (
-        "Structural item row projection repairs must be owned by the named "
-        f"{STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER} helper.\n"
+        "JAN POS row projection repairs must be owned by the named "
+        f"{JAN_POS_ROW_PROJECTION_PHASE_HELPER} helper.\n"
         f"Missing helper calls: {missing_repairs}"
     )
     assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER} must document the OCR/layout "
+        f"{JAN_POS_ROW_PROJECTION_PHASE_HELPER} must document the OCR/layout "
         "trigger and arithmetic or field-consistency invariant it enforces."
     )
 
 
-def test_postprocess_structural_item_projection_debt_is_phase_owned():
+def test_postprocess_jan_pos_row_projection_debt_is_phase_owned():
     tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
     postprocess = _function_def(tree, "postprocess_receipt")
     postprocess_calls = _call_names_in_function(postprocess)
     direct_projection_calls = [
-        name for name in postprocess_calls if name in STRUCTURAL_ITEM_PROJECTION_REPAIRS
+        name for name in postprocess_calls if name in JAN_POS_ROW_PROJECTION_REPAIRS
     ]
     phase_calls = [
         name
         for name in postprocess_calls
-        if name == STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER
+        if name == JAN_POS_ROW_PROJECTION_PHASE_HELPER
     ]
 
     assert not direct_projection_calls, (
-        "Structural item projection repairs should run through the named phase "
-        "helper so OCR/layout triggers and arithmetic invariants have one owner.\n"
+        "JAN POS row projection repairs should run through the named phase "
+        "helper so JAN/item-code OCR triggers and arithmetic invariants have one owner.\n"
         f"Direct calls still in postprocess_receipt: {direct_projection_calls}"
     )
-    assert 0 < len(phase_calls) <= STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT, (
-        "Structural item projection phase calls must be explicit and bounded.\n"
+    assert RETIRED_STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER not in postprocess_calls, (
+        "The broad structural item projection phase should not remain after "
+        "JAN POS row projection has a named postprocess owner."
+    )
+    assert not _has_function_def(tree, RETIRED_STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER), (
+        "The broad structural item projection helper should be retired once "
+        "JAN POS row projection has a named postprocess owner."
+    )
+    assert 0 < len(phase_calls) <= JAN_POS_ROW_PROJECTION_PHASE_CALL_LIMIT, (
+        "JAN POS row projection phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
-        f"limit: {STRUCTURAL_ITEM_PROJECTION_PHASE_CALL_LIMIT}"
+        f"limit: {JAN_POS_ROW_PROJECTION_PHASE_CALL_LIMIT}"
     )
 
 
@@ -1068,14 +1086,9 @@ def test_barcode_row_projection_phase_is_named_and_invariant_backed():
 def test_postprocess_barcode_row_projection_debt_is_phase_owned():
     tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
     postprocess = _function_def(tree, "postprocess_receipt")
-    structural_helper = _function_def(tree, STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER)
     postprocess_calls = _call_names_in_function(postprocess)
-    structural_calls = _call_names_in_function(structural_helper)
     direct_barcode_calls = [
         name for name in postprocess_calls if name in BARCODE_ROW_PROJECTION_REPAIRS
-    ]
-    structural_barcode_calls = [
-        name for name in structural_calls if name in BARCODE_ROW_PROJECTION_REPAIRS
     ]
     phase_calls = [
         name
@@ -1087,11 +1100,6 @@ def test_postprocess_barcode_row_projection_debt_is_phase_owned():
         "Barcode row projection repairs should run through the named phase "
         "helper so barcode OCR triggers and arithmetic invariants have one owner.\n"
         f"Direct calls still in postprocess_receipt: {direct_barcode_calls}"
-    )
-    assert not structural_barcode_calls, (
-        "Barcode row projection should no longer be hidden inside the broad "
-        f"{STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER} helper.\n"
-        f"Structural helper calls still owning barcode rows: {structural_barcode_calls}"
     )
     assert 0 < len(phase_calls) <= BARCODE_ROW_PROJECTION_PHASE_CALL_LIMIT, (
         "Barcode row projection phase calls must be explicit and bounded.\n"
@@ -1122,14 +1130,9 @@ def test_dense_item_row_projection_phase_is_named_and_invariant_backed():
 def test_postprocess_dense_item_row_projection_debt_is_phase_owned():
     tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
     postprocess = _function_def(tree, "postprocess_receipt")
-    structural_helper = _function_def(tree, STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER)
     postprocess_calls = _call_names_in_function(postprocess)
-    structural_calls = _call_names_in_function(structural_helper)
     direct_dense_calls = [
         name for name in postprocess_calls if name in DENSE_ITEM_ROW_PROJECTION_REPAIRS
-    ]
-    structural_dense_calls = [
-        name for name in structural_calls if name in DENSE_ITEM_ROW_PROJECTION_REPAIRS
     ]
     phase_calls = [
         name
@@ -1141,11 +1144,6 @@ def test_postprocess_dense_item_row_projection_debt_is_phase_owned():
         "Dense item row projection repairs should run through the named phase "
         "helper so dense OCR row triggers and arithmetic invariants have one owner.\n"
         f"Direct calls still in postprocess_receipt: {direct_dense_calls}"
-    )
-    assert not structural_dense_calls, (
-        "Dense item row projection should no longer be hidden inside the broad "
-        f"{STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER} helper.\n"
-        f"Structural helper calls still owning dense rows: {structural_dense_calls}"
     )
     assert 0 < len(phase_calls) <= DENSE_ITEM_ROW_PROJECTION_PHASE_CALL_LIMIT, (
         "Dense item row projection phase calls must be explicit and bounded.\n"
@@ -1176,16 +1174,11 @@ def test_dense_sequence_row_projection_phase_is_named_and_invariant_backed():
 def test_postprocess_dense_sequence_row_projection_debt_is_phase_owned():
     tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
     postprocess = _function_def(tree, "postprocess_receipt")
-    structural_helper = _function_def(tree, STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER)
     postprocess_calls = _call_names_in_function(postprocess)
-    structural_calls = _call_names_in_function(structural_helper)
     direct_sequence_calls = [
         name
         for name in postprocess_calls
         if name in DENSE_SEQUENCE_ROW_PROJECTION_REPAIRS
-    ]
-    structural_sequence_calls = [
-        name for name in structural_calls if name in DENSE_SEQUENCE_ROW_PROJECTION_REPAIRS
     ]
     phase_calls = [
         name
@@ -1198,11 +1191,6 @@ def test_postprocess_dense_sequence_row_projection_debt_is_phase_owned():
         "phase helper so dense OCR sequence triggers and arithmetic invariants "
         "have one owner.\n"
         f"Direct calls still in postprocess_receipt: {direct_sequence_calls}"
-    )
-    assert not structural_sequence_calls, (
-        "Dense sequence row projection should no longer be hidden inside the broad "
-        f"{STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER} helper.\n"
-        f"Structural helper calls still owning dense sequences: {structural_sequence_calls}"
     )
     assert 0 < len(phase_calls) <= DENSE_SEQUENCE_ROW_PROJECTION_PHASE_CALL_LIMIT, (
         "Dense sequence row projection phase calls must be explicit and bounded.\n"
@@ -2980,14 +2968,9 @@ def test_quantity_detail_reconciliation_phase_is_named_and_invariant_backed():
 def test_postprocess_quantity_detail_reconciliation_debt_is_phase_owned():
     tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
     postprocess = _function_def(tree, "postprocess_receipt")
-    structural_projection = _function_def(tree, STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER)
     postprocess_calls = _call_names_in_function(postprocess)
-    structural_calls = _call_names_in_function(structural_projection)
     direct_quantity_calls = [
         name for name in postprocess_calls if name in QUANTITY_DETAIL_RECONCILIATION_REPAIRS
-    ]
-    structural_quantity_calls = [
-        name for name in structural_calls if name in QUANTITY_DETAIL_RECONCILIATION_REPAIRS
     ]
     phase_calls = [
         name
@@ -2999,11 +2982,6 @@ def test_postprocess_quantity_detail_reconciliation_debt_is_phase_owned():
         "Quantity detail repairs should run through the named phase helper so "
         "OCR quantity triggers and qty * unit invariants have one owner.\n"
         f"Direct calls still in postprocess_receipt: {direct_quantity_calls}"
-    )
-    assert not structural_quantity_calls, (
-        "Quantity detail reconciliation should not be hidden inside the broader "
-        "structural projection phase.\n"
-        f"Structural helper still owns: {structural_quantity_calls}"
     )
     assert 0 < len(phase_calls) <= QUANTITY_DETAIL_RECONCILIATION_PHASE_CALL_LIMIT, (
         "Quantity detail reconciliation phase calls must be explicit and bounded.\n"

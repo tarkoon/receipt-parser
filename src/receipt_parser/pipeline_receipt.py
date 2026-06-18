@@ -14650,6 +14650,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Payment, points, and subtotal changes must preserve total/tax arithmetic.",
     },
     {
+        "name": "jan_pos_row_projection",
+        "reads": ("line_items", "subtotal", "total", "ocr_text", "ocr_totals"),
+        "writes": ("line_items",),
+        "invariant": "JAN/POS row projection requires visible item-code, quantity, and price OCR rows with item-sum arithmetic consistent with printed totals.",
+    },
+    {
         "name": "barcode_row_projection",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -14804,22 +14810,17 @@ def _run_dense_sequence_row_projection_phase(
             raise ValueError(f"Unknown dense sequence row projection repair: {repair}")
 
 
-def _run_structural_item_projection_phase(
+def _run_jan_pos_row_projection_phase(
     extracted: dict,
     unified_text: str,
     ocr_totals: dict | None,
-    repairs: tuple[str, ...],
 ) -> None:
-    """Trigger: OCR row layout exposes item/price/qty sequences or POS codes.
+    """Trigger: OCR exposes JAN/POS item-code rows with adjacent qty/price text.
 
-    Invariant: each projection helper may replace rows only when its own
-    arithmetic checks keep item totals coherent with printed receipt amounts.
+    Invariant: projected JAN/POS rows may replace line items only when item
+    sums remain coherent with printed receipt amounts.
     """
-    for repair in repairs:
-        if repair == "jan_pos_items":
-            _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals or {})
-        else:
-            raise ValueError(f"Unknown structural item projection repair: {repair}")
+    _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals or {})
 
 
 def _run_campaign_discount_projection_phase(
@@ -15522,11 +15523,12 @@ def postprocess_receipt(
         unified_text,
         ("drop_numeric_marker_description_rows",),
     )
-    _run_structural_item_projection_phase(
+    _run_jan_pos_row_projection_phase(extracted, unified_text, ocr_totals)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "jan_pos_row_projection",
+        trace_snapshot,
         extracted,
-        unified_text,
-        ocr_totals,
-        ("jan_pos_items",),
     )
     _run_line_item_cleanup_phase(
         extracted,
@@ -15580,11 +15582,12 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _run_structural_item_projection_phase(
+    _run_jan_pos_row_projection_phase(extracted, unified_text, ocr_totals)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "jan_pos_row_projection",
+        trace_snapshot,
         extracted,
-        unified_text,
-        ocr_totals,
-        ("jan_pos_items",),
     )
     _run_barcode_row_projection_phase(
         extracted,
@@ -16127,11 +16130,12 @@ def postprocess_receipt(
         extracted,
     )
     _replace_vertical_price_qty_total_rows_when_balanced(extracted, unified_text)
-    _run_structural_item_projection_phase(
+    _run_jan_pos_row_projection_phase(extracted, unified_text, ocr_totals)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "jan_pos_row_projection",
+        trace_snapshot,
         extracted,
-        unified_text,
-        ocr_totals,
-        ("jan_pos_items",),
     )
     _run_barcode_row_projection_phase(
         extracted,
