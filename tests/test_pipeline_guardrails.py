@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 15
+POSTPROCESS_REPAIR_CALL_LIMIT = 13
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -615,6 +615,12 @@ LINE_ITEM_CLEANUP_REPAIRS = {
 }
 LINE_ITEM_CLEANUP_PHASE_HELPER = "_run_line_item_cleanup_phase"
 LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT = 14
+ITEM_NAME_PRICE_CLEANUP_REPAIRS = {
+    "_fix_non_bag_items_named_as_bag",
+    "_fix_embedded_price_suffix_totals",
+}
+ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER = "_run_item_name_price_cleanup_phase"
+ITEM_NAME_PRICE_CLEANUP_PHASE_CALL_LIMIT = 1
 DUPLICATE_ROW_CLEANUP_PHASE_HELPER = "_run_duplicate_row_cleanup_phase"
 FINAL_OUTPUT_REPAIR_STAGES = (
     "barcode_unit_qty_amount_stack",
@@ -4624,6 +4630,53 @@ def test_postprocess_low_value_bag_recovery_debt_is_phase_owned():
         "Low-value bag recovery phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {LOW_VALUE_BAG_RECOVERY_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_item_name_price_cleanup_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        ITEM_NAME_PRICE_CLEANUP_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Item name/price cleanup repairs must be owned by the named "
+        f"{ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER} must document the OCR "
+        "item-name/embedded-price trigger and item field-consistency invariant."
+    )
+
+
+def test_postprocess_item_name_price_cleanup_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_cleanup_calls = [
+        name
+        for name in postprocess_calls
+        if name in ITEM_NAME_PRICE_CLEANUP_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER
+    ]
+
+    assert not direct_cleanup_calls, (
+        "Item name/price cleanup should run through the named phase helper "
+        "so OCR row ownership, embedded price suffixes, and item fields have "
+        "one consistency owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_cleanup_calls}"
+    )
+    assert 0 < len(phase_calls) <= ITEM_NAME_PRICE_CLEANUP_PHASE_CALL_LIMIT, (
+        "Item name/price cleanup phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {ITEM_NAME_PRICE_CLEANUP_PHASE_CALL_LIMIT}"
     )
 
 

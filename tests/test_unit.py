@@ -4609,6 +4609,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "discount_consistency_reconciliation",
         "coupon_discount_projection",
         "following_ocr_price_projection",
+        "item_name_price_cleanup",
         "discounted_ocr_item_repair",
         "ocr_description_reconciliation",
         "split_price_block_projection",
@@ -4649,6 +4650,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["discount_consistency_reconciliation"]["writes"]
     assert "line_items" in phases["coupon_discount_projection"]["writes"]
     assert "line_items" in phases["following_ocr_price_projection"]["writes"]
+    assert "line_items" in phases["item_name_price_cleanup"]["writes"]
     assert "line_items" in phases["discounted_ocr_item_repair"]["writes"]
     assert "line_items" in phases["ocr_description_reconciliation"]["writes"]
     assert "line_items" in phases["split_price_block_projection"]["writes"]
@@ -4695,6 +4697,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "discount_consistency_reconciliation",
             "coupon_discount_projection",
             "following_ocr_price_projection",
+            "item_name_price_cleanup",
             "discounted_ocr_item_repair",
             "ocr_description_reconciliation",
             "split_price_block_projection",
@@ -5946,6 +5949,44 @@ def test_small_non_bag_item_price_uses_following_visible_ocr_price():
 
     assert extracted["line_items"][0]["unit_price"] == 188.0
     assert extracted["line_items"][0]["total"] == 188.0
+
+
+def test_item_name_price_cleanup_phase_uses_visible_ocr_and_field_consistency():
+    from receipt_parser.pipeline_receipt import _run_item_name_price_cleanup_phase
+
+    extracted = {
+        "line_items": [
+            {
+                "description": "レジ袋",
+                "qty": 1,
+                "unit_price": 198,
+                "total": 198,
+            },
+            {
+                "description": "テスト商品 198",
+                "qty": 2,
+                "unit_price": 99,
+                "total": 200,
+            },
+        ],
+    }
+    ocr_text = "\n".join([
+        "テスト商品",
+        "198",
+        "テスト商品 198",
+        "小計",
+        "¥396",
+    ])
+
+    _run_item_name_price_cleanup_phase(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["description"] == "テスト商品"
+    assert extracted["line_items"][1] == {
+        "description": "テスト商品",
+        "qty": 1.0,
+        "unit_price": 198.0,
+        "total": 198.0,
+    }
 
 
 def test_split_bag_price_uses_nearby_single_digit_without_merchant_gate():

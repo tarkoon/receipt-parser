@@ -14615,6 +14615,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Following-OCR price projection requires repeated nearby OCR amount evidence and item-sum or rate-base arithmetic improvement.",
     },
     {
+        "name": "item_name_price_cleanup",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Item name/price cleanup requires visible OCR item names or embedded price suffixes and preserves item field consistency.",
+    },
+    {
         "name": "discounted_ocr_item_repair",
         "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
         "writes": ("line_items",),
@@ -15564,6 +15570,16 @@ def _run_line_item_cleanup_phase(
             raise ValueError(f"Unknown line-item cleanup repair: {repair}")
 
 
+def _run_item_name_price_cleanup_phase(extracted: dict, unified_text: str) -> None:
+    """Trigger: visible OCR names or embedded price suffixes repair item rows.
+
+    Invariant: description, qty, unit_price, and total changes must be backed
+    by visible OCR row ownership or embedded price field consistency.
+    """
+    _fix_non_bag_items_named_as_bag(extracted, unified_text)
+    _fix_embedded_price_suffix_totals(extracted, unified_text)
+
+
 def _run_duplicate_row_cleanup_phase(
     extracted: dict,
     unified_text: str,
@@ -15948,8 +15964,13 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _fix_non_bag_items_named_as_bag(extracted, unified_text)
-    _fix_embedded_price_suffix_totals(extracted, unified_text)
+    _run_item_name_price_cleanup_phase(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_name_price_cleanup",
+        trace_snapshot,
+        extracted,
+    )
     _run_adjacent_price_shift_reconciliation_phase(
         extracted,
         unified_text,
