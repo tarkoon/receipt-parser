@@ -311,8 +311,12 @@ RETIRED_FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_STAGE = (
 FINAL_DUPLICATE_ROW_CLEANUP_REPAIRS = {
     "_drop_duplicate_rows_when_subtotal_balances",
 }
-FINAL_DUPLICATE_ROW_CLEANUP_HELPER = "_run_final_duplicate_row_cleanup_phase"
-FINAL_DUPLICATE_ROW_CLEANUP_STAGE_LIMIT = 1
+RETIRED_FINAL_DUPLICATE_ROW_CLEANUP_HELPER = (
+    "_run_final_duplicate_row_cleanup_phase"
+)
+RETIRED_FINAL_DUPLICATE_ROW_CLEANUP_STAGE = (
+    "drop_duplicate_rows_when_subtotal_balances"
+)
 FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS = {
     "_clear_discount_when_negative_line_precedes_own_price",
 }
@@ -491,6 +495,7 @@ LINE_ITEM_CLEANUP_REPAIRS = {
 }
 LINE_ITEM_CLEANUP_PHASE_HELPER = "_run_line_item_cleanup_phase"
 LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT = 14
+DUPLICATE_ROW_CLEANUP_PHASE_HELPER = "_run_duplicate_row_cleanup_phase"
 FINAL_OUTPUT_REPAIR_STAGES = (
     "barcode_unit_qty_amount_stack",
     "barcode_qty_price_rows",
@@ -534,7 +539,6 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "prefixed_tax_marker_item_rows",
     "missing_items_from_gap",
     "ocr_description_reconciliation_after_layout",
-    "drop_duplicate_rows_when_subtotal_balances",
     "basket_marker_rows",
     "tax_categories_from_rate_bases",
     "external_tax_total_from_printed_subtotal_final",
@@ -2529,28 +2533,32 @@ def test_final_embedded_price_duplicate_cleanup_debt_is_removed():
     )
 
 
-def test_final_duplicate_row_cleanup_helper_is_named_and_invariant_backed():
+def test_final_duplicate_row_cleanup_is_retired_to_postprocess():
     tree = _parse_file(PARSER_DIR / "pipeline.py")
-    helper = _function_def(tree, FINAL_DUPLICATE_ROW_CLEANUP_HELPER)
-    docstring = ast.get_docstring(helper) or ""
+    receipt_tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    duplicate_cleanup_helper = _function_def(
+        receipt_tree,
+        DUPLICATE_ROW_CLEANUP_PHASE_HELPER,
+    )
 
-    missing_repairs = sorted(
+    assert (
         FINAL_DUPLICATE_ROW_CLEANUP_REPAIRS
-        - set(_call_names_in_function(helper))
+        <= set(_call_names_in_function(duplicate_cleanup_helper))
+    ), (
+        "Duplicate-row cleanup should be owned by postprocess duplicate row "
+        "cleanup so the OCR occurrence-count trigger and subtotal-overage "
+        "invariant run before final model serialization."
     )
-    assert not missing_repairs, (
-        "Late duplicate row cleanup must be owned by the named "
-        f"{FINAL_DUPLICATE_ROW_CLEANUP_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_DUPLICATE_ROW_CLEANUP_HELPER} must document the "
-        "OCR occurrence-count trigger and subtotal-overage duplicate-row "
-        "arithmetic invariant."
+    assert not _has_function_def(
+        tree,
+        RETIRED_FINAL_DUPLICATE_ROW_CLEANUP_HELPER,
+    ), (
+        "The late duplicate-row cleanup helper should be retired once "
+        "postprocess duplicate row cleanup owns the behavior."
     )
 
 
-def test_final_duplicate_row_cleanup_debt_is_helper_owned():
+def test_final_duplicate_row_cleanup_debt_is_removed():
     tree = _parse_file(PARSER_DIR / "pipeline.py")
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
@@ -2559,28 +2567,22 @@ def test_final_duplicate_row_cleanup_debt_is_helper_owned():
         for name in final_calls
         if name in FINAL_DUPLICATE_ROW_CLEANUP_REPAIRS
     ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_DUPLICATE_ROW_CLEANUP_HELPER
-    ]
 
     assert not direct_duplicate_calls, (
-        "Late duplicate row cleanup should run through the named helper so "
-        "OCR occurrence counts and subtotal-overage arithmetic have one "
-        "owner.\n"
+        "Duplicate-row cleanup should not run directly in late final output "
+        "repairs after postprocess owns the behavior.\n"
         "Direct calls still in _apply_final_receipt_output_repairs: "
         f"{direct_duplicate_calls}"
     )
+    assert RETIRED_FINAL_DUPLICATE_ROW_CLEANUP_HELPER not in final_calls, (
+        "The late duplicate-row cleanup helper should not be called from "
+        "_apply_final_receipt_output_repairs."
+    )
     assert (
-        0
-        < len(helper_calls)
-        <= FINAL_DUPLICATE_ROW_CLEANUP_STAGE_LIMIT
+        RETIRED_FINAL_DUPLICATE_ROW_CLEANUP_STAGE not in FINAL_OUTPUT_REPAIR_STAGES
     ), (
-        "Late duplicate row cleanup helper calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_DUPLICATE_ROW_CLEANUP_STAGE_LIMIT}"
+        "The duplicate-row final-output stage should be removed from the "
+        "tracked late repair list."
     )
 
 

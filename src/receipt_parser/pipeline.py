@@ -47,7 +47,6 @@ from .pipeline_receipt import (
     _repair_discounted_line_item_totals_when_balanced,
     _repair_discounted_ocr_pair_descriptions,
     _repair_pre_price_stack_descriptions_from_ocr,
-    _drop_duplicate_rows_when_subtotal_balances,
     _replace_basket_marker_rows_when_balanced,
     _fix_adjacent_ocr_price_shift_when_balanced,
     _fix_o_ring_descriptions_from_ocr,
@@ -1417,26 +1416,6 @@ def _run_final_gap_item_recovery_phase(
             )
 
 
-def _run_final_duplicate_row_cleanup_phase(
-    result: dict,
-    ocr_text: str,
-    repairs: tuple[str, ...],
-) -> None:
-    """Trigger: duplicate parsed rows whose item text appears once in OCR.
-
-    Invariant: the subtotal overage must equal one duplicate row total, so
-    removing that row reconciles item sum to the printed subtotal.
-    """
-    for repair in repairs:
-        if repair == "drop_duplicate_rows_when_subtotal_balances":
-            _drop_duplicate_rows_when_subtotal_balances(result, ocr_text)
-        else:
-            raise ValueError(
-                "Unknown final duplicate row cleanup repair: "
-                f"{repair}"
-            )
-
-
 def _run_final_discount_consistency_reconciliation_phase(
     result: dict,
     ocr_text: str,
@@ -1692,11 +1671,6 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "Owned by the final OCR description reconciliation helper as the "
         "bounded post-layout pass for discount-pair and pre-price stack "
         "description context.",
-    ),
-    "drop_duplicate_rows_when_subtotal_balances": (
-        "duplicate_row_cleanup",
-        "Owned by the final duplicate-row cleanup helper until singleton OCR "
-        "duplicate pruning moves out of post-serialization repair.",
     ),
     "basket_marker_rows": (
         "structural_item_reconstruction",
@@ -2071,14 +2045,6 @@ def _apply_final_receipt_output_repairs(
                 "discounted_ocr_pair_descriptions",
                 "pre_price_stack_descriptions",
             ),
-        ),
-    )
-    run(
-        "drop_duplicate_rows_when_subtotal_balances",
-        lambda: _run_final_duplicate_row_cleanup_phase(
-            result,
-            ocr_text,
-            ("drop_duplicate_rows_when_subtotal_balances",),
         ),
     )
     run(

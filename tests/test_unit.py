@@ -8725,7 +8725,49 @@ def test_final_receipt_output_repairs_do_not_drop_embedded_price_duplicate():
     assert not duplicate_events
 
 
-def test_final_receipt_output_repairs_trace_duplicate_row_cleanup_owner():
+def test_postprocess_receipt_duplicate_row_cleanup_drops_balanced_duplicate():
+    from receipt_parser.pipeline_receipt import postprocess_receipt
+
+    extracted = {
+        "document_type": "receipt",
+        "merchant": "TEST",
+        "total": 300,
+        "subtotal": 300,
+        "taxes": [],
+        "line_items": [
+            {"description": "ITEM A", "qty": 1, "unit_price": 100, "total": 100, "discount": 0},
+            {"description": "ITEM B", "qty": 1, "unit_price": 200, "total": 200, "discount": 0},
+            {"description": "ITEM B", "qty": 1, "unit_price": 200, "total": 200, "discount": 0},
+        ],
+    }
+    ocr_text = "\n".join([
+        "ITEM A 100",
+        "ITEM B 200",
+        "SUBTOTAL",
+        "300",
+    ])
+    trace = []
+
+    postprocess_receipt(
+        extracted,
+        ocr_text,
+        0.9,
+        {},
+        {},
+        "test-model",
+        mutation_trace=trace,
+    )
+
+    assert [item["description"] for item in extracted["line_items"]] == ["ITEM A", "ITEM B"]
+    assert sum(item["total"] for item in extracted["line_items"]) == 300
+    assert not [
+        event
+        for event in trace
+        if event["stage"] == "drop_duplicate_rows_when_subtotal_balances"
+    ]
+
+
+def test_final_receipt_output_repairs_do_not_drop_duplicate_row_cleanup():
     from receipt_parser.pipeline import _apply_final_receipt_output_repairs
 
     result = {
@@ -8750,17 +8792,17 @@ def test_final_receipt_output_repairs_trace_duplicate_row_cleanup_owner():
 
     _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=trace)
 
-    assert [item["description"] for item in result["line_items"]] == ["ITEM A", "ITEM B"]
-    assert sum(item["total"] for item in result["line_items"]) == 300
+    assert [item["description"] for item in result["line_items"]] == [
+        "ITEM A",
+        "ITEM B",
+        "ITEM B",
+    ]
     duplicate_events = [
         event
         for event in trace
         if event["stage"] == "drop_duplicate_rows_when_subtotal_balances"
     ]
-    assert duplicate_events
-    assert duplicate_events[0]["owner_phase"] == "duplicate_row_cleanup"
-    assert duplicate_events[0]["owner_invariant"]
-    assert duplicate_events[0]["justification"]
+    assert not duplicate_events
 
 
 def test_parent_company_header_prefers_consumer_katakana_store_brand():
