@@ -294,11 +294,19 @@ FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER = (
     "_run_final_following_ocr_price_projection_phase"
 )
 FINAL_FOLLOWING_OCR_PRICE_PROJECTION_STAGE_LIMIT = 1
-FINAL_MERCHANT_IDENTITY_REPAIR_REPAIRS = {
+MERCHANT_IDENTITY_REPAIR_REPAIRS = {
     "_fix_company_name_merchant",
 }
-FINAL_MERCHANT_IDENTITY_REPAIR_HELPER = "_run_final_merchant_identity_repair_phase"
-FINAL_MERCHANT_IDENTITY_REPAIR_STAGE_LIMIT = 1
+MERCHANT_IDENTITY_REPAIR_PHASE_HELPER = "_run_merchant_identity_repair_phase"
+MERCHANT_IDENTITY_REPAIR_PHASE_CALL_LIMIT = 1
+OUTPUT_MERCHANT_IDENTITY_REPAIR_PHASE_HELPER = (
+    "_run_receipt_output_merchant_identity_phase"
+)
+OUTPUT_MERCHANT_IDENTITY_REPAIR_PHASE_CALL_LIMIT = 1
+RETIRED_FINAL_MERCHANT_IDENTITY_REPAIR_HELPER = (
+    "_run_final_merchant_identity_repair_phase"
+)
+RETIRED_FINAL_MERCHANT_IDENTITY_REPAIR_STAGE = "company_name_merchant"
 FINAL_EMBEDDED_PRICE_DUPLICATE_CLEANUP_REPAIRS = {
     "_drop_duplicate_with_embedded_price",
 }
@@ -516,7 +524,6 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "printed_summary_total_tax_balanced",
     "printed_item_sum_total",
     "ocr_description_reconciliation",
-    "company_name_merchant",
     "adjacent_price_shift_reconciliation",
     "repeated_item_gap",
     "dense_sequence_rows",
@@ -2433,50 +2440,126 @@ def test_final_following_ocr_price_projection_debt_is_helper_owned():
     )
 
 
-def test_final_merchant_identity_repair_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
-    helper = _function_def(tree, FINAL_MERCHANT_IDENTITY_REPAIR_HELPER)
+def test_merchant_identity_repair_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, MERCHANT_IDENTITY_REPAIR_PHASE_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
     missing_repairs = sorted(
-        FINAL_MERCHANT_IDENTITY_REPAIR_REPAIRS
+        MERCHANT_IDENTITY_REPAIR_REPAIRS
         - set(_call_names_in_function(helper))
     )
     assert not missing_repairs, (
-        "Late merchant identity repair must be owned by the named "
-        f"{FINAL_MERCHANT_IDENTITY_REPAIR_HELPER} helper.\n"
+        "Merchant identity repair must be owned by the named "
+        f"{MERCHANT_IDENTITY_REPAIR_PHASE_HELPER} helper.\n"
         f"Missing helper calls: {missing_repairs}"
     )
     assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_MERCHANT_IDENTITY_REPAIR_HELPER} must document the "
+        f"{MERCHANT_IDENTITY_REPAIR_PHASE_HELPER} must document the "
         "header/legal-name trigger and merchant field-consistency invariant."
     )
 
 
-def test_final_merchant_identity_repair_debt_is_helper_owned():
+def test_postprocess_merchant_identity_repair_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_merchant_calls = [
+        name
+        for name in postprocess_calls
+        if name in MERCHANT_IDENTITY_REPAIR_REPAIRS
+    ]
+    helper_calls = [
+        name for name in postprocess_calls if name == MERCHANT_IDENTITY_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_merchant_calls, (
+        "Merchant identity repair should run through the named postprocess helper "
+        "so header/company-name evidence and merchant field consistency have "
+        "one owner.\n"
+        "Direct calls still in postprocess_receipt: "
+        f"{direct_merchant_calls}"
+    )
+    assert 0 < len(helper_calls) <= MERCHANT_IDENTITY_REPAIR_PHASE_CALL_LIMIT, (
+        "Merchant identity phase calls must be explicit and bounded.\n"
+        f"Current count: {len(helper_calls)}; "
+        f"limit: {MERCHANT_IDENTITY_REPAIR_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_final_merchant_identity_repair_debt_is_removed():
     tree = _parse_file(PARSER_DIR / "pipeline.py")
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_merchant_calls = [
         name
         for name in final_calls
-        if name in FINAL_MERCHANT_IDENTITY_REPAIR_REPAIRS
-    ]
-    helper_calls = [
-        name for name in final_calls if name == FINAL_MERCHANT_IDENTITY_REPAIR_HELPER
+        if name in MERCHANT_IDENTITY_REPAIR_REPAIRS
     ]
 
     assert not direct_merchant_calls, (
-        "Late merchant identity repair should run through the named helper "
-        "so header/company-name evidence and merchant field consistency have "
-        "one owner.\n"
+        "Merchant identity repair should not run directly in late final output "
+        "repairs after postprocess owns the behavior.\n"
         "Direct calls still in _apply_final_receipt_output_repairs: "
         f"{direct_merchant_calls}"
     )
-    assert 0 < len(helper_calls) <= FINAL_MERCHANT_IDENTITY_REPAIR_STAGE_LIMIT, (
-        "Late merchant identity helper calls must be explicit and bounded.\n"
+    assert RETIRED_FINAL_MERCHANT_IDENTITY_REPAIR_HELPER not in final_calls, (
+        "The late merchant identity repair helper should not be called from "
+        "_apply_final_receipt_output_repairs."
+    )
+    assert (
+        RETIRED_FINAL_MERCHANT_IDENTITY_REPAIR_STAGE not in FINAL_OUTPUT_REPAIR_STAGES
+    ), (
+        "The merchant identity final-output stage should be removed from the "
+        "tracked late repair list."
+    )
+
+
+def test_output_merchant_identity_repair_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    helper = _function_def(tree, OUTPUT_MERCHANT_IDENTITY_REPAIR_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        MERCHANT_IDENTITY_REPAIR_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Receipt output merchant identity repair must be owned by the named "
+        f"{OUTPUT_MERCHANT_IDENTITY_REPAIR_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{OUTPUT_MERCHANT_IDENTITY_REPAIR_PHASE_HELPER} must document the "
+        "header/legal-name trigger and merchant field-consistency invariant."
+    )
+
+
+def test_prepare_receipt_output_merchant_identity_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    prepare_output = _function_def(tree, "_prepare_receipt_output_payload")
+    prepare_calls = _call_names_in_function(prepare_output)
+    direct_merchant_calls = [
+        name
+        for name in prepare_calls
+        if name in MERCHANT_IDENTITY_REPAIR_REPAIRS
+    ]
+    helper_calls = [
+        name
+        for name in prepare_calls
+        if name == OUTPUT_MERCHANT_IDENTITY_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_merchant_calls, (
+        "Receipt output merchant identity repair should run through the named "
+        "phase so post-serialization merchant consistency has one owner.\n"
+        "Direct calls still in _prepare_receipt_output_payload: "
+        f"{direct_merchant_calls}"
+    )
+    assert 0 < len(helper_calls) <= OUTPUT_MERCHANT_IDENTITY_REPAIR_PHASE_CALL_LIMIT, (
+        "Receipt output merchant identity phase calls must be explicit and bounded.\n"
         f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_MERCHANT_IDENTITY_REPAIR_STAGE_LIMIT}"
+        f"limit: {OUTPUT_MERCHANT_IDENTITY_REPAIR_PHASE_CALL_LIMIT}"
     )
 
 

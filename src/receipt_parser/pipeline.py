@@ -823,6 +823,50 @@ def _record_final_receipt_output_repair(
         mutation_trace[-1]["justification"] = justification
 
 
+RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
+    "receipt_output_merchant_identity": (
+        "header_identity_repair",
+        "Owned by the receipt output merchant identity phase after Receipt serialization can reintroduce parent-company merchant text.",
+    ),
+}
+
+
+def _record_receipt_output_repair(
+    stage: str,
+    result: dict,
+    mutation_trace: list[dict] | None,
+    repair: Callable[[], None],
+) -> None:
+    before = (
+        _snapshot_receipt_mutation_fields(result)
+        if mutation_trace is not None
+        else None
+    )
+    repair()
+    trace_len = len(mutation_trace) if mutation_trace is not None else 0
+    _record_receipt_mutation(mutation_trace, stage, before, result)
+    if mutation_trace is not None and len(mutation_trace) > trace_len:
+        owner_phase, justification = RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS[stage]
+        mutation_trace[-1]["owner_phase"] = owner_phase
+        mutation_trace[-1]["owner_invariant"] = POSTPROCESS_PHASE_BY_NAME[owner_phase][
+            "invariant"
+        ]
+        mutation_trace[-1]["justification"] = justification
+
+
+def _run_receipt_output_merchant_identity_phase(
+    result: dict,
+    ocr_text: str | None,
+) -> None:
+    """Trigger: serialized receipt output has OCR header merchant evidence.
+
+    Invariant: merchant changes must be backed by visible header text and keep
+    the merchant field consistent with valid receipt identity candidates.
+    """
+    if result.get("document_type") == "receipt" and ocr_text:
+        _fix_company_name_merchant(result, ocr_text)
+
+
 def _run_final_structural_item_projection_phase(
     result: dict,
     ocr_text: str,
@@ -1004,25 +1048,6 @@ def _run_final_header_location_repair_phase(
             _normalize_noisy_city_location(result, ocr_text)
         else:
             raise ValueError(f"Unknown final header location repair: {repair}")
-
-
-def _run_final_merchant_identity_repair_phase(
-    result: dict,
-    ocr_text: str,
-    repairs: tuple[str, ...],
-) -> None:
-    """Trigger: header legal-name, authority, or brand/company-name evidence.
-
-    Invariant: merchant changes must be backed by visible header text and keep
-    the merchant field consistent with valid receipt identity candidates.
-    """
-    for repair in repairs:
-        if repair == "company_name_merchant":
-            _fix_company_name_merchant(result, ocr_text)
-        else:
-            raise ValueError(
-                f"Unknown final merchant identity repair: {repair}"
-            )
 
 
 def _run_final_single_rate_inclusive_tax_restoration_phase(
@@ -1558,10 +1583,6 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "JAN/barcode-adjacent description cleanup moves out of "
         "post-serialization repair.",
     ),
-    "company_name_merchant": (
-        "header_identity_repair",
-        "Owned by the final merchant identity helper until legal-name/header merchant cleanup moves out of post-serialization repair.",
-    ),
     "adjacent_price_shift_reconciliation": (
         "structural_item_reconstruction",
         "Owned by the final adjacent price-shift reconciliation helper until "
@@ -1858,14 +1879,6 @@ def _apply_final_receipt_output_repairs(
         ),
     )
     run(
-        "company_name_merchant",
-        lambda: _run_final_merchant_identity_repair_phase(
-            result,
-            ocr_text,
-            ("company_name_merchant",),
-        ),
-    )
-    run(
         "adjacent_price_shift_reconciliation",
         lambda: _run_final_adjacent_price_shift_reconciliation_phase(
             result,
@@ -2079,6 +2092,12 @@ def _prepare_receipt_output_payload(
     mutation_trace: list[dict] | None = None,
 ) -> dict:
     result = receipt.model_dump()
+    _record_receipt_output_repair(
+        "receipt_output_merchant_identity",
+        result,
+        mutation_trace,
+        lambda: _run_receipt_output_merchant_identity_phase(result, ocr_text),
+    )
     _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=mutation_trace)
     return result
 

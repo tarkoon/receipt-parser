@@ -8567,7 +8567,41 @@ def test_phone_number_merchant_recovers_visible_header_brand():
     assert extracted["merchant"] == "テストストア"
 
 
-def test_final_receipt_output_repairs_reject_invoice_registration_merchant():
+def test_postprocess_receipt_rejects_invoice_registration_merchant():
+    from receipt_parser.pipeline_receipt import postprocess_receipt
+
+    extracted = {
+        "document_type": "receipt",
+        "merchant": "T1234567890123",
+        "line_items": [],
+        "taxes": [],
+    }
+    ocr_text = "\n".join([
+        "支店名",
+        "テストストア (0940)38-0130",
+        "登録番号",
+        "T1234567890123",
+        "領収証",
+    ])
+    trace = []
+
+    postprocess_receipt(
+        extracted,
+        ocr_text,
+        0.9,
+        {},
+        {},
+        "test-model",
+        mutation_trace=trace,
+    )
+
+    assert extracted["merchant"] == "テストストア"
+    assert not [
+        event for event in trace if event["stage"] == "company_name_merchant"
+    ]
+
+
+def test_final_receipt_output_repairs_leave_invoice_registration_merchant():
     from receipt_parser.pipeline import _apply_final_receipt_output_repairs
 
     result = {
@@ -8587,14 +8621,47 @@ def test_final_receipt_output_repairs_reject_invoice_registration_merchant():
 
     _apply_final_receipt_output_repairs(result, ocr_text, mutation_trace=trace)
 
-    assert result["merchant"] == "テストストア"
-    company_events = [
+    assert result["merchant"] == "T1234567890123"
+    assert not [
         event for event in trace if event["stage"] == "company_name_merchant"
     ]
-    assert company_events
-    assert company_events[0]["owner_phase"] == "header_identity_repair"
-    assert company_events[0]["owner_invariant"]
-    assert company_events[0]["justification"]
+
+
+def test_prepare_receipt_output_payload_repairs_merchant_before_final_stack():
+    from receipt_parser.pipeline import _prepare_receipt_output_payload
+    from receipt_parser.schema import Receipt
+
+    receipt = Receipt(
+        document_type="receipt",
+        merchant="AEON",
+        line_items=[],
+        taxes=[],
+    )
+    ocr_text = "\n".join([
+        "AEON",
+        "マックスバリュくりえいと宗像店",
+        "イオン九州株式会社",
+        "登録番号 T1234567890123",
+        "領収証",
+    ])
+    trace = []
+
+    result = _prepare_receipt_output_payload(
+        receipt,
+        ocr_text,
+        mutation_trace=trace,
+    )
+
+    assert result["merchant"] == "マックスバリュ"
+    output_events = [
+        event
+        for event in trace
+        if event["stage"] == "receipt_output_merchant_identity"
+    ]
+    assert output_events
+    assert output_events[0]["owner_phase"] == "header_identity_repair"
+    assert output_events[0]["owner_invariant"]
+    assert output_events[0]["justification"]
 
 
 def test_final_receipt_output_repairs_recover_visible_repeated_item_gap():

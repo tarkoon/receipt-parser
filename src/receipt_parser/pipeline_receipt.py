@@ -15304,6 +15304,15 @@ def _run_duplicate_row_cleanup_phase(
             raise ValueError(f"Unknown duplicate row cleanup repair: {repair}")
 
 
+def _run_merchant_identity_repair_phase(extracted: dict, unified_text: str) -> None:
+    """Trigger: OCR header exposes legal-name, authority, or brand evidence.
+
+    Invariant: merchant changes must be backed by visible header text and keep
+    the merchant field consistent with valid receipt identity candidates.
+    """
+    _fix_company_name_merchant(extracted, unified_text)
+
+
 def postprocess_receipt(
     extracted: dict,
     unified_text: str,
@@ -15320,7 +15329,7 @@ def postprocess_receipt(
         if mutation_trace is not None
         else None
     )
-    _fix_company_name_merchant(extracted, unified_text)
+    _run_merchant_identity_repair_phase(extracted, unified_text)
     _run_body_total_layout_reconstruction_phase(
         extracted,
         unified_text,
