@@ -14753,6 +14753,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Structural reconstruction must be triggered by OCR row layout and validated by sums.",
     },
     {
+        "name": "code_prefixed_description_cleanup",
+        "reads": ("line_items", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Code-prefixed description cleanup requires visible OCR/POS item-code prefixes and preserves item description field consistency.",
+    },
+    {
         "name": "duplicate_row_cleanup",
         "reads": ("line_items", "subtotal", "ocr_text"),
         "writes": ("line_items",),
@@ -15598,6 +15604,15 @@ def _run_item_name_price_cleanup_phase(extracted: dict, unified_text: str) -> No
     """
     _fix_non_bag_items_named_as_bag(extracted, unified_text)
     _fix_embedded_price_suffix_totals(extracted, unified_text)
+
+
+def _run_code_prefixed_description_cleanup_phase(extracted: dict) -> None:
+    """Trigger: visible OCR/POS code prefixes remain in item descriptions.
+
+    Invariant: cleanup may change only item description text when stripping a
+    generic code prefix preserves a Japanese product-name field.
+    """
+    _clean_code_prefixed_item_descriptions(extracted)
 
 
 def _run_duplicate_row_cleanup_phase(
@@ -17104,10 +17119,10 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _clean_code_prefixed_item_descriptions(extracted)
+    _run_code_prefixed_description_cleanup_phase(extracted)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
-        "structural_item_reconstruction",
+        "code_prefixed_description_cleanup",
         trace_snapshot,
         extracted,
     )

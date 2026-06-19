@@ -4643,6 +4643,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "dense_item_row_projection",
         "dense_sequence_row_projection",
         "structural_item_reconstruction",
+        "code_prefixed_description_cleanup",
         "duplicate_row_cleanup",
         "basket_marker_rows",
         "final_consistency_pass",
@@ -4696,6 +4697,8 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["dense_item_row_projection"]["writes"]
     assert "line_items" in phases["dense_sequence_row_projection"]["writes"]
     assert "total" in phases["final_consistency_pass"]["writes"]
+    assert "line_items" in phases["code_prefixed_description_cleanup"]["reads"]
+    assert "line_items" in phases["code_prefixed_description_cleanup"]["writes"]
     expected_owners = {
         "line_items": {
             "adjacent_price_shift_reconciliation",
@@ -4723,6 +4726,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "dense_item_row_projection",
             "dense_sequence_row_projection",
             "structural_item_reconstruction",
+            "code_prefixed_description_cleanup",
             "duplicate_row_cleanup",
             "basket_marker_rows",
             "final_consistency_pass",
@@ -8724,19 +8728,26 @@ def test_single_rate_inclusive_tax_block_restores_inline_target_summary():
     assert [item["tax_category"] for item in extracted["line_items"]] == ["10%", "10%", "10%", "10%"]
 
 
-def test_code_prefixed_item_descriptions_are_cleaned_generically():
-    from receipt_parser.pipeline_receipt import _clean_code_prefixed_item_descriptions
+def test_code_prefixed_description_cleanup_phase_uses_generic_code_prefix_field_consistency():
+    from receipt_parser.pipeline_receipt import (
+        _run_code_prefixed_description_cleanup_phase,
+    )
 
     extracted = {
         "line_items": [
             {"description": "470-0244 パンスト 1", "qty": 1, "total": 759},
             {"description": "340-0059 フォーマル", "qty": 1, "total": 1969},
+            {"description": "Generic Item 123", "qty": 1, "total": 123},
         ]
     }
 
-    _clean_code_prefixed_item_descriptions(extracted)
+    _run_code_prefixed_description_cleanup_phase(extracted)
 
-    assert [item["description"] for item in extracted["line_items"]] == ["パンスト", "フォーマル"]
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "パンスト",
+        "フォーマル",
+        "Generic Item 123",
+    ]
 
 
 def test_price_line_reduced_markers_assign_categories_by_item_order():

@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 12
+POSTPROCESS_REPAIR_CALL_LIMIT = 11
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -626,6 +626,13 @@ ITEM_NAME_PRICE_CLEANUP_REPAIRS = {
 }
 ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER = "_run_item_name_price_cleanup_phase"
 ITEM_NAME_PRICE_CLEANUP_PHASE_CALL_LIMIT = 1
+CODE_PREFIXED_DESCRIPTION_CLEANUP_REPAIRS = {
+    "_clean_code_prefixed_item_descriptions",
+}
+CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_HELPER = (
+    "_run_code_prefixed_description_cleanup_phase"
+)
+CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_CALL_LIMIT = 1
 DUPLICATE_ROW_CLEANUP_PHASE_HELPER = "_run_duplicate_row_cleanup_phase"
 FINAL_OUTPUT_REPAIR_STAGES = (
     "barcode_unit_qty_amount_stack",
@@ -4727,6 +4734,60 @@ def test_postprocess_item_name_price_cleanup_debt_is_phase_owned():
         "Item name/price cleanup phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {ITEM_NAME_PRICE_CLEANUP_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_code_prefixed_description_cleanup_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        CODE_PREFIXED_DESCRIPTION_CLEANUP_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Code-prefixed item description cleanup must be owned by the named "
+        f"{CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_HELPER} must document the "
+        "OCR/POS code-prefix trigger and item description field-consistency "
+        "invariant."
+    )
+
+
+def test_postprocess_code_prefixed_description_cleanup_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_cleanup_calls = [
+        name
+        for name in postprocess_calls
+        if name in CODE_PREFIXED_DESCRIPTION_CLEANUP_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_HELPER
+    ]
+
+    assert not direct_cleanup_calls, (
+        "Code-prefixed item description cleanup should run through the named "
+        "phase helper so OCR/POS code prefixes and item description fields "
+        "have one consistency owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_cleanup_calls}"
+    )
+    assert (
+        0
+        < len(phase_calls)
+        <= CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_CALL_LIMIT
+    ), (
+        "Code-prefixed description cleanup phase calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_CALL_LIMIT}"
     )
 
 
