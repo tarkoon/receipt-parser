@@ -1003,6 +1003,25 @@ def test_subtotal_item_price_repair_phase_uses_nearby_ocr_price_and_sum_invarian
     assert sum(item["total"] for item in extracted["line_items"]) == 350.0
 
 
+def test_implausible_tax_amount_repair_phase_uses_rate_base_swap_invariant():
+    from receipt_parser.pipeline_receipt import _run_implausible_tax_amount_repair_phase
+
+    extracted = {
+        "total": 1080,
+        "taxes": [
+            {"rate": "10%", "amount": 1080, "label": "内税"},
+        ],
+    }
+
+    _run_implausible_tax_amount_repair_phase(
+        extracted,
+        "",
+        {"_breakdown_rate_bases": {"10%": 1080}},
+    )
+
+    assert extracted["taxes"][0]["amount"] == 98
+
+
 def test_neighborhood_item_fix_does_not_chase_tax_base_when_items_match_canonical_subtotal():
     from receipt_parser.pipeline_receipt import _fix_item_totals_from_ocr_neighborhood
 
@@ -4636,6 +4655,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "header_identity_repair",
         "transaction_datetime_repair",
         "financial_totals_repair",
+        "implausible_tax_amount_repair",
         "payment_method_repair",
         "toll_payment_reference_repair",
         "cash_tender_reconciliation",
@@ -4686,6 +4706,9 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "date" in phases["header_identity_repair"]["writes"]
     assert "location" in phases["body_total_layout_reconstruction"]["writes"]
     assert "subtotal" in phases["body_total_layout_reconstruction"]["writes"]
+    assert "taxes" in phases["implausible_tax_amount_repair"]["reads"]
+    assert "ocr_text" in phases["implausible_tax_amount_repair"]["reads"]
+    assert "taxes" in phases["implausible_tax_amount_repair"]["writes"]
     assert "line_items" in phases["initial_item_recovery"]["writes"]
     assert "line_items" in phases["body_total_layout_reconstruction"]["writes"]
     assert "line_items" in phases["gap_item_recovery"]["writes"]
@@ -4783,6 +4806,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         },
         "taxes": {
             "financial_totals_repair",
+            "implausible_tax_amount_repair",
             "service_receipt_recovery",
             "single_rate_inclusive_tax_restoration",
             "tax_excluded_rate_block_restoration",

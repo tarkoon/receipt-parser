@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 7
+POSTPROCESS_REPAIR_CALL_LIMIT = 6
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -648,6 +648,13 @@ SUBTOTAL_ITEM_PRICE_REPAIR_REPAIRS = {
 }
 SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_HELPER = "_run_subtotal_item_price_repair_phase"
 SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_CALL_LIMIT = 1
+IMPLAUSIBLE_TAX_AMOUNT_REPAIR_REPAIRS = {
+    "_fix_implausible_tax_amounts",
+}
+IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER = (
+    "_run_implausible_tax_amount_repair_phase"
+)
+IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_CALL_LIMIT = 1
 CODE_PREFIXED_DESCRIPTION_CLEANUP_REPAIRS = {
     "_clean_code_prefixed_item_descriptions",
 }
@@ -4897,6 +4904,52 @@ def test_postprocess_subtotal_item_price_repair_debt_is_phase_owned():
         "Subtotal item price repair phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_implausible_tax_amount_repair_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        IMPLAUSIBLE_TAX_AMOUNT_REPAIR_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Implausible tax amount repairs must be owned by the named "
+        f"{IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER} must document the OCR "
+        "rate-base/tax-swap trigger and tax arithmetic invariant."
+    )
+
+
+def test_postprocess_implausible_tax_amount_repair_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_repair_calls = [
+        name
+        for name in postprocess_calls
+        if name in IMPLAUSIBLE_TAX_AMOUNT_REPAIR_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_repair_calls, (
+        "Implausible tax amount repair should run through the named phase helper "
+        "so OCR rate-base evidence and tax arithmetic have one consistency owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_repair_calls}"
+    )
+    assert 0 < len(phase_calls) <= IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_CALL_LIMIT, (
+        "Implausible tax amount repair phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_CALL_LIMIT}"
     )
 
 

@@ -14531,6 +14531,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Totals must remain consistent with printed cash/tax/summary arithmetic.",
     },
     {
+        "name": "implausible_tax_amount_repair",
+        "reads": ("taxes", "total", "ocr_totals", "ocr_text"),
+        "writes": ("taxes",),
+        "invariant": "Implausible tax amount repair requires OCR rate-base evidence and repairs only rate-base/tax swaps that violate rate arithmetic.",
+    },
+    {
         "name": "payment_method_repair",
         "reads": ("payment_method", "ocr_text", "ocr_confidence", "llm_confidence"),
         "writes": ("payment_method",),
@@ -15642,6 +15648,19 @@ def _run_subtotal_item_price_repair_phase(
     _fix_items_from_subtotal(extracted, unified_text, ocr_totals)
 
 
+def _run_implausible_tax_amount_repair_phase(
+    extracted: dict,
+    unified_text: str,
+    ocr_totals: dict,
+) -> None:
+    """Trigger: OCR rate-base evidence shows tax amount/base column swap.
+
+    Invariant: tax amount changes must correct an implausible amount to the
+    rate-derived value for the printed base and receipt tax inclusion mode.
+    """
+    _fix_implausible_tax_amounts(extracted, unified_text, ocr_totals)
+
+
 def _run_item_name_price_cleanup_phase(extracted: dict, unified_text: str) -> None:
     """Trigger: visible OCR names or embedded price suffixes repair item rows.
 
@@ -15797,7 +15816,13 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _fix_implausible_tax_amounts(extracted, unified_text, ocr_totals)
+    _run_implausible_tax_amount_repair_phase(extracted, unified_text, ocr_totals)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "implausible_tax_amount_repair",
+        trace_snapshot,
+        extracted,
+    )
     _run_transaction_datetime_repair_phase(
         extracted,
         unified_text,
