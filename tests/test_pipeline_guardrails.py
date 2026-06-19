@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 3
+POSTPROCESS_REPAIR_CALL_LIMIT = 2
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -669,6 +669,13 @@ VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER = (
     "_run_vertical_price_qty_total_projection_phase"
 )
 VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_CALL_LIMIT = 1
+STACKED_NAME_PRICE_PROJECTION_REPAIRS = {
+    "_replace_stacked_name_price_rows_when_balanced",
+}
+STACKED_NAME_PRICE_PROJECTION_PHASE_HELPER = (
+    "_run_stacked_name_price_projection_phase"
+)
+STACKED_NAME_PRICE_PROJECTION_PHASE_CALL_LIMIT = 1
 SINGLE_ITEM_QUANTITY_REPAIR_REPAIRS = {
     "_fix_single_item_qty_from_ocr",
 }
@@ -5069,6 +5076,52 @@ def test_postprocess_vertical_price_qty_total_projection_debt_is_phase_owned():
         "bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_stacked_name_price_projection_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, STACKED_NAME_PRICE_PROJECTION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        STACKED_NAME_PRICE_PROJECTION_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Stacked name/price projection must be owned by the named "
+        f"{STACKED_NAME_PRICE_PROJECTION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{STACKED_NAME_PRICE_PROJECTION_PHASE_HELPER} must document the "
+        "stacked OCR name/price trigger and item-sum arithmetic invariant."
+    )
+
+
+def test_postprocess_stacked_name_price_projection_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_projection_calls = [
+        name
+        for name in postprocess_calls
+        if name in STACKED_NAME_PRICE_PROJECTION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == STACKED_NAME_PRICE_PROJECTION_PHASE_HELPER
+    ]
+
+    assert not direct_projection_calls, (
+        "Stacked name/price projection should run through the named phase "
+        "helper so OCR row order and subtotal/total arithmetic have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_projection_calls}"
+    )
+    assert 0 < len(phase_calls) <= STACKED_NAME_PRICE_PROJECTION_PHASE_CALL_LIMIT, (
+        "Stacked name/price projection phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {STACKED_NAME_PRICE_PROJECTION_PHASE_CALL_LIMIT}"
     )
 
 

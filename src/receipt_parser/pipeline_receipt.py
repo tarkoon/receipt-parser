@@ -14687,6 +14687,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Quantity-detail repairs require visible OCR qty/unit rows and qty * unit or discount-adjusted item arithmetic.",
     },
     {
+        "name": "stacked_name_price_projection",
+        "reads": ("line_items", "subtotal", "total", "amount_paid", "taxes", "ocr_text"),
+        "writes": ("line_items", "total", "amount_paid"),
+        "invariant": "Stacked name/price projection requires visible OCR name rows followed by price rows and item-sum consistency with printed subtotal, total, or rate-base arithmetic.",
+    },
+    {
         "name": "stacked_inclusive_tax_restoration",
         "reads": ("taxes", "subtotal", "total", "ocr_text"),
         "writes": ("taxes", "subtotal"),
@@ -15356,6 +15362,18 @@ def _run_stacked_inclusive_tax_restoration_phase(
     target/tax rows and update subtotal only through total-minus-tax arithmetic.
     """
     _restore_stacked_inclusive_tax_block(extracted, unified_text)
+
+
+def _run_stacked_name_price_projection_phase(
+    extracted: dict,
+    unified_text: str,
+) -> None:
+    """Trigger: OCR stacks item names before matching price rows.
+
+    Invariant: projected rows may replace items only when item totals reconcile
+    to printed subtotal, total, printed amount, or rate-base arithmetic.
+    """
+    _replace_stacked_name_price_rows_when_balanced(extracted, unified_text)
 
 
 def _run_single_rate_inclusive_tax_restoration_phase(
@@ -17166,7 +17184,13 @@ def postprocess_receipt(
         unified_text,
         ("qty_context_and_reduced_rate",),
     )
-    _replace_stacked_name_price_rows_when_balanced(extracted, unified_text)
+    _run_stacked_name_price_projection_phase(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "stacked_name_price_projection",
+        trace_snapshot,
+        extracted,
+    )
     _run_stacked_inclusive_tax_restoration_phase(extracted, unified_text)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,

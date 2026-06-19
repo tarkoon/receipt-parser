@@ -4738,6 +4738,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "digit_misread_item_repair",
         "split_price_block_projection",
         "quantity_detail_reconciliation",
+        "stacked_name_price_projection",
         "stacked_inclusive_tax_restoration",
         "single_rate_inclusive_tax_restoration",
         "tax_excluded_rate_block_restoration",
@@ -4801,6 +4802,11 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["split_price_block_projection"]["writes"]
     assert "line_items" in phases["service_receipt_recovery"]["writes"]
     assert "line_items" in phases["quantity_detail_reconciliation"]["writes"]
+    assert "line_items" in phases["stacked_name_price_projection"]["reads"]
+    assert "ocr_text" in phases["stacked_name_price_projection"]["reads"]
+    assert "line_items" in phases["stacked_name_price_projection"]["writes"]
+    assert "total" in phases["stacked_name_price_projection"]["writes"]
+    assert "amount_paid" in phases["stacked_name_price_projection"]["writes"]
     assert "taxes" in phases["stacked_inclusive_tax_restoration"]["reads"]
     assert "ocr_text" in phases["stacked_inclusive_tax_restoration"]["reads"]
     assert "taxes" in phases["stacked_inclusive_tax_restoration"]["writes"]
@@ -4862,6 +4868,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "digit_misread_item_repair",
             "split_price_block_projection",
             "quantity_detail_reconciliation",
+            "stacked_name_price_projection",
             "service_receipt_recovery",
             "single_rate_inclusive_tax_restoration",
             "tax_category_assignment",
@@ -4914,6 +4921,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "external_tax_total_restoration",
             "financial_totals_repair",
             "cash_tender_reconciliation",
+            "stacked_name_price_projection",
             "printed_item_sum_total_repair",
             "printed_summary_total_tax_repair",
             "structural_item_reconstruction",
@@ -4924,6 +4932,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "financial_totals_repair",
             "cash_tender_reconciliation",
             "payment_points_reconciliation",
+            "stacked_name_price_projection",
             "printed_item_sum_total_repair",
             "printed_summary_total_tax_repair",
             "structural_item_reconstruction",
@@ -8852,6 +8861,36 @@ def test_stacked_inclusive_tax_restoration_phase_uses_label_stack_and_subtotal_i
 
     assert extracted["taxes"] == [{"rate": "8%", "label": "内税", "amount": 73.0}]
     assert extracted["subtotal"] == 987.0
+
+
+def test_stacked_name_price_projection_phase_uses_row_order_and_sum_invariant():
+    from receipt_parser.pipeline_receipt import _run_stacked_name_price_projection_phase
+
+    extracted = {
+        "total": 600,
+        "line_items": [
+            {"description": "placeholder", "qty": 1, "unit_price": 600, "total": 600},
+        ],
+    }
+    ocr_text = "\n".join([
+        "テスト商品A",
+        "テスト商品B",
+        "テスト商品C",
+        "¥100",
+        "¥200",
+        "¥300",
+        "合計",
+        "¥600",
+    ])
+
+    _run_stacked_name_price_projection_phase(extracted, ocr_text)
+
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "テスト商品A",
+        "テスト商品B",
+        "テスト商品C",
+    ]
+    assert [item["total"] for item in extracted["line_items"]] == [100.0, 200.0, 300.0]
 
 
 def test_stacked_inclusive_tax_block_preserves_tax_excluded_receipts():
