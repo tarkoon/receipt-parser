@@ -14526,9 +14526,16 @@ POSTPROCESS_PHASES = (
     },
     {
         "name": "financial_totals_repair",
-        "reads": ("subtotal", "total", "amount_paid", "taxes", "ocr_totals", "ocr_text"),
-        "writes": ("subtotal", "total", "amount_paid", "taxes", "payment_method"),
-        "invariant": "Totals must remain consistent with printed cash/tax/summary arithmetic.",
+        "reads": (
+            "subtotal",
+            "total",
+            "taxes",
+            "ocr_totals",
+            "ocr_confidence",
+            "llm_confidence",
+        ),
+        "writes": ("subtotal", "total", "taxes"),
+        "invariant": "Reliable OCR subtotal, total, and tax overrides must preserve subtotal plus tax equals total arithmetic.",
     },
     {
         "name": "implausible_tax_amount_repair",
@@ -15848,6 +15855,20 @@ def _run_transaction_datetime_repair_phase(
             raise ValueError(f"Unknown transaction datetime repair: {repair}")
 
 
+def _run_financial_totals_repair_phase(
+    extracted: dict,
+    ocr_totals: dict,
+    ocr_conf: float,
+    llm_conf: dict | None,
+) -> None:
+    """Trigger: reliable OCR subtotal, total, or tax summary values are present.
+
+    Invariant: subtotal, total, and tax overrides must preserve OCR confidence
+    policy and subtotal/total/tax arithmetic consistency.
+    """
+    _apply_financial_overrides(extracted, ocr_totals, ocr_conf, llm_conf)
+
+
 def postprocess_receipt(
     extracted: dict,
     unified_text: str,
@@ -15876,7 +15897,13 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _apply_financial_overrides(extracted, ocr_totals, ocr_conf, llm_conf)
+    _run_financial_totals_repair_phase(extracted, ocr_totals, ocr_conf, llm_conf)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "financial_totals_repair",
+        trace_snapshot,
+        extracted,
+    )
     _run_cash_tender_reconciliation_phase(
         extracted,
         unified_text,
@@ -15924,12 +15951,6 @@ def postprocess_receipt(
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
         "toll_payment_reference_repair",
-        trace_snapshot,
-        extracted,
-    )
-    trace_snapshot = _record_receipt_phase_mutation(
-        mutation_trace,
-        "financial_totals_repair",
         trace_snapshot,
         extracted,
     )

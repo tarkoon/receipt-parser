@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 2
+POSTPROCESS_REPAIR_CALL_LIMIT = 1
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -620,6 +620,11 @@ BAG_AMOUNT_SHIFT_REPAIRS = {
 }
 BAG_AMOUNT_SHIFT_PHASE_HELPER = "_run_bag_amount_shift_reconciliation_phase"
 BAG_AMOUNT_SHIFT_PHASE_CALL_LIMIT = 3
+FINANCIAL_TOTALS_REPAIR_REPAIRS = {
+    "_apply_financial_overrides",
+}
+FINANCIAL_TOTALS_REPAIR_PHASE_HELPER = "_run_financial_totals_repair_phase"
+FINANCIAL_TOTALS_REPAIR_PHASE_CALL_LIMIT = 1
 LINE_ITEM_CLEANUP_REPAIRS = {
     "_drop_duplicate_with_embedded_price",
     "_drop_non_product_line_items",
@@ -5312,6 +5317,52 @@ def test_postprocess_bag_amount_shift_debt_is_phase_owned():
         "Paid-bag/product amount-shift phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {BAG_AMOUNT_SHIFT_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_financial_totals_repair_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, FINANCIAL_TOTALS_REPAIR_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        FINANCIAL_TOTALS_REPAIR_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Financial totals repair must be owned by the named "
+        f"{FINANCIAL_TOTALS_REPAIR_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{FINANCIAL_TOTALS_REPAIR_PHASE_HELPER} must document the OCR "
+        "totals/confidence trigger and subtotal/total/tax arithmetic invariant."
+    )
+
+
+def test_postprocess_financial_totals_repair_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_repair_calls = [
+        name
+        for name in postprocess_calls
+        if name in FINANCIAL_TOTALS_REPAIR_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == FINANCIAL_TOTALS_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_repair_calls, (
+        "Financial totals repair should run through the named phase helper so "
+        "OCR confidence and subtotal/total/tax arithmetic have one owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_repair_calls}"
+    )
+    assert 0 < len(phase_calls) <= FINANCIAL_TOTALS_REPAIR_PHASE_CALL_LIMIT, (
+        "Financial totals repair phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {FINANCIAL_TOTALS_REPAIR_PHASE_CALL_LIMIT}"
     )
 
 

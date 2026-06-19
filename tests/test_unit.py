@@ -2921,6 +2921,34 @@ def test_external_tax_summary_with_later_inclusive_zero_block_survives_final_rep
     ]
 
 
+def test_financial_totals_repair_phase_uses_ocr_confidence_and_tax_arithmetic():
+    from receipt_parser.pipeline_receipt import _run_financial_totals_repair_phase
+
+    extracted = {
+        "subtotal": 1000.0,
+        "total": 1000.0,
+        "taxes": [{"rate": "10%", "label": "外税", "amount": 10.0}],
+    }
+    ocr_totals = {
+        "subtotal": 900.0,
+        "total": 990.0,
+        "taxes": [{"rate": "10%", "label": "外税", "amount": 90.0}],
+    }
+
+    _run_financial_totals_repair_phase(
+        extracted,
+        ocr_totals,
+        0.95,
+        {"subtotal": 0.9, "total": 0.9, "taxes": 0.9},
+    )
+
+    assert extracted["subtotal"] == 900.0
+    assert extracted["total"] == 990.0
+    assert extracted["taxes"] == [
+        {"rate": "10%", "label": "外税", "amount": 90.0}
+    ]
+
+
 def test_postprocess_recovers_header_location_and_external_tax_split():
     from receipt_parser.pipeline_receipt import postprocess_receipt
 
@@ -4829,7 +4857,12 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["basket_marker_rows"]["writes"]
     assert "taxes" in phases["tax_category_assignment"]["writes"]
     assert "amount_paid" in phases["cash_tender_reconciliation"]["writes"]
+    assert "ocr_totals" in phases["financial_totals_repair"]["reads"]
+    assert "ocr_confidence" in phases["financial_totals_repair"]["reads"]
+    assert "llm_confidence" in phases["financial_totals_repair"]["reads"]
+    assert "subtotal" in phases["financial_totals_repair"]["writes"]
     assert "total" in phases["financial_totals_repair"]["writes"]
+    assert "taxes" in phases["financial_totals_repair"]["writes"]
     assert "payment_method" in phases["payment_method_repair"]["writes"]
     assert "payment_reference" in phases["toll_payment_reference_repair"]["writes"]
     assert "amount_paid" in phases["payment_points_reconciliation"]["reads"]
@@ -4929,7 +4962,6 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         },
         "amount_paid": {
             "external_tax_total_restoration",
-            "financial_totals_repair",
             "cash_tender_reconciliation",
             "payment_points_reconciliation",
             "stacked_name_price_projection",
@@ -4939,7 +4971,6 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "final_consistency_pass",
         },
         "payment_method": {
-            "financial_totals_repair",
             "cash_tender_reconciliation",
             "payment_method_repair",
             "payment_points_reconciliation",
