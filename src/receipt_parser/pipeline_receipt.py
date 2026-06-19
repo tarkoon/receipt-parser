@@ -14633,6 +14633,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Item name/price cleanup requires visible OCR item names or embedded price suffixes and preserves item field consistency.",
     },
     {
+        "name": "priced_name_item_repair",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Priced-name item repair requires an OCR-visible N円 item name, an unmatched OCR amount for that price, and improved subtotal/total item-sum arithmetic.",
+    },
+    {
         "name": "discounted_ocr_item_repair",
         "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
         "writes": ("line_items",),
@@ -15621,6 +15627,15 @@ def _run_item_name_price_cleanup_phase(extracted: dict, unified_text: str) -> No
     _fix_embedded_price_suffix_totals(extracted, unified_text)
 
 
+def _run_priced_name_item_repair_phase(extracted: dict, unified_text: str) -> None:
+    """Trigger: item text prints its own N円 price plus an unmatched OCR amount.
+
+    Invariant: unit/qty/total changes must consume visible OCR amount evidence
+    and strictly improve subtotal or total item-sum arithmetic.
+    """
+    _fix_priced_in_name_items(extracted, unified_text)
+
+
 def _run_code_prefixed_description_cleanup_phase(extracted: dict) -> None:
     """Trigger: visible OCR/POS code prefixes remain in item descriptions.
 
@@ -15817,7 +15832,13 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _fix_priced_in_name_items(extracted, unified_text)
+    _run_priced_name_item_repair_phase(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "priced_name_item_repair",
+        trace_snapshot,
+        extracted,
+    )
     _run_bag_item_ocr_repair_phase(extracted, unified_text)
     _fix_items_from_subtotal(extracted, unified_text, ocr_totals)
     _run_gap_item_recovery_phase(extracted, unified_text, ("missing_items",))

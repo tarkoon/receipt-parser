@@ -4623,6 +4623,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "coupon_discount_projection",
         "following_ocr_price_projection",
         "item_name_price_cleanup",
+        "priced_name_item_repair",
         "discounted_ocr_item_repair",
         "ocr_description_reconciliation",
         "split_price_block_projection",
@@ -4668,6 +4669,9 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["coupon_discount_projection"]["writes"]
     assert "line_items" in phases["following_ocr_price_projection"]["writes"]
     assert "line_items" in phases["item_name_price_cleanup"]["writes"]
+    assert "line_items" in phases["priced_name_item_repair"]["reads"]
+    assert "ocr_text" in phases["priced_name_item_repair"]["reads"]
+    assert "line_items" in phases["priced_name_item_repair"]["writes"]
     assert "line_items" in phases["discounted_ocr_item_repair"]["writes"]
     assert "line_items" in phases["ocr_description_reconciliation"]["writes"]
     assert "line_items" in phases["split_price_block_projection"]["writes"]
@@ -4719,6 +4723,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "coupon_discount_projection",
             "following_ocr_price_projection",
             "item_name_price_cleanup",
+            "priced_name_item_repair",
             "discounted_ocr_item_repair",
             "ocr_description_reconciliation",
             "split_price_block_projection",
@@ -6010,6 +6015,45 @@ def test_item_name_price_cleanup_phase_uses_visible_ocr_and_field_consistency():
         "unit_price": 198.0,
         "total": 198.0,
     }
+
+
+def test_priced_name_item_repair_phase_uses_ocr_amount_and_item_sum_invariant():
+    from receipt_parser.pipeline_receipt import _run_priced_name_item_repair_phase
+
+    extracted = {
+        "subtotal": 500,
+        "total": 500,
+        "line_items": [
+            {
+                "description": "100円均一",
+                "qty": 2,
+                "unit_price": 5,
+                "total": 10,
+            },
+            {
+                "description": "通常商品",
+                "qty": 1,
+                "unit_price": 400,
+                "total": 400,
+            },
+        ],
+    }
+    ocr_text = "\n".join([
+        "000501 100円均一",
+        "¥100",
+        "通常商品",
+        "¥400",
+    ])
+
+    _run_priced_name_item_repair_phase(extracted, ocr_text)
+
+    assert extracted["line_items"][0] == {
+        "description": "100円均一",
+        "qty": 1,
+        "unit_price": 100.0,
+        "total": 100.0,
+    }
+    assert extracted["line_items"][1]["total"] == 400
 
 
 def test_split_bag_price_uses_nearby_single_digit_without_merchant_gate():
