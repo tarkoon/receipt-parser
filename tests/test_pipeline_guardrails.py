@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 13
+POSTPROCESS_REPAIR_CALL_LIMIT = 12
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -545,6 +545,11 @@ CASH_TENDER_RECONCILIATION_REPAIRS = {
 }
 CASH_TENDER_RECONCILIATION_PHASE_HELPER = "_run_cash_tender_reconciliation_phase"
 CASH_TENDER_RECONCILIATION_PHASE_CALL_LIMIT = 2
+PAYMENT_METHOD_REPAIR_REPAIRS = {
+    "_fix_payment_method",
+}
+PAYMENT_METHOD_REPAIR_PHASE_HELPER = "_run_payment_method_repair_phase"
+PAYMENT_METHOD_REPAIR_PHASE_CALL_LIMIT = 1
 TOLL_PAYMENT_REFERENCE_REPAIR_REPAIRS = {
     "_fix_toll_payment_reference",
 }
@@ -4310,6 +4315,51 @@ def test_postprocess_cash_tender_reconciliation_debt_is_phase_owned():
         "Cash tender reconciliation phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {CASH_TENDER_RECONCILIATION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_payment_method_repair_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, PAYMENT_METHOD_REPAIR_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        PAYMENT_METHOD_REPAIR_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Payment method repairs must be owned by the named "
+        f"{PAYMENT_METHOD_REPAIR_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{PAYMENT_METHOD_REPAIR_PHASE_HELPER} must document the OCR payment "
+        "marker trigger and payment_method field-consistency invariant."
+    )
+
+
+def test_postprocess_payment_method_repair_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_payment_calls = [
+        name for name in postprocess_calls if name in PAYMENT_METHOD_REPAIR_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == PAYMENT_METHOD_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_payment_calls, (
+        "Payment method repairs should run through the named phase helper so "
+        "OCR payment markers and payment_method field consistency have one "
+        "owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_payment_calls}"
+    )
+    assert 0 < len(phase_calls) <= PAYMENT_METHOD_REPAIR_PHASE_CALL_LIMIT, (
+        "Payment method repair phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {PAYMENT_METHOD_REPAIR_PHASE_CALL_LIMIT}"
     )
 
 

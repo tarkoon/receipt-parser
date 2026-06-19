@@ -1442,6 +1442,17 @@ def test_payment_method_credit_overrides_hallucinated_cash_without_cash_tender()
     assert extracted["payment_method"] == "credit"
 
 
+def test_payment_method_repair_phase_uses_visible_payment_markers():
+    from receipt_parser.pipeline_receipt import _run_payment_method_repair_phase
+
+    extracted = {"payment_method": "cash"}
+    ocr_text = "お預り票\nクレジットカード\nお釣り\n0"
+
+    _run_payment_method_repair_phase(extracted, ocr_text, 0.9, {})
+
+    assert extracted["payment_method"] == "credit"
+
+
 def test_toll_payment_reference_recovers_handling_number_from_toll_context():
     from receipt_parser.pipeline_receipt import _fix_toll_payment_reference
 
@@ -4595,6 +4606,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "header_identity_repair",
         "transaction_datetime_repair",
         "financial_totals_repair",
+        "payment_method_repair",
         "toll_payment_reference_repair",
         "cash_tender_reconciliation",
         "service_receipt_recovery",
@@ -4675,6 +4687,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "taxes" in phases["tax_category_assignment"]["writes"]
     assert "amount_paid" in phases["cash_tender_reconciliation"]["writes"]
     assert "total" in phases["financial_totals_repair"]["writes"]
+    assert "payment_method" in phases["payment_method_repair"]["writes"]
     assert "payment_reference" in phases["toll_payment_reference_repair"]["writes"]
     assert "amount_paid" in phases["payment_points_reconciliation"]["reads"]
     assert "payment_method" in phases["payment_points_reconciliation"]["writes"]
@@ -4766,6 +4779,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "payment_method": {
             "financial_totals_repair",
             "cash_tender_reconciliation",
+            "payment_method_repair",
             "payment_points_reconciliation",
             "service_receipt_recovery",
         },

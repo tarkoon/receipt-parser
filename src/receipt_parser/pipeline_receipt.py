@@ -14531,6 +14531,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Totals must remain consistent with printed cash/tax/summary arithmetic.",
     },
     {
+        "name": "payment_method_repair",
+        "reads": ("payment_method", "ocr_text", "ocr_confidence", "llm_confidence"),
+        "writes": ("payment_method",),
+        "invariant": "Payment method repair requires visible OCR cash or card/e-money markers and preserves payment_method field consistency.",
+    },
+    {
         "name": "toll_payment_reference_repair",
         "reads": ("payment_reference", "ocr_text"),
         "writes": ("payment_reference",),
@@ -14954,6 +14960,20 @@ def _run_cash_tender_reconciliation_phase(
             _fix_unlabeled_cash_tender_change_block(extracted, unified_text)
         else:
             raise ValueError(f"Unknown cash tender reconciliation repair: {repair}")
+
+
+def _run_payment_method_repair_phase(
+    extracted: dict,
+    unified_text: str,
+    ocr_conf: float | None,
+    llm_conf: dict | None,
+) -> None:
+    """Trigger: OCR-visible cash, card, e-money, tender, or change markers.
+
+    Invariant: payment_method changes must be backed by visible payment
+    markers and preserve the field's cash-vs-credit consistency.
+    """
+    _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
 
 
 def _run_toll_payment_reference_repair_phase(
@@ -15717,7 +15737,13 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
+    _run_payment_method_repair_phase(extracted, unified_text, ocr_conf, llm_conf)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "payment_method_repair",
+        trace_snapshot,
+        extracted,
+    )
     _run_toll_payment_reference_repair_phase(extracted, unified_text)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
