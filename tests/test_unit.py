@@ -4626,6 +4626,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "priced_name_item_repair",
         "discounted_ocr_item_repair",
         "ocr_description_reconciliation",
+        "digit_misread_item_repair",
         "split_price_block_projection",
         "quantity_detail_reconciliation",
         "single_rate_inclusive_tax_restoration",
@@ -4674,6 +4675,9 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["priced_name_item_repair"]["writes"]
     assert "line_items" in phases["discounted_ocr_item_repair"]["writes"]
     assert "line_items" in phases["ocr_description_reconciliation"]["writes"]
+    assert "line_items" in phases["digit_misread_item_repair"]["reads"]
+    assert "ocr_text" in phases["digit_misread_item_repair"]["reads"]
+    assert "line_items" in phases["digit_misread_item_repair"]["writes"]
     assert "line_items" in phases["split_price_block_projection"]["writes"]
     assert "line_items" in phases["service_receipt_recovery"]["writes"]
     assert "line_items" in phases["quantity_detail_reconciliation"]["writes"]
@@ -4726,6 +4730,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "priced_name_item_repair",
             "discounted_ocr_item_repair",
             "ocr_description_reconciliation",
+            "digit_misread_item_repair",
             "split_price_block_projection",
             "quantity_detail_reconciliation",
             "service_receipt_recovery",
@@ -6054,6 +6059,48 @@ def test_priced_name_item_repair_phase_uses_ocr_amount_and_item_sum_invariant():
         "total": 100.0,
     }
     assert extracted["line_items"][1]["total"] == 400
+
+
+def test_digit_misread_item_repair_phase_uses_ocr_marker_and_sum_invariant():
+    from receipt_parser.pipeline_receipt import _run_digit_misread_item_repair_phase
+
+    extracted = {
+        "subtotal": 426,
+        "total": 459,
+        "line_items": [
+            {"description": "商品甲", "qty": 1, "unit_price": 100, "total": 100},
+            {"description": "商品乙", "qty": 1, "unit_price": 200, "total": 200},
+            {"description": "商品丙", "qty": 1, "unit_price": 50, "total": 50},
+            {"description": "商品丁", "qty": 1, "unit_price": 60, "total": 60},
+            {"description": "袋", "qty": 1, "unit_price": 8, "total": 8},
+        ],
+    }
+    ocr_text = "\n".join([
+        "商品甲",
+        "100%",
+        "商品乙",
+        "200*",
+        "商品丙",
+        "50*",
+        "商品丁",
+        "60*",
+        "袋",
+        "8",
+        "小計",
+        "¥426",
+    ])
+
+    _run_digit_misread_item_repair_phase(extracted, ocr_text)
+
+    assert [item["total"] for item in extracted["line_items"]] == [
+        108.0,
+        200,
+        50,
+        60,
+        8,
+    ]
+    assert extracted["line_items"][0]["unit_price"] == 108.0
+    assert sum(item["total"] for item in extracted["line_items"]) == 426.0
 
 
 def test_split_bag_price_uses_nearby_single_digit_without_merchant_gate():

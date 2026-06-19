@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 9
+POSTPROCESS_REPAIR_CALL_LIMIT = 8
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -638,6 +638,11 @@ PRICED_NAME_ITEM_REPAIR_REPAIRS = {
 }
 PRICED_NAME_ITEM_REPAIR_PHASE_HELPER = "_run_priced_name_item_repair_phase"
 PRICED_NAME_ITEM_REPAIR_PHASE_CALL_LIMIT = 1
+DIGIT_MISREAD_ITEM_REPAIR_REPAIRS = {
+    "_fix_digit_misread_items",
+}
+DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER = "_run_digit_misread_item_repair_phase"
+DIGIT_MISREAD_ITEM_REPAIR_PHASE_CALL_LIMIT = 1
 CODE_PREFIXED_DESCRIPTION_CLEANUP_REPAIRS = {
     "_clean_code_prefixed_item_descriptions",
 }
@@ -4793,6 +4798,53 @@ def test_postprocess_priced_name_item_repair_debt_is_phase_owned():
         "Priced-name item repair phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {PRICED_NAME_ITEM_REPAIR_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_digit_misread_item_repair_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        DIGIT_MISREAD_ITEM_REPAIR_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Digit-misread item repairs must be owned by the named "
+        f"{DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER} must document the OCR "
+        "digit-misread trigger and item-sum arithmetic invariant."
+    )
+
+
+def test_postprocess_digit_misread_item_repair_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_repair_calls = [
+        name
+        for name in postprocess_calls
+        if name in DIGIT_MISREAD_ITEM_REPAIR_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER
+    ]
+
+    assert not direct_repair_calls, (
+        "Digit-misread item repair should run through the named phase helper "
+        "so OCR percent-marker evidence and item-sum arithmetic have one "
+        "consistency owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_repair_calls}"
+    )
+    assert 0 < len(phase_calls) <= DIGIT_MISREAD_ITEM_REPAIR_PHASE_CALL_LIMIT, (
+        "Digit-misread item repair phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {DIGIT_MISREAD_ITEM_REPAIR_PHASE_CALL_LIMIT}"
     )
 
 

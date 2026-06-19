@@ -14651,6 +14651,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Description reconciliation requires visible OCR code/name context and must preserve item counts, prices, and totals.",
     },
     {
+        "name": "digit_misread_item_repair",
+        "reads": ("line_items", "subtotal", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Digit-misread item repair requires a small subtotal/total item-sum gap, exactly one digit-confusion candidate, and OCR percent-marker evidence.",
+    },
+    {
         "name": "split_price_block_projection",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -15636,6 +15642,15 @@ def _run_priced_name_item_repair_phase(extracted: dict, unified_text: str) -> No
     _fix_priced_in_name_items(extracted, unified_text)
 
 
+def _run_digit_misread_item_repair_phase(extracted: dict, unified_text: str) -> None:
+    """Trigger: a small item-sum gap matches one OCR digit-confusion marker.
+
+    Invariant: item total changes require exactly one candidate whose corrected
+    amount closes the subtotal/total gap and whose OCR row exposes the marker.
+    """
+    _fix_digit_misread_items(extracted, unified_text)
+
+
 def _run_code_prefixed_description_cleanup_phase(extracted: dict) -> None:
     """Trigger: visible OCR/POS code prefixes remain in item descriptions.
 
@@ -15927,7 +15942,13 @@ def postprocess_receipt(
         unified_text,
         ("qty_code_rows", "code_table_order", "duplicate_descriptions"),
     )
-    _fix_digit_misread_items(extracted, unified_text)
+    _run_digit_misread_item_repair_phase(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "digit_misread_item_repair",
+        trace_snapshot,
+        extracted,
+    )
     _run_ocr_description_reconciliation_phase(
         extracted,
         unified_text,
