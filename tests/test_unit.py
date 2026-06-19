@@ -973,6 +973,36 @@ def test_item_subtotal_fix_does_not_chase_tax_base_when_items_match_canonical_su
     assert totals.count(450) == 1
 
 
+def test_subtotal_item_price_repair_phase_uses_nearby_ocr_price_and_sum_invariant():
+    from receipt_parser.pipeline_receipt import _run_subtotal_item_price_repair_phase
+
+    extracted = {
+        "total": 350,
+        "line_items": [
+            {"description": "テスト商品A", "qty": 1, "unit_price": 100, "total": 100},
+            {"description": "テスト商品B", "qty": 1, "unit_price": 200, "total": 200},
+        ],
+    }
+    ocr_text = "\n".join([
+        "テスト商品A",
+        "¥150",
+        "テスト商品B",
+        "¥200",
+        "小計",
+        "¥350",
+    ])
+
+    _run_subtotal_item_price_repair_phase(
+        extracted,
+        ocr_text,
+        {"subtotal": 350},
+    )
+
+    assert extracted["line_items"][0]["unit_price"] == 150.0
+    assert extracted["line_items"][0]["total"] == 150.0
+    assert sum(item["total"] for item in extracted["line_items"]) == 350.0
+
+
 def test_neighborhood_item_fix_does_not_chase_tax_base_when_items_match_canonical_subtotal():
     from receipt_parser.pipeline_receipt import _fix_item_totals_from_ocr_neighborhood
 
@@ -4619,6 +4649,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "bag_amount_shift_reconciliation",
         "item_cleanup",
         "phantom_tax_amount_cleanup",
+        "subtotal_item_price_repair",
         "discount_consistency_reconciliation",
         "coupon_discount_projection",
         "following_ocr_price_projection",
@@ -4666,6 +4697,9 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["phantom_tax_amount_cleanup"]["reads"]
     assert "taxes" in phases["phantom_tax_amount_cleanup"]["reads"]
     assert "line_items" in phases["phantom_tax_amount_cleanup"]["writes"]
+    assert "line_items" in phases["subtotal_item_price_repair"]["reads"]
+    assert "ocr_text" in phases["subtotal_item_price_repair"]["reads"]
+    assert "line_items" in phases["subtotal_item_price_repair"]["writes"]
     assert "line_items" in phases["discount_consistency_reconciliation"]["writes"]
     assert "line_items" in phases["coupon_discount_projection"]["writes"]
     assert "line_items" in phases["following_ocr_price_projection"]["writes"]
@@ -4723,6 +4757,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "low_value_bag_recovery",
             "item_cleanup",
             "phantom_tax_amount_cleanup",
+            "subtotal_item_price_repair",
             "discount_consistency_reconciliation",
             "coupon_discount_projection",
             "following_ocr_price_projection",

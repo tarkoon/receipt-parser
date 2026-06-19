@@ -14609,6 +14609,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Phantom tax-amount cleanup requires a line total matching a printed tax amount plus suffix/clean-sibling item description consistency.",
     },
     {
+        "name": "subtotal_item_price_repair",
+        "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Subtotal item price repair requires OCR subtotal evidence, nearby OCR item price evidence, and improved item-sum arithmetic.",
+    },
+    {
         "name": "discount_consistency_reconciliation",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -15623,6 +15629,19 @@ def _run_phantom_tax_amount_cleanup_phase(extracted: dict) -> None:
     _drop_phantom_from_tax_amount(extracted)
 
 
+def _run_subtotal_item_price_repair_phase(
+    extracted: dict,
+    unified_text: str,
+    ocr_totals: dict,
+) -> None:
+    """Trigger: OCR subtotal conflicts with parsed item sum and nearby prices.
+
+    Invariant: item price changes must use nearby OCR price evidence and
+    strictly improve the item-sum gap to OCR/canonical subtotal.
+    """
+    _fix_items_from_subtotal(extracted, unified_text, ocr_totals)
+
+
 def _run_item_name_price_cleanup_phase(extracted: dict, unified_text: str) -> None:
     """Trigger: visible OCR names or embedded price suffixes repair item rows.
 
@@ -15855,7 +15874,13 @@ def postprocess_receipt(
         extracted,
     )
     _run_bag_item_ocr_repair_phase(extracted, unified_text)
-    _fix_items_from_subtotal(extracted, unified_text, ocr_totals)
+    _run_subtotal_item_price_repair_phase(extracted, unified_text, ocr_totals)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "subtotal_item_price_repair",
+        trace_snapshot,
+        extracted,
+    )
     _run_gap_item_recovery_phase(extracted, unified_text, ("missing_items",))
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
