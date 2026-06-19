@@ -1056,6 +1056,29 @@ def test_vertical_price_qty_total_projection_phase_uses_row_and_sum_invariant():
     assert sum(item["total"] for item in extracted["line_items"]) == 350.0
 
 
+def test_single_item_quantity_repair_phase_uses_ocr_unit_qty_invariant():
+    from receipt_parser.pipeline_receipt import _run_single_item_quantity_repair_phase
+
+    extracted = {
+        "total": 600,
+        "line_items": [
+            {"description": "テスト商品", "qty": 1, "unit_price": 600, "total": 600},
+        ],
+    }
+    ocr_text = "\n".join([
+        "テスト商品",
+        "@200 x 3",
+        "合計",
+        "¥600",
+    ])
+
+    _run_single_item_quantity_repair_phase(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["qty"] == 3.0
+    assert extracted["line_items"][0]["unit_price"] == 200.0
+    assert extracted["line_items"][0]["total"] == 600.0
+
+
 def test_neighborhood_item_fix_does_not_chase_tax_base_when_items_match_canonical_subtotal():
     from receipt_parser.pipeline_receipt import _fix_item_totals_from_ocr_neighborhood
 
@@ -4727,6 +4750,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "bag_item_rate_base_reconciliation",
         "tax_category_assignment",
         "payment_points_reconciliation",
+        "single_item_quantity_repair",
         "jan_pos_row_projection",
         "barcode_row_projection",
         "dense_item_row_projection",
@@ -4799,6 +4823,9 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "payment_reference" in phases["toll_payment_reference_repair"]["writes"]
     assert "amount_paid" in phases["payment_points_reconciliation"]["reads"]
     assert "payment_method" in phases["payment_points_reconciliation"]["writes"]
+    assert "line_items" in phases["single_item_quantity_repair"]["reads"]
+    assert "ocr_text" in phases["single_item_quantity_repair"]["reads"]
+    assert "line_items" in phases["single_item_quantity_repair"]["writes"]
     assert "line_items" in phases["jan_pos_row_projection"]["writes"]
     assert "line_items" in phases["barcode_row_projection"]["writes"]
     assert "line_items" in phases["dense_item_row_projection"]["writes"]
@@ -4833,6 +4860,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "service_receipt_recovery",
             "single_rate_inclusive_tax_restoration",
             "tax_category_assignment",
+            "single_item_quantity_repair",
             "jan_pos_row_projection",
             "barcode_row_projection",
             "dense_item_row_projection",

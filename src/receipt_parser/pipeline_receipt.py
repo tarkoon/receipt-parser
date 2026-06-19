@@ -14759,6 +14759,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Payment, points, and subtotal changes must preserve total/tax arithmetic.",
     },
     {
+        "name": "single_item_quantity_repair",
+        "reads": ("line_items", "total", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Single-item quantity repair requires OCR @unit x qty notation and unit*qty arithmetic matching the item or receipt total.",
+    },
+    {
         "name": "jan_pos_row_projection",
         "reads": ("line_items", "subtotal", "total", "ocr_text", "ocr_totals"),
         "writes": ("line_items",),
@@ -15677,6 +15683,18 @@ def _run_vertical_price_qty_total_projection_phase(
     must reconcile to subtotal, total, or total-minus-tax arithmetic.
     """
     _replace_vertical_price_qty_total_rows_when_balanced(extracted, unified_text)
+
+
+def _run_single_item_quantity_repair_phase(
+    extracted: dict,
+    unified_text: str,
+) -> None:
+    """Trigger: a single parsed item has nearby OCR @unit x qty notation.
+
+    Invariant: qty and unit_price may change only when unit * qty reconciles
+    to the item total or receipt total already present on the extraction.
+    """
+    _fix_single_item_qty_from_ocr(extracted, unified_text)
 
 
 def _run_item_name_price_cleanup_phase(extracted: dict, unified_text: str) -> None:
@@ -16702,7 +16720,13 @@ def postprocess_receipt(
 
     _extract_fuel_usage(extracted, unified_text)
     if extracted.get("line_items"):
-        _fix_single_item_qty_from_ocr(extracted, unified_text)
+        _run_single_item_quantity_repair_phase(extracted, unified_text)
+        trace_snapshot = _record_receipt_phase_mutation(
+            mutation_trace,
+            "single_item_quantity_repair",
+            trace_snapshot,
+            extracted,
+        )
     _run_body_total_layout_reconstruction_phase(
         extracted,
         unified_text,
