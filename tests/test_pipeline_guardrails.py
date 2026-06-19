@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 11
+POSTPROCESS_REPAIR_CALL_LIMIT = 10
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -620,6 +620,13 @@ LINE_ITEM_CLEANUP_REPAIRS = {
 }
 LINE_ITEM_CLEANUP_PHASE_HELPER = "_run_line_item_cleanup_phase"
 LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT = 14
+PHANTOM_TAX_AMOUNT_CLEANUP_REPAIRS = {
+    "_drop_phantom_from_tax_amount",
+}
+PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_HELPER = (
+    "_run_phantom_tax_amount_cleanup_phase"
+)
+PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_CALL_LIMIT = 1
 ITEM_NAME_PRICE_CLEANUP_REPAIRS = {
     "_fix_non_bag_items_named_as_bag",
     "_fix_embedded_price_suffix_totals",
@@ -4916,6 +4923,54 @@ def test_postprocess_line_item_cleanup_debt_is_phase_owned():
     assert 0 < len(phase_calls) <= LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT, (
         "Line-item cleanup phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; limit: {LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_phantom_tax_amount_cleanup_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        PHANTOM_TAX_AMOUNT_CLEANUP_REPAIRS - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Phantom tax-amount cleanup must be owned by the named "
+        f"{PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_HELPER} must document the OCR tax "
+        "amount phantom-row trigger and line-item/tax field-consistency "
+        "invariant."
+    )
+
+
+def test_postprocess_phantom_tax_amount_cleanup_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_cleanup_calls = [
+        name
+        for name in postprocess_calls
+        if name in PHANTOM_TAX_AMOUNT_CLEANUP_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_HELPER
+    ]
+
+    assert not direct_cleanup_calls, (
+        "Phantom tax-amount cleanup should run through the named phase helper "
+        "so printed tax amounts and corrupted item rows have one consistency "
+        "owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_cleanup_calls}"
+    )
+    assert 0 < len(phase_calls) <= PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_CALL_LIMIT, (
+        "Phantom tax-amount cleanup phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_CALL_LIMIT}"
     )
 
 

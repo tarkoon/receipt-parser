@@ -14603,6 +14603,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Cleanup may remove or rename rows only when OCR evidence and row sums stay coherent.",
     },
     {
+        "name": "phantom_tax_amount_cleanup",
+        "reads": ("line_items", "taxes", "ocr_text"),
+        "writes": ("line_items",),
+        "invariant": "Phantom tax-amount cleanup requires a line total matching a printed tax amount plus suffix/clean-sibling item description consistency.",
+    },
+    {
         "name": "discount_consistency_reconciliation",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -15596,6 +15602,15 @@ def _run_line_item_cleanup_phase(
             raise ValueError(f"Unknown line-item cleanup repair: {repair}")
 
 
+def _run_phantom_tax_amount_cleanup_phase(extracted: dict) -> None:
+    """Trigger: OCR tax amounts are parsed as corrupted duplicate item rows.
+
+    Invariant: a dropped row must match a printed tax amount and have a
+    suffix-corrupted description whose clean sibling carries that suffix total.
+    """
+    _drop_phantom_from_tax_amount(extracted)
+
+
 def _run_item_name_price_cleanup_phase(extracted: dict, unified_text: str) -> None:
     """Trigger: visible OCR names or embedded price suffixes repair item rows.
 
@@ -15795,7 +15810,13 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _drop_phantom_from_tax_amount(extracted)
+    _run_phantom_tax_amount_cleanup_phase(extracted)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "phantom_tax_amount_cleanup",
+        trace_snapshot,
+        extracted,
+    )
     _fix_priced_in_name_items(extracted, unified_text)
     _run_bag_item_ocr_repair_phase(extracted, unified_text)
     _fix_items_from_subtotal(extracted, unified_text, ocr_totals)

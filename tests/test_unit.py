@@ -4618,6 +4618,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "adjacent_price_shift_reconciliation",
         "bag_amount_shift_reconciliation",
         "item_cleanup",
+        "phantom_tax_amount_cleanup",
         "discount_consistency_reconciliation",
         "coupon_discount_projection",
         "following_ocr_price_projection",
@@ -4660,6 +4661,9 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["adjacent_price_shift_reconciliation"]["writes"]
     assert "line_items" in phases["bag_amount_shift_reconciliation"]["writes"]
     assert "line_items" in phases["item_cleanup"]["writes"]
+    assert "line_items" in phases["phantom_tax_amount_cleanup"]["reads"]
+    assert "taxes" in phases["phantom_tax_amount_cleanup"]["reads"]
+    assert "line_items" in phases["phantom_tax_amount_cleanup"]["writes"]
     assert "line_items" in phases["discount_consistency_reconciliation"]["writes"]
     assert "line_items" in phases["coupon_discount_projection"]["writes"]
     assert "line_items" in phases["following_ocr_price_projection"]["writes"]
@@ -4710,6 +4714,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "bag_item_rate_base_reconciliation",
             "low_value_bag_recovery",
             "item_cleanup",
+            "phantom_tax_amount_cleanup",
             "discount_consistency_reconciliation",
             "coupon_discount_projection",
             "following_ocr_price_projection",
@@ -8747,6 +8752,28 @@ def test_code_prefixed_description_cleanup_phase_uses_generic_code_prefix_field_
         "パンスト",
         "フォーマル",
         "Generic Item 123",
+    ]
+
+
+def test_phantom_tax_amount_cleanup_phase_uses_tax_amount_and_suffix_consistency():
+    from receipt_parser.pipeline_receipt import _run_phantom_tax_amount_cleanup_phase
+
+    extracted = {
+        "taxes": [{"rate": "8%", "label": "内税", "amount": 97}],
+        "line_items": [
+            {"description": "商品A", "qty": 1, "total": 98},
+            {"description": "商品A 98", "qty": 1, "total": 97},
+            {"description": "Service 98", "qty": 1, "total": 97},
+            {"description": "商品B 98", "qty": 1, "total": 97},
+        ],
+    }
+
+    _run_phantom_tax_amount_cleanup_phase(extracted)
+
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "商品A",
+        "Service 98",
+        "商品B 98",
     ]
 
 
