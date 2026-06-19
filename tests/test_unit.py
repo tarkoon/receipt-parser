@@ -1022,6 +1022,40 @@ def test_implausible_tax_amount_repair_phase_uses_rate_base_swap_invariant():
     assert extracted["taxes"][0]["amount"] == 98
 
 
+def test_vertical_price_qty_total_projection_phase_uses_row_and_sum_invariant():
+    from receipt_parser.pipeline_receipt import (
+        _run_vertical_price_qty_total_projection_phase,
+    )
+
+    extracted = {
+        "subtotal": 350,
+        "total": 350,
+        "line_items": [
+            {"description": "placeholder A", "qty": 1, "unit_price": 1, "total": 1},
+            {"description": "placeholder B", "qty": 1, "unit_price": 1, "total": 1},
+        ],
+    }
+    ocr_text = "\n".join([
+        "テスト商品A",
+        "¥100",
+        "2点",
+        "¥200",
+        "テスト商品B",
+        "¥150",
+        "1点",
+        "¥150",
+        "小計",
+        "¥350",
+    ])
+
+    _run_vertical_price_qty_total_projection_phase(extracted, ocr_text)
+
+    assert [item["qty"] for item in extracted["line_items"]] == [2.0, 1.0]
+    assert [item["unit_price"] for item in extracted["line_items"]] == [100.0, 150.0]
+    assert [item["total"] for item in extracted["line_items"]] == [200.0, 150.0]
+    assert sum(item["total"] for item in extracted["line_items"]) == 350.0
+
+
 def test_neighborhood_item_fix_does_not_chase_tax_base_when_items_match_canonical_subtotal():
     from receipt_parser.pipeline_receipt import _fix_item_totals_from_ocr_neighborhood
 
@@ -4673,6 +4707,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "discount_consistency_reconciliation",
         "coupon_discount_projection",
         "following_ocr_price_projection",
+        "vertical_price_qty_total_projection",
         "item_name_price_cleanup",
         "priced_name_item_repair",
         "discounted_ocr_item_repair",
@@ -4726,6 +4761,9 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["discount_consistency_reconciliation"]["writes"]
     assert "line_items" in phases["coupon_discount_projection"]["writes"]
     assert "line_items" in phases["following_ocr_price_projection"]["writes"]
+    assert "line_items" in phases["vertical_price_qty_total_projection"]["reads"]
+    assert "ocr_text" in phases["vertical_price_qty_total_projection"]["reads"]
+    assert "line_items" in phases["vertical_price_qty_total_projection"]["writes"]
     assert "line_items" in phases["item_name_price_cleanup"]["writes"]
     assert "line_items" in phases["priced_name_item_repair"]["reads"]
     assert "ocr_text" in phases["priced_name_item_repair"]["reads"]
@@ -4784,6 +4822,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "discount_consistency_reconciliation",
             "coupon_discount_projection",
             "following_ocr_price_projection",
+            "vertical_price_qty_total_projection",
             "item_name_price_cleanup",
             "priced_name_item_repair",
             "discounted_ocr_item_repair",
@@ -4833,6 +4872,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "single_rate_inclusive_tax_restoration",
             "small_target_only_tax_pruning",
             "structural_item_reconstruction",
+            "vertical_price_qty_total_projection",
             "final_consistency_pass",
         },
         "total": {

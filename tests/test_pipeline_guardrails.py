@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 6
+POSTPROCESS_REPAIR_CALL_LIMIT = 5
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -655,6 +655,13 @@ IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER = (
     "_run_implausible_tax_amount_repair_phase"
 )
 IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_CALL_LIMIT = 1
+VERTICAL_PRICE_QTY_TOTAL_PROJECTION_REPAIRS = {
+    "_replace_vertical_price_qty_total_rows_when_balanced",
+}
+VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER = (
+    "_run_vertical_price_qty_total_projection_phase"
+)
+VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_CALL_LIMIT = 1
 CODE_PREFIXED_DESCRIPTION_CLEANUP_REPAIRS = {
     "_clean_code_prefixed_item_descriptions",
 }
@@ -4950,6 +4957,57 @@ def test_postprocess_implausible_tax_amount_repair_debt_is_phase_owned():
         "Implausible tax amount repair phase calls must be explicit and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_vertical_price_qty_total_projection_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        VERTICAL_PRICE_QTY_TOTAL_PROJECTION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Vertical price/qty/total row projection must be owned by the named "
+        f"{VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER} must document the "
+        "vertical OCR row trigger and unit/qty/subtotal arithmetic invariant."
+    )
+
+
+def test_postprocess_vertical_price_qty_total_projection_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_projection_calls = [
+        name
+        for name in postprocess_calls
+        if name in VERTICAL_PRICE_QTY_TOTAL_PROJECTION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER
+    ]
+
+    assert not direct_projection_calls, (
+        "Vertical price/qty/total projection should run through the named phase "
+        "helper so OCR row order and arithmetic have one consistency owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_projection_calls}"
+    )
+    assert (
+        0 < len(phase_calls)
+        <= VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_CALL_LIMIT
+    ), (
+        "Vertical price/qty/total projection phase calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_CALL_LIMIT}"
     )
 
 
