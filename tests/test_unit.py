@@ -4738,6 +4738,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "digit_misread_item_repair",
         "split_price_block_projection",
         "quantity_detail_reconciliation",
+        "stacked_inclusive_tax_restoration",
         "single_rate_inclusive_tax_restoration",
         "tax_excluded_rate_block_restoration",
         "explicit_tax_amount_restoration",
@@ -4800,6 +4801,10 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["split_price_block_projection"]["writes"]
     assert "line_items" in phases["service_receipt_recovery"]["writes"]
     assert "line_items" in phases["quantity_detail_reconciliation"]["writes"]
+    assert "taxes" in phases["stacked_inclusive_tax_restoration"]["reads"]
+    assert "ocr_text" in phases["stacked_inclusive_tax_restoration"]["reads"]
+    assert "taxes" in phases["stacked_inclusive_tax_restoration"]["writes"]
+    assert "subtotal" in phases["stacked_inclusive_tax_restoration"]["writes"]
     assert "line_items" in phases["single_rate_inclusive_tax_restoration"]["writes"]
     assert "subtotal" in phases["single_rate_inclusive_tax_restoration"]["writes"]
     assert "taxes" in phases["single_rate_inclusive_tax_restoration"]["writes"]
@@ -4875,6 +4880,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "financial_totals_repair",
             "implausible_tax_amount_repair",
             "service_receipt_recovery",
+            "stacked_inclusive_tax_restoration",
             "single_rate_inclusive_tax_restoration",
             "tax_excluded_rate_block_restoration",
             "explicit_tax_amount_restoration",
@@ -4897,6 +4903,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "printed_summary_total_tax_repair",
             "prefixed_tax_marker_item_rows",
             "service_receipt_recovery",
+            "stacked_inclusive_tax_restoration",
             "single_rate_inclusive_tax_restoration",
             "small_target_only_tax_pruning",
             "structural_item_reconstruction",
@@ -8820,6 +8827,31 @@ def test_stacked_inclusive_tax_block_maps_label_values():
     _restore_stacked_inclusive_tax_block(extracted, ocr_text)
 
     assert extracted["taxes"] == [{"rate": "8%", "label": "内税", "amount": 73.0}]
+
+
+def test_stacked_inclusive_tax_restoration_phase_uses_label_stack_and_subtotal_invariant():
+    from receipt_parser.pipeline_receipt import _run_stacked_inclusive_tax_restoration_phase
+
+    extracted = {
+        "total": 1060,
+        "subtotal": 1060,
+        "taxes": [{"rate": "10%", "label": "内税", "amount": 58}],
+    }
+    ocr_text = "\n".join([
+        "10% 対象",
+        "(内消費税等",
+        "(8% 対象",
+        "(内消費税等",
+        "¥5)",
+        "¥0)",
+        "¥987)",
+        "¥73)",
+    ])
+
+    _run_stacked_inclusive_tax_restoration_phase(extracted, ocr_text)
+
+    assert extracted["taxes"] == [{"rate": "8%", "label": "内税", "amount": 73.0}]
+    assert extracted["subtotal"] == 987.0
 
 
 def test_stacked_inclusive_tax_block_preserves_tax_excluded_receipts():

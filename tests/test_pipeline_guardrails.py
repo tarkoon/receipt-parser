@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 4
+POSTPROCESS_REPAIR_CALL_LIMIT = 3
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -518,6 +518,13 @@ SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER = (
     "_run_single_rate_inclusive_tax_restoration_phase"
 )
 SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT = 5
+STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS = {
+    "_restore_stacked_inclusive_tax_block",
+}
+STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER = (
+    "_run_stacked_inclusive_tax_restoration_phase"
+)
+STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT = 1
 TAX_EXCLUDED_RATE_BLOCK_RESTORATION_REPAIRS = {
     "_restore_tax_excluded_per_rate_blocks",
 }
@@ -4168,6 +4175,55 @@ def test_postprocess_single_rate_inclusive_tax_restoration_debt_is_phase_owned()
         "and bounded.\n"
         f"Current count: {len(phase_calls)}; "
         f"limit: {SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT}"
+    )
+
+
+def test_stacked_inclusive_tax_restoration_phase_is_named_and_invariant_backed():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    helper = _function_def(tree, STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER)
+    docstring = ast.get_docstring(helper) or ""
+
+    missing_repairs = sorted(
+        STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS
+        - set(_call_names_in_function(helper))
+    )
+    assert not missing_repairs, (
+        "Stacked inclusive tax restoration must be owned by the named "
+        f"{STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER} helper.\n"
+        f"Missing helper calls: {missing_repairs}"
+    )
+    assert "Trigger:" in docstring and "Invariant:" in docstring, (
+        f"{STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER} must document the "
+        "stacked target/tax OCR trigger and total-minus-tax invariant."
+    )
+
+
+def test_postprocess_stacked_inclusive_tax_restoration_debt_is_phase_owned():
+    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    postprocess = _function_def(tree, "postprocess_receipt")
+    postprocess_calls = _call_names_in_function(postprocess)
+    direct_tax_calls = [
+        name
+        for name in postprocess_calls
+        if name in STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS
+    ]
+    phase_calls = [
+        name
+        for name in postprocess_calls
+        if name == STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER
+    ]
+
+    assert not direct_tax_calls, (
+        "Stacked inclusive tax restoration should run through the named phase "
+        "helper so stacked target/tax rows and subtotal arithmetic have one "
+        "owner.\n"
+        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
+    )
+    assert 0 < len(phase_calls) <= STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT, (
+        "Stacked inclusive tax restoration phase calls must be explicit and "
+        "bounded.\n"
+        f"Current count: {len(phase_calls)}; "
+        f"limit: {STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT}"
     )
 
 

@@ -14687,6 +14687,12 @@ POSTPROCESS_PHASES = (
         "invariant": "Quantity-detail repairs require visible OCR qty/unit rows and qty * unit or discount-adjusted item arithmetic.",
     },
     {
+        "name": "stacked_inclusive_tax_restoration",
+        "reads": ("taxes", "subtotal", "total", "ocr_text"),
+        "writes": ("taxes", "subtotal"),
+        "invariant": "Stacked inclusive tax restoration requires visible rate-target/tax label stacks and total-minus-tax subtotal arithmetic.",
+    },
+    {
         "name": "single_rate_inclusive_tax_restoration",
         "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
         "writes": ("line_items", "taxes", "subtotal"),
@@ -15338,6 +15344,18 @@ def _run_payment_points_reconciliation_phase(
             reconcile_points_payment_from_ocr(extracted, unified_text)
         else:
             raise ValueError(f"Unknown payment points reconciliation repair: {repair}")
+
+
+def _run_stacked_inclusive_tax_restoration_phase(
+    extracted: dict,
+    unified_text: str,
+) -> None:
+    """Trigger: stacked OCR rate-target labels followed by inclusive tax values.
+
+    Invariant: restored inclusive tax entries must come from visible stacked
+    target/tax rows and update subtotal only through total-minus-tax arithmetic.
+    """
+    _restore_stacked_inclusive_tax_block(extracted, unified_text)
 
 
 def _run_single_rate_inclusive_tax_restoration_phase(
@@ -17149,7 +17167,13 @@ def postprocess_receipt(
         ("qty_context_and_reduced_rate",),
     )
     _replace_stacked_name_price_rows_when_balanced(extracted, unified_text)
-    _restore_stacked_inclusive_tax_block(extracted, unified_text)
+    _run_stacked_inclusive_tax_restoration_phase(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "stacked_inclusive_tax_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _run_tax_excluded_rate_block_restoration_phase(
         extracted,
         unified_text,
