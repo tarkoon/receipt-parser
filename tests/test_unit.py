@@ -4058,6 +4058,45 @@ def test_nontaxable_admin_fee_receipt_recovers_single_certificate_item():
     assert extracted["taxes"] == [{"rate": "0%", "label": "非課税", "amount": 0}]
 
 
+def test_line_item_cleanup_phase_runs_broad_ocr_item_repair():
+    from receipt_parser.pipeline_receipt import _run_line_item_cleanup_phase
+
+    extracted = {
+        "total": 300,
+        "subtotal": 300,
+        "taxes": [],
+        "line_items": [],
+    }
+    text = "\n".join([
+        "領収書",
+        "テスト窓口",
+        "0001 テスト証明",
+        "¥300",
+        "小計",
+        "¥300",
+        "非課税対象額",
+        "¥300",
+        "合計",
+        "¥300",
+    ])
+
+    _run_line_item_cleanup_phase(
+        extracted,
+        text,
+        ("broad_ocr_line_item_repair",),
+    )
+
+    assert extracted["line_items"] == [{
+        "description": "テスト証明",
+        "qty": 1,
+        "unit_price": 300.0,
+        "total": 300.0,
+        "tax_category": "0%",
+        "discount": 0,
+        "discount_rate": "",
+    }]
+
+
 def test_postprocess_preserves_nontaxable_admin_fee_item_with_split_subtotal_label():
     from receipt_parser.pipeline_receipt import postprocess_receipt
 
@@ -4806,6 +4845,8 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "line_items" in phases["adjacent_price_shift_reconciliation"]["writes"]
     assert "line_items" in phases["bag_amount_shift_reconciliation"]["writes"]
     assert "line_items" in phases["item_cleanup"]["writes"]
+    assert "taxes" in phases["item_cleanup"]["writes"]
+    assert "ocr_layout_blocks" in phases["item_cleanup"]["reads"]
     assert "line_items" in phases["phantom_tax_amount_cleanup"]["reads"]
     assert "taxes" in phases["phantom_tax_amount_cleanup"]["reads"]
     assert "line_items" in phases["phantom_tax_amount_cleanup"]["writes"]
@@ -4919,6 +4960,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         "taxes": {
             "financial_totals_repair",
             "implausible_tax_amount_repair",
+            "item_cleanup",
             "service_receipt_recovery",
             "stacked_inclusive_tax_restoration",
             "single_rate_inclusive_tax_restoration",

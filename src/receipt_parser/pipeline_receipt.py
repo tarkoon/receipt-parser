@@ -14611,9 +14611,9 @@ POSTPROCESS_PHASES = (
     },
     {
         "name": "item_cleanup",
-        "reads": ("line_items", "subtotal", "total", "ocr_text"),
-        "writes": ("line_items",),
-        "invariant": "Cleanup may remove or rename rows only when OCR evidence and row sums stay coherent.",
+        "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text", "ocr_layout_blocks"),
+        "writes": ("line_items", "taxes"),
+        "invariant": "Cleanup may recover, remove, or rename rows only when OCR evidence, layout context, and row sums stay coherent.",
     },
     {
         "name": "phantom_tax_amount_cleanup",
@@ -15663,14 +15663,21 @@ def _run_line_item_cleanup_phase(
     extracted: dict,
     unified_text: str,
     repairs: tuple[str, ...],
+    ocr_layout_blocks: list[dict] | None = None,
 ) -> None:
-    """Trigger: OCR cleanup exposes duplicate, numeric-marker, or non-product rows.
+    """Trigger: OCR cleanup exposes recoverable, duplicate, numeric, or non-product rows.
 
-    Invariant: cleanup may drop rows only when visible OCR context or duplicate
-    structure supports removal without breaking item-total consistency.
+    Invariant: cleanup may recover or drop rows only when visible OCR/layout
+    context supports the change without breaking item-total consistency.
     """
     for repair in repairs:
-        if repair == "drop_duplicate_embedded_price":
+        if repair == "broad_ocr_line_item_repair":
+            _fix_line_items(
+                extracted,
+                unified_text,
+                ocr_layout_blocks=ocr_layout_blocks,
+            )
+        elif repair == "drop_duplicate_embedded_price":
             if extracted.get("line_items"):
                 _drop_duplicate_with_embedded_price(extracted["line_items"])
         elif repair == "drop_non_product_line_items":
@@ -15965,7 +15972,18 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _fix_line_items(extracted, unified_text, ocr_layout_blocks=ocr_layout_blocks)
+    _run_line_item_cleanup_phase(
+        extracted,
+        unified_text,
+        ("broad_ocr_line_item_repair",),
+        ocr_layout_blocks=ocr_layout_blocks,
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
+    )
     _run_quantity_detail_reconciliation_phase(
         extracted,
         unified_text,

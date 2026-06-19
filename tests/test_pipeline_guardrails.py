@@ -84,7 +84,7 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "postprocess_receipt",
 }
 BASELINE_COMMIT = "c175c17"
-POSTPROCESS_REPAIR_CALL_LIMIT = 1
+POSTPROCESS_REPAIR_CALL_LIMIT = 0
 
 REPAIR_CALL_PREFIXES = (
     "_append_",
@@ -626,12 +626,13 @@ FINANCIAL_TOTALS_REPAIR_REPAIRS = {
 FINANCIAL_TOTALS_REPAIR_PHASE_HELPER = "_run_financial_totals_repair_phase"
 FINANCIAL_TOTALS_REPAIR_PHASE_CALL_LIMIT = 1
 LINE_ITEM_CLEANUP_REPAIRS = {
+    "_fix_line_items",
     "_drop_duplicate_with_embedded_price",
     "_drop_non_product_line_items",
     "_drop_numeric_marker_description_rows",
 }
 LINE_ITEM_CLEANUP_PHASE_HELPER = "_run_line_item_cleanup_phase"
-LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT = 14
+LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT = 15
 PHANTOM_TAX_AMOUNT_CLEANUP_REPAIRS = {
     "_drop_phantom_from_tax_amount",
 }
