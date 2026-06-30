@@ -3,3 +3,13 @@ inherit = "core"
 
 [shell_environment_policy.set]
 GOOGLE_CLOUD_PROJECT = "insight-489412"
+
+[[hooks.SessionStart]]
+matcher = "^compact$"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$repo = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0) { exit 0 }; & (Join-Path $repo '.codex/hooks/debug_receipt_compact_checkpoint.ps1')\""
+command_windows = "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$repo = git rev-parse --show-toplevel; if ($LASTEXITCODE -ne 0) { exit 0 }; & (Join-Path $repo '.codex/hooks/debug_receipt_compact_checkpoint.ps1')\""
+timeout = 10
+statusMessage = "Checking debug-receipt checkpoint"
