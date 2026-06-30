@@ -213,14 +213,14 @@ def test_prod_export_utility_sections_are_adapted():
     }
 
 
-def test_manifest_freshness_requires_updated_at_checksum_and_files():
+def test_manifest_freshness_uses_checksum_files_and_ignored_tombstones():
     row = {"id": "receipt-id", "updated_at": "2026-06-11T00:00:00"}
     entry = {"updated_at": "2026-06-11T00:00:00", "checksum": "abc"}
 
     assert flagged_exporter.manifest_entry_current(
         entry, row, "abc", fixture_files_exist=True
     )
-    assert not flagged_exporter.manifest_entry_current(
+    assert flagged_exporter.manifest_entry_current(
         entry, {**row, "updated_at": "later"}, "abc", fixture_files_exist=True
     )
     assert not flagged_exporter.manifest_entry_current(
@@ -228,6 +228,63 @@ def test_manifest_freshness_requires_updated_at_checksum_and_files():
     )
     assert not flagged_exporter.manifest_entry_current(
         entry, row, "abc", fixture_files_exist=False
+    )
+    assert flagged_exporter.manifest_entry_current(
+        {"status": flagged_exporter.IGNORED_MANIFEST_STATUS},
+        row,
+        "different",
+        fixture_files_exist=False,
+    )
+
+
+def test_manifest_freshness_accepts_matching_fixture_truth_when_manifest_checksum_is_stale(
+    monkeypatch,
+):
+    truth = {"total": 1000, "amount_paid": 900, "points_used": 100}
+    truth_checksum = flagged_exporter.checksum_truth(truth)
+    scratch = Path(tempfile.mkdtemp(dir=Path(__file__).parents[1] / "local"))
+    try:
+        fixture_dir = scratch / "fixtures"
+        fixture_dir.mkdir()
+        (fixture_dir / "receipt_1.jpg").write_bytes(b"image")
+        (fixture_dir / "receipt_1_truth.json").write_text(
+            json.dumps(truth, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(flagged_exporter, "FIXTURES_DIR", fixture_dir)
+
+        assert flagged_exporter.manifest_entry_current(
+            {"fixture": "receipt_1", "checksum": "stale"},
+            {"id": "receipt-id", "updated_at": "later"},
+            truth_checksum,
+            fixture_files_exist=True,
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_changed_existing_manifest_entry_requires_overwrite():
+    entry = {"fixture": "receipt_1", "checksum": "old"}
+
+    assert flagged_exporter.changed_existing_entry_requires_overwrite(
+        entry,
+        fixture_files_exist=True,
+        overwrite=False,
+    )
+    assert not flagged_exporter.changed_existing_entry_requires_overwrite(
+        entry,
+        fixture_files_exist=True,
+        overwrite=True,
+    )
+    assert not flagged_exporter.changed_existing_entry_requires_overwrite(
+        entry,
+        fixture_files_exist=False,
+        overwrite=False,
+    )
+    assert not flagged_exporter.changed_existing_entry_requires_overwrite(
+        None,
+        fixture_files_exist=False,
+        overwrite=False,
     )
 
 
@@ -6715,7 +6772,7 @@ def test_dense_sequence_rows_flushes_pending_quantity_row_before_next_inline_ite
         "taxes": [{"rate": "8%", "label": "外税", "amount": 193}],
         "line_items": [{"description": "dummy", "qty": 1, "unit_price": 2419, "total": 2419}],
     }
-    ocr_text = (Path(__file__).parent.parent / ".data/ocr_cache/variants/receipt_96_v1.txt").read_text(
+    ocr_text = (Path(__file__).parent.parent / ".data/ocr_cache/variants/receipt_95_v1.txt").read_text(
         encoding="utf-8"
     )
 
@@ -7348,7 +7405,7 @@ def test_following_qty_detail_repairs_previous_small_amount_when_summary_balance
             {"description": "りんごクリームデニッ", "qty": 1, "unit_price": 138, "total": 138},
         ],
     }
-    ocr_path = Path(__file__).parent.parent / ".data/ocr_cache/variants/receipt_58_v1.txt"
+    ocr_path = Path(__file__).parent.parent / ".data/ocr_cache/variants/receipt_57_v1.txt"
 
     _repair_previous_item_from_following_qty_detail(extracted, ocr_path.read_text(encoding="utf-8"))
 

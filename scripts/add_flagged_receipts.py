@@ -30,6 +30,7 @@ DEFAULT_REMOTE_COMPOSE_DIR = "/home/tarkoon/apps/paper-ledger-deploy/pi"
 DEFAULT_REMOTE_STORAGE_ROOT = "/home/tarkoon/data/paper-ledger/storage"
 DEFAULT_POSTGRES_USER = "paper_ledger"
 DEFAULT_POSTGRES_DB = "paper_ledger"
+IGNORED_MANIFEST_STATUS = "ignored"
 
 SCALAR_FIELDS = (
     "document_type",
@@ -229,12 +230,23 @@ def manifest_entry_current(
     *,
     fixture_files_exist: bool,
 ) -> bool:
-    if not entry or not fixture_files_exist:
+    if not entry:
         return False
-    return (
-        entry.get("updated_at") == row.get("updated_at")
-        and entry.get("checksum") == truth_checksum
-    )
+    if entry.get("status") == IGNORED_MANIFEST_STATUS:
+        return True
+    if not fixture_files_exist:
+        return False
+    if entry.get("checksum") == truth_checksum:
+        return True
+    fixture_name = entry.get("fixture")
+    if not fixture_name:
+        return False
+    _, truth_path = fixture_paths(fixture_name)
+    try:
+        fixture_truth = json.loads(truth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return checksum_truth(fixture_truth) == truth_checksum
 
 
 def make_manifest_entry(
@@ -271,6 +283,15 @@ def entry_fixture_files_exist(entry: dict[str, Any] | None) -> bool:
         return False
     image_path, truth_path = fixture_paths(entry["fixture"])
     return image_path.exists() and truth_path.exists()
+
+
+def changed_existing_entry_requires_overwrite(
+    entry: dict[str, Any] | None,
+    *,
+    fixture_files_exist: bool,
+    overwrite: bool,
+) -> bool:
+    return bool(entry and entry.get("fixture") and fixture_files_exist and not overwrite)
 
 
 def existing_fixture_numbers() -> set[int]:
@@ -499,17 +520,26 @@ def export_rows(args: argparse.Namespace, rows: list[dict[str, Any]]) -> int:
     manifest = load_manifest(args.manifest)
 
     candidates: list[dict[str, Any]] = []
+    skipped_existing_updates = 0
     for row in rows:
         truth = prod_receipt_to_truth(row, template)
         truth_checksum = checksum_truth(truth)
         entry = manifest["receipts"].get(row["id"])
+        fixture_files_exist = entry_fixture_files_exist(entry)
         current = manifest_entry_current(
             entry,
             row,
             truth_checksum,
-            fixture_files_exist=entry_fixture_files_exist(entry),
+            fixture_files_exist=fixture_files_exist,
         )
         if current:
+            continue
+        if changed_existing_entry_requires_overwrite(
+            entry,
+            fixture_files_exist=fixture_files_exist,
+            overwrite=args.overwrite,
+        ):
+            skipped_existing_updates += 1
             continue
         candidates.append({"row": row, "truth": truth, "checksum": truth_checksum})
 
@@ -525,6 +555,8 @@ def export_rows(args: argparse.Namespace, rows: list[dict[str, Any]]) -> int:
 
     print(f"Flagged rows fetched : {len(rows)}")
     print(f"Changed/new exports : {len(candidates)}")
+    if skipped_existing_updates:
+        print(f"Existing updates skipped: {skipped_existing_updates} (pass --overwrite to replace fixtures)")
     print(f"Mode                : {'apply' if args.apply else 'dry-run'}")
     print()
 
