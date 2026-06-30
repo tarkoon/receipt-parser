@@ -19,6 +19,8 @@ import copy
 import io
 import re
 import subprocess
+
+import pytest
 import tokenize
 from collections import Counter
 from dataclasses import dataclass
@@ -27,8 +29,35 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PARSER_DIR = ROOT / "src" / "receipt_parser"
+FINAL_OUTPUT_PATH = PARSER_DIR / "receipt_output.py"
+PHASE_TRACE_PATH = PARSER_DIR / "receipt_phase_trace.py"
+POSTPROCESS_PATH = PARSER_DIR / "receipt_postprocess.py"
+POSTPROCESS_PHASES_PATH = PARSER_DIR / "receipt_postprocess_phases.py"
+BASELINE_LITERAL_SOURCE_BY_FILE = {
+    PARSER_DIR / "receipt_financial.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_location.py": PARSER_DIR / "pipeline.py",
+    PARSER_DIR / "receipt_output.py": PARSER_DIR / "pipeline.py",
+    PARSER_DIR / "receipt_phase_trace.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_postprocess.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_postprocess_phases.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_row_projection.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_marker_projection.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_item_cleanup.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_recovery.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_late_repairs.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_totals.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_tax_categories.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_identity_payment.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_items.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_projection.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_item_repair.py": PARSER_DIR / "pipeline_receipt.py",
+}
 SCANNED_FILES = tuple(
-    sorted({PARSER_DIR / "pipeline.py", *PARSER_DIR.glob("pipeline_*.py")})
+    sorted({
+        PARSER_DIR / "pipeline.py",
+        *PARSER_DIR.glob("pipeline_*.py"),
+        *PARSER_DIR.glob("receipt_*.py"),
+    })
 )
 
 MERCHANT_OR_STORE_RE = re.compile(
@@ -782,6 +811,10 @@ def _relative(path: Path) -> str:
     return path.relative_to(ROOT).as_posix()
 
 
+def _literal_count_key_path(path: Path) -> Path:
+    return BASELINE_LITERAL_SOURCE_BY_FILE.get(path, path)
+
+
 def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
     parents: dict[ast.AST, ast.AST] = {}
     for node in ast.walk(tree):
@@ -846,8 +879,7 @@ def _parse_file(path: Path) -> ast.Module:
 
 
 def _postprocess_repair_calls() -> list[tuple[str, int]]:
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    function = _function_def(tree, "postprocess_receipt")
+    function = _function_def(_parse_file(POSTPROCESS_PATH), "postprocess_receipt")
     calls = []
     for node in ast.walk(function):
         if not isinstance(node, ast.Call):
@@ -859,7 +891,7 @@ def _postprocess_repair_calls() -> list[tuple[str, int]]:
 
 
 def _final_output_repair_stage_calls() -> list[tuple[str, int]]:
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     function = _function_def(tree, "_apply_final_receipt_output_repairs")
     stages = []
     for node in ast.walk(function):
@@ -873,7 +905,7 @@ def _final_output_repair_stage_calls() -> list[tuple[str, int]]:
 
 
 def _final_output_repair_justifications() -> dict[str, tuple[str, str]]:
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Assign)
@@ -894,7 +926,7 @@ def _final_output_repair_justifications() -> dict[str, tuple[str, str]]:
 
 
 def _postprocess_phase_names() -> set[str]:
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    tree = _parse_file(PHASE_TRACE_PATH)
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Assign)
@@ -920,7 +952,7 @@ def _current_japanese_string_counts() -> Counter[tuple[str, str]]:
     counts: Counter[tuple[str, str]] = Counter()
     for path in SCANNED_FILES:
         tree = _parse_file(path)
-        rel = _relative(path)
+        rel = _relative(_literal_count_key_path(path))
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Constant)
@@ -933,7 +965,8 @@ def _current_japanese_string_counts() -> Counter[tuple[str, str]]:
 
 def _baseline_japanese_string_counts() -> Counter[tuple[str, str]]:
     counts: Counter[tuple[str, str]] = Counter()
-    for path in SCANNED_FILES:
+    baseline_paths = sorted({_literal_count_key_path(path) for path in SCANNED_FILES})
+    for path in baseline_paths:
         rel = _relative(path)
         try:
             source = subprocess.check_output(
@@ -1214,243 +1247,176 @@ def test_postprocess_receipt_repeated_mutators_are_explicitly_allowlisted():
     )
 
 
-def test_jan_pos_row_projection_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, JAN_POS_ROW_PROJECTION_PHASE_HELPER)
+POSTPROCESS_PHASE_INVARIANT_CASES = (
+    ("jan_pos_row_projection", JAN_POS_ROW_PROJECTION_REPAIRS, JAN_POS_ROW_PROJECTION_PHASE_HELPER),
+    ("barcode_row_projection", BARCODE_ROW_PROJECTION_REPAIRS, BARCODE_ROW_PROJECTION_PHASE_HELPER),
+    ("dense_item_row_projection", DENSE_ITEM_ROW_PROJECTION_REPAIRS, DENSE_ITEM_ROW_PROJECTION_PHASE_HELPER),
+    ("dense_sequence_row_projection", DENSE_SEQUENCE_ROW_PROJECTION_REPAIRS, DENSE_SEQUENCE_ROW_PROJECTION_PHASE_HELPER),
+    ("campaign_discount_projection", CAMPAIGN_DISCOUNT_PROJECTION_REPAIRS, CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER),
+    ("split_price_block_projection", SPLIT_PRICE_BLOCK_PROJECTION_REPAIRS, SPLIT_PRICE_BLOCK_PROJECTION_PHASE_HELPER),
+    ("coupon_discount_projection", COUPON_DISCOUNT_PROJECTION_REPAIRS, COUPON_DISCOUNT_PROJECTION_PHASE_HELPER),
+    ("following_ocr_price_projection", FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS, FOLLOWING_OCR_PRICE_PROJECTION_PHASE_HELPER),
+    ("merchant_identity_repair", MERCHANT_IDENTITY_REPAIR_REPAIRS, MERCHANT_IDENTITY_REPAIR_PHASE_HELPER),
+    ("transaction_datetime_repair", TRANSACTION_DATETIME_REPAIR_REPAIRS, TRANSACTION_DATETIME_REPAIR_PHASE_HELPER),
+    ("toll_payment_reference_repair", TOLL_PAYMENT_REFERENCE_REPAIR_REPAIRS, TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER),
+    ("header_location_repair", HEADER_LOCATION_REPAIR_REPAIRS, HEADER_LOCATION_REPAIR_PHASE_HELPER),
+    ("bag_item_ocr_repair", BAG_ITEM_OCR_REPAIR_REPAIRS, BAG_ITEM_OCR_REPAIR_PHASE_HELPER),
+    ("discount_consistency_reconciliation", DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS, DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER),
+    ("discounted_ocr_item_repair", DISCOUNTED_OCR_ITEM_REPAIR_REPAIRS, DISCOUNTED_OCR_ITEM_REPAIR_PHASE_HELPER),
+    ("basket_marker_rows", BASKET_MARKER_ROWS_REPAIRS, BASKET_MARKER_ROWS_PHASE_HELPER),
+    ("quantity_detail_reconciliation", QUANTITY_DETAIL_RECONCILIATION_REPAIRS, QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER),
+    ("tax_category_assignment", TAX_CATEGORY_ASSIGNMENT_REPAIRS, TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER),
+    ("bag_item_rate_base_reconciliation", BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS, BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_HELPER),
+    ("single_rate_inclusive_tax_restoration", SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_REPAIRS, SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER),
+    ("stacked_inclusive_tax_restoration", STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS, STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER),
+    ("tax_excluded_rate_block_restoration", TAX_EXCLUDED_RATE_BLOCK_RESTORATION_REPAIRS, TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_HELPER),
+    ("explicit_tax_amount_restoration", EXPLICIT_TAX_AMOUNT_RESTORATION_REPAIRS, EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_HELPER),
+    ("external_tax_total_restoration", EXTERNAL_TAX_TOTAL_RESTORATION_REPAIRS, EXTERNAL_TAX_TOTAL_RESTORATION_PHASE_HELPER),
+    ("cash_tender_reconciliation", CASH_TENDER_RECONCILIATION_REPAIRS, CASH_TENDER_RECONCILIATION_PHASE_HELPER),
+    ("payment_method_repair", PAYMENT_METHOD_REPAIR_REPAIRS, PAYMENT_METHOD_REPAIR_PHASE_HELPER),
+    ("payment_points_reconciliation", PAYMENT_POINTS_RECONCILIATION_REPAIRS, PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER),
+    ("service_receipt_recovery", SERVICE_RECEIPT_RECOVERY_REPAIRS, SERVICE_RECEIPT_RECOVERY_PHASE_HELPER),
+    ("body_total_layout_reconstruction", BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS, BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_HELPER),
+    ("ocr_description_reconciliation", OCR_DESCRIPTION_RECONCILIATION_REPAIRS, OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER),
+    ("gap_item_recovery", GAP_ITEM_RECOVERY_REPAIRS, GAP_ITEM_RECOVERY_PHASE_HELPER),
+    ("prefixed_tax_marker_item_rows", PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS, PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_HELPER),
+    ("low_value_bag_recovery", LOW_VALUE_BAG_RECOVERY_REPAIRS, LOW_VALUE_BAG_RECOVERY_PHASE_HELPER),
+    ("item_name_price_cleanup", ITEM_NAME_PRICE_CLEANUP_REPAIRS, ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER),
+    ("priced_name_item_repair", PRICED_NAME_ITEM_REPAIR_REPAIRS, PRICED_NAME_ITEM_REPAIR_PHASE_HELPER),
+    ("digit_misread_item_repair", DIGIT_MISREAD_ITEM_REPAIR_REPAIRS, DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER),
+    ("subtotal_item_price_repair", SUBTOTAL_ITEM_PRICE_REPAIR_REPAIRS, SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_HELPER),
+    ("implausible_tax_amount_repair", IMPLAUSIBLE_TAX_AMOUNT_REPAIR_REPAIRS, IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER),
+    ("vertical_price_qty_total_projection", VERTICAL_PRICE_QTY_TOTAL_PROJECTION_REPAIRS, VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER),
+    ("stacked_name_price_projection", STACKED_NAME_PRICE_PROJECTION_REPAIRS, STACKED_NAME_PRICE_PROJECTION_PHASE_HELPER),
+    ("single_item_quantity_repair", SINGLE_ITEM_QUANTITY_REPAIR_REPAIRS, SINGLE_ITEM_QUANTITY_REPAIR_PHASE_HELPER),
+    ("code_prefixed_description_cleanup", CODE_PREFIXED_DESCRIPTION_CLEANUP_REPAIRS, CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_HELPER),
+    ("adjacent_price_shift", ADJACENT_PRICE_SHIFT_REPAIRS, ADJACENT_PRICE_SHIFT_PHASE_HELPER),
+    ("bag_amount_shift", BAG_AMOUNT_SHIFT_REPAIRS, BAG_AMOUNT_SHIFT_PHASE_HELPER),
+    ("financial_totals_repair", FINANCIAL_TOTALS_REPAIR_REPAIRS, FINANCIAL_TOTALS_REPAIR_PHASE_HELPER),
+    ("line_item_cleanup", LINE_ITEM_CLEANUP_REPAIRS, LINE_ITEM_CLEANUP_PHASE_HELPER),
+    ("phantom_tax_amount_cleanup", PHANTOM_TAX_AMOUNT_CLEANUP_REPAIRS, PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_HELPER),
+)
+
+POSTPROCESS_PHASE_OWNERSHIP_CASES = (
+    ("jan_pos_row_projection", JAN_POS_ROW_PROJECTION_REPAIRS, JAN_POS_ROW_PROJECTION_PHASE_HELPER, JAN_POS_ROW_PROJECTION_PHASE_CALL_LIMIT),
+    ("barcode_row_projection", BARCODE_ROW_PROJECTION_REPAIRS, BARCODE_ROW_PROJECTION_PHASE_HELPER, BARCODE_ROW_PROJECTION_PHASE_CALL_LIMIT),
+    ("dense_item_row_projection", DENSE_ITEM_ROW_PROJECTION_REPAIRS, DENSE_ITEM_ROW_PROJECTION_PHASE_HELPER, DENSE_ITEM_ROW_PROJECTION_PHASE_CALL_LIMIT),
+    ("dense_sequence_row_projection", DENSE_SEQUENCE_ROW_PROJECTION_REPAIRS, DENSE_SEQUENCE_ROW_PROJECTION_PHASE_HELPER, DENSE_SEQUENCE_ROW_PROJECTION_PHASE_CALL_LIMIT),
+    ("campaign_discount_projection", CAMPAIGN_DISCOUNT_PROJECTION_REPAIRS, CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER, CAMPAIGN_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT),
+    ("split_price_block_projection", SPLIT_PRICE_BLOCK_PROJECTION_REPAIRS, SPLIT_PRICE_BLOCK_PROJECTION_PHASE_HELPER, SPLIT_PRICE_BLOCK_PROJECTION_PHASE_CALL_LIMIT),
+    ("printed_summary_total_repair", PRINTED_SUMMARY_TOTAL_REPAIR_REPAIRS, PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_HELPER, PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_CALL_LIMIT),
+    ("printed_item_sum_total_repair", PRINTED_ITEM_SUM_TOTAL_REPAIR_REPAIRS, PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_HELPER, PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_CALL_LIMIT),
+    ("printed_external_tax_amount_restoration", PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_REPAIRS, PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_PHASE_HELPER, PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_PHASE_CALL_LIMIT),
+    ("bare_number_tax_summary_restoration", BARE_NUMBER_TAX_SUMMARY_RESTORATION_REPAIRS, BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_HELPER, BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_CALL_LIMIT),
+    ("coupon_discount_projection", COUPON_DISCOUNT_PROJECTION_REPAIRS, COUPON_DISCOUNT_PROJECTION_PHASE_HELPER, COUPON_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT),
+    ("following_ocr_price_projection", FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS, FOLLOWING_OCR_PRICE_PROJECTION_PHASE_HELPER, FOLLOWING_OCR_PRICE_PROJECTION_PHASE_CALL_LIMIT),
+    ("merchant_identity_repair", MERCHANT_IDENTITY_REPAIR_REPAIRS, MERCHANT_IDENTITY_REPAIR_PHASE_HELPER, MERCHANT_IDENTITY_REPAIR_PHASE_CALL_LIMIT),
+    ("transaction_datetime_repair", TRANSACTION_DATETIME_REPAIR_REPAIRS, TRANSACTION_DATETIME_REPAIR_PHASE_HELPER, TRANSACTION_DATETIME_REPAIR_PHASE_CALL_LIMIT),
+    ("toll_payment_reference_repair", TOLL_PAYMENT_REFERENCE_REPAIR_REPAIRS, TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER, TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_CALL_LIMIT),
+    ("header_location_repair", HEADER_LOCATION_REPAIR_REPAIRS, HEADER_LOCATION_REPAIR_PHASE_HELPER, HEADER_LOCATION_REPAIR_PHASE_CALL_LIMIT),
+    ("bag_item_ocr_repair", BAG_ITEM_OCR_REPAIR_REPAIRS, BAG_ITEM_OCR_REPAIR_PHASE_HELPER, BAG_ITEM_OCR_REPAIR_PHASE_CALL_LIMIT),
+    ("discount_consistency_reconciliation", DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS, DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER, DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_CALL_LIMIT),
+    ("discounted_ocr_item_repair", DISCOUNTED_OCR_ITEM_REPAIR_REPAIRS, DISCOUNTED_OCR_ITEM_REPAIR_PHASE_HELPER, DISCOUNTED_OCR_ITEM_REPAIR_PHASE_CALL_LIMIT),
+    ("basket_marker_rows", BASKET_MARKER_ROWS_REPAIRS, BASKET_MARKER_ROWS_PHASE_HELPER, BASKET_MARKER_ROWS_PHASE_CALL_LIMIT),
+    ("quantity_detail_reconciliation", QUANTITY_DETAIL_RECONCILIATION_REPAIRS, QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER, QUANTITY_DETAIL_RECONCILIATION_PHASE_CALL_LIMIT),
+    ("tax_category_assignment", TAX_CATEGORY_ASSIGNMENT_REPAIRS, TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER, TAX_CATEGORY_ASSIGNMENT_PHASE_CALL_LIMIT),
+    ("bag_item_rate_base_reconciliation", BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS, BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_HELPER, BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_CALL_LIMIT),
+    ("single_rate_inclusive_tax_restoration", SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_REPAIRS, SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER, SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT),
+    ("stacked_inclusive_tax_restoration", STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS, STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER, STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT),
+    ("tax_excluded_rate_block_restoration", TAX_EXCLUDED_RATE_BLOCK_RESTORATION_REPAIRS, TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_HELPER, TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_CALL_LIMIT),
+    ("explicit_tax_amount_restoration", EXPLICIT_TAX_AMOUNT_RESTORATION_REPAIRS, EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_HELPER, EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_CALL_LIMIT),
+    ("external_tax_total_restoration", EXTERNAL_TAX_TOTAL_RESTORATION_REPAIRS, EXTERNAL_TAX_TOTAL_RESTORATION_PHASE_HELPER, EXTERNAL_TAX_TOTAL_RESTORATION_PHASE_CALL_LIMIT),
+    ("cash_tender_reconciliation", CASH_TENDER_RECONCILIATION_REPAIRS, CASH_TENDER_RECONCILIATION_PHASE_HELPER, CASH_TENDER_RECONCILIATION_PHASE_CALL_LIMIT),
+    ("payment_method_repair", PAYMENT_METHOD_REPAIR_REPAIRS, PAYMENT_METHOD_REPAIR_PHASE_HELPER, PAYMENT_METHOD_REPAIR_PHASE_CALL_LIMIT),
+    ("payment_points_reconciliation", PAYMENT_POINTS_RECONCILIATION_REPAIRS, PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER, PAYMENT_POINTS_RECONCILIATION_PHASE_CALL_LIMIT),
+    ("service_receipt_recovery", SERVICE_RECEIPT_RECOVERY_REPAIRS, SERVICE_RECEIPT_RECOVERY_PHASE_HELPER, SERVICE_RECEIPT_RECOVERY_PHASE_CALL_LIMIT),
+    ("body_total_layout_reconstruction", BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS, BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_HELPER, BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_CALL_LIMIT),
+    ("ocr_description_reconciliation", OCR_DESCRIPTION_RECONCILIATION_REPAIRS, OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER, OCR_DESCRIPTION_RECONCILIATION_PHASE_CALL_LIMIT),
+    ("gap_item_recovery", GAP_ITEM_RECOVERY_REPAIRS, GAP_ITEM_RECOVERY_PHASE_HELPER, GAP_ITEM_RECOVERY_PHASE_CALL_LIMIT),
+    ("prefixed_tax_marker_item_rows", PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS, PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_HELPER, PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_CALL_LIMIT),
+    ("low_value_bag_recovery", LOW_VALUE_BAG_RECOVERY_REPAIRS, LOW_VALUE_BAG_RECOVERY_PHASE_HELPER, LOW_VALUE_BAG_RECOVERY_PHASE_CALL_LIMIT),
+    ("item_name_price_cleanup", ITEM_NAME_PRICE_CLEANUP_REPAIRS, ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER, ITEM_NAME_PRICE_CLEANUP_PHASE_CALL_LIMIT),
+    ("priced_name_item_repair", PRICED_NAME_ITEM_REPAIR_REPAIRS, PRICED_NAME_ITEM_REPAIR_PHASE_HELPER, PRICED_NAME_ITEM_REPAIR_PHASE_CALL_LIMIT),
+    ("digit_misread_item_repair", DIGIT_MISREAD_ITEM_REPAIR_REPAIRS, DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER, DIGIT_MISREAD_ITEM_REPAIR_PHASE_CALL_LIMIT),
+    ("subtotal_item_price_repair", SUBTOTAL_ITEM_PRICE_REPAIR_REPAIRS, SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_HELPER, SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_CALL_LIMIT),
+    ("implausible_tax_amount_repair", IMPLAUSIBLE_TAX_AMOUNT_REPAIR_REPAIRS, IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER, IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_CALL_LIMIT),
+    ("vertical_price_qty_total_projection", VERTICAL_PRICE_QTY_TOTAL_PROJECTION_REPAIRS, VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER, VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_CALL_LIMIT),
+    ("stacked_name_price_projection", STACKED_NAME_PRICE_PROJECTION_REPAIRS, STACKED_NAME_PRICE_PROJECTION_PHASE_HELPER, STACKED_NAME_PRICE_PROJECTION_PHASE_CALL_LIMIT),
+    ("single_item_quantity_repair", SINGLE_ITEM_QUANTITY_REPAIR_REPAIRS, SINGLE_ITEM_QUANTITY_REPAIR_PHASE_HELPER, SINGLE_ITEM_QUANTITY_REPAIR_PHASE_CALL_LIMIT),
+    ("code_prefixed_description_cleanup", CODE_PREFIXED_DESCRIPTION_CLEANUP_REPAIRS, CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_HELPER, CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_CALL_LIMIT),
+    ("adjacent_price_shift", ADJACENT_PRICE_SHIFT_REPAIRS, ADJACENT_PRICE_SHIFT_PHASE_HELPER, ADJACENT_PRICE_SHIFT_PHASE_CALL_LIMIT),
+    ("bag_amount_shift", BAG_AMOUNT_SHIFT_REPAIRS, BAG_AMOUNT_SHIFT_PHASE_HELPER, BAG_AMOUNT_SHIFT_PHASE_CALL_LIMIT),
+    ("financial_totals_repair", FINANCIAL_TOTALS_REPAIR_REPAIRS, FINANCIAL_TOTALS_REPAIR_PHASE_HELPER, FINANCIAL_TOTALS_REPAIR_PHASE_CALL_LIMIT),
+    ("line_item_cleanup", LINE_ITEM_CLEANUP_REPAIRS, LINE_ITEM_CLEANUP_PHASE_HELPER, LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT),
+    ("phantom_tax_amount_cleanup", PHANTOM_TAX_AMOUNT_CLEANUP_REPAIRS, PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_HELPER, PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_CALL_LIMIT),
+)
+
+
+@pytest.mark.parametrize("label, repairs, helper_name", POSTPROCESS_PHASE_INVARIANT_CASES)
+def test_postprocess_phase_is_named_and_invariant_backed(label, repairs, helper_name):
+    tree = _parse_file(POSTPROCESS_PHASES_PATH)
+    helper = _function_def(tree, helper_name)
     docstring = ast.get_docstring(helper) or ""
 
-    missing_repairs = sorted(
-        JAN_POS_ROW_PROJECTION_REPAIRS - set(_call_names_in_function(helper))
-    )
+    missing_repairs = sorted(repairs - set(_call_names_in_function(helper)))
     assert not missing_repairs, (
-        "JAN POS row projection repairs must be owned by the named "
-        f"{JAN_POS_ROW_PROJECTION_PHASE_HELPER} helper.\n"
+        f"{label} repairs must be owned by the named {helper_name} helper.\n"
         f"Missing helper calls: {missing_repairs}"
     )
     assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{JAN_POS_ROW_PROJECTION_PHASE_HELPER} must document the OCR/layout "
-        "trigger and arithmetic or field-consistency invariant it enforces."
+        f"{helper_name} must document its structural trigger and invariant."
     )
 
 
-def test_postprocess_jan_pos_row_projection_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
+def test_retired_structural_item_projection_phase_is_removed():
+    tree = _parse_file(POSTPROCESS_PHASES_PATH)
+    postprocess = _function_def(_parse_file(POSTPROCESS_PATH), "postprocess_receipt")
     postprocess_calls = _call_names_in_function(postprocess)
-    direct_projection_calls = [
-        name for name in postprocess_calls if name in JAN_POS_ROW_PROJECTION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == JAN_POS_ROW_PROJECTION_PHASE_HELPER
-    ]
 
-    assert not direct_projection_calls, (
-        "JAN POS row projection repairs should run through the named phase "
-        "helper so JAN/item-code OCR triggers and arithmetic invariants have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_projection_calls}"
-    )
-    assert RETIRED_STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER not in postprocess_calls, (
-        "The broad structural item projection phase should not remain after "
-        "JAN POS row projection has a named postprocess owner."
-    )
-    assert not _has_function_def(tree, RETIRED_STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER), (
-        "The broad structural item projection helper should be retired once "
-        "JAN POS row projection has a named postprocess owner."
-    )
-    assert 0 < len(phase_calls) <= JAN_POS_ROW_PROJECTION_PHASE_CALL_LIMIT, (
-        "JAN POS row projection phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {JAN_POS_ROW_PROJECTION_PHASE_CALL_LIMIT}"
-    )
+    assert RETIRED_STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER not in postprocess_calls
+    assert not _has_function_def(tree, RETIRED_STRUCTURAL_ITEM_PROJECTION_PHASE_HELPER)
 
 
-def test_barcode_row_projection_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, BARCODE_ROW_PROJECTION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        BARCODE_ROW_PROJECTION_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Barcode row projection repairs must be owned by the named "
-        f"{BARCODE_ROW_PROJECTION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{BARCODE_ROW_PROJECTION_PHASE_HELPER} must document the OCR/layout "
-        "trigger and arithmetic or field-consistency invariant it enforces."
-    )
-
-
-def test_postprocess_barcode_row_projection_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
+@pytest.mark.parametrize(
+    "label, repairs, helper_name, call_limit", POSTPROCESS_PHASE_OWNERSHIP_CASES
+)
+def test_postprocess_phase_debt_is_phase_owned(label, repairs, helper_name, call_limit):
+    postprocess = _function_def(_parse_file(POSTPROCESS_PATH), "postprocess_receipt")
     postprocess_calls = _call_names_in_function(postprocess)
-    direct_barcode_calls = [
-        name for name in postprocess_calls if name in BARCODE_ROW_PROJECTION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == BARCODE_ROW_PROJECTION_PHASE_HELPER
-    ]
+    direct_calls = [name for name in postprocess_calls if name in repairs]
+    phase_calls = [name for name in postprocess_calls if name == helper_name]
 
-    assert not direct_barcode_calls, (
-        "Barcode row projection repairs should run through the named phase "
-        "helper so barcode OCR triggers and arithmetic invariants have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_barcode_calls}"
+    assert not direct_calls, (
+        f"{label} repairs should run through {helper_name}.\n"
+        f"Direct calls still in postprocess_receipt: {direct_calls}"
     )
-    assert 0 < len(phase_calls) <= BARCODE_ROW_PROJECTION_PHASE_CALL_LIMIT, (
-        "Barcode row projection phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {BARCODE_ROW_PROJECTION_PHASE_CALL_LIMIT}"
+    assert 0 < len(phase_calls) <= call_limit, (
+        f"{label} phase calls must be explicit and bounded.\n"
+        f"Current count: {len(phase_calls)}; limit: {call_limit}"
     )
 
 
-def test_dense_item_row_projection_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, DENSE_ITEM_ROW_PROJECTION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        DENSE_ITEM_ROW_PROJECTION_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Dense item row projection must be owned by the named "
-        f"{DENSE_ITEM_ROW_PROJECTION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{DENSE_ITEM_ROW_PROJECTION_PHASE_HELPER} must document the OCR/layout "
-        "trigger and arithmetic or field-consistency invariant it enforces."
-    )
 
 
-def test_postprocess_dense_item_row_projection_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_dense_calls = [
-        name for name in postprocess_calls if name in DENSE_ITEM_ROW_PROJECTION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == DENSE_ITEM_ROW_PROJECTION_PHASE_HELPER
-    ]
-
-    assert not direct_dense_calls, (
-        "Dense item row projection repairs should run through the named phase "
-        "helper so dense OCR row triggers and arithmetic invariants have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_dense_calls}"
-    )
-    assert 0 < len(phase_calls) <= DENSE_ITEM_ROW_PROJECTION_PHASE_CALL_LIMIT, (
-        "Dense item row projection phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {DENSE_ITEM_ROW_PROJECTION_PHASE_CALL_LIMIT}"
-    )
 
 
-def test_dense_sequence_row_projection_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, DENSE_SEQUENCE_ROW_PROJECTION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        DENSE_SEQUENCE_ROW_PROJECTION_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Dense sequence row projection must be owned by the named "
-        f"{DENSE_SEQUENCE_ROW_PROJECTION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{DENSE_SEQUENCE_ROW_PROJECTION_PHASE_HELPER} must document the OCR/layout "
-        "trigger and arithmetic or field-consistency invariant it enforces."
-    )
 
 
-def test_postprocess_dense_sequence_row_projection_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_sequence_calls = [
-        name
-        for name in postprocess_calls
-        if name in DENSE_SEQUENCE_ROW_PROJECTION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == DENSE_SEQUENCE_ROW_PROJECTION_PHASE_HELPER
-    ]
-
-    assert not direct_sequence_calls, (
-        "Dense sequence row projection repairs should run through the named "
-        "phase helper so dense OCR sequence triggers and arithmetic invariants "
-        "have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_sequence_calls}"
-    )
-    assert 0 < len(phase_calls) <= DENSE_SEQUENCE_ROW_PROJECTION_PHASE_CALL_LIMIT, (
-        "Dense sequence row projection phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {DENSE_SEQUENCE_ROW_PROJECTION_PHASE_CALL_LIMIT}"
-    )
 
 
-def test_campaign_discount_projection_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        CAMPAIGN_DISCOUNT_PROJECTION_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Campaign discount stream projection must be owned by the named "
-        f"{CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER} must document the "
-        "campaign discount OCR trigger and subtotal/discount invariant."
-    )
 
 
-def test_postprocess_campaign_discount_projection_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_projection_calls = [
-        name
-        for name in postprocess_calls
-        if name in CAMPAIGN_DISCOUNT_PROJECTION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER
-    ]
 
-    assert not direct_projection_calls, (
-        "Campaign discount projection should run through the named phase "
-        "helper so campaign discount OCR triggers and subtotal/discount "
-        "invariants have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_projection_calls}"
-    )
-    assert 0 < len(phase_calls) <= CAMPAIGN_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT, (
-        "Campaign discount projection phase calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {CAMPAIGN_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT}"
-    )
+
+
+
+
+
+
 
 
 def test_final_campaign_discount_projection_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_projection_calls = [
@@ -1480,7 +1446,7 @@ def test_final_campaign_discount_projection_debt_is_phase_owned():
 
 
 def test_final_structural_item_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_STRUCTURAL_ITEM_PROJECTION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -1500,7 +1466,7 @@ def test_final_structural_item_projection_helper_is_named_and_invariant_backed()
 
 
 def test_final_structural_item_projection_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_projection_calls = [
@@ -1530,7 +1496,7 @@ def test_final_structural_item_projection_debt_is_helper_owned():
 
 
 def test_final_jan_pos_item_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_JAN_POS_ITEM_PROJECTION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -1550,7 +1516,7 @@ def test_final_jan_pos_item_projection_helper_is_named_and_invariant_backed():
 
 
 def test_final_jan_pos_item_projection_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_jan_calls = [
@@ -1583,7 +1549,7 @@ def test_final_jan_pos_item_projection_debt_is_helper_owned():
 
 
 def test_final_barcode_qty_price_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_BARCODE_QTY_PRICE_PROJECTION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -1603,7 +1569,7 @@ def test_final_barcode_qty_price_projection_helper_is_named_and_invariant_backed
 
 
 def test_final_barcode_qty_price_projection_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_projection_calls = [
@@ -1635,7 +1601,7 @@ def test_final_barcode_qty_price_projection_debt_is_helper_owned():
 
 
 def test_final_item_price_qty_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_ITEM_PRICE_QTY_PROJECTION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -1655,7 +1621,7 @@ def test_final_item_price_qty_projection_helper_is_named_and_invariant_backed():
 
 
 def test_final_item_price_qty_projection_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_projection_calls = [
@@ -1685,7 +1651,7 @@ def test_final_item_price_qty_projection_debt_is_helper_owned():
 
 
 def test_final_split_price_block_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_SPLIT_PRICE_BLOCK_PROJECTION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -1705,7 +1671,7 @@ def test_final_split_price_block_projection_helper_is_named_and_invariant_backed
 
 
 def test_final_split_price_block_projection_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_projection_calls = [
@@ -1734,57 +1700,12 @@ def test_final_split_price_block_projection_debt_is_helper_owned():
     )
 
 
-def test_split_price_block_projection_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, SPLIT_PRICE_BLOCK_PROJECTION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        SPLIT_PRICE_BLOCK_PROJECTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Postprocess split-price block projection must be owned by the named "
-        f"{SPLIT_PRICE_BLOCK_PROJECTION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{SPLIT_PRICE_BLOCK_PROJECTION_PHASE_HELPER} must document split OCR "
-        "name/price block evidence and subtotal/total consistency invariant."
-    )
 
 
-def test_postprocess_split_price_block_projection_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_projection_calls = [
-        name
-        for name in postprocess_calls
-        if name in SPLIT_PRICE_BLOCK_PROJECTION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == SPLIT_PRICE_BLOCK_PROJECTION_PHASE_HELPER
-    ]
-
-    assert not direct_projection_calls, (
-        "Postprocess split-price block projection should run through a named "
-        "phase helper so split OCR name/price evidence and arithmetic "
-        "consistency have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_projection_calls}"
-    )
-    assert 0 < len(phase_calls) <= SPLIT_PRICE_BLOCK_PROJECTION_PHASE_CALL_LIMIT, (
-        "Postprocess split-price block phase calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {SPLIT_PRICE_BLOCK_PROJECTION_PHASE_CALL_LIMIT}"
-    )
 
 
 def test_final_body_total_layout_reconstruction_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -1804,7 +1725,7 @@ def test_final_body_total_layout_reconstruction_helper_is_named_and_invariant_ba
 
 
 def test_final_body_total_layout_reconstruction_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_reconstruction_calls = [
@@ -1834,7 +1755,7 @@ def test_final_body_total_layout_reconstruction_debt_is_helper_owned():
 
 
 def test_final_stacked_name_price_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_STACKED_NAME_PRICE_PROJECTION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -1855,7 +1776,7 @@ def test_final_stacked_name_price_projection_helper_is_named_and_invariant_backe
 
 
 def test_final_stacked_name_price_projection_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_projection_calls = [
@@ -1885,7 +1806,7 @@ def test_final_stacked_name_price_projection_debt_is_helper_owned():
 
 
 def test_final_dense_sequence_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_DENSE_SEQUENCE_PROJECTION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -1905,7 +1826,7 @@ def test_final_dense_sequence_projection_helper_is_named_and_invariant_backed():
 
 
 def test_final_dense_sequence_projection_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_projection_calls = [
@@ -1935,7 +1856,7 @@ def test_final_dense_sequence_projection_debt_is_helper_owned():
 
 
 def test_final_header_location_repair_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_HEADER_LOCATION_REPAIR_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -1955,7 +1876,7 @@ def test_final_header_location_repair_helper_is_named_and_invariant_backed():
 
 
 def test_final_header_location_repair_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_location_calls = [
@@ -1984,7 +1905,7 @@ def test_final_header_location_repair_debt_is_helper_owned():
 
 
 def test_final_single_rate_inclusive_tax_restoration_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -2005,7 +1926,7 @@ def test_final_single_rate_inclusive_tax_restoration_helper_is_named_and_invaria
 
 
 def test_final_single_rate_inclusive_tax_restoration_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_tax_calls = [
@@ -2039,7 +1960,7 @@ def test_final_single_rate_inclusive_tax_restoration_debt_is_helper_owned():
 
 
 def test_final_stacked_inclusive_tax_restoration_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -2060,7 +1981,7 @@ def test_final_stacked_inclusive_tax_restoration_helper_is_named_and_invariant_b
 
 
 def test_final_stacked_inclusive_tax_restoration_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_tax_calls = [
@@ -2092,7 +2013,7 @@ def test_final_stacked_inclusive_tax_restoration_debt_is_helper_owned():
 
 
 def test_final_printed_summary_total_repair_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_PRINTED_SUMMARY_TOTAL_REPAIR_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -2113,7 +2034,7 @@ def test_final_printed_summary_total_repair_helper_is_named_and_invariant_backed
 
 
 def test_final_printed_summary_total_repair_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_total_calls = [
@@ -2145,7 +2066,7 @@ def test_final_printed_summary_total_repair_debt_is_helper_owned():
 
 
 def test_postprocess_printed_summary_total_repair_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    tree = _parse_file(POSTPROCESS_PHASES_PATH)
     helper = _function_def(tree, PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -2164,36 +2085,10 @@ def test_postprocess_printed_summary_total_repair_helper_is_named_and_invariant_
     )
 
 
-def test_postprocess_printed_summary_total_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_total_calls = [
-        name
-        for name in postprocess_calls
-        if name in PRINTED_SUMMARY_TOTAL_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_total_calls, (
-        "Postprocess printed summary total repair should run through the named "
-        "phase helper so printed total/tax triggers and total/tax/payment "
-        "invariants have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_total_calls}"
-    )
-    assert 0 < len(phase_calls) <= PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_CALL_LIMIT, (
-        "Printed summary total repair phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_CALL_LIMIT}"
-    )
 
 
 def test_final_printed_item_sum_total_repair_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -2214,7 +2109,7 @@ def test_final_printed_item_sum_total_repair_helper_is_named_and_invariant_backe
 
 
 def test_final_printed_item_sum_total_repair_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_total_calls = [
@@ -2246,7 +2141,7 @@ def test_final_printed_item_sum_total_repair_debt_is_helper_owned():
 
 
 def test_postprocess_printed_item_sum_total_repair_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    tree = _parse_file(POSTPROCESS_PHASES_PATH)
     helper = _function_def(tree, PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -2265,36 +2160,10 @@ def test_postprocess_printed_item_sum_total_repair_helper_is_named_and_invariant
     )
 
 
-def test_postprocess_printed_item_sum_total_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_total_calls = [
-        name
-        for name in postprocess_calls
-        if name in PRINTED_ITEM_SUM_TOTAL_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_total_calls, (
-        "Postprocess printed item-sum total repair should run through the named "
-        "phase helper so printed item/summary total triggers and item/tax/payment "
-        "invariants have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_total_calls}"
-    )
-    assert 0 < len(phase_calls) <= PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_CALL_LIMIT, (
-        "Printed item-sum total repair phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_CALL_LIMIT}"
-    )
 
 
 def test_final_cash_tender_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_CASH_TENDER_RECONCILIATION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -2315,7 +2184,7 @@ def test_final_cash_tender_reconciliation_helper_is_named_and_invariant_backed()
 
 
 def test_final_cash_tender_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_cash_calls = [
@@ -2344,7 +2213,7 @@ def test_final_cash_tender_reconciliation_debt_is_helper_owned():
 
 
 def test_final_payment_points_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_PAYMENT_POINTS_RECONCILIATION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -2364,7 +2233,7 @@ def test_final_payment_points_reconciliation_helper_is_named_and_invariant_backe
 
 
 def test_final_payment_points_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_payment_points_calls = [
@@ -2395,7 +2264,7 @@ def test_final_payment_points_reconciliation_debt_is_helper_owned():
 
 
 def test_final_tax_category_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_TAX_CATEGORY_RECONCILIATION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -2416,7 +2285,7 @@ def test_final_tax_category_reconciliation_helper_is_named_and_invariant_backed(
 
 
 def test_final_tax_category_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_tax_calls = [
@@ -2447,7 +2316,7 @@ def test_final_tax_category_reconciliation_debt_is_helper_owned():
 
 
 def test_final_external_tax_total_restoration_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_EXTERNAL_TAX_TOTAL_RESTORATION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -2468,7 +2337,7 @@ def test_final_external_tax_total_restoration_helper_is_named_and_invariant_back
 
 
 def test_final_external_tax_total_restoration_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_tax_total_calls = [
@@ -2499,7 +2368,7 @@ def test_final_external_tax_total_restoration_debt_is_helper_owned():
 
 
 def test_final_printed_external_tax_amount_restoration_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(
         tree,
         FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_HELPER,
@@ -2523,7 +2392,7 @@ def test_final_printed_external_tax_amount_restoration_helper_is_named_and_invar
 
 
 def test_final_printed_external_tax_amount_restoration_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_tax_calls = [
@@ -2557,7 +2426,7 @@ def test_final_printed_external_tax_amount_restoration_debt_is_helper_owned():
 
 
 def test_printed_external_tax_amount_restoration_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    tree = _parse_file(POSTPROCESS_PHASES_PATH)
     helper = _function_def(
         tree,
         PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_PHASE_HELPER,
@@ -2581,41 +2450,10 @@ def test_printed_external_tax_amount_restoration_phase_is_named_and_invariant_ba
     )
 
 
-def test_postprocess_printed_external_tax_amount_restoration_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_tax_calls = [
-        name
-        for name in postprocess_calls
-        if name in PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_PHASE_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "Postprocess printed external-tax amount restoration should run "
-        "through the named phase helper so printed tax amount evidence and "
-        "tax/base/total consistency have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
-    )
-    assert (
-        0
-        < len(phase_calls)
-        <= PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_PHASE_CALL_LIMIT
-    ), (
-        "Postprocess printed external-tax amount phase calls must be explicit "
-        "and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_PHASE_CALL_LIMIT}"
-    )
 
 
 def test_final_bare_number_tax_summary_restoration_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(
         tree,
         FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_HELPER,
@@ -2639,7 +2477,7 @@ def test_final_bare_number_tax_summary_restoration_helper_is_named_and_invariant
 
 
 def test_final_bare_number_tax_summary_restoration_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_tax_calls = [
@@ -2673,7 +2511,7 @@ def test_final_bare_number_tax_summary_restoration_debt_is_helper_owned():
 
 
 def test_bare_number_tax_summary_restoration_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    tree = _parse_file(POSTPROCESS_PHASES_PATH)
     helper = _function_def(
         tree,
         BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_HELPER,
@@ -2696,41 +2534,10 @@ def test_bare_number_tax_summary_restoration_phase_is_named_and_invariant_backed
     )
 
 
-def test_postprocess_bare_number_tax_summary_restoration_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_tax_calls = [
-        name
-        for name in postprocess_calls
-        if name in BARE_NUMBER_TAX_SUMMARY_RESTORATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "Postprocess bare-number tax summary restoration should run through "
-        "the named phase helper so bare numeric tax rows and "
-        "tax/subtotal/total consistency have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
-    )
-    assert (
-        0
-        < len(phase_calls)
-        <= BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_CALL_LIMIT
-    ), (
-        "Postprocess bare-number tax summary phase calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_CALL_LIMIT}"
-    )
 
 
 def test_final_small_target_only_tax_pruning_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(
         tree,
         FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_HELPER,
@@ -2754,7 +2561,7 @@ def test_final_small_target_only_tax_pruning_helper_is_named_and_invariant_backe
 
 
 def test_final_small_target_only_tax_pruning_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_tax_calls = [
@@ -2788,7 +2595,7 @@ def test_final_small_target_only_tax_pruning_debt_is_helper_owned():
 
 
 def test_final_coupon_discount_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_COUPON_DISCOUNT_PROJECTION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -2809,7 +2616,7 @@ def test_final_coupon_discount_projection_helper_is_named_and_invariant_backed()
 
 
 def test_final_coupon_discount_projection_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_discount_calls = [
@@ -2836,58 +2643,12 @@ def test_final_coupon_discount_projection_debt_is_helper_owned():
     )
 
 
-def test_coupon_discount_projection_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, COUPON_DISCOUNT_PROJECTION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        COUPON_DISCOUNT_PROJECTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Postprocess coupon discount projection must be owned by the named "
-        f"{COUPON_DISCOUNT_PROJECTION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{COUPON_DISCOUNT_PROJECTION_PHASE_HELPER} must document the OCR "
-        "coupon/CPN trigger and item gross-minus-discount or subtotal "
-        "consistency invariant."
-    )
 
 
-def test_postprocess_coupon_discount_projection_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_coupon_calls = [
-        name
-        for name in postprocess_calls
-        if name in COUPON_DISCOUNT_PROJECTION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == COUPON_DISCOUNT_PROJECTION_PHASE_HELPER
-    ]
-
-    assert not direct_coupon_calls, (
-        "Postprocess coupon discount projection should run through a named "
-        "phase helper so OCR coupon markers and item/subtotal arithmetic "
-        "have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_coupon_calls}"
-    )
-    assert 0 < len(phase_calls) <= COUPON_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT, (
-        "Postprocess coupon discount phase calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {COUPON_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT}"
-    )
 
 
 def test_final_following_ocr_price_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -2907,7 +2668,7 @@ def test_final_following_ocr_price_projection_helper_is_named_and_invariant_back
 
 
 def test_final_following_ocr_price_projection_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_price_calls = [
@@ -2940,295 +2701,32 @@ def test_final_following_ocr_price_projection_debt_is_helper_owned():
     )
 
 
-def test_following_ocr_price_projection_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, FOLLOWING_OCR_PRICE_PROJECTION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Postprocess following-OCR price projection must be owned by the "
-        f"named {FOLLOWING_OCR_PRICE_PROJECTION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FOLLOWING_OCR_PRICE_PROJECTION_PHASE_HELPER} must document the "
-        "repeated following OCR amount trigger and item-sum/rate-base "
-        "invariant."
-    )
 
 
-def test_postprocess_following_ocr_price_projection_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_price_calls = [
-        name
-        for name in postprocess_calls
-        if name in FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == FOLLOWING_OCR_PRICE_PROJECTION_PHASE_HELPER
-    ]
-
-    assert not direct_price_calls, (
-        "Postprocess following-OCR price projection should run through a "
-        "named phase helper so repeated OCR amount evidence and item-sum "
-        "arithmetic have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_price_calls}"
-    )
-    assert 0 < len(phase_calls) <= FOLLOWING_OCR_PRICE_PROJECTION_PHASE_CALL_LIMIT, (
-        "Postprocess following-OCR price projection phase calls must be "
-        "explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {FOLLOWING_OCR_PRICE_PROJECTION_PHASE_CALL_LIMIT}"
-    )
 
 
-def test_merchant_identity_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, MERCHANT_IDENTITY_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        MERCHANT_IDENTITY_REPAIR_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Merchant identity repair must be owned by the named "
-        f"{MERCHANT_IDENTITY_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{MERCHANT_IDENTITY_REPAIR_PHASE_HELPER} must document the "
-        "header/legal-name trigger and merchant field-consistency invariant."
-    )
 
 
-def test_postprocess_merchant_identity_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_merchant_calls = [
-        name
-        for name in postprocess_calls
-        if name in MERCHANT_IDENTITY_REPAIR_REPAIRS
-    ]
-    helper_calls = [
-        name for name in postprocess_calls if name == MERCHANT_IDENTITY_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_merchant_calls, (
-        "Merchant identity repair should run through the named postprocess helper "
-        "so header/company-name evidence and merchant field consistency have "
-        "one owner.\n"
-        "Direct calls still in postprocess_receipt: "
-        f"{direct_merchant_calls}"
-    )
-    assert 0 < len(helper_calls) <= MERCHANT_IDENTITY_REPAIR_PHASE_CALL_LIMIT, (
-        "Merchant identity phase calls must be explicit and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {MERCHANT_IDENTITY_REPAIR_PHASE_CALL_LIMIT}"
-    )
 
 
-def test_transaction_datetime_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, TRANSACTION_DATETIME_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        TRANSACTION_DATETIME_REPAIR_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Transaction date/time repairs must be owned by the named "
-        f"{TRANSACTION_DATETIME_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{TRANSACTION_DATETIME_REPAIR_PHASE_HELPER} must document the "
-        "OCR date/time trigger and date/time field-consistency invariant."
-    )
 
 
-def test_postprocess_transaction_datetime_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_datetime_calls = [
-        name
-        for name in postprocess_calls
-        if name in TRANSACTION_DATETIME_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == TRANSACTION_DATETIME_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_datetime_calls, (
-        "Transaction date/time repairs should run through the named phase "
-        "helper so OCR transaction-date anchors and time consistency have one "
-        "owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_datetime_calls}"
-    )
-    assert 0 < len(phase_calls) <= TRANSACTION_DATETIME_REPAIR_PHASE_CALL_LIMIT, (
-        "Transaction datetime phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {TRANSACTION_DATETIME_REPAIR_PHASE_CALL_LIMIT}"
-    )
 
 
-def test_toll_payment_reference_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        TOLL_PAYMENT_REFERENCE_REPAIR_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Toll payment-reference repair must be owned by the named "
-        f"{TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER} must document the "
-        "toll OCR trigger and payment_reference preservation invariant."
-    )
 
 
-def test_postprocess_toll_payment_reference_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_reference_calls = [
-        name
-        for name in postprocess_calls
-        if name in TOLL_PAYMENT_REFERENCE_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_reference_calls, (
-        "Toll payment-reference repair should run through the named phase "
-        "helper so toll OCR evidence and reference preservation have one "
-        "owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_reference_calls}"
-    )
-    assert (
-        0 < len(phase_calls) <= TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_CALL_LIMIT
-    ), (
-        "Toll payment-reference phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_CALL_LIMIT}"
-    )
 
 
-def test_header_location_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, HEADER_LOCATION_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        HEADER_LOCATION_REPAIR_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Header/location repairs must be owned by the named "
-        f"{HEADER_LOCATION_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{HEADER_LOCATION_REPAIR_PHASE_HELPER} must document OCR header, "
-        "split-address, or purchase-site triggers and a location "
-        "field-consistency invariant."
-    )
 
 
-def test_postprocess_header_location_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_location_calls = [
-        name
-        for name in postprocess_calls
-        if name in HEADER_LOCATION_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == HEADER_LOCATION_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_location_calls, (
-        "Header/location repairs should run through the named phase helper so "
-        "OCR header, address, and purchase-site location evidence have one "
-        "owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_location_calls}"
-    )
-    assert 0 < len(phase_calls) <= HEADER_LOCATION_REPAIR_PHASE_CALL_LIMIT, (
-        "Header/location repair phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {HEADER_LOCATION_REPAIR_PHASE_CALL_LIMIT}"
-    )
 
 
-def test_bag_item_ocr_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, BAG_ITEM_OCR_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        BAG_ITEM_OCR_REPAIR_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Bag/small-item OCR repairs must be owned by the named "
-        f"{BAG_ITEM_OCR_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{BAG_ITEM_OCR_REPAIR_PHASE_HELPER} must document visible item/bag "
-        "OCR price triggers and an item total consistency invariant."
-    )
 
 
-def test_postprocess_bag_item_ocr_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_item_calls = [
-        name
-        for name in postprocess_calls
-        if name in BAG_ITEM_OCR_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == BAG_ITEM_OCR_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_item_calls, (
-        "Bag/small-item OCR repairs should run through the named phase helper "
-        "so item-price OCR evidence and total consistency have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_item_calls}"
-    )
-    assert 0 < len(phase_calls) <= BAG_ITEM_OCR_REPAIR_PHASE_CALL_LIMIT, (
-        "Bag/small-item OCR repair phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {BAG_ITEM_OCR_REPAIR_PHASE_CALL_LIMIT}"
-    )
 
 
 def test_final_merchant_identity_repair_debt_is_removed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_merchant_calls = [
@@ -3256,7 +2754,7 @@ def test_final_merchant_identity_repair_debt_is_removed():
 
 
 def test_output_merchant_identity_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, OUTPUT_MERCHANT_IDENTITY_REPAIR_PHASE_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -3276,7 +2774,7 @@ def test_output_merchant_identity_repair_phase_is_named_and_invariant_backed():
 
 
 def test_prepare_receipt_output_merchant_identity_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     prepare_output = _function_def(tree, "_prepare_receipt_output_payload")
     prepare_calls = _call_names_in_function(prepare_output)
     direct_merchant_calls = [
@@ -3304,8 +2802,8 @@ def test_prepare_receipt_output_merchant_identity_debt_is_phase_owned():
 
 
 def test_final_embedded_price_duplicate_cleanup_is_retired_to_postprocess():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
-    receipt_tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
+    receipt_tree = _parse_file(POSTPROCESS_PHASES_PATH)
     item_cleanup_helper = _function_def(receipt_tree, LINE_ITEM_CLEANUP_PHASE_HELPER)
 
     assert (
@@ -3326,7 +2824,7 @@ def test_final_embedded_price_duplicate_cleanup_is_retired_to_postprocess():
 
 
 def test_final_embedded_price_duplicate_cleanup_debt_is_removed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_duplicate_calls = [
@@ -3357,8 +2855,8 @@ def test_final_embedded_price_duplicate_cleanup_debt_is_removed():
 
 
 def test_final_duplicate_row_cleanup_is_retired_to_postprocess():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
-    receipt_tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
+    receipt_tree = _parse_file(POSTPROCESS_PHASES_PATH)
     duplicate_cleanup_helper = _function_def(
         receipt_tree,
         DUPLICATE_ROW_CLEANUP_PHASE_HELPER,
@@ -3382,7 +2880,7 @@ def test_final_duplicate_row_cleanup_is_retired_to_postprocess():
 
 
 def test_final_duplicate_row_cleanup_debt_is_removed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_duplicate_calls = [
@@ -3410,7 +2908,7 @@ def test_final_duplicate_row_cleanup_debt_is_removed():
 
 
 def test_final_discount_consistency_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(
         tree,
         FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_HELPER,
@@ -3434,7 +2932,7 @@ def test_final_discount_consistency_reconciliation_helper_is_named_and_invariant
 
 
 def test_final_discount_consistency_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_discount_calls = [
@@ -3467,62 +2965,12 @@ def test_final_discount_consistency_reconciliation_debt_is_helper_owned():
     )
 
 
-def test_discount_consistency_reconciliation_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Postprocess discount consistency reconciliation must be owned by the "
-        f"named {DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER} must document "
-        "the adjacent negative discount row trigger and item gross-minus-"
-        "discount consistency invariant."
-    )
 
 
-def test_postprocess_discount_consistency_reconciliation_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_discount_calls = [
-        name
-        for name in postprocess_calls
-        if name in DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER
-    ]
-
-    assert not direct_discount_calls, (
-        "Postprocess discount consistency reconciliation should run through a "
-        "named phase helper so OCR discount placement and item arithmetic have "
-        "one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_discount_calls}"
-    )
-    assert (
-        0
-        < len(phase_calls)
-        <= DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_CALL_LIMIT
-    ), (
-        "Postprocess discount consistency phase calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_CALL_LIMIT}"
-    )
 
 
 def test_final_quantity_detail_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_QUANTITY_DETAIL_RECONCILIATION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -3542,7 +2990,7 @@ def test_final_quantity_detail_reconciliation_helper_is_named_and_invariant_back
 
 
 def test_final_quantity_detail_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_qty_calls = [
@@ -3575,7 +3023,7 @@ def test_final_quantity_detail_reconciliation_debt_is_helper_owned():
 
 
 def test_final_ocr_description_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_OCR_DESCRIPTION_RECONCILIATION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -3595,7 +3043,7 @@ def test_final_ocr_description_reconciliation_helper_is_named_and_invariant_back
 
 
 def test_final_ocr_description_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_description_calls = [
@@ -3625,60 +3073,12 @@ def test_final_ocr_description_reconciliation_debt_is_helper_owned():
     )
 
 
-def test_discounted_ocr_item_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, DISCOUNTED_OCR_ITEM_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        DISCOUNTED_OCR_ITEM_REPAIR_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Postprocess discounted OCR item repair must be owned by the named "
-        f"{DISCOUNTED_OCR_ITEM_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{DISCOUNTED_OCR_ITEM_REPAIR_PHASE_HELPER} must document the "
-        "visible discount/stacked-price OCR trigger and item-sum or "
-        "description field-consistency invariant."
-    )
 
 
-def test_postprocess_discounted_ocr_item_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_discounted_item_calls = [
-        name
-        for name in postprocess_calls
-        if name in DISCOUNTED_OCR_ITEM_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == DISCOUNTED_OCR_ITEM_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_discounted_item_calls, (
-        "Postprocess discounted OCR item repair should run through a named "
-        "phase helper so visible discount rows, stacked price descriptions, "
-        "and item-sum consistency have one owner.\n"
-        "Direct calls still in postprocess_receipt: "
-        f"{direct_discounted_item_calls}"
-    )
-    assert (
-        0 < len(phase_calls) <= DISCOUNTED_OCR_ITEM_REPAIR_PHASE_CALL_LIMIT
-    ), (
-        "Postprocess discounted OCR item repair phase calls must be explicit "
-        "and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {DISCOUNTED_OCR_ITEM_REPAIR_PHASE_CALL_LIMIT}"
-    )
 
 
 def test_final_adjacent_price_shift_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(
         tree,
         FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_HELPER,
@@ -3701,7 +3101,7 @@ def test_final_adjacent_price_shift_reconciliation_helper_is_named_and_invariant
 
 
 def test_final_adjacent_price_shift_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_price_shift_calls = [
@@ -3735,7 +3135,7 @@ def test_final_adjacent_price_shift_reconciliation_debt_is_helper_owned():
 
 
 def test_final_prefixed_tax_marker_item_rows_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(
         tree,
         FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER,
@@ -3758,7 +3158,7 @@ def test_final_prefixed_tax_marker_item_rows_helper_is_named_and_invariant_backe
 
 
 def test_final_prefixed_tax_marker_item_rows_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_marker_calls = [
@@ -3792,7 +3192,7 @@ def test_final_prefixed_tax_marker_item_rows_debt_is_helper_owned():
 
 
 def test_final_gap_item_recovery_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_GAP_ITEM_RECOVERY_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -3811,7 +3211,7 @@ def test_final_gap_item_recovery_helper_is_named_and_invariant_backed():
 
 
 def test_final_gap_item_recovery_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_gap_calls = [
@@ -3835,7 +3235,7 @@ def test_final_gap_item_recovery_debt_is_helper_owned():
 
 
 def test_final_repeated_gap_item_recovery_debt_is_removed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_helper = _function_def(tree, FINAL_GAP_ITEM_RECOVERY_HELPER)
     final_calls = _call_names_in_function(final_repairs)
@@ -3860,7 +3260,7 @@ def test_final_repeated_gap_item_recovery_debt_is_removed():
 
 
 def test_final_basket_marker_rows_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_BASKET_MARKER_ROWS_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -3879,7 +3279,7 @@ def test_final_basket_marker_rows_helper_is_named_and_invariant_backed():
 
 
 def test_final_basket_marker_rows_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_basket_calls = [
@@ -3903,193 +3303,24 @@ def test_final_basket_marker_rows_debt_is_helper_owned():
     )
 
 
-def test_basket_marker_rows_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, BASKET_MARKER_ROWS_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        BASKET_MARKER_ROWS_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Postprocess basket marker row projection must be owned by the named "
-        f"{BASKET_MARKER_ROWS_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{BASKET_MARKER_ROWS_PHASE_HELPER} must document the OCR basket "
-        "marker/stacked price trigger and subtotal/rate-base arithmetic "
-        "invariant."
-    )
 
 
-def test_postprocess_basket_marker_rows_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_basket_calls = [
-        name for name in postprocess_calls if name in BASKET_MARKER_ROWS_REPAIRS
-    ]
-    phase_calls = [
-        name for name in postprocess_calls if name == BASKET_MARKER_ROWS_PHASE_HELPER
-    ]
-
-    assert not direct_basket_calls, (
-        "Postprocess basket marker row projection should run through a named "
-        "phase helper so basket marker OCR layout and subtotal/rate-base "
-        "arithmetic have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_basket_calls}"
-    )
-    assert 0 < len(phase_calls) <= BASKET_MARKER_ROWS_PHASE_CALL_LIMIT, (
-        "Postprocess basket marker row phase calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {BASKET_MARKER_ROWS_PHASE_CALL_LIMIT}"
-    )
 
 
-def test_quantity_detail_reconciliation_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        QUANTITY_DETAIL_RECONCILIATION_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Quantity detail repairs must be owned by the named "
-        f"{QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER} must document the OCR "
-        "quantity-detail trigger and arithmetic or field-consistency invariant."
-    )
 
 
-def test_postprocess_quantity_detail_reconciliation_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_quantity_calls = [
-        name for name in postprocess_calls if name in QUANTITY_DETAIL_RECONCILIATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER
-    ]
-
-    assert not direct_quantity_calls, (
-        "Quantity detail repairs should run through the named phase helper so "
-        "OCR quantity triggers and qty * unit invariants have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_quantity_calls}"
-    )
-    assert 0 < len(phase_calls) <= QUANTITY_DETAIL_RECONCILIATION_PHASE_CALL_LIMIT, (
-        "Quantity detail reconciliation phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {QUANTITY_DETAIL_RECONCILIATION_PHASE_CALL_LIMIT}"
-    )
 
 
-def test_tax_category_assignment_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        TAX_CATEGORY_ASSIGNMENT_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Tax category assignment and rate-base rebalance repairs must be owned "
-        f"by the named {TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER} must document the OCR "
-        "rate-marker trigger and tax/line-item consistency invariant."
-    )
 
 
-def test_postprocess_tax_category_assignment_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_tax_calls = [
-        name for name in postprocess_calls if name in TAX_CATEGORY_ASSIGNMENT_REPAIRS
-    ]
-    phase_calls = [
-        name for name in postprocess_calls if name == TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "Tax category assignment repairs should run through the named phase "
-        "helper so OCR rate markers, rate bases, and item/tax invariants have "
-        "one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
-    )
-    assert 0 < len(phase_calls) <= TAX_CATEGORY_ASSIGNMENT_PHASE_CALL_LIMIT, (
-        "Tax category assignment phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {TAX_CATEGORY_ASSIGNMENT_PHASE_CALL_LIMIT}"
-    )
 
 
-def test_bag_item_rate_base_reconciliation_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Bag item price/rate-base reconciliation must be owned by the named "
-        f"{BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_HELPER} must document "
-        "the tiny printed 10% rate-base trigger and paid-bag total invariant."
-    )
 
 
-def test_postprocess_bag_item_rate_base_reconciliation_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_bag_calls = [
-        name
-        for name in postprocess_calls
-        if name in BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_HELPER
-    ]
-
-    assert not direct_bag_calls, (
-        "Bag item price/rate-base reconciliation should run through the "
-        "named phase helper so paid-bag evidence and printed 10% rate-base "
-        "arithmetic have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_bag_calls}"
-    )
-    assert (
-        0
-        < len(phase_calls)
-        <= BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_CALL_LIMIT
-    ), (
-        "Bag item price/rate-base reconciliation phase calls must be "
-        "explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_CALL_LIMIT}"
-    )
 
 
 def test_final_bag_item_rate_base_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     helper = _function_def(tree, FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_HELPER)
     docstring = ast.get_docstring(helper) or ""
 
@@ -4109,7 +3340,7 @@ def test_final_bag_item_rate_base_reconciliation_helper_is_named_and_invariant_b
 
 
 def test_final_bag_item_rate_base_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline.py")
+    tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
     final_calls = _call_names_in_function(final_repairs)
     direct_bag_calls = [
@@ -4142,1316 +3373,116 @@ def test_final_bag_item_rate_base_reconciliation_debt_is_helper_owned():
     )
 
 
-def test_single_rate_inclusive_tax_restoration_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Single-rate inclusive tax restorations must be owned by the named "
-        f"{SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER} must document "
-        "the printed single-rate inclusive tax trigger and total/tax invariant."
-    )
-
-
-def test_postprocess_single_rate_inclusive_tax_restoration_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_tax_calls = [
-        name
-        for name in postprocess_calls
-        if name in SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "Single-rate inclusive tax restoration should run through the named "
-        "phase helper so printed target/tax rows and subtotal arithmetic have "
-        "one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
-    )
-    assert 0 < len(phase_calls) <= SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT, (
-        "Single-rate inclusive tax restoration phase calls must be explicit "
-        "and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_stacked_inclusive_tax_restoration_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Stacked inclusive tax restoration must be owned by the named "
-        f"{STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER} must document the "
-        "stacked target/tax OCR trigger and total-minus-tax invariant."
-    )
-
-
-def test_postprocess_stacked_inclusive_tax_restoration_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_tax_calls = [
-        name
-        for name in postprocess_calls
-        if name in STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "Stacked inclusive tax restoration should run through the named phase "
-        "helper so stacked target/tax rows and subtotal arithmetic have one "
-        "owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
-    )
-    assert 0 < len(phase_calls) <= STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT, (
-        "Stacked inclusive tax restoration phase calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {STACKED_INCLUSIVE_TAX_RESTORATION_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_tax_excluded_rate_block_restoration_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        TAX_EXCLUDED_RATE_BLOCK_RESTORATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Tax-excluded per-rate block restorations must be owned by the named "
-        f"{TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_HELPER} must document "
-        "the printed tax-excluded subtotal/tax-row trigger and rate-pair "
-        "consistency invariant."
-    )
-
-
-def test_postprocess_tax_excluded_rate_block_restoration_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_tax_calls = [
-        name
-        for name in postprocess_calls
-        if name in TAX_EXCLUDED_RATE_BLOCK_RESTORATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "Tax-excluded per-rate block restoration should run through the named "
-        "phase helper so printed subtotal/tax labels and rate-paired tax "
-        "entries have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
-    )
-    assert 0 < len(phase_calls) <= TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_CALL_LIMIT, (
-        "Tax-excluded per-rate block restoration phase calls must be explicit "
-        "and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {TAX_EXCLUDED_RATE_BLOCK_RESTORATION_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_explicit_tax_amount_restoration_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        EXPLICIT_TAX_AMOUNT_RESTORATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Explicit tax amount restorations must be owned by the named "
-        f"{EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_HELPER} must document "
-        "the visible tax-rate amount row trigger and item/tax consistency "
-        "invariant."
-    )
-
-
-def test_postprocess_explicit_tax_amount_restoration_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_tax_calls = [
-        name
-        for name in postprocess_calls
-        if name in EXPLICIT_TAX_AMOUNT_RESTORATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "Explicit tax amount restoration should run through the named phase "
-        "helper so visible 税率N%税額 rows and tax-entry replacement have one "
-        "owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
-    )
-    assert 0 < len(phase_calls) <= EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_CALL_LIMIT, (
-        "Explicit tax amount restoration phase calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {EXPLICIT_TAX_AMOUNT_RESTORATION_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_external_tax_total_restoration_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, EXTERNAL_TAX_TOTAL_RESTORATION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        EXTERNAL_TAX_TOTAL_RESTORATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "External tax total restorations must be owned by the named "
-        f"{EXTERNAL_TAX_TOTAL_RESTORATION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{EXTERNAL_TAX_TOTAL_RESTORATION_PHASE_HELPER} must document "
-        "the printed subtotal plus external-tax summary trigger and "
-        "total/payment arithmetic invariant."
-    )
-
-
-def test_postprocess_external_tax_total_restoration_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_tax_calls = [
-        name
-        for name in postprocess_calls
-        if name in EXTERNAL_TAX_TOTAL_RESTORATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == EXTERNAL_TAX_TOTAL_RESTORATION_PHASE_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "External tax total restoration should run through the named phase "
-        "helper so printed subtotal, external-tax entries, and visible "
-        "summary/payment totals have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_tax_calls}"
-    )
-    assert 0 < len(phase_calls) <= EXTERNAL_TAX_TOTAL_RESTORATION_PHASE_CALL_LIMIT, (
-        "External tax total restoration phase calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {EXTERNAL_TAX_TOTAL_RESTORATION_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_cash_tender_reconciliation_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, CASH_TENDER_RECONCILIATION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        CASH_TENDER_RECONCILIATION_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Cash tender/change repairs must be owned by the named "
-        f"{CASH_TENDER_RECONCILIATION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{CASH_TENDER_RECONCILIATION_PHASE_HELPER} must document the OCR "
-        "cash-layout trigger and total/payment consistency invariant."
-    )
-
-
-def test_postprocess_cash_tender_reconciliation_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_cash_calls = [
-        name for name in postprocess_calls if name in CASH_TENDER_RECONCILIATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == CASH_TENDER_RECONCILIATION_PHASE_HELPER
-    ]
-
-    assert not direct_cash_calls, (
-        "Cash tender/change repairs should run through the named phase helper "
-        "so printed total, tendered amount, and change arithmetic have one "
-        "owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_cash_calls}"
-    )
-    assert 0 < len(phase_calls) <= CASH_TENDER_RECONCILIATION_PHASE_CALL_LIMIT, (
-        "Cash tender reconciliation phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {CASH_TENDER_RECONCILIATION_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_payment_method_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, PAYMENT_METHOD_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        PAYMENT_METHOD_REPAIR_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Payment method repairs must be owned by the named "
-        f"{PAYMENT_METHOD_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{PAYMENT_METHOD_REPAIR_PHASE_HELPER} must document the OCR payment "
-        "marker trigger and payment_method field-consistency invariant."
-    )
-
-
-def test_postprocess_payment_method_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_payment_calls = [
-        name for name in postprocess_calls if name in PAYMENT_METHOD_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == PAYMENT_METHOD_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_payment_calls, (
-        "Payment method repairs should run through the named phase helper so "
-        "OCR payment markers and payment_method field consistency have one "
-        "owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_payment_calls}"
-    )
-    assert 0 < len(phase_calls) <= PAYMENT_METHOD_REPAIR_PHASE_CALL_LIMIT, (
-        "Payment method repair phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {PAYMENT_METHOD_REPAIR_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_payment_points_reconciliation_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        PAYMENT_POINTS_RECONCILIATION_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Payment/points repairs must be owned by the named "
-        f"{PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER} must document the OCR "
-        "points/payment trigger and total/payment consistency invariant."
-    )
-
-
-def test_postprocess_payment_points_reconciliation_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_payment_points_calls = [
-        name for name in postprocess_calls if name in PAYMENT_POINTS_RECONCILIATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER
-    ]
-
-    assert not direct_payment_points_calls, (
-        "Payment/points repairs should run through the named phase helper so "
-        "OCR point-use evidence and total minus points payment arithmetic have "
-        "one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_payment_points_calls}"
-    )
-    assert 0 < len(phase_calls) <= PAYMENT_POINTS_RECONCILIATION_PHASE_CALL_LIMIT, (
-        "Payment/points reconciliation phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {PAYMENT_POINTS_RECONCILIATION_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_service_receipt_recovery_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, SERVICE_RECEIPT_RECOVERY_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        SERVICE_RECEIPT_RECOVERY_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Service receipt recovery repairs must be owned by the named "
-        f"{SERVICE_RECEIPT_RECOVERY_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{SERVICE_RECEIPT_RECOVERY_PHASE_HELPER} must document the OCR "
-        "service-layout trigger and item/total/tax consistency invariant."
-    )
-
-
-def test_postprocess_service_receipt_recovery_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_service_calls = [
-        name for name in postprocess_calls if name in SERVICE_RECEIPT_RECOVERY_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == SERVICE_RECEIPT_RECOVERY_PHASE_HELPER
-    ]
-
-    assert not direct_service_calls, (
-        "Service receipt recovery repairs should run through the named phase "
-        "helper so service-table layout, bare-service suppression, and "
-        "single-service tax invariants have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_service_calls}"
-    )
-    assert 0 < len(phase_calls) <= SERVICE_RECEIPT_RECOVERY_PHASE_CALL_LIMIT, (
-        "Service receipt recovery phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {SERVICE_RECEIPT_RECOVERY_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_body_total_layout_reconstruction_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Body-total layout reconstruction repairs must be owned by the named "
-        f"{BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_HELPER} must document the "
-        "visible body-total layout trigger and item/tax arithmetic invariant."
-    )
-
-
-def test_postprocess_body_total_layout_reconstruction_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_layout_calls = [
-        name
-        for name in postprocess_calls
-        if name in BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_HELPER
-    ]
-
-    assert not direct_layout_calls, (
-        "Body-total layout reconstruction should run through the named phase "
-        "helper so split item rows, location, subtotal, and tax entries have "
-        "one layout/arithmetic owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_layout_calls}"
-    )
-    assert 0 < len(phase_calls) <= BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_CALL_LIMIT, (
-        "Body-total layout reconstruction phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_ocr_description_reconciliation_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        OCR_DESCRIPTION_RECONCILIATION_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "OCR description reconciliation repairs must be owned by the named "
-        f"{OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER} must document the OCR "
-        "description-context trigger and item field-consistency invariant."
-    )
-
-
-def test_postprocess_ocr_description_reconciliation_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_description_calls = [
-        name for name in postprocess_calls if name in OCR_DESCRIPTION_RECONCILIATION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER
-    ]
-
-    assert not direct_description_calls, (
-        "OCR description reconciliation repairs should run through the named "
-        "phase helper so code-row, duplicate, O-ring, colon-split, and bag "
-        "description invariants have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_description_calls}"
-    )
-    assert 0 < len(phase_calls) <= OCR_DESCRIPTION_RECONCILIATION_PHASE_CALL_LIMIT, (
-        "OCR description reconciliation phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {OCR_DESCRIPTION_RECONCILIATION_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_gap_item_recovery_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, GAP_ITEM_RECOVERY_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        GAP_ITEM_RECOVERY_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Gap item recovery repairs must be owned by the named "
-        f"{GAP_ITEM_RECOVERY_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{GAP_ITEM_RECOVERY_PHASE_HELPER} must document the OCR row-gap "
-        "trigger and subtotal/total arithmetic invariant."
-    )
-
-
-def test_postprocess_gap_item_recovery_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_gap_calls = [
-        name for name in postprocess_calls if name in GAP_ITEM_RECOVERY_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == GAP_ITEM_RECOVERY_PHASE_HELPER
-    ]
-
-    assert not direct_gap_calls, (
-        "Gap item recovery repairs should run through the named phase helper "
-        "so missing, discounted, repeated, and repeated-block row recovery "
-        "share one OCR/arithmetic owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_gap_calls}"
-    )
-    assert 0 < len(phase_calls) <= GAP_ITEM_RECOVERY_PHASE_CALL_LIMIT, (
-        "Gap item recovery phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {GAP_ITEM_RECOVERY_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_prefixed_tax_marker_item_rows_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Prefixed tax-marker item row projection must be owned by the named "
-        f"{PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_HELPER} must document the OCR "
-        "tax-marker row trigger and subtotal/rate-base balance invariant."
-    )
-
-
-def test_postprocess_prefixed_tax_marker_item_rows_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_marker_calls = [
-        name
-        for name in postprocess_calls
-        if name in PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_HELPER
-    ]
-
-    assert not direct_marker_calls, (
-        "Prefixed tax-marker item row projection should run through the named "
-        "phase helper so marker-prefixed OCR rows and subtotal/rate-base "
-        "arithmetic have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_marker_calls}"
-    )
-    assert 0 < len(phase_calls) <= PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_CALL_LIMIT, (
-        "Prefixed tax-marker item row phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_low_value_bag_recovery_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, LOW_VALUE_BAG_RECOVERY_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        LOW_VALUE_BAG_RECOVERY_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Low-value bag recovery repairs must be owned by the named "
-        f"{LOW_VALUE_BAG_RECOVERY_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{LOW_VALUE_BAG_RECOVERY_PHASE_HELPER} must document the OCR small-bag "
-        "trigger and subtotal/total arithmetic invariant."
-    )
-
-
-def test_postprocess_low_value_bag_recovery_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_bag_calls = [
-        name for name in postprocess_calls if name in LOW_VALUE_BAG_RECOVERY_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == LOW_VALUE_BAG_RECOVERY_PHASE_HELPER
-    ]
-
-    assert not direct_bag_calls, (
-        "Low-value bag recovery repairs should run through the named phase "
-        "helper so missing bag rows, overage replacement, and numeric OCR "
-        "context share one OCR/arithmetic owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_bag_calls}"
-    )
-    assert 0 < len(phase_calls) <= LOW_VALUE_BAG_RECOVERY_PHASE_CALL_LIMIT, (
-        "Low-value bag recovery phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {LOW_VALUE_BAG_RECOVERY_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_item_name_price_cleanup_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        ITEM_NAME_PRICE_CLEANUP_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Item name/price cleanup repairs must be owned by the named "
-        f"{ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER} must document the OCR "
-        "item-name/embedded-price trigger and item field-consistency invariant."
-    )
-
-
-def test_postprocess_item_name_price_cleanup_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_cleanup_calls = [
-        name
-        for name in postprocess_calls
-        if name in ITEM_NAME_PRICE_CLEANUP_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER
-    ]
-
-    assert not direct_cleanup_calls, (
-        "Item name/price cleanup should run through the named phase helper "
-        "so OCR row ownership, embedded price suffixes, and item fields have "
-        "one consistency owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_cleanup_calls}"
-    )
-    assert 0 < len(phase_calls) <= ITEM_NAME_PRICE_CLEANUP_PHASE_CALL_LIMIT, (
-        "Item name/price cleanup phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {ITEM_NAME_PRICE_CLEANUP_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_priced_name_item_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, PRICED_NAME_ITEM_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        PRICED_NAME_ITEM_REPAIR_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Priced-name item repairs must be owned by the named "
-        f"{PRICED_NAME_ITEM_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{PRICED_NAME_ITEM_REPAIR_PHASE_HELPER} must document the OCR "
-        "priced-name trigger and subtotal/total item-sum invariant."
-    )
-
-
-def test_postprocess_priced_name_item_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_repair_calls = [
-        name
-        for name in postprocess_calls
-        if name in PRICED_NAME_ITEM_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == PRICED_NAME_ITEM_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_repair_calls, (
-        "Priced-name item repair should run through the named phase helper "
-        "so OCR-visible item names, orphan amounts, and item-sum arithmetic "
-        "have one consistency owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_repair_calls}"
-    )
-    assert 0 < len(phase_calls) <= PRICED_NAME_ITEM_REPAIR_PHASE_CALL_LIMIT, (
-        "Priced-name item repair phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {PRICED_NAME_ITEM_REPAIR_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_digit_misread_item_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        DIGIT_MISREAD_ITEM_REPAIR_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Digit-misread item repairs must be owned by the named "
-        f"{DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER} must document the OCR "
-        "digit-misread trigger and item-sum arithmetic invariant."
-    )
-
-
-def test_postprocess_digit_misread_item_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_repair_calls = [
-        name
-        for name in postprocess_calls
-        if name in DIGIT_MISREAD_ITEM_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_repair_calls, (
-        "Digit-misread item repair should run through the named phase helper "
-        "so OCR percent-marker evidence and item-sum arithmetic have one "
-        "consistency owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_repair_calls}"
-    )
-    assert 0 < len(phase_calls) <= DIGIT_MISREAD_ITEM_REPAIR_PHASE_CALL_LIMIT, (
-        "Digit-misread item repair phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {DIGIT_MISREAD_ITEM_REPAIR_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_subtotal_item_price_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        SUBTOTAL_ITEM_PRICE_REPAIR_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Subtotal item price repairs must be owned by the named "
-        f"{SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_HELPER} must document the OCR "
-        "subtotal/nearby-price trigger and item-sum arithmetic invariant."
-    )
-
-
-def test_postprocess_subtotal_item_price_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_repair_calls = [
-        name
-        for name in postprocess_calls
-        if name in SUBTOTAL_ITEM_PRICE_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_repair_calls, (
-        "Subtotal item price repair should run through the named phase helper "
-        "so OCR subtotal evidence, nearby item prices, and item sums have one "
-        "consistency owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_repair_calls}"
-    )
-    assert 0 < len(phase_calls) <= SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_CALL_LIMIT, (
-        "Subtotal item price repair phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_implausible_tax_amount_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        IMPLAUSIBLE_TAX_AMOUNT_REPAIR_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Implausible tax amount repairs must be owned by the named "
-        f"{IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER} must document the OCR "
-        "rate-base/tax-swap trigger and tax arithmetic invariant."
-    )
-
-
-def test_postprocess_implausible_tax_amount_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_repair_calls = [
-        name
-        for name in postprocess_calls
-        if name in IMPLAUSIBLE_TAX_AMOUNT_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_repair_calls, (
-        "Implausible tax amount repair should run through the named phase helper "
-        "so OCR rate-base evidence and tax arithmetic have one consistency owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_repair_calls}"
-    )
-    assert 0 < len(phase_calls) <= IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_CALL_LIMIT, (
-        "Implausible tax amount repair phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_vertical_price_qty_total_projection_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        VERTICAL_PRICE_QTY_TOTAL_PROJECTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Vertical price/qty/total row projection must be owned by the named "
-        f"{VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER} must document the "
-        "vertical OCR row trigger and unit/qty/subtotal arithmetic invariant."
-    )
-
-
-def test_postprocess_vertical_price_qty_total_projection_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_projection_calls = [
-        name
-        for name in postprocess_calls
-        if name in VERTICAL_PRICE_QTY_TOTAL_PROJECTION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER
-    ]
-
-    assert not direct_projection_calls, (
-        "Vertical price/qty/total projection should run through the named phase "
-        "helper so OCR row order and arithmetic have one consistency owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_projection_calls}"
-    )
-    assert (
-        0 < len(phase_calls)
-        <= VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_CALL_LIMIT
-    ), (
-        "Vertical price/qty/total projection phase calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_stacked_name_price_projection_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, STACKED_NAME_PRICE_PROJECTION_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        STACKED_NAME_PRICE_PROJECTION_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Stacked name/price projection must be owned by the named "
-        f"{STACKED_NAME_PRICE_PROJECTION_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{STACKED_NAME_PRICE_PROJECTION_PHASE_HELPER} must document the "
-        "stacked OCR name/price trigger and item-sum arithmetic invariant."
-    )
-
-
-def test_postprocess_stacked_name_price_projection_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_projection_calls = [
-        name
-        for name in postprocess_calls
-        if name in STACKED_NAME_PRICE_PROJECTION_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == STACKED_NAME_PRICE_PROJECTION_PHASE_HELPER
-    ]
-
-    assert not direct_projection_calls, (
-        "Stacked name/price projection should run through the named phase "
-        "helper so OCR row order and subtotal/total arithmetic have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_projection_calls}"
-    )
-    assert 0 < len(phase_calls) <= STACKED_NAME_PRICE_PROJECTION_PHASE_CALL_LIMIT, (
-        "Stacked name/price projection phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {STACKED_NAME_PRICE_PROJECTION_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_single_item_quantity_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, SINGLE_ITEM_QUANTITY_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        SINGLE_ITEM_QUANTITY_REPAIR_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Single-item quantity repair must be owned by the named "
-        f"{SINGLE_ITEM_QUANTITY_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{SINGLE_ITEM_QUANTITY_REPAIR_PHASE_HELPER} must document the OCR "
-        "@unit x qty trigger and unit/qty/total arithmetic invariant."
-    )
-
-
-def test_postprocess_single_item_quantity_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_repair_calls = [
-        name
-        for name in postprocess_calls
-        if name in SINGLE_ITEM_QUANTITY_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == SINGLE_ITEM_QUANTITY_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_repair_calls, (
-        "Single-item quantity repair should run through the named phase helper "
-        "so OCR quantity notation and line-total arithmetic have one consistency "
-        "owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_repair_calls}"
-    )
-    assert 0 < len(phase_calls) <= SINGLE_ITEM_QUANTITY_REPAIR_PHASE_CALL_LIMIT, (
-        "Single-item quantity repair phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {SINGLE_ITEM_QUANTITY_REPAIR_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_code_prefixed_description_cleanup_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        CODE_PREFIXED_DESCRIPTION_CLEANUP_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Code-prefixed item description cleanup must be owned by the named "
-        f"{CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_HELPER} must document the "
-        "OCR/POS code-prefix trigger and item description field-consistency "
-        "invariant."
-    )
-
-
-def test_postprocess_code_prefixed_description_cleanup_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_cleanup_calls = [
-        name
-        for name in postprocess_calls
-        if name in CODE_PREFIXED_DESCRIPTION_CLEANUP_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_HELPER
-    ]
-
-    assert not direct_cleanup_calls, (
-        "Code-prefixed item description cleanup should run through the named "
-        "phase helper so OCR/POS code prefixes and item description fields "
-        "have one consistency owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_cleanup_calls}"
-    )
-    assert (
-        0
-        < len(phase_calls)
-        <= CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_CALL_LIMIT
-    ), (
-        "Code-prefixed description cleanup phase calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {CODE_PREFIXED_DESCRIPTION_CLEANUP_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_adjacent_price_shift_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, ADJACENT_PRICE_SHIFT_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        ADJACENT_PRICE_SHIFT_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Adjacent OCR price-shift repairs must be owned by the named "
-        f"{ADJACENT_PRICE_SHIFT_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{ADJACENT_PRICE_SHIFT_PHASE_HELPER} must document the adjacent OCR "
-        "row trigger and subtotal arithmetic invariant."
-    )
-
-
-def test_postprocess_adjacent_price_shift_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_price_shift_calls = [
-        name for name in postprocess_calls if name in ADJACENT_PRICE_SHIFT_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == ADJACENT_PRICE_SHIFT_PHASE_HELPER
-    ]
-
-    assert not direct_price_shift_calls, (
-        "Adjacent OCR price-shift repairs should run through the named phase "
-        "helper so neighboring OCR row projection has one arithmetic owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_price_shift_calls}"
-    )
-    assert 0 < len(phase_calls) <= ADJACENT_PRICE_SHIFT_PHASE_CALL_LIMIT, (
-        "Adjacent OCR price-shift phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {ADJACENT_PRICE_SHIFT_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_bag_amount_shift_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, BAG_AMOUNT_SHIFT_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        BAG_AMOUNT_SHIFT_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Paid-bag/product amount-shift repairs must be owned by the named "
-        f"{BAG_AMOUNT_SHIFT_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{BAG_AMOUNT_SHIFT_PHASE_HELPER} must document the OCR paid-bag "
-        "row trigger and subtotal/rate-base arithmetic invariant."
-    )
-
-
-def test_postprocess_bag_amount_shift_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_bag_shift_calls = [
-        name for name in postprocess_calls if name in BAG_AMOUNT_SHIFT_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == BAG_AMOUNT_SHIFT_PHASE_HELPER
-    ]
-
-    assert not direct_bag_shift_calls, (
-        "Paid-bag/product amount-shift repairs should run through the named "
-        "phase helper so OCR row order, rate bases, and subtotal arithmetic "
-        "have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_bag_shift_calls}"
-    )
-    assert 0 < len(phase_calls) <= BAG_AMOUNT_SHIFT_PHASE_CALL_LIMIT, (
-        "Paid-bag/product amount-shift phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {BAG_AMOUNT_SHIFT_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_financial_totals_repair_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, FINANCIAL_TOTALS_REPAIR_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINANCIAL_TOTALS_REPAIR_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Financial totals repair must be owned by the named "
-        f"{FINANCIAL_TOTALS_REPAIR_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINANCIAL_TOTALS_REPAIR_PHASE_HELPER} must document the OCR "
-        "totals/confidence trigger and subtotal/total/tax arithmetic invariant."
-    )
-
-
-def test_postprocess_financial_totals_repair_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_repair_calls = [
-        name
-        for name in postprocess_calls
-        if name in FINANCIAL_TOTALS_REPAIR_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == FINANCIAL_TOTALS_REPAIR_PHASE_HELPER
-    ]
-
-    assert not direct_repair_calls, (
-        "Financial totals repair should run through the named phase helper so "
-        "OCR confidence and subtotal/total/tax arithmetic have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_repair_calls}"
-    )
-    assert 0 < len(phase_calls) <= FINANCIAL_TOTALS_REPAIR_PHASE_CALL_LIMIT, (
-        "Financial totals repair phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {FINANCIAL_TOTALS_REPAIR_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_line_item_cleanup_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, LINE_ITEM_CLEANUP_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(LINE_ITEM_CLEANUP_REPAIRS - set(_call_names_in_function(helper)))
-    assert not missing_repairs, (
-        "Line-item cleanup/drop repairs must be owned by the named "
-        f"{LINE_ITEM_CLEANUP_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{LINE_ITEM_CLEANUP_PHASE_HELPER} must document the OCR/layout trigger "
-        "and arithmetic or field-consistency invariant it enforces."
-    )
-
-
-def test_postprocess_line_item_cleanup_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_cleanup_calls = [
-        name for name in postprocess_calls if name in LINE_ITEM_CLEANUP_REPAIRS
-    ]
-    phase_calls = [
-        name for name in postprocess_calls if name == LINE_ITEM_CLEANUP_PHASE_HELPER
-    ]
-
-    assert not direct_cleanup_calls, (
-        "Line-item cleanup/drop repairs should run through the named phase "
-        "helper so OCR/layout triggers and item-total invariants have one owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_cleanup_calls}"
-    )
-    assert 0 < len(phase_calls) <= LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT, (
-        "Line-item cleanup phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; limit: {LINE_ITEM_CLEANUP_PHASE_CALL_LIMIT}"
-    )
-
-
-def test_phantom_tax_amount_cleanup_phase_is_named_and_invariant_backed():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    helper = _function_def(tree, PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        PHANTOM_TAX_AMOUNT_CLEANUP_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Phantom tax-amount cleanup must be owned by the named "
-        f"{PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_HELPER} must document the OCR tax "
-        "amount phantom-row trigger and line-item/tax field-consistency "
-        "invariant."
-    )
-
-
-def test_postprocess_phantom_tax_amount_cleanup_debt_is_phase_owned():
-    tree = _parse_file(PARSER_DIR / "pipeline_receipt.py")
-    postprocess = _function_def(tree, "postprocess_receipt")
-    postprocess_calls = _call_names_in_function(postprocess)
-    direct_cleanup_calls = [
-        name
-        for name in postprocess_calls
-        if name in PHANTOM_TAX_AMOUNT_CLEANUP_REPAIRS
-    ]
-    phase_calls = [
-        name
-        for name in postprocess_calls
-        if name == PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_HELPER
-    ]
-
-    assert not direct_cleanup_calls, (
-        "Phantom tax-amount cleanup should run through the named phase helper "
-        "so printed tax amounts and corrupted item rows have one consistency "
-        "owner.\n"
-        f"Direct calls still in postprocess_receipt: {direct_cleanup_calls}"
-    )
-    assert 0 < len(phase_calls) <= PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_CALL_LIMIT, (
-        "Phantom tax-amount cleanup phase calls must be explicit and bounded.\n"
-        f"Current count: {len(phase_calls)}; "
-        f"limit: {PHANTOM_TAX_AMOUNT_CLEANUP_PHASE_CALL_LIMIT}"
-    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def test_final_receipt_output_repairs_are_explicit_traced_stages():

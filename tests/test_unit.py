@@ -10027,6 +10027,34 @@ def test_item_price_qty_rows_project_adjacent_descriptions_when_subtotal_balance
     ]
 
 
+def test_item_price_qty_rows_keeps_balanced_existing_items():
+    from receipt_parser.pipeline_receipt import _replace_item_price_qty_rows_when_balanced
+
+    extracted = {
+        "subtotal": 110,
+        "total": 118,
+        "taxes": [{"rate": "8%", "label": "外税", "amount": 8}],
+        "line_items": [
+            {"description": "レジ袋5円", "qty": 1, "unit_price": 5, "total": 5, "tax_category": "10%"},
+            {"description": "いちご", "qty": 1, "unit_price": 105, "total": 105, "tax_category": "8%"},
+        ],
+    }
+    before = [dict(item) for item in extracted["line_items"]]
+    ocr_text = "\n".join([
+        "000226 レジ袋5円",
+        "¥5",
+        "000052 *いちご",
+        "¥105",
+        "小計",
+        "2点",
+        "¥110",
+    ])
+
+    _replace_item_price_qty_rows_when_balanced(extracted, ocr_text)
+
+    assert extracted["line_items"] == before
+
+
 def test_qty_context_does_not_attach_next_item_quantity_detail():
     from receipt_parser.pipeline_receipt import _fix_qty_context_and_reduced_rate_from_ocr
 
