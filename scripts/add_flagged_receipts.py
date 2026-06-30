@@ -380,7 +380,10 @@ payloads AS (
       'payment_method', s.payment_method,
       'account_number', s.account_number,
       'points_used', s.points_used,
-      'amount_paid', s.amount_paid,
+      'amount_paid', CASE
+        WHEN s.total IS NULL THEN NULL
+        ELSE GREATEST(s.total - GREATEST(COALESCE(s.points_used, 0), 0), 0)
+      END,
       'subtotal', s.subtotal,
       'service_type', s.service_type,
       'payer', s.payer,

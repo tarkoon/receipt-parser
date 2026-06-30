@@ -172,6 +172,14 @@ def test_prod_export_empty_receipt_sections_keep_template_pattern():
     }
 
 
+def test_flagged_receipts_sql_derives_amount_paid_from_current_prod_schema():
+    sql = flagged_exporter.build_flagged_receipts_sql([], limit=1)
+
+    assert "s.amount_paid" not in sql
+    assert "'amount_paid', CASE" in sql
+    assert "GREATEST(s.total - GREATEST(COALESCE(s.points_used, 0), 0), 0)" in sql
+
+
 def test_prod_export_utility_sections_are_adapted():
     template = _export_template()
     row = {
