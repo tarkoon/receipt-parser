@@ -75,6 +75,7 @@ FIXTURE_REFERENCE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+BESPOKE_RECEIPT_LITERAL_RE = re.compile(r"(?:\bVIO\b|サンリブ)")
 KNOWN_ANSWER_NAME_RE = re.compile(
     r"(^|_)known(_|$)|final_known|known_answer|known_financial",
     re.IGNORECASE,
@@ -521,6 +522,7 @@ TAX_CATEGORY_ASSIGNMENT_REPAIRS = {
     "_normalize_taxes",
     "_rebalance_standard_categories_from_reduced_rate_markers",
     "_rebalance_tax_categories_to_rate_bases",
+    "_restore_tax_entries_from_item_rate_sums",
     "assign_tax_categories",
 }
 TAX_CATEGORY_ASSIGNMENT_PHASE_HELPER = "_run_tax_category_assignment_phase"
@@ -646,6 +648,7 @@ ADJACENT_PRICE_SHIFT_PHASE_HELPER = "_run_adjacent_price_shift_reconciliation_ph
 ADJACENT_PRICE_SHIFT_PHASE_CALL_LIMIT = 4
 BAG_AMOUNT_SHIFT_REPAIRS = {
     "_fix_name_bag_amount_shift_from_ocr",
+    "_revert_unsupported_qty_inflation",
 }
 BAG_AMOUNT_SHIFT_PHASE_HELPER = "_run_bag_amount_shift_reconciliation_phase"
 BAG_AMOUNT_SHIFT_PHASE_CALL_LIMIT = 3
@@ -771,9 +774,10 @@ FINAL_OUTPUT_REPAIR_STAGES = (
 )
 STRUCTURAL_JAPANESE_LITERAL_RE = re.compile(
     r"(小計|合計|内税|外税|非課税|消費税|税|対象|軽減|税込|税抜|"
-    r"現金|預|釣|支払|ポイント|領収|レシート|登録番号|電話|TEL|"
+    r"現金|預|釣|支払|売上|ポイント|領収|レシート|登録番号|電話|TEL|ありがとう|"
     r"店|支店|営業所|料金所|住所|市|区|町|村|県|都|道|府|"
-    r"年|月|日|時|分|個|点|円|品番|JAN|バーコード)"
+    r"年|月|日|時|分|個|点|円|品番|JAN|バーコード|除|外|内|"
+    r"\\u[0-9a-fA-F]{4}|ぁ-ん|ァ-ン|ァ-ヶ|一-龥|¥|￥)"
 )
 JAPANESE_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 
@@ -1053,6 +1057,19 @@ def _scan_ast(path: Path) -> list[Violation]:
 
     for node in ast.walk(tree):
         function = _enclosing_function(node, parents)
+
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            match = BESPOKE_RECEIPT_LITERAL_RE.search(node.value)
+            if match:
+                violations.append(
+                    Violation(
+                        rel,
+                        node.lineno,
+                        function,
+                        "bespoke_receipt_literal",
+                        match.group(0),
+                    )
+                )
 
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if MERCHANT_OR_STORE_RE.search(node.name):
