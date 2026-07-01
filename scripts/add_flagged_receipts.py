@@ -31,6 +31,7 @@ DEFAULT_REMOTE_STORAGE_ROOT = "/home/tarkoon/data/paper-ledger/storage"
 DEFAULT_POSTGRES_USER = "paper_ledger"
 DEFAULT_POSTGRES_DB = "paper_ledger"
 IGNORED_MANIFEST_STATUS = "ignored"
+IMAGE_FIXTURE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 SCALAR_FIELDS = (
     "document_type",
@@ -307,6 +308,22 @@ def existing_fixture_numbers() -> set[int]:
     return numbers
 
 
+def existing_fixture_image_hashes() -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for path in FIXTURES_DIR.glob("receipt_*.*"):
+        if path.suffix.lower() not in IMAGE_FIXTURE_SUFFIXES:
+            continue
+        parts = path.stem.split("_")
+        if len(parts) != 2 or parts[0] != "receipt":
+            continue
+        try:
+            int(parts[1])
+        except ValueError:
+            continue
+        hashes[hashlib.sha256(path.read_bytes()).hexdigest()] = path.stem
+    return hashes
+
+
 def allocate_fixture_names(
     rows: list[dict[str, Any]],
     manifest: dict[str, Any],
@@ -562,6 +579,7 @@ def export_rows(args: argparse.Namespace, rows: list[dict[str, Any]]) -> int:
 
     exported = 0
     exported_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    image_hashes = existing_fixture_image_hashes() if args.apply and not args.overwrite else {}
     for index, candidate in enumerate(candidates, 1):
         row = candidate["row"]
         fixture_name = assignments[row["id"]]
@@ -577,6 +595,18 @@ def export_rows(args: argparse.Namespace, rows: list[dict[str, Any]]) -> int:
 
         ensure_can_write_fixture(image_path, truth_path, overwrite=args.overwrite)
         image_bytes = read_remote_file(args.stardust_host, remote_image, debug_enabled=args.debug)
+        image_checksum = hashlib.sha256(image_bytes).hexdigest()
+        duplicate_of = image_hashes.get(image_checksum)
+        if duplicate_of:
+            entry = make_manifest_entry(row, "", candidate["checksum"], exported_at)
+            entry["fixture"] = None
+            entry["status"] = IGNORED_MANIFEST_STATUS
+            entry["duplicate_of"] = duplicate_of
+            manifest["receipts"][row["id"]] = entry
+            save_manifest(args.manifest, manifest)
+            print(f"  skipped duplicate image of: {duplicate_of}")
+            continue
+
         write_bytes_atomic(image_path, image_bytes)
         write_text_atomic(
             truth_path,
@@ -589,6 +619,7 @@ def export_rows(args: argparse.Namespace, rows: list[dict[str, Any]]) -> int:
             exported_at,
         )
         save_manifest(args.manifest, manifest)
+        image_hashes[image_checksum] = fixture_name
         exported += 1
         print(f"  wrote: {image_path.relative_to(REPO_ROOT)}")
         print(f"  wrote: {truth_path.relative_to(REPO_ROOT)}")

@@ -307,6 +307,51 @@ def test_fixture_overwrite_guard():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def test_export_rows_skips_exact_duplicate_fixture_image(monkeypatch):
+    scratch = Path(tempfile.mkdtemp(dir=Path(__file__).parents[1] / "local"))
+    try:
+        fixture_dir = scratch / "fixtures"
+        fixture_dir.mkdir()
+        (fixture_dir / "receipt_1.jpg").write_bytes(b"same-image")
+        (fixture_dir / "receipt_1_truth.json").write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(flagged_exporter, "FIXTURES_DIR", fixture_dir)
+        monkeypatch.setattr(
+            flagged_exporter,
+            "read_remote_file",
+            lambda *args, **kwargs: b"same-image",
+        )
+
+        args = SimpleNamespace(
+            manifest=scratch / "manifest.json",
+            dry_run=False,
+            apply=True,
+            overwrite=False,
+            limit=None,
+            start_number=None,
+            remote_storage_root="/storage",
+            stardust_host="stardust",
+            debug=False,
+        )
+        row = {
+            "id": "prod-duplicate",
+            "image_path": "images/new-name.jpg",
+            "updated_at": "2026-06-30T00:00:00",
+            "currency": "JPY",
+        }
+
+        assert flagged_exporter.export_rows(args, [row]) == 0
+        manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+        entry = manifest["receipts"]["prod-duplicate"]
+
+        assert entry["status"] == flagged_exporter.IGNORED_MANIFEST_STATUS
+        assert entry["duplicate_of"] == "receipt_1"
+        assert not (fixture_dir / "receipt_2.jpg").exists()
+        assert not (fixture_dir / "receipt_2_truth.json").exists()
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 # --- Normalization tests ---
 
 def test_fullwidth_digits():
