@@ -34,13 +34,21 @@ def _merchant_looks_invalid(merchant: str | None) -> bool:
         return True
     if re.match(r'^[（(]?[¥￥]?\s*[\d,]+(?:円)?[）)]?$', merchant):
         return True
-    if merchant in {'領収書', '領収証', 'レシート', '様'}:
+    if merchant in {'領収書', '領収証', 'レシート', '様', '売上'}:
+        return True
+    if re.search(r'お買い上げありがとうございます|ご利用ありがとうございます', merchant):
         return True
     if re.match(r'^(?:ご購入店|購入店|お買上店|お買い上げ店)\s*[:：]?', merchant):
         return True
     if re.fullmatch(r'[（(]?(?:消費税|内消費税|税込|税抜|課税対象|税額).*[）)]?', compact):
         return True
     if re.search(r'軽減税率|対象商品|適用商品|印は', compact):
+        return True
+    if re.search(r'返品交換|レシート|ご来店|未使用品|ポイント|割引券', compact):
+        return True
+    if re.search(r'[!！]', merchant) and not re.search(r'[A-Za-z0-9]', merchant):
+        return True
+    if re.search(r'税務|承認済|付につき|印紙税申告納', compact):
         return True
     if re.search(r'但し|上記.*受領|正に受領', merchant):
         return True
@@ -89,6 +97,16 @@ def _fix_company_name_merchant(extracted, unified_text):
             ):
                 extracted["merchant"] = authority_header
                 return
+    if merchant_text and re.search(r'店$', merchant_text):
+        compact_merchant = re.sub(r'\s+', '', merchant_text)
+        for raw_line in lines[:4]:
+            line = raw_line.strip()
+            if line == merchant_text or re.search(r'TEL|FAX|https?://|登録番号|領収', line, re.IGNORECASE):
+                continue
+            for candidate in re.findall(r'[ァ-ヶー]{2,}', line):
+                if compact_merchant.startswith(candidate) and not _merchant_looks_invalid(candidate):
+                    extracted["merchant"] = candidate
+                    return
     if (
         re.fullmatch(r'[A-Z][A-Z0-9&.\'-]{2,}', merchant_text)
         and any(raw_line.strip() == merchant_text for raw_line in lines[:3])
@@ -110,6 +128,23 @@ def _fix_company_name_merchant(extracted, unified_text):
             line = raw_line.strip()
             if line != merchant_text:
                 continue
+            if re.fullmatch(r'[A-Z][A-Z0-9&.\'-]{2,8}', merchant_text):
+                for offset, nearby_raw in enumerate(lines[idx + 1:idx + 4], start=1):
+                    nearby = nearby_raw.strip()
+                    if not nearby or re.search(r'TEL|FAX|https?://|登録番号|領収', nearby, re.IGNORECASE):
+                        continue
+                    if re.search(r'[ぁ-んァ-ン一-龥]', nearby):
+                        if idx == 0 and any(
+                            re.fullmatch(r'[A-Z][A-Z\s&.\'-]{3,}', between.strip())
+                            for between in lines[idx + 1:idx + offset]
+                        ):
+                            return
+                        if re.search(r'(?:店$|ホームセンター|スーパー|ショッピング|モール)', nearby):
+                            return
+                        candidate = _clean_merchant_candidate(nearby)
+                        if candidate and not _merchant_looks_invalid(candidate):
+                            extracted["merchant"] = candidate
+                            return
             if re.fullmatch(r'[A-Z][A-Z\s&.\'-]{4,}', line):
                 for prev_raw in reversed(lines[:idx]):
                     prev = prev_raw.strip()
@@ -152,7 +187,12 @@ def _fix_company_name_merchant(extracted, unified_text):
         ):
             extracted["merchant"] = m.group(1)
             return
-    if merchant and re.search(r'[ぁ-んァ-ン一-龥]', merchant):
+    if (
+        merchant
+        and re.search(r'[ぁ-んァ-ン一-龥]', merchant)
+        and not _merchant_looks_invalid(merchant)
+        and re.search(r'(?:店$|ホームセンター|スーパー|ショッピング|モール)', merchant)
+    ):
         merchant_visible_in_header = any(
             merchant in raw_line for raw_line in lines[:6]
         )
@@ -170,6 +210,12 @@ def _fix_company_name_merchant(extracted, unified_text):
             line = raw_line.strip()
             if not line:
                 continue
+            app_brand = re.search(r'([ァ-ヶー]{3,})\s*アプリ', line)
+            if app_brand:
+                candidate = _clean_merchant_candidate(app_brand.group(1))
+                if candidate and not _merchant_looks_invalid(candidate):
+                    extracted["merchant"] = candidate
+                    return
             business = re.search(r'(?:事業者名|販売者|発行者|店舗名)\s*[:：]\s*(.+)$', line)
             if business:
                 candidate = _clean_merchant_candidate(business.group(1), keep_company_suffix=True)

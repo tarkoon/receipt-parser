@@ -161,6 +161,30 @@ def _recover_header_branch_store_location(extracted: dict, ocr_text: str) -> Non
             return
 
 
+def _recover_ascii_brand_header_location(extracted: dict, ocr_text: str) -> None:
+    """Recover compact location text from an early "ASCII brand + suffix" line."""
+    if not ocr_text:
+        return
+    merchant = re.sub(r'\s+', '', str(extracted.get("merchant") or "")).upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9&.'-]{2,}", merchant):
+        return
+    current = re.sub(r'\s+', '', str(extracted.get("location") or ""))
+    if current and not _is_broad_japanese_admin_location(current):
+        return
+    for raw_line in ocr_text.splitlines()[:8]:
+        compact = re.sub(r'\s+', '', raw_line.strip())
+        if not compact.upper().startswith(merchant):
+            continue
+        suffix = compact[len(merchant):]
+        if (
+            2 <= len(suffix) <= 10
+            and re.fullmatch(r'[ぁ-んァ-ン一-龥ー]+', suffix)
+            and not ADMIN_SUFFIX_RE.fullmatch(suffix)
+        ):
+            extracted["location"] = suffix
+            return
+
+
 def _is_broad_japanese_admin_location(value: str) -> bool:
     """Return true for city/ward/prefecture fragments that are not store names."""
     location = re.sub(r'\s+', '', str(value or ""))
@@ -291,6 +315,13 @@ def _normalize_noisy_city_location(extracted: dict, ocr_text: str) -> None:
     if location in compact_ocr:
         return
     if tail and f"{tail}店" in compact_ocr:
+        candidate = dict(extracted)
+        candidate["location"] = base
+        _recover_header_branch_store_location(candidate, ocr_text)
+        recovered = candidate.get("location")
+        if recovered and recovered != base:
+            extracted["location"] = recovered
+            return
         extracted["location"] = base
         return
     if re.match(r'^(?:ご来|ご利用|ありが|担当|No|レジ)', tail):

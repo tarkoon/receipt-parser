@@ -73,6 +73,7 @@ from .receipt_late_repairs import (
     _restore_stacked_inclusive_tax_block,
     _restore_tax_excluded_per_rate_blocks,
 )
+from .receipt_location import _recover_ascii_brand_header_location
 from .receipt_marker_projection import (
     _fix_qty_totals_from_ocr_unit_lines,
     _replace_campaign_discount_stream_when_balanced,
@@ -1049,6 +1050,7 @@ def _run_header_location_repair_phase(extracted: dict, unified_text: str) -> Non
     """
     _fix_header_store_line_location(extracted, unified_text)
     _fix_split_address_location_from_ocr(extracted, unified_text)
+    _recover_ascii_brand_header_location(extracted, unified_text)
     _recover_labeled_purchase_site_location(extracted, unified_text)
 
 

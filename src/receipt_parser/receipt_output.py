@@ -69,6 +69,7 @@ from .receipt_phase_trace import (
 )
 from .receipt_location import (
     _normalize_noisy_city_location,
+    _recover_ascii_brand_header_location,
     _recover_header_branch_store_location,
     _recover_phone_area_city_location,
     _recover_short_branch_over_phone_area_city,
@@ -316,6 +317,8 @@ def _run_final_header_location_repair_phase(
             _trim_store_in_store_header_location(result, ocr_text)
         elif repair == "header_branch_store_location":
             _recover_header_branch_store_location(result, ocr_text)
+        elif repair == "ascii_brand_header_location":
+            _recover_ascii_brand_header_location(result, ocr_text)
         elif repair == "phone_area_city_location":
             _recover_phone_area_city_location(result, ocr_text)
         elif repair == "short_branch_over_phone_area_city":
@@ -1037,7 +1040,7 @@ def _apply_final_receipt_output_repairs(
         lambda: _run_final_header_location_repair_phase(
             result,
             ocr_text,
-            ("header_branch_store_location",),
+            ("header_branch_store_location", "ascii_brand_header_location"),
         ),
     )
     run(

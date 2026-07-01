@@ -4424,6 +4424,24 @@ def test_header_branch_store_location_recovers_visible_store_token():
     assert extracted["location"] == "サンリブ店"
 
 
+def test_header_location_phase_recovers_ascii_brand_prefixed_location():
+    from receipt_parser.receipt_postprocess_phases import _run_header_location_repair_phase
+
+    extracted = {"merchant": "BRAND", "location": "船橋市"}
+    ocr_text = "\n".join([
+        "BRAND",
+        "税務承認済",
+        "付につき船橋",
+        "印紙税申告納",
+        "BRAND福岡新宮",
+        "10:00-20:00",
+    ])
+
+    _run_header_location_repair_phase(extracted, ocr_text)
+
+    assert extracted["location"] == "福岡新宮"
+
+
 def test_header_branch_store_location_overrides_broad_admin_fragment():
     from receipt_parser.pipeline import _recover_header_branch_store_location
 
@@ -4530,6 +4548,21 @@ def test_final_receipt_output_repairs_trim_footer_noise_from_city_location():
     _apply_final_receipt_output_repairs(result, ocr_text)
 
     assert result["location"] == "宗像市"
+
+
+def test_noisy_city_location_prefers_visible_header_branch():
+    from receipt_parser.receipt_location import _normalize_noisy_city_location
+
+    extracted = {"merchant": "TSUTAYA", "location": "宗像市ブ宗像"}
+    ocr_text = "\n".join([
+        "TSUTAYA",
+        "TSUTAYA サンリブ宗像店",
+        "TEL 0940-38-2050",
+    ])
+
+    _normalize_noisy_city_location(extracted, ocr_text)
+
+    assert extracted["location"] == "サンリブ宗像店"
 
 
 def test_final_receipt_output_repairs_keeps_exact_phone_city_over_short_branch():
@@ -9274,32 +9307,105 @@ def test_price_line_reduced_markers_assign_categories_by_item_order():
     assert [item["tax_category"] for item in extracted["line_items"]] == ["8%", "10%", "10%"]
 
 
-def test_header_ascii_brand_preferred_when_host_store_was_extracted():
+@pytest.mark.parametrize(
+    ("merchant", "ocr_lines", "expected"),
+    [
+        (
+            "サンリブ",
+            ["HAPNS サンリブくりえいと宗像店", "2026/06/01", "領収書"],
+            "HAPNS",
+        ),
+        (
+            "スーパービバホーム",
+            ["Super", "VIVAHOME", "ホームセンター スーパービバホーム", "赤間店", "領収証"],
+            "VIVAHOME",
+        ),
+        (
+            "マックスバリュ",
+            ["AEON", "マックスバリュくりえいと宗像店", "TEL 0940-00-0000"],
+            "マックスバリュ",
+        ),
+        (
+            "KALDI",
+            ["KALDI", "COFFEE FARM", "サンリブくりえいと宗像店", "TEL0940-33-6500"],
+            "KALDI",
+        ),
+        (
+            "VIVAHOME",
+            ["Super", "VIVAHOME", "ホームセンター スーパービバホーム", "アークランズ株式会社", "赤間店"],
+            "VIVAHOME",
+        ),
+        (
+            "HIMARAYA",
+            ["HIMARAYA", "登録番号: T9200001004384", "お買い上げありがとうございます。", "返品交換は本日より30日以内に、"],
+            "HIMARAYA",
+        ),
+        (
+            "いいこと、いろいろ!",
+            ["MINO", "いいこと、いろいろ!", "STOP> ミニストップアプリ", "門司港レトロ店", "MINISTOP"],
+            "ミニストップ",
+        ),
+    ],
+)
+def test_company_name_merchant_structural_header_cases(merchant, ocr_lines, expected):
     from receipt_parser.pipeline_receipt import _fix_company_name_merchant
 
-    extracted = {"merchant": "サンリブ"}
-    ocr_text = "HAPNS サンリブくりえいと宗像店\n2026/06/01\n領収書"
-
-    _fix_company_name_merchant(extracted, ocr_text)
-
-    assert extracted["merchant"] == "HAPNS"
+    extracted = {"merchant": merchant}
+    _fix_company_name_merchant(extracted, "\n".join(ocr_lines))
+    assert extracted["merchant"] == expected
 
 
-def test_stacked_header_ascii_brand_preferred_when_host_store_was_extracted():
+def test_header_identity_phase_runs_merchant_repair_before_location_repair():
     from receipt_parser.pipeline_receipt import _fix_company_name_merchant
 
-    extracted = {"merchant": "スーパービバホーム"}
+    extracted = {"merchant": "ホームセンター スーパービバホーム"}
     ocr_text = "\n".join([
         "Super",
         "VIVAHOME",
         "ホームセンター スーパービバホーム",
+        "アークランズ株式会社",
+        "登録番号",
         "赤間店",
-        "領収証",
+        "TEL:0940-35-7611",
     ])
 
     _fix_company_name_merchant(extracted, ocr_text)
 
     assert extracted["merchant"] == "VIVAHOME"
+
+
+def test_invalid_header_noise_merchants_recover_visible_ascii_brand():
+    from receipt_parser.pipeline_receipt import _fix_company_name_merchant
+
+    cases = [
+        ("売上", "ENEOS\n売上\n納品書(領収書)", "ENEOS"),
+        ("お買い上げありがとうございます。", "HIMARAYA\n登録番号: T9200001004384\nお買い上げありがとうございます。", "HIMARAYA"),
+        ("印紙税申告納", "IKEA\n税務承認済\n付につき船橋\n印紙税申告納", "IKEA"),
+    ]
+
+    for merchant, ocr_text, expected in cases:
+        extracted = {"merchant": merchant}
+        _fix_company_name_merchant(extracted, ocr_text)
+        assert extracted["merchant"] == expected
+
+
+def test_short_ascii_logo_fragment_uses_full_japanese_header_name():
+    from receipt_parser.pipeline_receipt import _fix_company_name_merchant
+
+    extracted = {"merchant": "DELI"}
+    ocr_text = "\n".join([
+        "FROM FARME",
+        "DA",
+        "M",
+        "DELI",
+        "KITCHEN",
+        "オアシス デリ キッチン",
+        "TEL 0940-72-5522",
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "オアシス デリ キッチン"
 
 
 def test_invoice_registration_number_merchant_recovers_phone_header_name():
@@ -9721,6 +9827,22 @@ def test_parent_company_header_prefers_consumer_katakana_store_brand():
     assert extracted["merchant"] == "テストマート"
 
 
+def test_store_specific_katakana_merchant_prefers_visible_header_brand_token():
+    from receipt_parser.pipeline_receipt import _fix_company_name_merchant
+
+    extracted = {"merchant": "ダイソー くりえいと宗像店"}
+    ocr_text = "\n".join([
+        "だんぜん! ダイソー",
+        "DAISO",
+        "ダイソー くりえいと宗像店",
+        "TEL: 082-420-0100",
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "ダイソー"
+
+
 def test_invalid_tax_annotation_merchant_recovers_explicit_business_name():
     from receipt_parser.pipeline_receipt import _fix_company_name_merchant
 
@@ -9764,6 +9886,22 @@ def test_invalid_tax_annotation_merchant_does_not_use_service_line_before_busine
     _fix_company_name_merchant(extracted, ocr_text)
 
     assert extracted["merchant"] == "テスト登山鉄道株式会社"
+
+
+def test_invalid_tax_office_fragment_merchant_recovers_ascii_header_brand():
+    from receipt_parser.pipeline_receipt import _fix_company_name_merchant
+
+    extracted = {"merchant": "付につき船橋"}
+    ocr_text = "\n".join([
+        "IKEA",
+        "税務当承認済",
+        "付につき船橋",
+        "IKEA福岡新宮",
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "IKEA"
 
 
 def test_purchase_store_metadata_merchant_recovers_visible_header_brand():
