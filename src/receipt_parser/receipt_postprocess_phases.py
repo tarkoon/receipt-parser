@@ -794,6 +794,123 @@ def _tax_assignment_rate_bases(unified_text: str, ocr_totals: dict | None) -> di
     return rate_bases
 
 
+def _has_printed_vertical_tax_block(unified_text: str) -> bool:
+    return bool(
+        re.search(r'税率\s*\n\s*(?:\d+(?:\.\d+)?)\s*\n\s*\*+\s*\n\s*税抜き\s*\n\s*税額', unified_text)
+        or re.search(r'税率\s*\n\s*(?:\d+(?:\.\d+)?)\s*%?\s*\n.*?\n\s*税抜き\s*\n\s*税額', unified_text, re.S)
+    )
+
+
+def _restore_tax_entries_from_item_rate_sums(
+    extracted: dict,
+    unified_text: str,
+    ocr_totals: dict | None,
+    rate_bases: dict | None,
+) -> None:
+    """Trigger: item tax categories exist but tax entries are missing or stale.
+
+    Invariant: restored tax entries must be derived from item rate sums unless a
+    printed vertical tax block owns the tax amounts.
+    """
+    if (
+        not extracted.get("line_items")
+        or not extracted.get("taxes")
+        or _has_printed_vertical_tax_block(unified_text)
+    ):
+        return
+
+    rate_sums: dict[str, float] = {}
+    for item in extracted["line_items"]:
+        if not isinstance(item, dict):
+            continue
+        cat = item.get("tax_category", "0%")
+        if cat and cat != "0%":
+            rate_sums[cat] = rate_sums.get(cat, 0) + (item.get("total") or 0)
+    existing_rates = {tax.get("rate") for tax in extracted["taxes"]}
+    existing_labels = [
+        tax.get("label", "") for tax in extracted["taxes"] if tax.get("label")
+    ]
+    default_label = existing_labels[0] if existing_labels else None
+    is_inclusive = default_label in ("内税", "消費税等") or (
+        default_label or ""
+    ).startswith("内")
+    ocr_tax_rates = {
+        tax.get("rate")
+        for tax in ((ocr_totals or {}).get("taxes") or [])
+        if isinstance(tax, dict) and tax.get("rate") and (tax.get("amount") or 0) > 0
+    }
+    target_only_rates = {
+        rate
+        for rate, base in (rate_bases or {}).items()
+        if base and base > 0 and rate not in ocr_tax_rates
+    }
+    for cat in sorted(rate_sums):
+        if cat not in existing_rates and rate_sums[cat] > 0:
+            rate_pct = float(cat.replace("%", "")) / 100.0
+            if is_inclusive:
+                computed_tax = round(rate_sums[cat] * rate_pct / (1 + rate_pct))
+            else:
+                computed_tax = round(rate_sums[cat] * rate_pct)
+            if cat in target_only_rates and computed_tax <= 1:
+                continue
+            if computed_tax > 0:
+                extracted["taxes"].append({
+                    "rate": cat,
+                    "label": default_label,
+                    "amount": computed_tax,
+                })
+
+    ocr_zero_rates = {
+        tax.get("rate")
+        for tax in ((ocr_totals or {}).get("taxes") or [])
+        if isinstance(tax, dict) and (tax.get("amount") or 0) == 0
+    }
+    for tax in extracted["taxes"]:
+        if not isinstance(tax, dict):
+            continue
+        rate = tax.get("rate")
+        if not rate or rate not in rate_sums or rate in ocr_zero_rates:
+            continue
+        amount = tax.get("amount") or 0
+        try:
+            rate_pct = float(rate.replace("%", "")) / 100.0
+        except ValueError:
+            continue
+        if rate_pct <= 0:
+            continue
+        entry_label = tax.get("label") or default_label or ""
+        entry_inclusive = entry_label in ("内税", "消費税等") or entry_label.startswith("内")
+        if entry_inclusive:
+            expected = round(rate_sums[rate] * rate_pct / (1 + rate_pct))
+        else:
+            expected = round(rate_sums[rate] * rate_pct)
+        if expected > 0 and (amount == 0 or amount > expected * 3):
+            tax["amount"] = expected
+        elif expected > 0 and amount > 0 and amount < expected / 3:
+            tax["amount"] = expected
+
+    kept = []
+    for tax in extracted["taxes"]:
+        if not isinstance(tax, dict):
+            kept.append(tax)
+            continue
+        rate = tax.get("rate")
+        if rate and rate in rate_sums:
+            try:
+                rate_pct = float(rate.replace("%", "")) / 100.0
+            except ValueError:
+                rate_pct = 0
+            if rate_pct > 0:
+                if is_inclusive:
+                    expected = round(rate_sums[rate] * rate_pct / (1 + rate_pct))
+                else:
+                    expected = round(rate_sums[rate] * rate_pct)
+                if expected == 0:
+                    continue
+        kept.append(tax)
+    extracted["taxes"] = kept
+
+
 def _run_tax_category_assignment_phase(
     extracted: dict,
     unified_text: str,
@@ -803,9 +920,9 @@ def _run_tax_category_assignment_phase(
 ) -> dict:
     """Trigger: OCR rate markers, rate-base summaries, or price-line flags.
 
-    Invariant: item tax categories and normalized tax entries must remain
-    consistent with visible rate markers, printed rate bases, subtotal/total
-    arithmetic, and single-bag splits.
+    Invariant: item tax categories and normalized/restored tax entries must
+    remain consistent with visible rate markers, printed rate bases,
+    subtotal/total arithmetic, and single-bag splits.
     """
     items = extracted.get("line_items") or []
     merged_rate_bases = rate_bases if rate_bases is not None else _tax_assignment_rate_bases(
@@ -853,6 +970,13 @@ def _run_tax_category_assignment_phase(
                 _assign_single_standard_rate_from_small_base(items, merged_rate_bases)
         elif repair == "normalize_tax_entries":
             _normalize_taxes(extracted, unified_text, ocr_totals)
+        elif repair == "restore_item_rate_sum_tax_entries":
+            _restore_tax_entries_from_item_rate_sums(
+                extracted,
+                unified_text,
+                ocr_totals,
+                merged_rate_bases,
+            )
         else:
             raise ValueError(f"Unknown tax category assignment repair: {repair}")
     return merged_rate_bases

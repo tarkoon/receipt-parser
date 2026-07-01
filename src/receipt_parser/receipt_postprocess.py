@@ -61,6 +61,7 @@ from .receipt_postprocess_phases import (
     _run_bag_item_ocr_repair_phase,
     _run_transaction_datetime_repair_phase,
     _run_financial_totals_repair_phase,
+    _has_printed_vertical_tax_block,
     _tax_assignment_rate_bases,
 )
 
@@ -616,6 +617,7 @@ def postprocess_receipt(
         extracted["account_number"] = None
 
     # Tax categories
+    rate_bases = None
     if extracted.get("line_items"):
         rate_bases = _tax_assignment_rate_bases(unified_text, ocr_totals)
         _run_bag_item_rate_base_reconciliation_phase(
@@ -700,107 +702,6 @@ def postprocess_receipt(
         extracted,
     )
 
-    # Ensure tax entries exist for all assigned item categories
-    if extracted.get("line_items") and extracted.get("taxes"):
-        rate_sums: dict[str, float] = {}
-        for item in extracted["line_items"]:
-            if not isinstance(item, dict):
-                continue
-            cat = item.get("tax_category", "0%")
-            if cat and cat != "0%":
-                rate_sums[cat] = rate_sums.get(cat, 0) + (item.get("total") or 0)
-        existing_rates = {t.get("rate") for t in extracted["taxes"]}
-        existing_labels = [t.get("label", "") for t in extracted["taxes"] if t.get("label")]
-        default_label = existing_labels[0] if existing_labels else None
-        is_inclusive = default_label in ('内税', '消費税等') or (default_label or '').startswith('内')
-        ocr_tax_rates = {
-            t.get("rate")
-            for t in (ocr_totals.get("taxes") or [])
-            if isinstance(t, dict) and t.get("rate") and (t.get("amount") or 0) > 0
-        }
-        target_only_rates = {
-            rate
-            for rate, base in (rate_bases or {}).items()
-            if base and base > 0 and rate not in ocr_tax_rates
-        }
-        for cat in sorted(rate_sums):
-            if cat not in existing_rates and rate_sums[cat] > 0:
-                rate_pct = float(cat.replace('%', '')) / 100.0
-                if is_inclusive:
-                    computed_tax = round(rate_sums[cat] * rate_pct / (1 + rate_pct))
-                else:
-                    computed_tax = round(rate_sums[cat] * rate_pct)
-                # Truth-file convention: omit tax entries that round to 0
-                # (e.g., a レジ袋 at 5円 × 10% = 0.5 → 0).
-                if cat in target_only_rates and computed_tax <= 1:
-                    continue
-                if computed_tax > 0:
-                    extracted["taxes"].append({
-                        "rate": cat,
-                        "label": default_label,
-                        "amount": computed_tax,
-                    })
-
-        # Fix LLM-extracted tax entries with amount=0 when items at that
-        # rate yield non-zero expected tax. The LLM occasionally extracts
-        # {rate: X, amount: 0} when the receipt prints a "X% target N"
-        # rate-base line but no companion tax-amount line (e.g. receipts
-        # with a single レジ袋 at 10円 and 10% rate base 10 — no separate
-        # 10% tax printed because it rounds to ~1 yen).
-        # Skip rates the OCR explicitly reports as ¥0 (truth-file convention
-        # omits printed-zero tax entries).
-        ocr_zero_rates = {
-            t.get("rate") for t in (ocr_totals.get("taxes") or [])
-            if isinstance(t, dict) and (t.get("amount") or 0) == 0
-        }
-        for t in extracted["taxes"]:
-            if not isinstance(t, dict):
-                continue
-            r = t.get("rate")
-            if not r or r not in rate_sums or r in ocr_zero_rates:
-                continue
-            amount = t.get("amount") or 0
-            try:
-                rate_pct = float(r.replace('%', '')) / 100.0
-            except ValueError:
-                continue
-            if rate_pct <= 0:
-                continue
-            entry_label = t.get("label") or default_label or ""
-            entry_inclusive = entry_label in ('内税', '消費税等') or entry_label.startswith('内')
-            if entry_inclusive:
-                expected = round(rate_sums[r] * rate_pct / (1 + rate_pct))
-            else:
-                expected = round(rate_sums[r] * rate_pct)
-            if expected > 0 and (amount == 0 or amount > expected * 3):
-                t["amount"] = expected
-            elif expected > 0 and amount > 0 and amount < expected / 3:
-                t["amount"] = expected
-
-        # Drop tax entries for rates whose items-side computed tax rounds to 0
-        # (e.g., LLM merged a `{rate: 10%, amount: 4}` entry by mis-reading a 4
-        # yen レジ袋 as the tax amount). The truth-file convention omits these.
-        kept = []
-        for t in extracted["taxes"]:
-            if not isinstance(t, dict):
-                kept.append(t)
-                continue
-            r = t.get("rate")
-            if r and r in rate_sums:
-                try:
-                    rate_pct = float(r.replace('%', '')) / 100.0
-                except ValueError:
-                    rate_pct = 0
-                if rate_pct > 0:
-                    if is_inclusive:
-                        expected = round(rate_sums[r] * rate_pct / (1 + rate_pct))
-                    else:
-                        expected = round(rate_sums[r] * rate_pct)
-                    if expected == 0:
-                        continue  # drop — items at this rate produce 0 tax
-            kept.append(t)
-        extracted["taxes"] = kept
-
     # Drop any remaining tax entries with amount=0 (LLM-supplied unhandled).
     # Exempt the 0% / 非課税 entry: truth files keep it (rate '0%' may have
     # amount=0 since there's no tax to record on a non-taxable line).
@@ -818,6 +719,7 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
+    has_printed_vertical_tax_block = _has_printed_vertical_tax_block(unified_text)
     _run_payment_points_reconciliation_phase(
         extracted,
         unified_text,
@@ -853,7 +755,8 @@ def postprocess_receipt(
         extracted,
         unified_text,
         ocr_totals,
-        ("normalize_tax_entries",),
+        ("restore_item_rate_sum_tax_entries", "normalize_tax_entries"),
+        rate_bases=rate_bases,
     )
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
@@ -897,7 +800,8 @@ def postprocess_receipt(
 
     # Fix tax amounts when OCR taxes are missing
     if (extracted.get("taxes") and extracted.get("line_items")
-            and extracted.get("total") and not ocr_totals.get("taxes")):
+            and extracted.get("total") and not ocr_totals.get("taxes")
+            and not has_printed_vertical_tax_block):
         rate_sums: dict[str, float] = {}
         for item in extracted["line_items"]:
             cat = item.get("tax_category", "0%")
@@ -926,6 +830,7 @@ def postprocess_receipt(
         extracted.get("taxes")
         and not ocr_totals.get("taxes")
         and not _items_plus_tax_matches_total(extracted)
+        and not has_printed_vertical_tax_block
     ):
         rb = extract_rate_bases(unified_text)
         bb = ocr_totals.get('_breakdown_rate_bases', {})

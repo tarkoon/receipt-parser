@@ -334,7 +334,7 @@ def _is_bag_description(desc: str | None) -> bool:
     return bool(_BAG_DESC_RE.search(desc or ""))
 
 
-def _fix_tax_categories_from_ocr_markers(items, unified_text):
+def _fix_tax_categories_from_ocr_markers(items, unified_text, *, stacked_only: bool = False):
     """Use visible reduced-tax markers next to OCR item prices."""
     if not items:
         return
@@ -352,49 +352,82 @@ def _fix_tax_categories_from_ocr_markers(items, unified_text):
 
     norm_lines = [_norm(line) for line in lines]
 
+    has_reduced_marker_footnote = bool(
+        re.search(r'[*＊※☆★].{0,12}軽減税率|軽減税率.{0,12}[*＊※☆★]', unified_text)
+    )
 
+    def _is_code_continuation(line: str) -> bool:
+        return bool(re.fullmatch(r'\d{6,14}\s*(?:JAN)?', line or "", re.IGNORECASE))
+
+    def _is_price_row(line: str) -> bool:
+        return bool(re.fullmatch(r'[¥￥]?\s*\d[\d,]*\s*(?:[%％][*※除軽外内]|[*※除軽外内])?\s*$', line or ""))
+
+    def _precedes_marked_stacked_reduced_item(line_idx: int) -> bool:
+        if not has_reduced_marker_footnote:
+            return False
+        saw_code = False
+        for nearby in lines[line_idx + 1:line_idx + 5]:
+            nearby = nearby.strip()
+            if not nearby:
+                continue
+            if _is_price_row(nearby):
+                return False
+            if _is_code_continuation(nearby):
+                saw_code = True
+                continue
+            if saw_code and re.match(r'^[*＊※☆★]\s*[ぁ-んァ-ン一-龥A-Za-z]', nearby):
+                return True
+            if saw_code and re.search(r'[ぁ-んァ-ン一-龥A-Za-z]', nearby):
+                return False
+        return False
 
     for item in items:
         if not isinstance(item, dict):
             continue
         raw_desc = item.get("description") or ""
-        if (
-            re.search(r'ごみ袋|ゴミ袋', raw_desc)
-            and re.search(r'(?:ごみ袋|ゴミ袋)[^\n]*非|非課税対象額', unified_text)
-        ):
-            item["tax_category"] = "0%"
-            continue
-        if _is_bag_description(raw_desc):
-            item["tax_category"] = "10%"
-            continue
-        if "本みりん" in raw_desc:
-            item["tax_category"] = "10%"
-            continue
-        if (
-            not has_standard_rate_evidence
-            and _FOOD_DESC_RE.search(raw_desc)
-            and re.search(r'軽減税率|8%対象|8%対象額|※印', unified_text)
-        ):
-            item["tax_category"] = "8%"
-            continue
-        if _is_service_fee_description(raw_desc) and _has_service_inclusive_tax_evidence(unified_text):
-            item["tax_category"] = "10%"
-            continue
-        if "100円均一" in raw_desc:
-            item["tax_category"] = "10%"
-            continue
-        if (item.get("total") or 0) == 100 and "100円均一" in unified_text and "業務スーパー" in unified_text:
-            item["tax_category"] = "10%"
-            continue
-        if re.search(r'液体BL|水切り|抗菌|キレイ液体|漂白|洗剤', raw_desc):
-            item["tax_category"] = "10%"
-            continue
-        if (
-            re.search(r'美容|ヘア|リップ|UV|マスク|モイスチャー|サンプロテクター|シャンプー', raw_desc, re.IGNORECASE)
-            and re.search(r'コスモス|ドラッグ|医薬|化粧品|薬', unified_text)
-        ):
-            item["tax_category"] = "10%"
-            continue
+        if not stacked_only:
+            if (
+                re.search(r'ごみ袋|ゴミ袋', raw_desc)
+                and re.search(r'(?:ごみ袋|ゴミ袋)[^\n]*非|非課税対象額', unified_text)
+            ):
+                item["tax_category"] = "0%"
+                continue
+            if _is_bag_description(raw_desc):
+                item["tax_category"] = "10%"
+                continue
+            if "本みりん" in raw_desc:
+                item["tax_category"] = "10%"
+                continue
+            if (
+                not has_standard_rate_evidence
+                and _FOOD_DESC_RE.search(raw_desc)
+                and re.search(r'軽減税率|8%対象|8%対象額|※印', unified_text)
+            ):
+                item["tax_category"] = "8%"
+                continue
+            if _is_service_fee_description(raw_desc) and _has_service_inclusive_tax_evidence(unified_text):
+                item["tax_category"] = "10%"
+                continue
+            if "100円均一" in raw_desc:
+                item["tax_category"] = "10%"
+                continue
+            if (item.get("total") or 0) == 100 and "100円均一" in unified_text and "業務スーパー" in unified_text:
+                item["tax_category"] = "10%"
+                continue
+            if re.search(r'液体BL|水切り|抗菌|キレイ液体|漂白|洗剤', raw_desc):
+                item["tax_category"] = "10%"
+                continue
+            if (
+                re.search(r'美容|ヘア|リップ|UV|マスク|モイスチャー|サンプロテクター|シャンプー', raw_desc, re.IGNORECASE)
+                and re.search(r'コスモス|ドラッグ|医薬|化粧品|薬', unified_text)
+            ):
+                item["tax_category"] = "10%"
+                continue
+            if has_reduced_marker_footnote:
+                marker_cleaned = re.sub(r'^[*＊※☆★]\s*', '', raw_desc).strip()
+                if marker_cleaned != raw_desc and re.search(r'[ぁ-んァ-ン一-龥]', marker_cleaned):
+                    item["description"] = marker_cleaned
+                    raw_desc = marker_cleaned
         desc = _norm(item.get("description") or "")
         if len(desc) < 3:
             continue
@@ -415,6 +448,11 @@ def _fix_tax_categories_from_ocr_markers(items, unified_text):
         line = lines[best_idx].strip()
         if re.match(r'^内\s*\*', line):
             item["tax_category"] = "8%"
+            continue
+        if _precedes_marked_stacked_reduced_item(best_idx):
+            item["tax_category"] = "8%"
+            continue
+        if stacked_only:
             continue
         if re.search(r'ドラッグストア\s*\n\s*コスモス|コスモス', unified_text):
             marked_current_line = bool(re.search(r'[%％][*※除軽]|[*※軽]', line))
@@ -784,6 +822,7 @@ def reconcile_tax_categories_from_rate_bases(extracted: dict, unified_text: str)
         rate_bases,
     )
     _assign_visible_bags_to_standard_rate(items, unified_text)
+    _fix_tax_categories_from_ocr_markers(items, unified_text, stacked_only=True)
 
 
 def _rebalance_standard_categories_from_reduced_rate_markers(items, unified_text, rate_bases):

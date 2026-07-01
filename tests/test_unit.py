@@ -1132,6 +1132,34 @@ def test_implausible_tax_amount_repair_phase_uses_rate_base_swap_invariant():
     assert extracted["taxes"][0]["amount"] == 98
 
 
+def test_implausible_tax_amount_repair_keeps_visible_smaller_tax_value():
+    from receipt_parser.pipeline_receipt import _run_implausible_tax_amount_repair_phase
+
+    extracted = {
+        "total": 5072,
+        "taxes": [
+            {"rate": "10%", "amount": 287, "label": "外税"},
+            {"rate": "8%", "amount": 141, "label": "外税"},
+        ],
+    }
+    ocr_text = "\n".join([
+        "外税8%対象額",
+        "8%外税額",
+        "¥1,766",
+        "¥141",
+        "合計",
+        "¥5,072",
+    ])
+
+    _run_implausible_tax_amount_repair_phase(
+        extracted,
+        ocr_text,
+        {"_breakdown_rate_bases": {"8%": 141}},
+    )
+
+    assert extracted["taxes"][1]["amount"] == 141
+
+
 def test_vertical_price_qty_total_projection_phase_uses_row_and_sum_invariant():
     from receipt_parser.pipeline_receipt import (
         _run_vertical_price_qty_total_projection_phase,
@@ -2407,6 +2435,53 @@ def test_ocr_food_shortcut_does_not_override_standard_category_on_mixed_rate_rec
     assert [item["tax_category"] for item in items] == ["10%", "8%"]
 
 
+def test_tax_marker_cleanup_strips_leading_marker_glyphs_from_descriptions():
+    from receipt_parser.pipeline_receipt import _fix_tax_categories_from_ocr_markers
+
+    items = [
+        {"description": "* ザバスプロウェイトダウンチョコ", "total": 2699, "tax_category": "8%"},
+        {"description": "☆何回投げても大丈夫", "total": 800, "tax_category": "10%"},
+    ]
+    text = "\n".join([
+        "* ザバスプロウェイトダウンチョコ",
+        "☆何回投げても大丈夫",
+        "「*」印は軽減税率(8%) 適用商品",
+    ])
+
+    _fix_tax_categories_from_ocr_markers(items, text)
+
+    assert [item["description"] for item in items] == [
+        "ザバスプロウェイトダウンチョコ",
+        "何回投げても大丈夫",
+    ]
+
+
+def test_reduced_rate_marker_applies_to_preceding_stacked_code_item():
+    from receipt_parser.pipeline_receipt import _fix_tax_categories_from_ocr_markers
+
+    items = [
+        {"description": "前々の商品", "total": 799, "tax_category": "10%"},
+        {"description": "前の商品", "total": 1680, "tax_category": "10%"},
+        {"description": "* マーク商品", "total": 2699, "tax_category": "10%"},
+    ]
+    text = "\n".join([
+        "前々の商品",
+        "4560224462238JAN",
+        "前の商品",
+        "4987176111081JAN",
+        "* マーク商品",
+        "4549777403431JAN",
+        "¥799",
+        "¥1,680",
+        "¥2,699",
+        "「*」印は軽減税率(8%) 適用商品",
+    ])
+
+    _fix_tax_categories_from_ocr_markers(items, text)
+
+    assert [item["tax_category"] for item in items] == ["10%", "8%", "8%"]
+
+
 def test_reduced_tax_footnote_does_not_override_truncated_standard_tax_block():
     from receipt_parser.pipeline_receipt import _fix_tax_categories_from_ocr_markers
 
@@ -2428,111 +2503,117 @@ def test_reduced_tax_footnote_does_not_override_truncated_standard_tax_block():
     assert items[0]["tax_category"] == "10%"
 
 
-def test_extract_rate_bases_accepts_ocr_year_for_percent_marker():
+@pytest.mark.parametrize(
+    ("lines", "expected"),
+    [
+        (
+            [
+                "外税8%対象額",
+                "¥2,986",
+                "外税10年対象額",
+                "¥3",
+            ],
+            {"8%": 2986.0, "10%": 3.0},
+        ),
+        (
+            [
+                "合計",
+                "¥1,630",
+                "(10% 対象",
+                "(内消費税等",
+                "¥5)",
+                "¥0)",
+                "(8%対象",
+                "(内消費税等",
+                "¥1,625)",
+                "¥120)",
+            ],
+            {"10%": 5.0, "8%": 1625.0},
+        ),
+        (
+            [
+                "外税8%対象額",
+                "外税8%",
+                "外税10年対象額",
+                "外枠10%",
+                "合計",
+                "クレジット",
+                "お釣り",
+                "¥2,986",
+                "¥238",
+                "¥3",
+                "¥0",
+            ],
+            {"8%": 2986.0, "10%": 3.0},
+        ),
+        (
+            [
+                "軽:軽減税率対象商品",
+                "E:軽減税率対象商品 (店内飲食)",
+                "外税10%対象額",
+                "外税10%",
+                "外税8%対象額",
+                "外税8%",
+                "合おお",
+                "計",
+                "お預り",
+                "釣",
+                "¥3",
+                "¥0",
+                "¥814",
+                "¥65",
+                "¥882",
+                "¥1,000",
+                "¥118",
+            ],
+            {"10%": 3.0, "8%": 814.0},
+        ),
+        (
+            [
+                "小計",
+                "外税8%対象額",
+                "外税8%",
+                "外税10年対象額",
+                "外枠10%",
+                "合計",
+                "クレジット",
+                "お釣り",
+                "278*",
+                "268",
+                "118*",
+                "¥2,989",
+                "¥2,986",
+                "¥238",
+                "¥3",
+                "¥0",
+                "¥3,227",
+                "¥3,227",
+            ],
+            {"8%": 2986.0, "10%": 3.0},
+        ),
+        (
+            [
+                "税率 8%課税対象額",
+                "¥7,800",
+                "税率 8%税額",
+                "税率10%課税対象額",
+                "¥577",
+                "¥231",
+                "(消費税等",
+                "税率10%税額",
+                "合計",
+                "QUICPay",
+                "¥21",
+                "¥8,031",
+            ],
+            {"8%": 7800.0, "10%": 231.0},
+        ),
+    ],
+)
+def test_extract_rate_bases_structural_ocr_cases(lines, expected):
     from receipt_parser.pipeline_receipt import extract_rate_bases
 
-    text = "\n".join([
-        "外税8%対象額",
-        "¥2,986",
-        "外税10年対象額",
-        "¥3",
-    ])
-
-    assert extract_rate_bases(text) == {"8%": 2986.0, "10%": 3.0}
-
-
-def test_extract_rate_bases_maps_stacked_tax_labels_to_values():
-    from receipt_parser.pipeline_receipt import extract_rate_bases
-
-    text = "\n".join([
-        "外税8%対象額",
-        "外税8%",
-        "外税10年対象額",
-        "外枠10%",
-        "合計",
-        "クレジット",
-        "お釣り",
-        "¥2,986",
-        "¥238",
-        "¥3",
-        "¥0",
-    ])
-
-    assert extract_rate_bases(text) == {"8%": 2986.0, "10%": 3.0}
-
-
-def test_extract_rate_bases_ignores_reduced_rate_footnotes_before_stacked_values():
-    from receipt_parser.pipeline_receipt import extract_rate_bases
-
-    text = "\n".join([
-        "軽:軽減税率対象商品",
-        "E:軽減税率対象商品 (店内飲食)",
-        "外税10%対象額",
-        "外税10%",
-        "外税8%対象額",
-        "外税8%",
-        "合おお",
-        "計",
-        "お預り",
-        "釣",
-        "¥3",
-        "¥0",
-        "¥814",
-        "¥65",
-        "¥882",
-        "¥1,000",
-        "¥118",
-    ])
-
-    assert extract_rate_bases(text) == {"10%": 3.0, "8%": 814.0}
-
-
-def test_extract_rate_bases_maps_stacked_tax_labels_past_item_values():
-    from receipt_parser.pipeline_receipt import extract_rate_bases
-
-    text = "\n".join([
-        "小計",
-        "外税8%対象額",
-        "外税8%",
-        "外税10年対象額",
-        "外枠10%",
-        "合計",
-        "クレジット",
-        "お釣り",
-        "278*",
-        "268",
-        "118*",
-        "¥2,989",
-        "¥2,986",
-        "¥238",
-        "¥3",
-        "¥0",
-        "¥3,227",
-        "¥3,227",
-    ])
-
-    assert extract_rate_bases(text) == {"8%": 2986.0, "10%": 3.0}
-
-
-def test_extract_rate_bases_skips_previous_tax_value_before_next_target_label():
-    from receipt_parser.pipeline_receipt import extract_rate_bases
-
-    text = "\n".join([
-        "税率 8%課税対象額",
-        "¥7,800",
-        "税率 8%税額",
-        "税率10%課税対象額",
-        "¥577",
-        "¥231",
-        "(消費税等",
-        "税率10%税額",
-        "合計",
-        "QUICPay",
-        "¥21",
-        "¥8,031",
-    ])
-
-    assert extract_rate_bases(text) == {"8%": 7800.0, "10%": 231.0}
+    assert extract_rate_bases("\n".join(lines)) == expected
 
 
 def test_extract_rate_bases_uses_immediate_values_in_interleaved_summary():
@@ -2597,6 +2678,85 @@ def test_parenthesized_target_consumption_tax_uses_base_rate_arithmetic():
     ]
 
 
+def test_financial_totals_ignore_points_aggregate_total_labels():
+    from receipt_parser.pipeline_receipt import extract_financial_totals, extract_rate_bases
+
+    text = "\n".join([
+        "税込小計 1品",
+        "¥1,170",
+        "合計",
+        "¥1,170",
+        "内消費税",
+        "¥106",
+        "(10%対象",
+        "¥1,170 税",
+        "¥106)",
+        "ポイント対象額",
+        "¥1,064",
+        "全品ポイント合計",
+        "(計算対象額",
+        "¥1,064)",
+    ])
+
+    totals = extract_financial_totals(text)
+
+    assert totals["total"] == 1170.0
+    assert totals["taxes"] == [{"rate": "10%", "label": "内税", "amount": 106.0}]
+    assert extract_rate_bases(text) == {"10%": 1170.0}
+
+
+def test_financial_totals_ignore_waon_points_summary_total():
+    from receipt_parser.pipeline_receipt import extract_financial_totals
+
+    text = "\n".join([
+        "小計",
+        "¥1,918",
+        "外税8%",
+        "¥153",
+        "合計",
+        "¥2,071",
+        "WAON支払",
+        "¥2,071",
+        "ポイント対象金額(税込)",
+        "合 計",
+        "¥2,068",
+        "20P",
+    ])
+
+    totals = extract_financial_totals(text)
+
+    assert totals["total"] == 2071.0
+
+
+def test_financial_totals_use_inclusive_rate_base_with_trailing_tax_marker():
+    from receipt_parser.pipeline_receipt import extract_financial_totals, extract_rate_bases
+
+    text = "\n".join([
+        "レギュラーガソリン P07 ¥3600",
+        "数量",
+        "単価",
+        "(内がソリン税",
+        "合計",
+        "(内税分消費税",
+        "21.95L",
+        "@164",
+        "@28.7",
+        "¥630)",
+        "¥3,600",
+        "¥327)",
+        "(内税10%対象",
+        "¥3600)",
+        "(内税10%消費税",
+        "¥327)",
+    ])
+
+    totals = extract_financial_totals(text)
+
+    assert extract_rate_bases(text) == {"10%": 3600.0}
+    assert totals["total"] == 3600.0
+    assert totals["taxes"] == [{"rate": "10%", "label": "内税", "amount": 327.0}]
+
+
 def test_bare_number_rate_summary_stack_maps_targets_and_tax_amounts():
     from receipt_parser.pipeline_receipt import extract_financial_totals, extract_rate_bases
 
@@ -2647,6 +2807,92 @@ def test_interleaved_rate_summary_maps_bases_and_tax_amounts_without_yen_marks()
     assert extract_financial_totals(text)["taxes"] == [
         {"rate": "8%", "label": "内税", "amount": 2275.0},
         {"rate": "10%", "label": "内税", "amount": 522.0},
+    ]
+
+
+def test_column_split_rate_bases_keep_subtotal_padded_target_alignment():
+    from receipt_parser.pipeline_receipt import extract_financial_totals, extract_rate_bases
+
+    text = "\n".join([
+        "小計",
+        "8% 対象額",
+        "8%税額",
+        "10% 対象額",
+        "¥10,334",
+        "¥3,058",
+        "¥244",
+        "¥7,276",
+        "10%税額",
+        "¥727",
+        "合計",
+        "¥11,305",
+    ])
+
+    assert extract_rate_bases(text) == {"8%": 3058.0, "10%": 7276.0}
+    assert extract_financial_totals(text)["taxes"] == [
+        {"rate": "10%", "label": "税額", "amount": 727.0},
+        {"rate": "8%", "label": "外税", "amount": 244.0},
+    ]
+
+
+def test_parenthesized_rate_bases_use_one_closing_value_per_target():
+    from receipt_parser.pipeline_receipt import extract_rate_bases
+
+    text = "\n".join([
+        "小計",
+        "(10% 対象",
+        "(8%対象",
+        "合計",
+        "QUICPay",
+        "¥8,478)",
+        "0)",
+    ])
+
+    assert extract_rate_bases(text) == {"10%": 8478.0, "8%": 0.0}
+
+
+def test_single_parenthesized_rate_base_uses_tax_plausibility_not_first_closing_tax():
+    from receipt_parser.pipeline_receipt import extract_rate_bases
+
+    text = "\n".join([
+        "合",
+        "計",
+        "(内消費税等",
+        "(8%対象",
+        "(内消費税額",
+        "¥370",
+        "¥27)",
+        "¥370)",
+        "¥27)",
+    ])
+
+    assert extract_rate_bases(text) == {"8%": 370.0}
+
+
+def test_vertical_tax_rate_base_amount_stack_restores_inclusive_taxes():
+    from receipt_parser.pipeline_receipt import extract_financial_totals, extract_rate_bases
+
+    text = "\n".join([
+        "合計",
+        "1200",
+        "内税",
+        "税率",
+        "10.0",
+        "1000",
+        "税抜き",
+        "税額",
+        "8.0",
+        "%",
+        "93",
+        "100",
+        "7",
+        "担当者",
+    ])
+
+    assert extract_rate_bases(text) == {"10%": 1000.0, "8%": 93.0}
+    assert extract_financial_totals(text)["taxes"] == [
+        {"rate": "10%", "label": "内税", "amount": 100.0},
+        {"rate": "8%", "label": "内税", "amount": 7.0},
     ]
 
 
@@ -10961,6 +11207,49 @@ def test_printed_item_sum_total_repairs_close_financial_drift():
     assert extracted["subtotal"] == 7690.0
 
 
+def test_printed_item_sum_total_preserves_external_tax_summary_total():
+    from receipt_parser.pipeline_receipt import _prefer_printed_item_sum_total_when_balanced
+
+    extracted = {
+        "subtotal": 4549,
+        "total": 5072,
+        "amount_paid": 5072,
+        "taxes": [
+            {"rate": "10%", "label": "外税", "amount": 287},
+            {"rate": "8%", "label": "外税", "amount": 236},
+        ],
+        "line_items": [
+            {"description": "A", "total": 1139},
+            {"description": "B", "total": 1179},
+            {"description": "C", "total": 209},
+            {"description": "D", "total": 209},
+            {"description": "E", "total": 209},
+            {"description": "F", "total": 1699},
+        ],
+    }
+    ocr_text = "\n".join([
+        "小",
+        "計",
+        "¥4,644",
+        "外税10%対象額",
+        "¥2,878",
+        "10%外税額",
+        "¥287",
+        "外税8%対象額",
+        "8%外税額",
+        "¥1,766",
+        "¥141",
+        "合計",
+        "¥5,072",
+    ])
+
+    _prefer_printed_item_sum_total_when_balanced(extracted, ocr_text)
+
+    assert extracted["total"] == 5072
+    assert extracted["amount_paid"] == 5072
+    assert extracted["subtotal"] == 4549
+
+
 def test_printed_summary_total_uses_tax_balanced_labeled_total_and_points():
     from receipt_parser.pipeline_receipt import _restore_printed_summary_total_when_tax_balanced
 
@@ -11091,6 +11380,34 @@ def test_split_external_tax_amount_labels_restore_financial_summary():
     assert extracted["subtotal"] == 4816.0
     assert extracted["total"] == 5248.0
     assert extracted["amount_paid"] == 5248.0
+
+
+def test_extract_financial_totals_handles_target_tax_labels_before_value_stack():
+    from receipt_parser.pipeline_receipt import extract_financial_totals
+
+    text = "\n".join([
+        "小",
+        "計",
+        "¥4,644",
+        "外税10%対象額",
+        "¥2,878",
+        "10%外税額",
+        "¥287",
+        "外税8%対象額",
+        "8%外税額",
+        "¥1,766",
+        "¥141",
+        "合計",
+        "¥5,072",
+    ])
+
+    totals = extract_financial_totals(text)
+
+    assert totals["total"] == 5072.0
+    assert totals["taxes"] == [
+        {"rate": "10%", "label": "外税", "amount": 287.0},
+        {"rate": "8%", "label": "外税", "amount": 141.0},
+    ]
 
 
 def test_final_receipt_output_repairs_apply_printed_external_tax_amount_restoration():

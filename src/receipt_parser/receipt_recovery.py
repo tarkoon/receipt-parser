@@ -694,6 +694,24 @@ def _fix_implausible_tax_amounts(extracted, unified_text, ocr_totals):
     total = extracted.get("total") or 0
     bases_inclusive = rb_sum > 0 and total > 0 and abs(rb_sum - total) < 5
 
+    def _has_visible_tax_amount(rate: str, amount: float) -> bool:
+        rate_num = re.escape(rate.rstrip("%"))
+        lines = [line.strip() for line in unified_text.split("\n")]
+        for idx, line in enumerate(lines):
+            if not re.search(rf'{rate_num}\s*[%％]\s*.*税額', line) or "対象" in line:
+                continue
+            values: list[float] = []
+            for nearby in lines[idx + 1:min(len(lines), idx + 5)]:
+                vm = re.fullmatch(r'[¥￥]\s*([\d,]+)\s*[\)）]?', nearby)
+                if vm:
+                    values.append(float(vm.group(1).replace(",", "")))
+                    continue
+                if values or re.search(r'合\s*計|お預り|お釣|登録番号', nearby):
+                    break
+            if values and abs(min(values) - amount) <= 2:
+                return True
+        return False
+
     for t in taxes:
         if not isinstance(t, dict):
             continue

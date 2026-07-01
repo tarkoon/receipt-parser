@@ -585,9 +585,24 @@ def _restore_stacked_inclusive_tax_block(extracted, unified_text):
     if not labels or len(values) < len(labels):
         return
     taxes: list[dict] = []
-    for (rate, is_tax), value in zip(labels, values[:len(labels)]):
-        if is_tax and value > 0:
-            taxes.append({"rate": rate, "label": "内税", "amount": value})
+    tax_rates = {rate for rate, is_tax in labels if is_tax}
+    if len(tax_rates) == 1 and values:
+        rate = next(iter(tax_rates))
+        try:
+            rate_pct = float(rate.rstrip("%")) / 100.0
+        except ValueError:
+            rate_pct = 0.0
+        base = max(values)
+        candidates = [value for value in values if 0 < value < base]
+        if rate_pct > 0 and candidates:
+            expected = base * rate_pct / (1 + rate_pct)
+            amount = min(candidates, key=lambda value: abs(value - expected))
+            if abs(amount - expected) <= max(2.0, expected * 0.10):
+                taxes.append({"rate": rate, "label": "内税", "amount": amount})
+    else:
+        for (rate, is_tax), value in zip(labels, values[:len(labels)]):
+            if is_tax and value > 0:
+                taxes.append({"rate": rate, "label": "内税", "amount": value})
     if taxes:
         extracted["taxes"] = taxes
         total = extracted.get("total")

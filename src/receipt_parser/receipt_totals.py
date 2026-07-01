@@ -151,6 +151,43 @@ def _prefer_printed_item_sum_total_when_balanced(extracted, unified_text):
     ]
     if not any(abs(amount - item_sum) <= 2 for amount in printed_amounts):
         return
+
+    lines = [line.strip() for line in unified_text.split('\n') if line.strip()]
+
+    def _yen_after(label_idx: int, lookahead: int = 3) -> float | None:
+        for j in range(label_idx + 1, min(len(lines), label_idx + 1 + lookahead)):
+            vm = re.fullmatch(r'[¥￥]\s*([\d,]+)\s*[\)）]?', lines[j])
+            if vm:
+                return float(vm.group(1).replace(',', ''))
+            if re.search(r'お預り|お釣|ポイント|伝票|レシート', lines[j]):
+                break
+        return None
+
+    subtotal_label = chr(0x5C0F) + chr(0x8A08)
+    total_label = chr(0x5408) + chr(0x8A08)
+    total_head, total_tail = total_label
+    for idx, line in enumerate(lines):
+        vm = re.fullmatch(r'[¥￥]\s*([\d,]+)\s*[\)）]?', line)
+        if not vm or abs(float(vm.group(1).replace(',', '')) - item_sum) > 2:
+            continue
+        prior = "\n".join(lines[max(0, idx - 3):idx])
+        if subtotal_label not in re.sub(r'\s+', '', prior):
+            continue
+        saw_external_tax = False
+        for j in range(idx + 1, min(len(lines), idx + 14)):
+            if "外税" in lines[j]:
+                saw_external_tax = True
+            if not saw_external_tax:
+                continue
+            compact_line = re.sub(r'\s+', '', lines[j])
+            if compact_line == total_label or (
+                lines[j] == total_head and j + 1 < len(lines) and lines[j + 1] == total_tail
+            ):
+                label_idx = j + 1 if lines[j] == total_head else j
+                printed_total = _yen_after(label_idx)
+                if printed_total is not None and printed_total > item_sum + 2:
+                    return
+
     old_total = current_total_f
     extracted["total"] = item_sum
     amount_paid = extracted.get("amount_paid")
