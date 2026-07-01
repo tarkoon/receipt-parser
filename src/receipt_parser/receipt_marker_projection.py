@@ -839,7 +839,7 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
             if re.search(r'[@＠]', line):
                 return None
             qty_first = re.search(
-                r'\(?\s*(\d+)\s*(?:[個コ点]\s*[xX×Ⅹ]?\s*[単单]?|[xX×Ⅹ]\s*[単单]?|[単单])\s*(\d[\d,]*)\s*\)?',
+                r'\(?\s*(\d+)\s*(?P<marker>[個コ点]\s*[xX×Ⅹ]?\s*[単单]?|[xX×Ⅹ]\s*[単单]?|[単单])\s*(\d[\d,]*)\s*\)?',
                 line,
             )
             if not qty_first:
@@ -862,10 +862,20 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                     return None
                 return qty, unit
             qty = float(qty_first.group(1))
-            unit = float(qty_first.group(2).replace(',', ''))
+            unit = float(qty_first.group(3).replace(',', ''))
+            marker = qty_first.group("marker")
+            if len(qty_first.group(1)) > 1 and re.search(r'[xX×Ⅹ]', marker) and not re.search(r'[個コ点]', marker):
+                nearby_total = _nearby_standalone_amount(detail_idx)
+                if nearby_total is None or abs(qty * unit - nearby_total) > 2:
+                    return None
         if qty < 2 or unit <= 0:
             return None
         return qty, unit
+
+    def _strip_embedded_qty_detail(desc: str) -> str:
+        cleaned = _OCR_QTY_NOTATION_RE.sub("", desc or "")
+        cleaned = re.sub(r'\s*[（(]\s*[）)]\s*$', '', cleaned).strip()
+        return cleaned
 
     qty_detail_matched_items: set[int] = set()
     for idx, line in enumerate(lines):
@@ -1010,6 +1020,9 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                     item["unit_price"] = unit
                     expected_total = qty * unit
                     item["total"] = split_total if split_total and abs(split_total - expected_total) <= 2 else expected_total
+                    cleaned_desc = _strip_embedded_qty_detail(item.get("description") or "")
+                    if cleaned_desc and _valid_desc(cleaned_desc):
+                        item["description"] = cleaned_desc
                     matched_item = item
                     qty_detail_matched_items.add(id(item))
                     break

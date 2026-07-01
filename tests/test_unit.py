@@ -12547,3 +12547,60 @@ def test_final_receipt_output_repairs_trace_bag_item_rate_base_reconciliation():
     assert bag_events[0]["owner_phase"] == "bag_item_rate_base_reconciliation"
     assert bag_events[0]["owner_invariant"]
     assert bag_events[0]["justification"]
+
+
+def test_qty_unit_lines_ignore_unbalanced_bare_multidigit_x_ocr():
+    from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "line_items": [
+            {
+                "description": "パイナップル",
+                "qty": 1,
+                "unit_price": 196,
+                "total": 196,
+            }
+        ]
+    }
+    ocr_text = "\n".join([
+        "パイナップル",
+        "196* A",
+        "(21 X 198)",
+        "小計",
+        "¥196",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["qty"] == 1
+    assert extracted["line_items"][0]["unit_price"] == 196
+    assert extracted["line_items"][0]["total"] == 196
+
+
+def test_qty_unit_lines_strip_embedded_qty_detail_from_description():
+    from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "line_items": [
+            {
+                "description": "うどん1食 (4個 X 単38)",
+                "qty": 1,
+                "unit_price": 152,
+                "total": 152,
+            }
+        ]
+    }
+    ocr_text = "\n".join([
+        "うどん1食",
+        "152*",
+        "(4個 X 単38)",
+        "小計",
+        "¥152",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["description"] == "うどん1食"
+    assert extracted["line_items"][0]["qty"] == 4
+    assert extracted["line_items"][0]["unit_price"] == 38
+    assert extracted["line_items"][0]["total"] == 152
