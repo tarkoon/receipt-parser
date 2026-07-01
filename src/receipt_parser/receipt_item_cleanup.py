@@ -27,6 +27,20 @@ from .receipt_totals import (
 )
 from .schema import VALID_TAX_RATES
 
+_CATALOG_METADATA_RE = re.compile(
+    "|".join(
+        (
+            "".join(chr(cp) for cp in (0x30E9, 0x30D9, 0x30EB)),
+            "".join(chr(cp) for cp in (0x901A, 0x5E38, 0x4FA1, 0x683C)),
+            "".join(chr(cp) for cp in (0x5546, 0x54C1, 0x540D)),
+            "Customer",
+            "Return",
+            "model",
+        )
+    ),
+    re.IGNORECASE,
+)
+
 
 def _fix_non_bag_items_named_as_bag(extracted, unified_text):
     """Replace bag descriptions attached to non-bag prices using OCR price rows."""
@@ -451,10 +465,106 @@ def _repair_discounted_ocr_pair_descriptions(extracted, unified_text):
         candidate["total"] = net
 
 
+def _catalog_model_amounts(line: str) -> list[float]:
+    text = line.strip()
+    if re.fullmatch(r'\d{1,6}(?:\s+0)?', text):
+        return [float(text.split()[0])]
+    m = re.fullmatch(r'\d+\s*\*\s*(\d{1,6})', text)
+    return [float(m.group(1))] if m else []
+
+
+def _catalog_model_detail_desc(line: str, following: list[str]) -> tuple[str, int]:
+    if not re.search(r'[A-Za-z?]{2,}', line) or not re.search(r'[ぁ-んァ-ン一-龥]', line):
+        return "", 0
+    head = re.sub(r'^[A-Za-z0-9?][A-Za-z0-9?/\- ]{2,}\s+', '', line).strip()
+    if not _valid_pre_price_stack_item_desc(line, head):
+        return "", 0
+    parts = [head]
+    for raw in following[:2]:
+        if _CATALOG_METADATA_RE.search(raw):
+            break
+        desc = _clean_ocr_price_line_desc(raw)
+        if not _valid_pre_price_stack_item_desc(raw, desc):
+            break
+        parts.append(desc)
+    desc = re.sub(r'\s*,\s*', ', ', " ".join(parts)).strip()
+    desc = re.sub(r'[/／]\s*$', '', desc).strip()
+    return desc, len(parts)
+
+
+def _repair_catalog_model_detail_stack_descriptions(extracted, lines: list[str]) -> bool:
+    items = [item for item in (extracted.get("line_items") or []) if isinstance(item, dict)]
+    if len(items) < 2:
+        return False
+    if not any(re.search(r'[A-Za-z?]{2,}', item.get("description") or "") for item in items):
+        return False
+
+    def _previous_line_has_amount(idx: int) -> bool:
+        return idx > 0 and bool(_catalog_model_amounts(lines[idx - 1]))
+
+    def _amount_after(idx: int, total: float) -> bool:
+        for raw in lines[idx + 1:min(idx + 10, len(lines))]:
+            if any(abs(amount - total) <= 2 for amount in _catalog_model_amounts(raw)):
+                return True
+        return False
+
+    candidates_by_total: dict[float, list[tuple[int, str, int]]] = {}
+    for idx, line in enumerate(lines):
+        amounts = _catalog_model_amounts(line)
+        if amounts:
+            for lookahead in range(idx + 1, min(idx + 4, len(lines))):
+                if _catalog_model_amounts(lines[lookahead]):
+                    break
+                desc, part_count = _catalog_model_detail_desc(lines[lookahead], [])
+                if desc:
+                    for amount in amounts:
+                        candidates_by_total.setdefault(amount, []).append((lookahead, desc, part_count + 2))
+                    break
+            continue
+        if _previous_line_has_amount(idx):
+            continue
+        desc, part_count = _catalog_model_detail_desc(line, lines[idx + 1:idx + 3])
+        if not desc:
+            continue
+        for item in items:
+            try:
+                total = float(item.get("total") or 0)
+            except (TypeError, ValueError):
+                continue
+            if total > 0 and _amount_after(idx, total):
+                candidates_by_total.setdefault(total, []).append((idx, desc, part_count))
+
+    chosen: dict[int, tuple[int, str]] = {}
+    for item_idx, item in enumerate(items):
+        try:
+            total = float(item.get("total") or 0)
+        except (TypeError, ValueError):
+            return False
+        options = candidates_by_total.get(total, [])
+        if not options:
+            return False
+        best = max(options, key=lambda row: (row[2], len(_norm_layout_desc(row[1]))))
+        if sum(1 for row in options if (row[2], len(_norm_layout_desc(row[1]))) == (best[2], len(_norm_layout_desc(best[1])))) > 1:
+            return False
+        chosen[item_idx] = (best[0], best[1])
+
+    if len({idx for idx, _desc in chosen.values()}) != len(items):
+        return False
+    for item_idx, (_line_idx, desc) in chosen.items():
+        items[item_idx]["description"] = desc
+    order_by_id = {id(items[item_idx]): line_idx for item_idx, (line_idx, _desc) in chosen.items()}
+    items.sort(key=lambda item: order_by_id[id(item)])
+    extracted["line_items"] = items
+    return True
+
+
 def _repair_pre_price_stack_descriptions_from_ocr(extracted, unified_text):
     """Map product names before a stacked price block onto matching item amounts."""
     items = [item for item in (extracted.get("line_items") or []) if isinstance(item, dict)]
     if len(items) < 2 or not unified_text:
+        return
+    lines = [line.strip() for line in unified_text.split('\n')]
+    if _repair_catalog_model_detail_stack_descriptions(extracted, lines):
         return
     current_descs = [
         _norm_layout_desc(item.get("description") or "")
@@ -486,7 +596,6 @@ def _repair_pre_price_stack_descriptions_from_ocr(extracted, unified_text):
     if targets and not any(abs(item_sum - target) <= 2 for target in targets):
         return
 
-    lines = [line.strip() for line in unified_text.split('\n')]
     zone_end = len(lines)
     for idx, line in enumerate(lines):
         if re.fullmatch(r'小\s*計|合\s*計|総\s*合\s*計', line):
@@ -546,8 +655,11 @@ def _repair_pre_price_stack_descriptions_from_ocr(extracted, unified_text):
             item["description"] = desc
 
 
-def _drop_duplicate_rows_when_subtotal_balances(extracted, unified_text):
-    """Drop exact duplicate parsed rows only when OCR count and subtotal agree."""
+def _drop_duplicate_rows_when_subtotal_balances(
+    extracted,
+    unified_text,
+):
+    """Drop or merge duplicate parsed rows only when OCR and subtotal agree."""
     items = extracted.get("line_items") or []
     subtotal = extracted.get("subtotal")
     if not items or subtotal is None:
@@ -556,13 +668,35 @@ def _drop_duplicate_rows_when_subtotal_balances(extracted, unified_text):
         target = float(subtotal)
     except (TypeError, ValueError):
         return
-    item_sum = sum(float(item.get("total") or 0) for item in items if isinstance(item, dict))
-    overage = item_sum - target
-    if overage <= 0 or overage > 1000:
-        return
-
     def _norm(text: str) -> str:
         return re.sub(r'\s+', '', str(text or ""))
+
+    def _line_amount(line: str) -> float | None:
+        match = re.search(
+            r'(?:^|[\s(（])([¥￥]?\s*\d[\d,]*)\s*(?:[%％][*※除軽外内]|[*※除軽外内])?\s*$',
+            line,
+        )
+        if not match:
+            return None
+        try:
+            return float(match.group(1).strip().lstrip('¥￥').replace(',', ''))
+        except ValueError:
+            return None
+
+    def _single_ocr_desc_has_amount(desc_key: str, amount: float) -> bool:
+        lines = [line.strip() for line in unified_text.splitlines() if line.strip()]
+        for idx, line in enumerate(lines):
+            line_desc = _norm(_clean_ocr_price_line_desc(line))
+            if not line_desc or not (desc_key in line_desc or line_desc in desc_key):
+                continue
+            for nearby in lines[idx + 1:min(idx + 4, len(lines))]:
+                nearby_desc = _clean_ocr_price_line_desc(nearby)
+                if _valid_ocr_item_desc(nearby_desc):
+                    break
+                value = _line_amount(nearby)
+                if value is not None and abs(value - amount) <= 2:
+                    return True
+        return False
 
     text_norm = _norm(unified_text)
     groups: dict[tuple[str, float, float], list[dict]] = {}
@@ -576,6 +710,30 @@ def _drop_duplicate_rows_when_subtotal_balances(extracted, unified_text):
         )
         if key[0] and key[1] > 0:
             groups.setdefault(key, []).append(item)
+
+    item_sum = sum(float(item.get("total") or 0) for item in items if isinstance(item, dict))
+    if abs(item_sum - target) <= 2:
+        for (desc_key, total, discount), group in groups.items():
+            if len(group) < 2 or discount:
+                continue
+            if desc_key and text_norm.count(desc_key) >= len(group):
+                continue
+            if len({item.get("tax_category") for item in group}) > 1:
+                continue
+            combined = sum(float(item.get("total") or 0) for item in group)
+            if not _single_ocr_desc_has_amount(desc_key, combined):
+                continue
+            keep = group[0]
+            keep["qty"] = 1
+            keep["unit_price"] = combined
+            keep["total"] = combined
+            for duplicate in group[1:]:
+                items.remove(duplicate)
+            return
+
+    overage = item_sum - target
+    if overage <= 0 or overage > 1000:
+        return
 
     for (desc_key, total, _discount), group in groups.items():
         if len(group) < 2 or abs(total - overage) > 2:

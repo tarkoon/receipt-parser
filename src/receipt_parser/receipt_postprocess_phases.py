@@ -57,6 +57,7 @@ from .receipt_item_repair import (
     _fix_code_table_descriptions_by_order,
     _fix_digit_misread_items,
     _fix_priced_in_name_items,
+    _revert_unsupported_qty_inflation,
     _fix_single_item_qty_from_ocr,
     _fix_split_item_price_body_total_layout,
 )
@@ -534,13 +535,23 @@ def _run_bag_amount_shift_reconciliation_phase(
 ) -> None:
     """Trigger: adjacent OCR product name, paid-bag price, and product amount rows.
 
-    Invariant: bag/product amount shifts may mutate rows only when printed rate
-    bases identify bag/product tax categories and subtotal item-sum arithmetic
-    remains balanced.
+    Invariant: bag/product amount shifts and unsupported quantity reversions may
+    mutate rows only when printed rate bases identify tax categories and
+    subtotal item-sum arithmetic remains balanced.
     """
+    items = extracted.get("line_items") or []
+    try:
+        if items and extracted.get("total") is not None:
+            row_sum = sum(float(item.get("total") or 0) for item in items if isinstance(item, dict))
+            if len(items) >= 2 and abs(row_sum - float(extracted["total"])) <= 2:
+                return
+    except (TypeError, ValueError):
+        pass
     for repair in repairs:
         if repair == "name_bag_amount_shift":
-            _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
+            changed = _fix_name_bag_amount_shift_from_ocr(extracted, unified_text)
+            if changed and extracted.get("line_items"):
+                _revert_unsupported_qty_inflation(extracted["line_items"], unified_text)
         else:
             raise ValueError(
                 f"Unknown bag amount-shift reconciliation repair: {repair}"

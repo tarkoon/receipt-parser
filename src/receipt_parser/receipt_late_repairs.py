@@ -439,6 +439,8 @@ def _fix_name_bag_amount_shift_from_ocr(extracted, unified_text):
         if not bag_m:
             continue
         bag_desc = _OCR_TRAILING_PRICE_RE.sub("", bag_line).strip()
+        if re.search(r'\d+\s*/\s*\d+', bag_line):
+            continue
         bag_price = _parse_amount_fragment(bag_m.group(1).replace("¥", "").replace("￥", "").strip())
         product_price = _marked_amount(amount_line)
         if (
@@ -545,6 +547,7 @@ def _fix_name_bag_amount_shift_from_ocr(extracted, unified_text):
     bag_item["discount_rate"] = bag_item.get("discount_rate") or ""
 
     _fill_single_qty_unit_prices()
+    return True
 
 
 def _drop_numeric_marker_description_rows(extracted, unified_text):

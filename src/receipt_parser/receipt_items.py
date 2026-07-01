@@ -639,6 +639,35 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
     if not extracted.get("line_items"):
         return
 
+    def _rows_already_balance_total() -> bool:
+        total = extracted.get("total")
+        if total is None or len(extracted.get("line_items") or []) < 2:
+            return False
+        try:
+            total_f = float(total)
+        except (TypeError, ValueError):
+            return False
+        row_sum = 0.0
+        for item in extracted["line_items"]:
+            if not isinstance(item, dict):
+                return False
+            try:
+                qty = float(item.get("qty") or 1)
+                unit = float(item.get("unit_price") or 0)
+                discount = float(item.get("discount") or 0)
+                line_total = float(item.get("total") or 0)
+            except (TypeError, ValueError):
+                return False
+            if abs(qty * unit - discount - line_total) > 1:
+                return False
+            row_sum += line_total
+        return abs(row_sum - total_f) <= 2
+
+    if _rows_already_balance_total():
+        _revert_unsupported_qty_inflation(extracted["line_items"], unified_text)
+        if _rows_already_balance_total():
+            return
+
     _drop_banner_phantom_items(extracted["line_items"], unified_text)
     _fix_item_desc_from_ocr_price_line(extracted["line_items"], unified_text)
     _merge_qty_detail_into_previous(extracted["line_items"], unified_text)
@@ -994,6 +1023,20 @@ def _fix_bag_item_prices_from_ocr(extracted, unified_text):
     ]
     if not bag_items:
         return
+    used_embedded_price = False
+    for item in bag_items:
+        desc = item.get("description") or ""
+        price_m = re.search(r'(\d{1,2})\s*円', desc)
+        if not price_m:
+            continue
+        price = float(price_m.group(1))
+        if 0 < price <= 50:
+            item["qty"] = 1.0
+            item["unit_price"] = price
+            item["total"] = price
+            used_embedded_price = True
+    if used_embedded_price:
+        return
     entries = _bag_entries_from_ocr(unified_text)
     if not entries:
         return
@@ -1268,7 +1311,30 @@ def _recover_repeated_item_from_gap(extracted, unified_text):
         text = re.sub(r'[^\wぁ-んァ-ン一-龥]', '', text, flags=re.UNICODE)
         return text.lower()
 
-    norm_lines = [_norm(line) for line in unified_text.split('\n')]
+    raw_lines = unified_text.split('\n')
+    norm_lines = [line for line in (_norm(line) for line in raw_lines) if line]
+
+    def _visible_amount_after_desc(ndesc: str, amount: float) -> bool:
+        for idx, line in enumerate(raw_lines):
+            nline = _norm(line)
+            if not nline or not (ndesc in nline or nline in ndesc):
+                continue
+            for nearby in raw_lines[idx + 1:min(idx + 4, len(raw_lines))]:
+                amount_m = re.search(
+                    r'[¥￥]?\s*([\d,]+)\s*(?:外|内|軽|[*＊※])?\s*$',
+                    nearby.strip(),
+                )
+                if amount_m:
+                    try:
+                        visible = float(amount_m.group(1).replace(',', ''))
+                    except ValueError:
+                        continue
+                    if abs(visible - amount) <= 2:
+                        return True
+                if _norm(nearby):
+                    break
+        return False
+
     for item in list(items):
         if not isinstance(item, dict):
             continue
@@ -1283,6 +1349,12 @@ def _recover_repeated_item_from_gap(extracted, unified_text):
         ndesc = _norm(desc)
         if len(ndesc) < 3:
             continue
+        combined = next((price + gap for gap in gaps if abs(gap - price) <= 2), None)
+        if combined and _visible_amount_after_desc(ndesc, combined):
+            item["qty"] = 1
+            item["unit_price"] = combined
+            item["total"] = combined
+            return
         ocr_count = sum(1 for line in norm_lines if ndesc and (ndesc in line or line in ndesc))
         extracted_count = sum(
             1 for other in items

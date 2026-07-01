@@ -995,6 +995,8 @@ def _revert_unsupported_qty_inflation(items, unified_text):
     ocr_lines = unified_text.split('\n')
     qty_re = re.compile(
         r'[\(（<]?\s*\d+\s*[コ個点]\s*[xX×]\s*(?:単|@)?\s*\d[\d,]*'
+        r'|[\(（<]?\s*(?:単|@)?\s*\d[\d,]*\s*[xX×]\s*\d+\s*[コ個点]'
+        r'|(?:^|\s)\d+\s*(?:[*＊xX×])\s*$'
     )
     for item in items:
         if not isinstance(item, dict):
@@ -1027,8 +1029,10 @@ def _revert_unsupported_qty_inflation(items, unified_text):
         # Look at the next 3 non-empty lines for a qty notation. Stop
         # early at the next item-name line.
         has_qty = False
-        for offset in range(1, 5):
+        for offset in (0, -1, -2, 1, 2, 3, 4):
             j = match_li + offset
+            if j < 0:
+                continue
             if j >= len(ocr_lines):
                 break
             nearby = ocr_lines[j].strip()
@@ -1038,12 +1042,45 @@ def _revert_unsupported_qty_inflation(items, unified_text):
                 has_qty = True
                 break
             # Stop on next name (≥ 2 Japanese chars) without qty notation.
-            if re.search(r'[ぁ-んァ-ン一-龥]{2,}', nearby):
+            if offset > 0 and re.search(r'[ぁ-んァ-ン一-龥]{2,}', nearby):
                 break
         if has_qty:
             continue
         # No qty notation supports this qty>1 — revert to qty=1.
+        visible_total = None
+        visible_unit = None
+        for nearby in ocr_lines[match_li + 1:min(len(ocr_lines), match_li + 4)]:
+            amount_m = re.search(r'[¥￥]?\s*([\d,]+)\s*(?:外|内|軽|[*＊※])?\s*$', nearby.strip())
+            if amount_m:
+                try:
+                    amount = float(amount_m.group(1).replace(',', ''))
+                except ValueError:
+                    amount = None
+                if amount is not None and abs(amount - total) <= 1:
+                    visible_total = amount
+                    break
+                if amount is not None and abs(amount - unit) <= 1:
+                    visible_unit = amount
+                    break
+            if re.search(r'[ぁ-んァ-ン一-龥]{2,}', nearby):
+                break
+        if visible_total is None and visible_unit is None:
+            try:
+                unit_is_fractional = abs(float(unit) - round(float(unit))) > 0.001
+            except (TypeError, ValueError):
+                unit_is_fractional = False
+            total_text = str(int(total)) if float(total).is_integer() else str(total)
+            if unit_is_fractional and re.search(rf'(?<!\d){re.escape(total_text)}(?!\d)', unified_text):
+                visible_total = total
         item["qty"] = 1
+        if visible_total is not None:
+            item["total"] = visible_total
+            item["unit_price"] = visible_total
+            continue
+        if visible_unit is not None:
+            item["total"] = visible_unit
+            item["unit_price"] = visible_unit
+            continue
         item["total"] = unit
         item["unit_price"] = unit
 
@@ -1286,7 +1323,15 @@ def _fix_qty_from_ocr_patterns(items, unified_text):
                             if not isinstance(item, dict):
                                 continue
                             desc = item.get("description", "")
-                            if not desc or abs((item.get("unit_price") or 0) - price) >= 1:
+                            item_total = float(item.get("total") or 0)
+                            item_unit = float(item.get("unit_price") or 0)
+                            if (
+                                not desc
+                                or (
+                                    abs(item_unit - price) >= 1
+                                    and abs(item_total - price * qty) >= 1
+                                )
+                            ):
                                 continue
                             overlap = 0
                             for k in range(min(len(desc), len(desc_context)), 0, -1):
@@ -1296,9 +1341,22 @@ def _fix_qty_from_ocr_patterns(items, unified_text):
                             if overlap > best_overlap:
                                 best_overlap = overlap
                                 matched_item = item
-                    if matched_item and matched_item.get("qty", 1) != qty:
+                    if matched_item and (
+                        matched_item.get("qty", 1) != qty
+                        or abs(float(matched_item.get("unit_price") or 0) - price) > 1
+                    ):
                         matched_item["qty"] = qty
+                        matched_item["unit_price"] = price
                         matched_item["total"] = qty * price - (matched_item.get("discount") or 0)
+                        for item in items:
+                            if item is matched_item or not isinstance(item, dict):
+                                continue
+                            if abs(float(item.get("total") or 0) - qty * price) > 1:
+                                continue
+                            if abs(float(item.get("unit_price") or 0) - price) > 1:
+                                continue
+                            item["qty"] = 1
+                            item["total"] = price
                     elif not matched_item:
                         ocr_qty_prices.append((qty, price, qty * price))
 
@@ -1306,21 +1364,31 @@ def _fix_qty_from_ocr_patterns(items, unified_text):
     for oq, op, ot in ocr_qty_prices:
         if oq <= 1:
             continue
-        for idx, item in enumerate(items):
-            if not isinstance(item, dict) or idx in used_indices:
-                continue
-            item_total = item.get("total", 0)
-            item_price = item.get("unit_price")
-            matched = abs(item_total - ot) < 1
-            if not matched and item_price is not None:
-                matched = abs(item_price - op) < 1 and item.get("qty", 1) != oq
-            if matched:
-                if item.get("qty", 1) != oq or item.get("unit_price") != op:
-                    item["qty"] = oq
-                    item["unit_price"] = op
-                    item["total"] = op * oq - (item.get("discount") or 0)
-                used_indices.add(idx)
-                break
+        candidates = [
+            (idx, item) for idx, item in enumerate(items)
+            if isinstance(item, dict) and idx not in used_indices
+        ]
+        total_match = next(
+            ((idx, item) for idx, item in candidates if abs(float(item.get("total") or 0) - ot) < 1),
+            None,
+        )
+        unit_match = next(
+            (
+                (idx, item) for idx, item in candidates
+                if item.get("unit_price") is not None
+                and abs(float(item.get("unit_price") or 0) - op) < 1
+                and item.get("qty", 1) != oq
+            ),
+            None,
+        )
+        match = total_match or unit_match
+        if match:
+            idx, item = match
+            if item.get("qty", 1) != oq or item.get("unit_price") != op:
+                item["qty"] = oq
+                item["unit_price"] = op
+                item["total"] = op * oq - (item.get("discount") or 0)
+            used_indices.add(idx)
 
     for idx, item in enumerate(items):
         if not isinstance(item, dict) or idx in used_indices:

@@ -1113,6 +1113,39 @@ def test_subtotal_item_price_repair_phase_uses_nearby_ocr_price_and_sum_invarian
     assert sum(item["total"] for item in extracted["line_items"]) == 350.0
 
 
+def test_subtotal_item_price_repair_does_not_inflate_visible_tiny_bag():
+    from receipt_parser.pipeline_receipt import _run_subtotal_item_price_repair_phase
+
+    extracted = {
+        "subtotal": 1918,
+        "total": 2071,
+        "taxes": [
+            {"rate": "8%", "label": "外税", "amount": 153},
+            {"rate": "10%", "label": "外税", "amount": 0},
+        ],
+        "line_items": [
+            {"description": "食品ボリ袋L (バイオマス30", "qty": 1, "unit_price": 3, "total": 3},
+            {"description": "たまご三昧", "qty": 1, "unit_price": 278, "total": 278},
+        ],
+    }
+    ocr_text = "\n".join([
+        "食品ボリ袋L (バイオマス30 3除",
+        "たまご三昧",
+        "278*",
+        "小計",
+        "¥1,918",
+    ])
+
+    _run_subtotal_item_price_repair_phase(
+        extracted,
+        ocr_text,
+        {"subtotal": 1918},
+    )
+
+    assert extracted["line_items"][0]["unit_price"] == 3
+    assert extracted["line_items"][0]["total"] == 3
+
+
 def test_implausible_tax_amount_repair_phase_uses_rate_base_swap_invariant():
     from receipt_parser.pipeline_receipt import _run_implausible_tax_amount_repair_phase
 
@@ -7220,6 +7253,68 @@ def test_campaign_discount_stream_reconstructs_shifted_price_block_when_balanced
     assert extracted["line_items"][4]["discount"] == 70.0
 
 
+@pytest.mark.parametrize(
+    "ocr_lines",
+    [
+        [
+            "111111※商品ア ¥45",
+            "222222※商品イ",
+            "値引割引",
+            "333333商品ウ",
+            "商品エ",
+            "¥799",
+            "¥348",
+            "20%",
+            "-70",
+            "¥129",
+            "444444※商品オ",
+            "¥199",
+        ],
+        [
+            "111111※商品ア ¥45",
+            "333333商品エ",
+            "222222※商品イ",
+            "値引割引",
+            "¥799",
+            "¥348",
+            "20%",
+            "-70",
+            "333333商品ウ",
+            "¥129",
+            "444444※商品オ",
+            "¥199",
+        ],
+    ],
+)
+def test_campaign_discount_stream_handles_single_interleaved_discount_stack(ocr_lines):
+    from receipt_parser.pipeline_receipt import _replace_campaign_discount_stream_when_balanced
+
+    extracted = {
+        "subtotal": 1450,
+        "taxes": [{"rate": "8%", "label": "内税", "amount": 107}],
+        "line_items": [{"description": "dummy", "qty": 1, "unit_price": 1450, "total": 1450}],
+    }
+    ocr_text = "\n".join([
+        "テスト店",
+        "2026年06月22日 11:05",
+        *ocr_lines,
+        "小計",
+        "¥1,450",
+        "※8%内税対象",
+        "¥1,450",
+    ])
+
+    _replace_campaign_discount_stream_when_balanced(extracted, ocr_text)
+
+    assert [(item["description"], item["unit_price"], item["total"], item["discount"]) for item in extracted["line_items"]] == [
+        ("商品ア", 45.0, 45.0, 0.0),
+        ("商品エ", 799.0, 799.0, 0.0),
+        ("商品イ", 348.0, 278.0, 70.0),
+        ("商品ウ", 129.0, 129.0, 0.0),
+        ("商品オ", 199.0, 199.0, 0.0),
+    ]
+
+
 def test_campaign_discount_stream_ignores_standalone_code_before_late_amount():
     from receipt_parser.pipeline_receipt import _replace_campaign_discount_stream_when_balanced
 
@@ -8046,6 +8141,125 @@ def test_qty_detail_repair_recovers_ocr_compacted_qty_when_printed_total_matches
     assert extracted["line_items"][0]["total"] == 276
 
 
+def test_qty_detail_repair_accepts_simplified_unit_marker_when_total_matches():
+    """Trigger: qty/unit OCR with 单; invariant: qty * unit equals printed total."""
+    from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "line_items": [
+            {
+                "description": "お徳用とろけるスライス",
+                "qty": 1,
+                "unit_price": 1194,
+                "total": 1194,
+                "tax_category": "8%",
+            }
+        ]
+    }
+    ocr_text = "\n".join([
+        "*お徳用とろけるスライス",
+        "3コ单398",
+        "¥1,194",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["qty"] == 3
+    assert extracted["line_items"][0]["unit_price"] == 398
+    assert extracted["line_items"][0]["total"] == 1194
+
+
+def test_qty_detail_repair_does_not_demote_previously_matched_sibling():
+    from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "line_items": [
+            {"description": "プレッツィオーザウズラマメ", "qty": 2, "unit_price": 235, "total": 470},
+            {"description": "ラ・プレッツィ白インゲン", "qty": 2, "unit_price": 235, "total": 470},
+        ]
+    }
+    ocr_text = "\n".join([
+        "0005プレッツィオーザウズラマメ",
+        "軽",
+        "単235×2個",
+        "¥470",
+        "0005 ラ・プレッツィ白インゲン",
+        "単235× 2個",
+        "¥470",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert [(item["qty"], item["unit_price"], item["total"]) for item in extracted["line_items"]] == [
+        (2, 235, 470),
+        (2, 235, 470),
+    ]
+
+
+def test_qty_detail_repair_ignores_bare_price_and_summary_number_lines():
+    """Trigger: bare numeric OCR rows; invariant: only explicit qty detail changes qty."""
+    from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "line_items": [
+            {"description": "デザートマルシェミカン", "qty": 1, "unit_price": 98, "total": 98},
+            {"description": "シナモンロール", "qty": 1, "unit_price": 100, "total": 100},
+            {"description": "レジ袋5円", "qty": 1, "unit_price": 5, "total": 5},
+        ]
+    }
+    ocr_text = "\n".join([
+        "デザートマルシェミカン",
+        "98*",
+        "はくさい 1/4カット",
+        "128*",
+        "シナモンロール",
+        "100 1",
+        "レジ袋5円",
+        "05",
+        "小計",
+        "8,478",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert [(item["qty"], item["unit_price"], item["total"]) for item in extracted["line_items"]] == [
+        (1, 98, 98),
+        (1, 100, 100),
+        (1, 5, 5),
+    ]
+
+
+def test_qty_detail_repair_demotes_siblings_not_owned_by_following_qty_row():
+    """Trigger: one qty detail after multiple same-unit rows; invariant: visible row prices pick the owner."""
+    from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "subtotal": 500,
+        "line_items": [
+            {"description": "R35ボックス (グレー)", "qty": 2, "unit_price": 100, "total": 200, "tax_category": "10%"},
+            {"description": "デスク整理L", "qty": 2, "unit_price": 100, "total": 200, "tax_category": "10%"},
+            {"description": "デスク整理 S", "qty": 2, "unit_price": 100, "total": 200, "tax_category": "10%"},
+        ],
+    }
+    ocr_text = "\n".join([
+        "R35ボックス (グレー)",
+        "¥200外",
+        "デスク整理L",
+        "¥100外",
+        "デスク整理 S",
+        "¥200外",
+        "(@100 × 2個)",
+        "小計",
+        "¥500",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert [item["qty"] for item in extracted["line_items"]] == [1.0, 1.0, 2]
+    assert [item["unit_price"] for item in extracted["line_items"]] == [200.0, 100.0, 100]
+    assert [item["total"] for item in extracted["line_items"]] == [200.0, 100.0, 200]
+
+
 def test_qty_detail_repair_names_unit_first_detail_row_from_nearest_owner_when_total_matches():
     """Trigger: item row is OCR qty detail; invariant: nearest owner and qty * unit total."""
     from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
@@ -8502,6 +8716,41 @@ def test_discounted_ocr_pair_repair_uses_visible_owner_for_duplicate_description
     assert extracted["line_items"][1]["total"] == 150
 
 
+def test_pre_price_stack_description_repair_uses_catalog_model_structure():
+    from receipt_parser.pipeline_receipt import _repair_pre_price_stack_descriptions_from_ocr
+
+    extracted = {
+        "subtotal": 600,
+        "line_items": [
+            {"description": "MODELA アルファモデル", "qty": 1, "unit_price": 100, "total": 100},
+            {"description": "MODELC ガンマモデル", "qty": 1, "unit_price": 300, "total": 300},
+            {"description": "MODELB ベータモデル", "qty": 1, "unit_price": 200, "total": 200},
+        ],
+    }
+    ocr_text = "\n".join([
+        "ASIS",
+        "MODELA アルファ",
+        "小物ケース, 白",
+        "1 *",
+        "100",
+        "200 0",
+        "MODELB ベータ",
+        "300",
+        "MODELC ガンマ",
+        "合計",
+        "600",
+    ])
+
+    _repair_pre_price_stack_descriptions_from_ocr(extracted, ocr_text)
+
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "アルファ 小物ケース, 白",
+        "ベータ",
+        "ガンマ",
+    ]
+    assert [item["total"] for item in extracted["line_items"]] == [100, 200, 300]
+
+
 def test_discounted_ocr_item_repair_phase_uses_visible_discount_and_stack_invariants():
     from receipt_parser.pipeline_receipt import _run_discounted_ocr_item_repair_phase
 
@@ -8584,6 +8833,39 @@ def test_duplicate_row_drop_requires_subtotal_balance_and_single_ocr_occurrence(
     kept = [item for item in extracted["line_items"] if item["description"] == "ちょっと贅沢 ぶどう"]
     assert kept == [
         {"description": "ちょっと贅沢 ぶどう", "qty": 2, "unit_price": 158, "total": 308, "discount": 8}
+    ]
+
+
+def test_duplicate_row_cleanup_merges_split_row_when_single_ocr_amount_balances():
+    from receipt_parser.pipeline_receipt import _drop_duplicate_rows_when_subtotal_balances
+
+    extracted = {
+        "subtotal": 500,
+        "line_items": [
+            {"description": "R35ボックス (グレー)", "qty": 1, "unit_price": 100, "total": 100, "tax_category": "10%"},
+            {"description": "R35ボックス (グレー)", "qty": 1, "unit_price": 100, "total": 100, "tax_category": "10%"},
+            {"description": "デスク整理L", "qty": 1, "unit_price": 100, "total": 100, "tax_category": "10%"},
+            {"description": "デスク整理 S", "qty": 2, "unit_price": 100, "total": 200, "tax_category": "10%"},
+        ],
+    }
+    ocr_text = "\n".join([
+        "R35ボックス (グレー)",
+        "¥200外",
+        "デスク整理L",
+        "¥100外",
+        "デスク整理 S",
+        "¥200外",
+        "(@100 × 2個)",
+        "小計",
+        "¥500",
+    ])
+
+    _drop_duplicate_rows_when_subtotal_balances(extracted, ocr_text)
+
+    assert extracted["line_items"] == [
+        {"description": "R35ボックス (グレー)", "qty": 1, "unit_price": 200, "total": 200, "tax_category": "10%"},
+        {"description": "デスク整理L", "qty": 1, "unit_price": 100, "total": 100, "tax_category": "10%"},
+        {"description": "デスク整理 S", "qty": 2, "unit_price": 100, "total": 200, "tax_category": "10%"},
     ]
 
 
@@ -10056,6 +10338,47 @@ def test_final_receipt_output_repairs_do_not_drop_duplicate_row_cleanup():
     assert not duplicate_events
 
 
+def test_duplicate_row_cleanup_phase_merges_balanced_duplicate_split_row():
+    from receipt_parser.pipeline_receipt import _run_duplicate_row_cleanup_phase
+
+    result = {
+        "document_type": "receipt",
+        "merchant": "ダイソー",
+        "total": 550,
+        "subtotal": 500,
+        "taxes": [{"rate": "10%", "label": "外税", "amount": 50}],
+        "line_items": [
+            {"description": "R35ボックス (グレー)", "qty": 1, "unit_price": 100, "total": 100, "tax_category": "10%"},
+            {"description": "R35ボックス (グレー)", "qty": 1, "unit_price": 100, "total": 100, "tax_category": "10%"},
+            {"description": "デスク整理L", "qty": 1, "unit_price": 100, "total": 100, "tax_category": "10%"},
+            {"description": "デスク整理 S", "qty": 2, "unit_price": 100, "total": 200, "tax_category": "10%"},
+        ],
+    }
+    ocr_text = "\n".join([
+        "R35ボックス (グレー)",
+        "¥200外",
+        "デスク整理L",
+        "¥100外",
+        "デスク整理 S",
+        "¥200外",
+        "(@100 × 2個)",
+        "小計",
+        "¥500",
+    ])
+
+    _run_duplicate_row_cleanup_phase(
+        result,
+        ocr_text,
+        ("drop_duplicate_rows_when_subtotal_balances",),
+    )
+
+    assert result["line_items"] == [
+        {"description": "R35ボックス (グレー)", "qty": 1, "unit_price": 200, "total": 200, "tax_category": "10%"},
+        {"description": "デスク整理L", "qty": 1, "unit_price": 100, "total": 100, "tax_category": "10%"},
+        {"description": "デスク整理 S", "qty": 2, "unit_price": 100, "total": 200, "tax_category": "10%"},
+    ]
+
+
 def test_parent_company_header_prefers_consumer_katakana_store_brand():
     from receipt_parser.pipeline_receipt import _fix_company_name_merchant
 
@@ -10543,6 +10866,99 @@ def test_qty_context_repair_ignores_receipts_without_structural_evidence():
     assert extracted["line_items"] == before
 
 
+@pytest.mark.parametrize(
+    ("helper_name", "items", "ocr_lines", "expected"),
+    [
+        (
+            "_revert_unsupported_qty_inflation",
+            [
+                {"description": "ホットドッグ", "qty": 2, "unit_price": 100, "total": 200, "discount": 0},
+                {"description": "ピクルス", "qty": 2, "unit_price": 50, "total": 100, "discount": 0},
+                {"description": "フライドチキン", "qty": 2, "unit_price": 240, "total": 480, "discount": 0},
+            ],
+            [
+                "ホットドッグ  2 *",
+                "100",
+                "200 0",
+                "ピクルス",
+                "2x",
+                "50",
+                "100 0",
+                "商品名 80593998  2 *",
+                "フライドチキン",
+                "フライドチキン",
+                "240",
+                "480",
+            ],
+            [(2, 100, 200), (2, 50, 100), (2, 240, 480)],
+        ),
+        (
+            "_revert_unsupported_qty_inflation",
+            [
+                {"description": "R35ボックス (グレー)", "qty": 2, "unit_price": 100, "total": 200, "discount": 0},
+                {"description": "デスク整理L", "qty": 2, "unit_price": 100, "total": 200, "discount": 0},
+                {"description": "デスク整理 S", "qty": 2, "unit_price": 100, "total": 200, "discount": 0},
+            ],
+            [
+                "R35ボックス (グレー)",
+                "¥200外",
+                "デスク整理L",
+                "¥100外",
+                "デスク整理 S",
+                "¥200外",
+                "(@100 × 2個)",
+            ],
+            [(1, 200, 200), (1, 100, 100), (2, 100, 200)],
+        ),
+        (
+            "_fix_qty_from_ocr_patterns",
+            [
+                {"description": "7P カリット マカダミアチョコバー", "qty": 3, "unit_price": 278, "total": 834},
+                {"description": "7P カリット ピスタチオチョコバー", "qty": 1, "unit_price": 834, "total": 834},
+            ],
+            [
+                "7P カリット マカダミアチョコバー",
+                "*278",
+                "7P カリット ピスタチオチョコバー",
+                "@278x",
+                "3",
+                "*834",
+            ],
+            [(1, 278, 278), (3.0, 278.0, 834.0)],
+        ),
+        (
+            "_fix_qty_from_ocr_patterns",
+            [
+                {"description": "デスク整理 L", "qty": 1, "unit_price": 100, "total": 100},
+                {"description": "デスク整理 S", "qty": 1, "unit_price": 200, "total": 200},
+            ],
+            [
+                "デスク整理 L",
+                "¥100外",
+                "デスク整理 S",
+                "¥200外",
+                "(@100 ×2個)",
+            ],
+            [(1, 100, 100), (2.0, 100.0, 200.0)],
+        ),
+        (
+            "_revert_unsupported_qty_inflation",
+            [
+                {"description": "手巻 炙り熟成紅鮭", "qty": 2, "unit_price": 110.5, "total": 221, "discount": 0},
+            ],
+            ["手巻 炙り熟成紅鮭", "合", "計", "149 軽", "221 軽"],
+            [(1, 221, 221)],
+        ),
+    ],
+)
+def test_qty_repairs_follow_visible_quantity_context(helper_name, items, ocr_lines, expected):
+    import receipt_parser.pipeline_receipt as pipeline_receipt
+
+    getattr(pipeline_receipt, helper_name)(items, "\n".join(ocr_lines))
+
+    assert [(item["qty"], item["unit_price"], item["total"]) for item in items] == expected
+
+
 def test_o_ring_description_repaired_from_jan_context():
     from receipt_parser.pipeline_receipt import _fix_o_ring_descriptions_from_ocr
 
@@ -10649,6 +11065,45 @@ def test_repeated_item_from_gap_skips_discounted_quantity_detail_row():
     assert len(extracted["line_items"]) == 1
     assert extracted["line_items"][0]["qty"] == 2
     assert extracted["line_items"][0]["total"] == 308
+
+
+def test_repeated_item_from_gap_ignores_empty_normalized_price_lines():
+    from receipt_parser.pipeline_receipt import _recover_repeated_item_from_gap
+
+    extracted = {
+        "total": 550,
+        "subtotal": 500,
+        "taxes": [{"rate": "10%", "label": "外税", "amount": 50}],
+        "line_items": [
+            {"description": "R35ボックス (グレー)", "qty": 1, "unit_price": 100, "total": 100},
+            {"description": "デスク整理L", "qty": 1, "unit_price": 100, "total": 100},
+            {"description": "デスク整理 S", "qty": 2, "unit_price": 100, "total": 200},
+        ],
+    }
+    ocr_text = "\n".join([
+        "R35ボックス (グレー)",
+        "¥200外",
+        "デスク整理L",
+        "¥100外",
+        "デスク整理 S",
+        "¥200外",
+        "(@100 × 2個)",
+        "小計",
+        "¥500",
+    ])
+
+    _recover_repeated_item_from_gap(extracted, ocr_text)
+
+    assert [(item["description"], item["total"]) for item in extracted["line_items"]] == [
+        ("R35ボックス (グレー)", 200),
+        ("デスク整理L", 100),
+        ("デスク整理 S", 200),
+    ]
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "R35ボックス (グレー)",
+        "デスク整理L",
+        "デスク整理 S",
+    ]
 
 
 def test_duplicate_description_repair_ignores_inline_price_suffix_candidate():

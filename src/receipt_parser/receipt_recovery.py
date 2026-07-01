@@ -651,6 +651,14 @@ def _fix_items_from_subtotal(extracted, unified_text, ocr_totals):
         desc_key = desc[:8] if len(desc) >= 8 else desc
         if not desc_key:
             continue
+        if re.search(r'(?:レジ袋|袋).*\d+\s*円|\d+\s*円.*(?:レジ袋|袋)', desc):
+            continue
+        if _is_bag_description(desc):
+            try:
+                if float(item.get("total") or 0) <= 30:
+                    continue
+            except (TypeError, ValueError):
+                continue
         for li, ocr_line in enumerate(ocr_lines):
             if desc_key not in ocr_line:
                 continue
@@ -725,6 +733,8 @@ def _fix_implausible_tax_amounts(extracted, unified_text, ocr_totals):
         if rate_pct <= 0:
             continue
         amount = t.get("amount") or 0
+        if _has_visible_tax_amount(rate, float(amount)):
+            continue
         base = rate_bases.get(rate)
         if base is None or base <= 0:
             continue
