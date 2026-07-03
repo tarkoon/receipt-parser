@@ -566,6 +566,43 @@ def _fix_numeric_desc_from_ocr_price_context(extracted, unified_text):
                 break
 
 
+def _low_value_bag_rows_from_ocr(lines: list[str]) -> list[tuple[str, float]]:
+    rows: list[tuple[str, float]] = []
+
+    def _standalone_small_price(line: str) -> float | None:
+        m = re.fullmatch(r'[¥￥]?\s*(\d{1,2})\s*[%％*※除軽Xx]?', line.strip())
+        if not m:
+            return None
+        price = float(m.group(1))
+        return price if 0 < price < 10 else None
+
+    for idx, line in enumerate(lines):
+        if not re.search(r'袋|バッグ|bag', line, re.IGNORECASE):
+            continue
+        desc = re.sub(r'\s+', ' ', re.sub(r'\s+[¥￥]?\s*\d[\d,]*\s*(?:[%％*※除軽Xx])?\s*$', '', line)).strip()
+        inline_price = None
+        m = re.search(r'^(.+?[ぁ-んァ-ン一-龥][^¥￥]*?)\s+([¥￥]?\s*\d[\d,]*)\s*(?:[%％*※除軽Xx])?\s*$', line)
+        if m:
+            desc = re.sub(r'\s+', ' ', m.group(1)).strip()
+            try:
+                inline_price = float(m.group(2).strip().lstrip('¥￥').replace(',', ''))
+            except ValueError:
+                inline_price = None
+        price = None
+        for nearby in lines[idx + 1:min(len(lines), idx + 6)]:
+            if _is_bag_description(nearby):
+                break
+            nearby_price = _standalone_small_price(nearby)
+            if nearby_price is not None:
+                price = nearby_price
+                break
+        if price is None:
+            price = inline_price
+        if price is not None and 0 < price < 10:
+            rows.append((desc, price))
+    return rows
+
+
 def _replace_overage_item_with_low_value_bag(extracted, unified_text):
     """When a low-value bag row is missing and one item absorbs the overage, restore it."""
     items = extracted.get("line_items") or []
@@ -583,20 +620,7 @@ def _replace_overage_item_with_low_value_bag(extracted, unified_text):
         return
     overage = min(overages)
     lines = [line.strip() for line in unified_text.split('\n')]
-    bag_rows: list[tuple[str, float]] = []
-    for line in lines:
-        if not re.search(r'袋|バッグ|bag', line, re.IGNORECASE):
-            continue
-        m = re.search(r'^(.+?[ぁ-んァ-ン一-龥][^¥￥]*?)\s+([¥￥]?\s*\d[\d,]*)\s*(?:[%％*※除軽Xx])?\s*$', line)
-        if not m:
-            continue
-        desc = re.sub(r'\s+', ' ', m.group(1)).strip()
-        try:
-            price = float(m.group(2).strip().lstrip('¥￥').replace(',', ''))
-        except ValueError:
-            continue
-        if 0 < price < 10:
-            bag_rows.append((desc, price))
+    bag_rows = _low_value_bag_rows_from_ocr(lines)
     if len(bag_rows) != 1:
         return
     bag_desc, bag_price = bag_rows[0]
@@ -636,21 +660,7 @@ def _append_missing_low_value_bag_from_gap(extracted, unified_text):
     if not targets:
         return
     items_sum = sum(float(item.get("total") or 0) for item in items if isinstance(item, dict))
-    bag_rows: list[tuple[str, float]] = []
-    for raw_line in unified_text.split('\n'):
-        line = raw_line.strip()
-        if not re.search(r'袋|バッグ|bag', line, re.IGNORECASE):
-            continue
-        m = re.search(r'^(.+?[ぁ-んァ-ン一-龥][^¥￥]*?)\s+([¥￥]?\s*\d[\d,]*)\s*(?:[%％*※除軽Xx])?\s*$', line)
-        if not m:
-            continue
-        desc = re.sub(r'\s+', ' ', m.group(1)).strip()
-        try:
-            price = float(m.group(2).strip().lstrip('¥￥').replace(',', ''))
-        except ValueError:
-            continue
-        if 0 < price < 10:
-            bag_rows.append((desc, price))
+    bag_rows = _low_value_bag_rows_from_ocr([line.strip() for line in unified_text.split('\n')])
     if len(bag_rows) != 1:
         return
     desc, price = bag_rows[0]

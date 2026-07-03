@@ -58,7 +58,11 @@ from .receipt_projection import (
 )
 from .receipt_recovery import _recover_missing_items_from_gap
 from .receipt_tax_categories import _is_bag_description
-from .receipt_totals import _canonical_subtotal_from_taxes, _sum_taxable_amounts
+from .receipt_totals import (
+    _canonical_subtotal_from_taxes,
+    _printed_amount_targets,
+    _sum_taxable_amounts,
+)
 
 
 def _fix_single_service_inclusive_tax(extracted, unified_text):
@@ -791,7 +795,12 @@ def _fix_duplicate_descriptions_from_ocr(extracted, unified_text):
         _norm(item.get("description") or "")
         for item in items if isinstance(item, dict)
     }
-    ocr_candidates: list[tuple[float, str]] = []
+    light_marker = chr(0x8EFD)
+
+    def _rate_from_price_line(line: str) -> str | None:
+        return "8%" if re.search(rf'[\*※{light_marker}]', line) else None
+
+    ocr_candidates: list[tuple[float, str, str]] = []
     for line_idx, raw_line in enumerate(lines):
         line = raw_line.strip()
         if _SKIP_PRICE_LINE.search(line) or _OCR_QTY_NOTATION_RE.search(line):
@@ -815,9 +824,9 @@ def _fix_duplicate_descriptions_from_ocr(extracted, unified_text):
         norm_desc = _norm(desc)
         if not norm_desc or norm_desc in existing_norms:
             continue
-        ocr_candidates.append((price, desc))
+        ocr_candidates.append((price, desc, _rate_from_price_line(line)))
 
-    def _desc_supported_at_price(desc: str, total: float) -> bool:
+    def _desc_supported_at_price(desc: str, total: float, tax_category: str | None = None) -> bool:
         desc_norm = _norm(desc)
         if not desc_norm or total <= 0:
             return False
@@ -848,6 +857,9 @@ def _fix_duplicate_descriptions_from_ocr(extracted, unified_text):
                     continue
                 cand = _clean_ocr_price_line_desc(raw)
                 if _norm(cand) == desc_norm:
+                    line_rate = _rate_from_price_line(line)
+                    if line_rate and tax_category in {"8%", "10%"} and line_rate != tax_category:
+                        continue
                     return True
         return False
 
@@ -860,15 +872,23 @@ def _fix_duplicate_descriptions_from_ocr(extracted, unified_text):
             total = float(item.get("total") or 0)
             if total <= 0:
                 continue
-            if _desc_supported_at_price(item.get("description") or "", total):
+            tax_category = str(item.get("tax_category") or "")
+            if _desc_supported_at_price(item.get("description") or "", total, tax_category):
                 continue
             match_idx = None
-            for cand_idx, (price, desc) in enumerate(ocr_candidates):
+            fallback_idx = None
+            for cand_idx, (price, desc, rate) in enumerate(ocr_candidates):
                 if cand_idx in used_candidates:
                     continue
-                if abs(price - total) <= 2:
+                if abs(price - total) > 2:
+                    continue
+                if tax_category in {"8%", "10%"} and rate == tax_category:
                     match_idx = cand_idx
                     break
+                if fallback_idx is None:
+                    fallback_idx = cand_idx
+            if match_idx is None:
+                match_idx = fallback_idx
             if match_idx is None:
                 continue
             item["description"] = ocr_candidates[match_idx][1]
@@ -1070,7 +1090,7 @@ def _fix_bag_item_prices_from_rate_bases(extracted, rate_bases, unified_text):
         return
 
     current_total = sum(float(item.get("total") or 0) for item in bag_items)
-    if abs(current_total - standard_base) <= 2:
+    if abs(current_total - standard_base) <= 0.5:
         return
 
     entries = _bag_entries_from_ocr(unified_text)
@@ -1622,6 +1642,58 @@ def _drop_non_product_line_items(extracted, unified_text):
         r'取引内容|お取扱日|^クレジット$|^現金$|^お釣り$|^釣銭$|'
         r'^[\(（\s※＊*]*(?:\d+(?:\.\d+)?\s*[%％]\s*)?[内外]\s*(?:税)?[\)）\s]*$'
     )
+    lines = [line.strip() for line in unified_text.split('\n')]
+    header_end = next(
+        (
+            idx
+            for idx, line in enumerate(lines)
+            if re.search(r'領収|20\d{2}[年/-]|レジ\s*#?|No\.', line, re.IGNORECASE)
+        ),
+        min(6, len(lines)),
+    )
+    header_lines = lines[:header_end]
+    targets = _printed_amount_targets(extracted, unified_text)
+
+    def _norm(text: str) -> str:
+        return re.sub(r'[^\wぁ-んァ-ン一-龥]', '', str(text or ""), flags=re.UNICODE).lower()
+
+    def _drop_improves_balance(drop_total: float) -> bool:
+        if not targets:
+            return False
+        new_sum = priced_sum - drop_total
+        return (
+            min(abs(new_sum - target) for target in targets) <= 2
+            and min(abs(priced_sum - target) for target in targets) > 2
+        )
+
+    def _looks_like_header_duplicate(desc: str, total: float) -> bool:
+        if total <= 0 or not _drop_improves_balance(total):
+            return False
+        if sum(
+            1
+            for other in items
+            if isinstance(other, dict)
+            and abs(float(other.get("total") or 0) - total) <= 2
+        ) < 2:
+            return False
+        desc_norm = _norm(desc)
+        return bool(desc_norm) and any(desc_norm == _norm(line) for line in header_lines)
+
+    def _looks_like_payment_context_amount(total: float) -> bool:
+        if total <= 0:
+            return False
+        if not any(abs(priced_sum - total - target) <= 2 for target in targets):
+            return False
+        amount = str(int(total)) if float(total).is_integer() else str(total)
+        amount_re = re.compile(rf'(?<!\d){re.escape(amount)}(?!\d)')
+        for idx, line in enumerate(lines):
+            if not amount_re.search(line):
+                continue
+            context = "\n".join(lines[max(0, idx - 8):min(len(lines), idx + 2)])
+            if re.search(r'お釣り|お釣|釣銭|おつり|(?:^|\n)\s*釣\s*(?:\n|$)', context):
+                return True
+        return False
+
     kept = []
     for item in items:
         if not isinstance(item, dict):
@@ -1645,6 +1717,8 @@ def _drop_non_product_line_items(extracted, unified_text):
             or bool(_HEADER_LINE_RE.search(desc))
             or bool(_BANNER_PHRASE_RE.search(desc))
             or (receipt_total and total > receipt_total * 1.2)
+            or _looks_like_header_duplicate(desc, total)
+            or _looks_like_payment_context_amount(total)
         )
         if looks_bad and not is_bag:
             continue

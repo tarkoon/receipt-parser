@@ -42,6 +42,47 @@ def _line_items_sum(extracted) -> float:
     )
 
 
+def _printed_amount_targets(extracted, unified_text, *, include_rate_bases: bool = True) -> list[float]:
+    """OCR-visible summary/rate-base amounts that can balance item cleanup."""
+    targets = [
+        float(value)
+        for value in (
+            extracted.get("subtotal"),
+            extracted.get("total"),
+            _canonical_subtotal_from_taxes(extracted),
+        )
+        if value is not None and float(value or 0) > 0
+    ]
+    lines = [line.strip() for line in unified_text.split('\n')]
+    total_label = chr(0x5408) + chr(0x8A08)
+    summary_labels = {
+        chr(0x8A08),
+        chr(0x5C0F) + chr(0x8A08),
+        total_label,
+        chr(0x7DCF) + total_label,
+    }
+    for idx, line in enumerate(lines):
+        compact_line = re.sub(r'\s+', '', line)
+        if compact_line not in summary_labels:
+            continue
+        if re.search(r'税|対象|ポイント', "\n".join(lines[max(0, idx - 2):idx + 1])):
+            continue
+        for following in lines[idx + 1:min(len(lines), idx + 4)]:
+            if re.search(r'お預り|お釣|釣銭|おつり|ポイント', following):
+                break
+            amount_m = re.fullmatch(r'[¥￥]\s*([\d,]+)', following)
+            if amount_m:
+                targets.append(float(amount_m.group(1).replace(',', '')))
+                break
+    if include_rate_bases:
+        targets.extend(
+            float(base)
+            for base in extract_rate_bases(unified_text).values()
+            if base is not None and float(base) > 0
+        )
+    return targets
+
+
 def _drop_unprinted_small_target_only_taxes(extracted, unified_text):
     """Omit tiny tax rows when OCR prints only a target base, not a tax amount."""
     taxes = [tax for tax in (extracted.get("taxes") or []) if isinstance(tax, dict)]
@@ -285,6 +326,18 @@ def _restore_printed_summary_total_when_tax_balanced(extracted, unified_text):
             total_candidates.append(value)
 
     item_sum = _line_items_sum(extracted)
+    inclusive_tax = any(str(tax.get("label") or "") == "内税" for tax in taxes)
+    rate_bases = extract_rate_bases(unified_text)
+    if item_sum > 0 and inclusive_tax:
+        gross_matches = [
+            float(base)
+            for base in rate_bases.values()
+            if base is not None and abs(float(base) - item_sum) <= 2
+        ]
+        if gross_matches:
+            printed_total = gross_matches[0]
+            printed_subtotal = printed_total - tax_sum
+
     if item_sum > 0 and values:
         subtotal_candidates = [amount for amount in values if abs(amount - item_sum) <= 5]
         if subtotal_candidates:
@@ -330,7 +383,7 @@ def _restore_printed_summary_total_when_tax_balanced(extracted, unified_text):
         and abs(current_subtotal_f - printed_subtotal) <= 0.01
     ):
         return
-    if item_sum > 0 and abs(item_sum - printed_subtotal) > 5:
+    if item_sum > 0 and abs(item_sum - printed_subtotal) > 5 and abs(item_sum - printed_total) > 5:
         return
 
     extracted["subtotal"] = printed_subtotal

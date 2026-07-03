@@ -1007,8 +1007,48 @@ def _column_split_label_value_pairs(lines: list[str]) -> list[tuple[str, str]]:
     return []
 
 
+def _vertical_inner_tax_table_entries(lines: list[str]) -> list[tuple[str, str, float]]:
+    """Parse vertical 税率/税抜き/税額 stacks into base and tax entries."""
+    joined = "\n".join(lines)
+    if re.search(r'内税', joined) and re.search(r'税率', joined) and re.search(r'税抜き', joined) and re.search(r'税額', joined):
+        stack_lines: list[str] = []
+        in_stack = False
+        for raw in lines:
+            line = raw.strip()
+            if re.search(r'税率', line):
+                in_stack = True
+            if not in_stack:
+                continue
+            if stack_lines and re.search(r'担当者|日付|時間|店舗|登録番号', line):
+                break
+            stack_lines.append(line)
+        nums = [
+            float(m.group(0).replace(',', ''))
+            for line in stack_lines
+            if not re.search(r'[\*xX年月日:/-]', line)
+            for m in re.finditer(r'(?<![\d.])\d+(?:\.\d+)?(?![\d.])', line)
+        ]
+        rates = [
+            normalize_tax_rate(f"{num}%")
+            for num in nums
+            if num in {8.0, 10.0}
+        ]
+        values = [float(num) for num in nums if num == int(num) and num not in {8.0, 10.0}]
+        if rates and len(values) >= len(rates) * 2:
+            bases = values[:len(rates)]
+            taxes = values[len(rates):len(rates) * 2]
+            return (
+                [(rate, "base", value) for rate, value in zip(rates, bases)]
+                + [(rate, "tax", value) for rate, value in zip(rates, taxes)]
+            )
+    return []
+
+
 def _bare_number_tax_summary_entries(lines: list[str]) -> list[tuple[str, str, float]]:
     """Map rate target/tax labels to a following bare-number value stack."""
+    vertical_entries = _vertical_inner_tax_table_entries(lines)
+    if vertical_entries:
+        return vertical_entries
     labels: list[tuple[int, str, str]] = []
     for idx, raw in enumerate(lines):
         line = raw.strip()
@@ -1353,34 +1393,32 @@ def extract_rate_bases(text: str) -> dict[str, float | None]:
         if kind == "base" and rate not in paren_rates:
             bases[rate] = value
 
-    if re.search(r'内税', text) and re.search(r'税率', text) and re.search(r'税抜き', text):
-        stack_lines: list[str] = []
-        in_stack = False
-        for raw in lines:
-            line = raw.strip()
-            if '税率' in line:
-                in_stack = True
-            if in_stack:
-                if re.search(r'担当者|日付|時間|店舗|登録番号', line):
-                    break
-                stack_lines.append(line)
-        nums = [
-            float(m.group(0).replace(',', ''))
-            for line in stack_lines
-            if not re.search(r'[\*xX年月日:/-]', line)
-            for m in re.finditer(r'(?<![\d.])\d+(?:\.\d+)?(?![\d.])', line.strip())
-        ]
-        if {8.0, 10.0}.issubset(set(nums)):
-            tail_ints = [int(n) for n in nums if n == int(n) and n not in {8.0, 10.0}]
-            if len(tail_ints) >= 4:
-                bases["10%"] = float(tail_ints[-4])
-                bases["8%"] = float(tail_ints[-3])
-
     return bases
 
 
 def extract_points_used(text: str) -> float | None:
     """Extract loyalty points applied as payment from OCR text."""
+    # Prefer explicit point-unit rows before loose yen amounts; payment
+    # summaries can say "ポイント利用" next to the remaining cash/card amount.
+    if re.search(r'利用ポイント|ポイント利用', text):
+        lines = text.split('\n')
+        current_total_label = ''.join(chr(c) for c in (0x4ECA, 0x56DE, 0x8A08))
+        for i, line in enumerate(lines):
+            if '利用ポイント' in line or 'ポイント利用' in line:
+                point_rows = [
+                    lines[j]
+                    for j in range(i + 1, min(i + 7, len(lines)))
+                    if re.match(r'^\s*(?:[\d,]+|[0O])\s*P\s*$', lines[j])
+                ]
+                if re.search(current_total_label, "\n".join(lines[max(0, i - 3):i])):
+                    point_rows = point_rows[1:]
+                for row in point_rows:
+                    used = re.match(r'^\s*([\d,]+)\s*P\s*$', row)
+                    if used:
+                        return float(used.group(1).replace(',', ''))
+                    if re.match(r'^\s*[0O]\s*P\s*$', row):
+                        return 0.0
+                break
     patterns = [
         r'ポイント利用\s*[¥￥]?\s*([\d,]+)',
         r'利用ポイント\s*[¥￥]?\s*([\d,]+)',
@@ -1391,15 +1429,6 @@ def extract_points_used(text: str) -> float | None:
         m = re.search(pattern, text)
         if m:
             return float(m.group(1).replace(',', ''))
-    # Detect zero-point usage: "利用ポイント" header with "OP"/"0P" value nearby
-    if re.search(r'利用ポイント|ポイント利用', text):
-        lines = text.split('\n')
-        for i, line in enumerate(lines):
-            if '利用ポイント' in line or 'ポイント利用' in line:
-                for j in range(i, min(i + 5, len(lines))):
-                    if re.match(r'^\s*[0O]\s*P\s*$', lines[j]):
-                        return 0.0
-                break
     lines = [line.strip() for line in text.split('\n')]
     for idx, line in enumerate(lines):
         if not re.fullmatch(r'(?:楽天)?ポイント', line):
@@ -1458,6 +1487,12 @@ def reconcile_points_payment_from_ocr(extracted: dict, unified_text: str) -> Non
         or existing_amount > total
     ):
         extracted["amount_paid"] = expected_paid
+    if (
+        points > 0
+        and expected_paid <= 2
+        and not re.search(r'現金|現計|(?:お預り金?|お預かり)(?!票)|(?<![お\w])預\s*[¥￥]', unified_text)
+    ):
+        extracted["payment_method"] = "credit"
 
 
 def _find_subset_sum(items, target, max_k=3, tolerance=5.0):

@@ -837,7 +837,23 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
             qty = float(unit_first.group(2))
         else:
             if re.search(r'[@＠]', line):
-                return None
+                bare_unit_first = re.search(
+                    r'\(?\s*[@＠]\s*(\d[\d,]*)\s*[xX×Ⅹ]\s*(\d+)\s*\)?',
+                    line,
+                )
+                if not bare_unit_first:
+                    return None
+                unit = float(bare_unit_first.group(1).replace(',', ''))
+                qty = float(bare_unit_first.group(2))
+                nearby_total = _nearby_standalone_amount(detail_idx)
+                if (
+                    qty < 2
+                    or unit <= 0
+                    or nearby_total is None
+                    or abs(qty * unit - nearby_total) > 2
+                ):
+                    return None
+                return qty, unit
             qty_first = re.search(
                 r'\(?\s*(\d+)\s*(?P<marker>[個コ点]\s*[xX×Ⅹ]?\s*[単单]?|[xX×Ⅹ]\s*[単单]?|[単单])\s*(\d[\d,]*)\s*\)?',
                 line,
@@ -925,10 +941,17 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                     continue
                 item_total = float(item.get("total") or 0)
                 item_discount = float(item.get("discount") or 0)
+                nearby_total = _nearby_standalone_amount(idx)
+                supported_by_nearby_total = (
+                    desc_rank < 2
+                    and nearby_total is not None
+                    and abs(nearby_total - expected_total) <= 2
+                )
                 if (
                     abs(item_total - unit) > 2
                     and abs(item_total - expected_total) > 2
                     and abs(item_total + item_discount - expected_total) > 2
+                    and not supported_by_nearby_total
                 ):
                     continue
                 if (

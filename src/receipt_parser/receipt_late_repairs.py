@@ -43,6 +43,11 @@ def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
         except (TypeError, ValueError):
             pass
     max_known_amount = max(known_amounts) if known_amounts else None
+    current_items = [item for item in (extracted.get("line_items") or []) if isinstance(item, dict)]
+    if len(current_items) >= 2 and known_amounts:
+        current_sum = sum(float(item.get("total") or 0) for item in current_items)
+        if any(abs(current_sum - amount) <= 2 for amount in known_amounts):
+            return
 
     def _clean_desc(text: str) -> str:
         text = re.sub(r'^[◎○●内*＊]\s*', '', text.strip())

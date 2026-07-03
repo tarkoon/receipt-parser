@@ -28,6 +28,7 @@ from .receipt_tax_categories import (
 from .receipt_totals import (
     _canonical_subtotal_from_taxes,
     _line_items_sum,
+    _printed_amount_targets,
     _sum_taxable_amounts,
 )
 
@@ -319,6 +320,11 @@ def _recover_missing_items_from_gap(extracted, unified_text):
         return
 
     lines = unified_text.split('\n')
+    if any(
+        abs(float(target) - float(items_sum)) <= 2
+        for target in _printed_amount_targets(extracted, unified_text)
+    ):
+        return
 
     # Collect OCR item-zone amounts excluding summary lines. Some OCR layouts
     # omit the yen symbol on product rows, so use the same trailing-price
@@ -374,7 +380,31 @@ def _recover_missing_items_from_gap(extracted, unified_text):
         i.get("total", 0) for i in items if isinstance(i, dict)
     ]
     unmatched = list(ocr_prices)
-    for amt in item_amounts:
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        amt = item.get("total", 0)
+        desc_norm = re.sub(r'\s+', '', str(item.get("description") or ""))
+        best_j = None
+        best_score = 0.0
+        if desc_norm:
+            for j, (idx, oa) in enumerate(unmatched):
+                if abs(oa - amt) >= 1:
+                    continue
+                cand = _find_ocr_item_desc(lines, idx, [])
+                cand_norm = re.sub(r'\s+', '', str(cand or ""))
+                if not cand_norm:
+                    continue
+                if desc_norm in cand_norm or cand_norm in desc_norm:
+                    score = 1.0
+                else:
+                    score = SequenceMatcher(None, desc_norm, cand_norm).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_j = j
+        if best_j is not None and best_score >= 0.72:
+            unmatched.pop(best_j)
+            continue
         for j, (_idx, oa) in enumerate(unmatched):
             if abs(oa - amt) < 1:
                 unmatched.pop(j)
@@ -391,6 +421,14 @@ def _recover_missing_items_from_gap(extracted, unified_text):
     if tax_amts:
         unmatched = [(idx, amt) for idx, amt in unmatched
                      if amt not in tax_amts]
+    unmatched = [
+        (idx, amt)
+        for idx, amt in unmatched
+        if not re.search(
+            r'お釣り|お釣|釣銭|おつり|(?:^|\n)\s*釣\s*(?:\n|$)',
+            "\n".join(lines[max(0, idx - 8):min(len(lines), idx + 2)]),
+        )
+    ]
 
     # Try both targets: items add to total (内税) or to subtotal (外税).
     # Pre-normalize, the LLM-supplied tax label is unreliable, so test both

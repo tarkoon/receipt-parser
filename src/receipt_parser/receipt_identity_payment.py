@@ -15,6 +15,43 @@ from .patterns import (
 from .receipt_totals import _sum_taxable_amounts
 
 
+_CREDIT_LABEL = ''.join(chr(c) for c in (0x30AF, 0x30EC, 0x30B8, 0x30C3, 0x30C8))
+_ELECTRONIC_MONEY_LABEL = ''.join(chr(c) for c in (0x96FB, 0x5B50, 0x30DE, 0x30CD, 0x30FC))
+_TRANSPORT_LABEL = ''.join(chr(c) for c in (0x4EA4, 0x901A, 0x7CFB))
+_CARD_LABEL = ''.join(chr(c) for c in (0x30AB, 0x30FC, 0x30C9))
+_LOYALTY_LABELS = ''.join(chr(c) for c in (0x30DD, 0x30A4, 0x30F3, 0x30C8, 0x4F1A, 0x54E1, 0x5BFE, 0x8C61, 0x756A, 0x53F7))
+_CARD_NOISE_RE = re.compile(
+    '|'.join(
+        ''.join(chr(c) for c in chars)
+        for chars in (
+            (0x30AE, 0x30D5, 0x30C8),
+            (0x9664, 0x304F),
+            (0x6709, 0x52B9, 0x671F, 0x9650),
+            (0x7D2F, 0x8A08),
+            (0x30DD, 0x30A4, 0x30F3, 0x30C8),
+            (0x4F1A, 0x54E1, 0x52DF, 0x96C6, 0x4E2D),
+            (0x304A, 0x3059, 0x3059, 0x3081),
+        )
+    )
+)
+_CARD_FOOTER_NOISE_RE = re.compile(
+    '|'.join(
+        ''.join(chr(c) for c in chars)
+        for chars in (
+            (0x9664, 0x304F),
+            (0x6709, 0x52B9, 0x671F, 0x9650),
+            (0x7D2F, 0x8A08),
+        )
+    )
+)
+_PAYMENT_TOKEN_RE = re.compile(
+    rf'{_CREDIT_LABEL}|VISA|Master(?:Card)?|JCB|AMEX|QUICPay|'
+    rf'{_ELECTRONIC_MONEY_LABEL}|(?<![A-Za-z])iD(?![A-Za-z])|'
+    rf'PayPay|{_TRANSPORT_LABEL}|(?<![A-Za-z])IC(?![A-Za-z])',
+    re.IGNORECASE,
+)
+
+
 def _merchant_looks_invalid(merchant: str | None) -> bool:
     merchant = (merchant or "").strip()
     if not merchant:
@@ -351,7 +388,8 @@ def _apply_financial_overrides(extracted, ocr_totals, ocr_conf, llm_conf):
         computed_tax = ocr_totals["total"] - ocr_totals["subtotal"]
         if computed_tax >= 0 and should_override_field("taxes", ocr_conf, llm_conf):
             llm_tax = _sum_taxable_amounts(extracted.get("taxes", []))
-            if abs(llm_tax - computed_tax) > 5:
+            ocr_tax = _sum_taxable_amounts(ocr_totals.get("taxes") or [])
+            if not (ocr_tax > 0 and abs(ocr_tax - computed_tax) > 5) and abs(llm_tax - computed_tax) > 5:
                 if extracted.get("taxes"):
                     if llm_tax > 0:
                         scale = computed_tax / llm_tax
@@ -366,6 +404,24 @@ def _apply_financial_overrides(extracted, ocr_totals, ocr_conf, llm_conf):
         # Merge: trust OCR for rates it found, but keep LLM's tax entries for
         # rates the OCR scan missed (column-split layouts often hide one rate's
         # tax line from the OCR forward-scan while the LLM still recovers it).
+        existing_total = extracted.get("total")
+        existing_subtotal = extracted.get("subtotal")
+        existing_tax_sum = _sum_taxable_amounts(extracted.get("taxes") or [])
+        ocr_tax_sum = _sum_taxable_amounts(ocr_totals.get("taxes") or [])
+        try:
+            existing_total_f = float(existing_total) if existing_total is not None else None
+            existing_subtotal_f = float(existing_subtotal) if existing_subtotal is not None else None
+        except (TypeError, ValueError):
+            existing_total_f = existing_subtotal_f = None
+        if (
+            existing_total_f is not None
+            and existing_subtotal_f is not None
+            and existing_tax_sum > 0
+            and abs(existing_subtotal_f + existing_tax_sum - existing_total_f) <= 2
+            and ocr_tax_sum > 0
+            and abs(existing_subtotal_f + ocr_tax_sum - existing_total_f) > 5
+        ):
+            return
         ocr_rates = {t.get("rate") for t in ocr_totals["taxes"]}
         llm_extra = [
             t for t in (extracted.get("taxes") or [])
@@ -590,11 +646,24 @@ def _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf):
     ):
         extracted["payment_method"] = "credit"
         existing = "credit"
-    has_explicit_credit = bool(re.search(
-        r'クレジット|カード|VISA|Master(?:Card)?|JCB|AMEX|QUICPay|電子マネー|iD|PayPay|交通系|IC',
-        unified_text,
-        re.IGNORECASE,
-    ))
+    def _line_has_payment_card(line: str, context: str) -> bool:
+        if _CARD_NOISE_RE.search(line):
+            return False
+        context_tail = context[len(line):]
+        if _CARD_FOOTER_NOISE_RE.search(context_tail):
+            return False
+        if _PAYMENT_TOKEN_RE.search(line):
+            return True
+        return bool(
+            re.search(rf'{_CARD_LABEL}|card', line, re.IGNORECASE)
+            and not re.search(f'[{_LOYALTY_LABELS}]', line)
+        )
+
+    payment_lines = unified_text.splitlines()
+    has_explicit_credit = any(
+        _line_has_payment_card(line, "\n".join(payment_lines[idx:min(len(payment_lines), idx + 3)]))
+        for idx, line in enumerate(payment_lines)
+    )
     has_cash_tender_evidence = bool(re.search(
         r'現金|現計|(?:お預り金?|お預かり)(?!票)|(?<![お\w])預\s*[¥￥]',
         unified_text,
@@ -605,6 +674,7 @@ def _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf):
     if not existing and has_explicit_credit:
         extracted["payment_method"] = "credit"
         existing = "credit"
+    has_payment_card = has_explicit_credit
 
     has_cash = '現計' in unified_text
     if not has_cash:
@@ -636,6 +706,8 @@ def _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf):
     if has_cash:
         if strong_cash:
             extracted["payment_method"] = "cash"
+        elif existing == "cash" and has_payment_card:
+            extracted["payment_method"] = "credit"
         elif not existing or existing == "cash":
             extracted["payment_method"] = "cash"
         elif should_override_field("payment_method", ocr_conf, llm_conf) and not existing:

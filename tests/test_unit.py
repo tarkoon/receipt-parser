@@ -1730,6 +1730,35 @@ def test_payment_method_repair_phase_uses_visible_payment_markers():
     assert extracted["payment_method"] == "credit"
 
 
+def test_payment_method_card_marker_overrides_weak_cash_total_label():
+    from receipt_parser.pipeline_receipt import _fix_payment_method
+
+    extracted = {"payment_method": "cash"}
+    ocr_text = "\n".join([
+        "現金計",
+        "給油DEカード",
+        "楽天ポイントカード ************ 1234",
+    ])
+
+    _fix_payment_method(extracted, ocr_text, 0.9, {})
+
+    assert extracted["payment_method"] == "credit"
+
+
+def test_payment_method_loyalty_card_does_not_override_cash_label():
+    from receipt_parser.pipeline_receipt import _fix_payment_method
+
+    extracted = {"payment_method": "cash"}
+    ocr_text = "\n".join([
+        "現金計",
+        "楽天ポイントカード ************ 1234",
+    ])
+
+    _fix_payment_method(extracted, ocr_text, 0.9, {})
+
+    assert extracted["payment_method"] == "cash"
+
+
 def test_toll_payment_reference_recovers_handling_number_from_toll_context():
     from receipt_parser.pipeline_receipt import _fix_toll_payment_reference
 
@@ -2264,6 +2293,7 @@ def test_points_tender_reconciles_amount_paid_from_ocr():
 
     assert extracted["points_used"] == 570
     assert extracted["amount_paid"] == 0
+    assert extracted["payment_method"] == "credit"
 
 
 def test_zero_points_restored_from_reward_context_without_redemption():
@@ -12604,3 +12634,312 @@ def test_qty_unit_lines_strip_embedded_qty_detail_from_description():
     assert extracted["line_items"][0]["qty"] == 4
     assert extracted["line_items"][0]["unit_price"] == 38
     assert extracted["line_items"][0]["total"] == 152
+
+
+def test_qty_unit_lines_accept_bare_at_unit_x_qty_when_gross_is_printed():
+    from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "line_items": [
+            {"description": "にがりソフト", "qty": 1, "unit_price": 14, "total": 14},
+        ]
+    }
+    ocr_text = "\n".join([
+        "にがりソフト",
+        "@88x2",
+        "*176",
+        "小計",
+        "¥193",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["qty"] == 2
+    assert extracted["line_items"][0]["unit_price"] == 88
+    assert extracted["line_items"][0]["total"] == 176
+
+
+def test_non_product_cleanup_drops_header_duplicate_when_balance_improves():
+    from receipt_parser.pipeline_receipt import _drop_non_product_line_items
+
+    extracted = {
+        "total": 193,
+        "subtotal": 179,
+        "line_items": [
+            {"description": "7セブン-イレブン", "qty": 1, "unit_price": 176, "total": 176},
+            {"description": "にがりソフト", "qty": 2, "unit_price": 88, "total": 176},
+            {"description": "バイオ30レジ袋中1枚", "qty": 1, "unit_price": 3, "total": 3},
+        ],
+    }
+    ocr_text = "\n".join([
+        "7 セブン-イレブン",
+        "宗像陵厳寺店",
+        "領収書",
+        "にがりソフト",
+        "@88x2",
+        "*176",
+        "バイオ30レジ袋中1枚",
+        "3",
+        "小計 (税抜 8%)",
+        "¥176",
+        "小計(税抜10%)",
+        "¥3",
+    ])
+
+    _drop_non_product_line_items(extracted, ocr_text)
+
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "にがりソフト",
+        "バイオ30レジ袋中1枚",
+    ]
+
+
+def test_non_product_cleanup_drops_change_amount_promoted_to_item():
+    from receipt_parser.pipeline_receipt import _drop_non_product_line_items
+
+    extracted = {
+        "total": 503,
+        "line_items": [
+            {"description": "クラフトボスイタリアー", "qty": 1, "unit_price": 193, "total": 193},
+            {"description": "アップルティーソーダ", "qty": 1, "unit_price": 140, "total": 140},
+            {"description": "トロピカーナアップル", "qty": 1, "unit_price": 140, "total": 140},
+            {"description": "◎アップルティーソーダ", "qty": 1, "unit_price": 30, "total": 30},
+        ],
+    }
+    ocr_text = "\n".join([
+        "計",
+        "¥473",
+        "お預り",
+        "¥503",
+        "釣",
+        "¥30",
+    ])
+
+    _drop_non_product_line_items(extracted, ocr_text)
+
+    assert [item["total"] for item in extracted["line_items"]] == [193, 140, 140]
+
+
+def test_non_product_cleanup_repairs_inclusive_tax_total_after_dropping_change_row():
+    from receipt_parser.pipeline_receipt import (
+        _drop_non_product_line_items,
+        _restore_printed_summary_total_when_tax_balanced,
+    )
+
+    extracted = {
+        "total": 503,
+        "subtotal": 468,
+        "amount_paid": 503,
+        "taxes": [{"rate": "8%", "label": "内税", "amount": 35}],
+        "line_items": [
+            {"description": "クラフトボスイタリアー", "qty": 1, "unit_price": 193, "total": 193},
+            {"description": "アップルティーソーダ", "qty": 1, "unit_price": 140, "total": 140},
+            {"description": "トロピカーナアップル", "qty": 1, "unit_price": 140, "total": 140},
+            {"description": "◎アップルティーソーダ", "qty": 1, "unit_price": 30, "total": 30},
+        ],
+    }
+    ocr_text = "\n".join([
+        "計",
+        "8%対象",
+        "(内消費税等",
+        "お預り",
+        "釣",
+        "¥140",
+        "¥473",
+        "¥473)",
+        "¥35)",
+        "¥503",
+        "¥30",
+    ])
+
+    _drop_non_product_line_items(extracted, ocr_text)
+    _restore_printed_summary_total_when_tax_balanced(extracted, ocr_text)
+
+    assert [item["total"] for item in extracted["line_items"]] == [193, 140, 140]
+    assert extracted["total"] == 473
+    assert extracted["subtotal"] == 438
+    assert extracted["amount_paid"] == 473
+
+
+def test_extract_points_used_reads_split_point_p_value():
+    from receipt_parser.pipeline_receipt import extract_points_used
+
+    text = "\n".join([
+        "利用ポイント",
+        "4,000P",
+        "利用可能ポイント",
+        "3,942P",
+    ])
+
+    assert extract_points_used(text) == 4000
+
+
+def test_missing_item_recovery_skips_when_items_match_printed_summary_amount():
+    from receipt_parser.pipeline_receipt import _recover_missing_items_from_gap
+
+    extracted = {
+        "total": 503,
+        "line_items": [
+            {"description": "クラフトボスイタリアー", "qty": 1, "unit_price": 193, "total": 193},
+            {"description": "アップルティーソーダ", "qty": 1, "unit_price": 140, "total": 140},
+            {"description": "トロピカーナアップル", "qty": 1, "unit_price": 140, "total": 140},
+        ],
+    }
+    ocr_text = "\n".join([
+        "計",
+        "¥473",
+        "お預り",
+        "¥503",
+        "釣",
+        "¥30",
+        "アップルティーソーダ",
+        "¥30",
+    ])
+
+    _recover_missing_items_from_gap(extracted, ocr_text)
+
+    assert [item["total"] for item in extracted["line_items"]] == [193, 140, 140]
+
+
+def test_stacked_name_price_repair_skips_when_existing_items_match_known_amount():
+    from receipt_parser.pipeline_receipt import _replace_stacked_name_price_rows_when_balanced
+
+    extracted = {
+        "total": 193,
+        "subtotal": 179,
+        "line_items": [
+            {"description": "にがりソフト", "qty": 2, "unit_price": 88, "total": 176},
+            {"description": "バイオ30レジ袋中1枚", "qty": 1, "unit_price": 3, "total": 3},
+        ],
+    }
+    ocr_text = "\n".join([
+        "領収書",
+        "7 セブン-イレブン",
+        "にがりソフト",
+        "バイオ30レジ袋中1枚",
+        "¥176",
+        "¥3",
+        "合計",
+        "¥193",
+    ])
+
+    _replace_stacked_name_price_rows_when_balanced(extracted, ocr_text)
+
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "にがりソフト",
+        "バイオ30レジ袋中1枚",
+    ]
+
+
+def test_financial_overrides_keep_tax_when_existing_values_already_balance():
+    from receipt_parser.pipeline_receipt import _apply_financial_overrides
+
+    extracted = {
+        "total": 4175,
+        "subtotal": 3795,
+        "taxes": [{"rate": "10%", "label": "内税", "amount": 380}],
+    }
+    ocr_totals = {"taxes": [{"rate": "10%", "label": "内税", "amount": 175}]}
+
+    _apply_financial_overrides(extracted, ocr_totals, 0.9, {})
+
+    assert extracted["subtotal"] == 3795
+    assert extracted["taxes"] == [{"rate": "10%", "label": "内税", "amount": 380}]
+
+
+def test_printed_summary_total_uses_inclusive_tax_item_sum_rate_base():
+    from receipt_parser.pipeline_receipt import _restore_printed_summary_total_when_tax_balanced
+
+    extracted = {
+        "total": 503,
+        "amount_paid": 503,
+        "subtotal": 468,
+        "points_used": 0,
+        "taxes": [{"rate": "8%", "label": "内税", "amount": 35}],
+        "line_items": [
+            {"description": "クラフトボスイタリアー", "qty": 1, "unit_price": 193, "total": 193},
+            {"description": "アップルティーソーダ", "qty": 1, "unit_price": 140, "total": 140},
+            {"description": "トロピカーナアップル", "qty": 1, "unit_price": 140, "total": 140},
+        ],
+    }
+    ocr_text = "\n".join([
+        "計",
+        "8%対象",
+        "(内消費税等",
+        "お預り",
+        "釣",
+        "¥140",
+        "¥473",
+        "¥473)",
+        "¥35)",
+        "¥503",
+        "¥30",
+    ])
+
+    _restore_printed_summary_total_when_tax_balanced(extracted, ocr_text)
+
+    assert extracted["total"] == 473
+    assert extracted["subtotal"] == 438
+    assert extracted["amount_paid"] == 473
+
+
+def test_missing_item_recovery_matches_duplicate_amounts_by_existing_description():
+    from receipt_parser.pipeline_receipt import _recover_missing_items_from_gap
+
+    extracted = {
+        "total": 662,
+        "subtotal": 612,
+        "taxes": [
+            {"rate": "8%", "label": "外税", "amount": 38},
+            {"rate": "10%", "label": "外税", "amount": 12},
+        ],
+        "line_items": [
+            {"description": "バーモントカレー甘口", "qty": 1, "unit_price": 258, "total": 258},
+            {"description": "カスタードシュークリ", "qty": 1, "unit_price": 98, "total": 98},
+            {"description": "パピコマンゴー", "qty": 1, "unit_price": 128, "total": 128},
+        ],
+    }
+    ocr_text = "\n".join([
+        "TVBP タケプレート1 128",
+        "バーモントカレー甘口",
+        "258*",
+        "カスタードシュークリ",
+        "98*",
+        "パピコマンゴー",
+        "128*",
+        "小計",
+        "¥612",
+    ])
+
+    _recover_missing_items_from_gap(extracted, ocr_text)
+
+    descriptions = [item["description"] for item in extracted["line_items"]]
+    assert "TVBP タケプレート1" in descriptions
+    assert descriptions.count("パピコマンゴー") == 1
+
+
+def test_duplicate_description_repair_uses_tax_marker_to_choose_replacement_row():
+    from receipt_parser.pipeline_receipt import _fix_duplicate_descriptions_from_ocr
+
+    extracted = {
+        "line_items": [
+            {"description": "パピコマンゴー", "qty": 1, "unit_price": 128, "total": 128, "tax_category": "10%"},
+            {"description": "バーモントカレー甘口", "qty": 1, "unit_price": 258, "total": 258, "tax_category": "8%"},
+            {"description": "カスタードシュークリ", "qty": 1, "unit_price": 98, "total": 98, "tax_category": "8%"},
+            {"description": "パピコマンゴー", "qty": 1, "unit_price": 128, "total": 128, "tax_category": "8%"},
+        ]
+    }
+    ocr_text = "\n".join([
+        "TVBP タケプレート1 128",
+        "バーモントカレー甘口",
+        "258*",
+        "カスタードシュークリ",
+        "98*",
+        "パピコマンゴー",
+        "128*",
+    ])
+
+    _fix_duplicate_descriptions_from_ocr(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["description"] == "TVBP タケプレート1"
+    assert extracted["line_items"][3]["description"] == "パピコマンゴー"
