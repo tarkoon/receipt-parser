@@ -134,13 +134,35 @@ def _restore_bare_number_tax_summary(extracted, unified_text):
     entries = _bare_number_tax_summary_entries(lines)
     entries.extend(_interleaved_rate_tax_summary_entries(lines))
     taxes = [(rate, value) for rate, kind, value in entries if kind == "tax" and value > 0]
-    if not taxes:
-        return
     total = extracted.get("total")
     try:
         total_f = float(total) if total is not None else None
     except (TypeError, ValueError):
         total_f = None
+    if not taxes and total_f is not None:
+        amounts = []
+        for line in lines:
+            if re.search(r'[%％]|登録番号|TEL|電話|No\.?|№', line, re.IGNORECASE):
+                continue
+            m = re.fullmatch(r'[¥￥]?\s*(\d{1,3}(?:,\d{3})*|\d{1,6})\s*', line)
+            if not m:
+                continue
+            value = float(m.group(1).replace(',', ''))
+            if 0 < value <= total_f * 0.25:
+                amounts.append(value)
+        for rate_m in re.finditer(r'(\d+(?:\.\d+)?)\s*[%％]\s*\(?(?:税込|税抜)', unified_text):
+            rate = normalize_tax_rate(rate_m.group(1) + "%")
+            try:
+                pct = float(rate.rstrip("%"))
+            except (TypeError, ValueError):
+                continue
+            expected = total_f * pct / (100.0 + pct)
+            matches = sorted(amounts, key=lambda value: abs(value - expected))
+            if matches and abs(matches[0] - expected) <= 2:
+                taxes.append((rate, matches[0]))
+                break
+    if not taxes:
+        return
     tax_sum = sum(value for _rate, value in taxes)
     item_sum = _line_items_sum(extracted)
     subtotal = total_f - tax_sum if total_f is not None and total_f >= tax_sum else extracted.get("subtotal")

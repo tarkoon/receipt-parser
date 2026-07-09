@@ -779,6 +779,7 @@ STRUCTURAL_JAPANESE_LITERAL_RE = re.compile(
     r"年|月|日|時|分|個|点|円|品番|JAN|バーコード|除|外|内|"
     r"\\u[0-9a-fA-F]{4}|ぁ-ん|ァ-ン|ァ-ヶ|一-龥|¥|￥)"
 )
+FORMAL_RECEIPT_PURPOSE_LITERALS = {"但", "代", r"^\s*し[、,。\s]+"}
 JAPANESE_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 
 
@@ -995,7 +996,11 @@ def _baseline_japanese_string_counts() -> Counter[tuple[str, str]]:
 
 
 def _looks_structural_japanese_literal(value: str) -> bool:
-    return bool(STRUCTURAL_JAPANESE_LITERAL_RE.search(value))
+    return bool(
+        STRUCTURAL_JAPANESE_LITERAL_RE.search(value)
+        or value in FORMAL_RECEIPT_PURPOSE_LITERALS
+        or "代(?:として" in value
+    )
 
 
 def _assigned_semantic_fields(node: ast.AST) -> set[str]:

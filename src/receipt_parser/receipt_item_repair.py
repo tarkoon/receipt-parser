@@ -20,6 +20,11 @@ from .receipt_projection import (
     _parse_qty_detail_total,
 )
 
+_PURPOSE_STEM_CHARS = r'ぁ-んァ-ン一-龥A-Za-z0-9ー・'
+_FORMAL_PURPOSE_SUFFIX_RE = re.compile(
+    rf'([{_PURPOSE_STEM_CHARS}]{{2,}})代(?:として|$|[\s。、，,）)])'
+)
+
 
 def _clean_code_prefixed_item_descriptions(extracted):
     """Remove visible product-code prefixes from item descriptions."""
@@ -33,6 +38,36 @@ def _clean_code_prefixed_item_descriptions(extracted):
         cleaned = re.sub(r'\s+1$', '', cleaned).strip()
         if cleaned != desc and re.search(r'[ぁ-んァ-ン一-龥]', cleaned):
             item["description"] = cleaned
+
+
+def _clean_formal_receipt_purpose_suffix_descriptions(extracted, unified_text):
+    """Drop formal receipt purpose suffixes when the OCR purpose line proves it."""
+    if "領収" not in unified_text or "但" not in unified_text or "代" not in unified_text:
+        return
+    stems = set()
+    # ponytail: purpose phrases are treated as one OCR line; split-line OCR can
+    # graduate to layout-aware recovery if we find that failure mode.
+    for line in unified_text.splitlines():
+        if "但" not in line or "代" not in line:
+            continue
+        tail = line.split("但", 1)[1]
+        tail = re.sub(r'^\s*し[、,。\s]+', '', tail)
+        tail = re.sub(rf'^[^{_PURPOSE_STEM_CHARS}]+', '', tail)
+        stems.update(
+            re.sub(r'\s+', '', match.group(1))
+            for match in _FORMAL_PURPOSE_SUFFIX_RE.finditer(tail)
+        )
+    if not stems:
+        return
+    for item in extracted.get("line_items") or []:
+        if not isinstance(item, dict):
+            continue
+        desc = (item.get("description") or "").strip()
+        if not desc.endswith("代"):
+            continue
+        stem = desc[:-1].strip()
+        if re.sub(r'\s+', '', stem) in stems:
+            item["description"] = stem
 
 
 def _fix_code_table_descriptions_by_order(extracted, unified_text):

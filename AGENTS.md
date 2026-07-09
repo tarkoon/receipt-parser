@@ -42,6 +42,12 @@ python tests/benchmark.py --ci
 - When debugging LLM-based pipelines, confirm determinism FIRST (same input → same output). If the model API supports seed/temperature controls, lock those down before investigating individual failures.
 - After the first failing test run, STOP and classify errors (deterministic vs non-deterministic, code bug vs model behavior vs OCR variance). Present the classification and proposed fix strategy BEFORE running tests again.
 
+## Production Deploy
+- Paper Ledger production deploy instructions live in `../paper-ledger-api/AGENTS.md`; check that file before shipping parser changes.
+- The API image bakes `receipt-parser` at CI time. Commit and push this repo first, then trigger/re-run `paper-ledger-api` CI (`gh workflow run ci.yml` from the API repo) so the image includes the parser commit.
+- Deploy from `../paper-ledger-api` with `./scripts/deploy.ps1`; that script waits for the matching API CI run, backs up Stardust, deploys the new image, and verifies the public health endpoint.
+- After deploy, verify `https://finance.oni-development.com/api/v1/health` and the live container/DB checks requested by the API AGENTS file. Do not call parser-only pushes deployed until the API image is rebuilt and Stardust is green.
+
 ## UI Design & Review Workflow
 
 ### Agents

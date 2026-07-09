@@ -42,7 +42,22 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
     for rate in rate_bases:
         if rate in valid_rates:
             detected_rates.add(rate)
-    if re.search(r'軽減税率.*8%', unified_text):
+    item_sum = sum(
+        float(item.get("total") or 0)
+        for item in items
+        if isinstance(item, dict)
+    )
+    nonzero_rate_bases = {
+        rate: float(base)
+        for rate, base in rate_bases.items()
+        if rate in valid_rates and base is not None and float(base or 0) > 0
+    }
+    single_standard_base_covers_items = (
+        item_sum > 0
+        and set(nonzero_rate_bases) == {STANDARD_RATE}
+        and abs(item_sum - nonzero_rate_bases[STANDARD_RATE]) <= 2
+    )
+    if re.search(r'軽減税率.*8%', unified_text) and not single_standard_base_covers_items:
         detected_rates.add(REDUCED_RATE)
     for m in re.finditer(r'(\d+)%\s*(?:内税|外税)', unified_text):
         r = m.group(1) + "%"
@@ -352,9 +367,15 @@ def _fix_tax_categories_from_ocr_markers(items, unified_text, *, stacked_only: b
 
     norm_lines = [_norm(line) for line in lines]
 
-    has_reduced_marker_footnote = bool(
-        re.search(r'[*＊※☆★].{0,12}軽減税率|軽減税率.{0,12}[*＊※☆★]', unified_text)
+    marker_footnote = re.search(
+        r'([*＊※☆★A-Za-z])\s*(?:印|マーク)?.{0,12}軽減税率|'
+        r'軽減税率.{0,12}([*＊※☆★A-Za-z])\s*(?:印|マーク)?',
+        unified_text,
     )
+    reduced_markers = {marker for marker in (marker_footnote.groups() if marker_footnote else ()) if marker}
+    reduced_marker_chars = ''.join(re.escape(marker) for marker in reduced_markers)
+    marker_strip_chars = r'\*＊※☆★' if any(marker in '*＊※☆★' for marker in reduced_markers) else reduced_marker_chars
+    has_reduced_marker_footnote = bool(reduced_marker_chars)
 
     def _is_code_continuation(line: str) -> bool:
         return bool(re.fullmatch(r'\d{6,14}\s*(?:JAN)?', line or "", re.IGNORECASE))
@@ -375,7 +396,7 @@ def _fix_tax_categories_from_ocr_markers(items, unified_text, *, stacked_only: b
             if _is_code_continuation(nearby):
                 saw_code = True
                 continue
-            if saw_code and re.match(r'^[*＊※☆★]\s*[ぁ-んァ-ン一-龥A-Za-z]', nearby):
+            if saw_code and re.match(rf'^[{reduced_marker_chars}]\s*[ぁ-んァ-ン一-龥A-Za-z]', nearby):
                 return True
             if saw_code and re.search(r'[ぁ-んァ-ン一-龥A-Za-z]', nearby):
                 return False
@@ -424,7 +445,7 @@ def _fix_tax_categories_from_ocr_markers(items, unified_text, *, stacked_only: b
                 item["tax_category"] = "10%"
                 continue
             if has_reduced_marker_footnote:
-                marker_cleaned = re.sub(r'^[*＊※☆★]\s*', '', raw_desc).strip()
+                marker_cleaned = re.sub(rf'^[{marker_strip_chars}]\s*', '', raw_desc).strip()
                 if marker_cleaned != raw_desc and re.search(r'[ぁ-んァ-ン一-龥]', marker_cleaned):
                     item["description"] = marker_cleaned
                     raw_desc = marker_cleaned

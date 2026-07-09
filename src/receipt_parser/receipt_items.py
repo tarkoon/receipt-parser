@@ -107,7 +107,7 @@ def _fix_bare_service_receipt_without_itemization(extracted, unified_text):
         return
     has_itemization = bool(re.search(
         r'商品名|品名|明細|内訳|数量|単価|小計|@\s*\d|[×xX]\s*\d|'
-        r'\d+(?:\.\d+)?\s*(?:L|個|点)\b',
+        r'\d+(?:\.\d+)?\s*(?:L|個|点)\b|(?:^|\n)\s*但[^\n]{0,40}(?:代|料|品|として)',
         unified_text,
         re.IGNORECASE,
     ))

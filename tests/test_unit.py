@@ -172,6 +172,22 @@ def test_prod_export_empty_receipt_sections_keep_template_pattern():
     }
 
 
+def test_prod_export_omits_zero_amount_tax_entries_except_nontaxable():
+    taxes = flagged_exporter.adapt_taxes(
+        [
+            {"rate": "10%", "label": "内税", "amount": 100},
+            {"rate": "8%", "label": "内税", "amount": 0},
+            {"rate": "0%", "label": "非課税", "amount": 0},
+        ],
+        "JPY",
+    )
+
+    assert taxes == [
+        {"rate": "10%", "label": "内税", "amount": 100},
+        {"rate": "0%", "label": "非課税", "amount": 0},
+    ]
+
+
 def test_flagged_receipts_sql_derives_amount_paid_from_current_prod_schema():
     sql = flagged_exporter.build_flagged_receipts_sql([], limit=1)
 
@@ -12943,3 +12959,163 @@ def test_duplicate_description_repair_uses_tax_marker_to_choose_replacement_row(
 
     assert extracted["line_items"][0]["description"] == "TVBP タケプレート1"
     assert extracted["line_items"][3]["description"] == "パピコマンゴー"
+
+
+def test_formal_receipt_purpose_line_keeps_single_item():
+    from receipt_parser.receipt_items import _fix_bare_service_receipt_without_itemization
+
+    extracted = {
+        "total": 1550,
+        "line_items": [{"description": "ジェラート", "qty": 1, "unit_price": 1550, "total": 1550}],
+    }
+    ocr_text = "\n".join([
+        "領収証",
+        "但□ジェラート代",
+        "¥1,550",
+        "上記正に領収いたしました",
+    ])
+
+    _fix_bare_service_receipt_without_itemization(extracted, ocr_text)
+
+    assert extracted["line_items"]
+
+
+def test_formal_receipt_purpose_suffix_cleanup_strips_marker():
+    from receipt_parser.receipt_postprocess_phases import _run_item_name_price_cleanup_phase
+
+    extracted = {
+        "line_items": [
+            {"description": "ジェラート代", "qty": 1, "unit_price": 1550, "total": 1550}
+        ]
+    }
+    ocr_text = "\n".join([
+        "領収証",
+        "但□ジェラート代",
+        "¥1,550",
+        "上記正に領収いたしました",
+    ])
+
+    _run_item_name_price_cleanup_phase(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["description"] == "ジェラート"
+
+
+def test_formal_receipt_purpose_suffix_cleanup_keeps_shi_item_stem():
+    from receipt_parser.receipt_postprocess_phases import _run_item_name_price_cleanup_phase
+
+    extracted = {
+        "line_items": [
+            {"description": "しゃもじ代", "qty": 1, "unit_price": 500, "total": 500}
+        ]
+    }
+    ocr_text = "\n".join([
+        "領収証",
+        "但□しゃもじ代",
+        "¥500",
+        "上記正に領収いたしました",
+    ])
+
+    _run_item_name_price_cleanup_phase(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["description"] == "しゃもじ"
+
+
+def test_payment_method_ignores_unselected_cash_card_option_line():
+    from receipt_parser.receipt_identity_payment import _fix_payment_method
+
+    extracted = {"payment_method": None}
+    ocr_text = "\n".join([
+        "領収証",
+        "現金・カード・(",
+        "上記正に領収いたしました",
+    ])
+
+    _fix_payment_method(extracted, ocr_text, 0.95, 0.95)
+
+    assert extracted["payment_method"] == "cash"
+
+
+def test_qty_repair_ignores_summary_count_when_items_already_balance_total():
+    from receipt_parser.receipt_marker_projection import _fix_qty_totals_from_ocr_unit_lines
+
+    extracted = {
+        "total": 1520,
+        "line_items": [
+            {"description": "紙袋", "qty": 1, "unit_price": 10, "total": 10},
+            {"description": "不揃い 発酵バターバウム", "qty": 1, "unit_price": 180, "total": 180},
+            {"description": "不揃い 塩パン風バウム", "qty": 1, "unit_price": 250, "total": 250},
+            {"description": "不揃い バウム", "qty": 1, "unit_price": 180, "total": 180},
+            {"description": "不揃い バウム", "qty": 1, "unit_price": 180, "total": 180},
+            {"description": "不揃い バウム", "qty": 1, "unit_price": 180, "total": 180},
+            {"description": "不揃い バウム", "qty": 1, "unit_price": 180, "total": 180},
+            {"description": "不揃い バウム", "qty": 1, "unit_price": 180, "total": 180},
+            {"description": "不揃い バウム", "qty": 1, "unit_price": 180, "total": 180},
+        ],
+    }
+    ocr_text = "\n".join([
+        "不揃い 発酵バターバウム",
+        "180",
+        "お買上点数",
+        "9点",
+        "合計",
+        "¥1,520",
+    ])
+
+    _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert extracted["line_items"][1]["qty"] == 1
+    assert extracted["line_items"][1]["total"] == 180
+
+
+def test_formal_receipt_tax_summary_uses_rate_arithmetic_candidate():
+    from receipt_parser.receipt_totals import _restore_bare_number_tax_summary
+
+    extracted = {
+        "total": 1550,
+        "subtotal": 1525,
+        "taxes": [{"rate": "8%", "label": "内税", "amount": 25}],
+        "line_items": [{"description": "ジェラート", "qty": 1, "unit_price": 1550, "total": 1550}],
+    }
+    ocr_text = "\n".join([
+        "領収証",
+        "8%(税込・税抜)金額",
+        "消費税額等",
+        "25",
+        "10%(税込・税抜)金額",
+        "上記正に領収いたしました",
+        "114",
+        "消費税額等",
+    ])
+
+    _restore_bare_number_tax_summary(extracted, ocr_text)
+
+    assert extracted["taxes"] == [{"rate": "8%", "label": "内税", "amount": 114}]
+    assert extracted["subtotal"] == 1436
+
+
+def test_reduced_rate_legend_does_not_override_single_standard_rate_base():
+    from receipt_parser.receipt_tax_categories import assign_tax_categories
+
+    items = [
+        {"description": "茶碗蒸し", "qty": 1, "unit_price": 250, "total": 250},
+        {"description": "★110円皿1", "qty": 1, "unit_price": 110, "total": 110},
+        {"description": "寿司皿", "qty": 11, "unit_price": 115, "total": 1265},
+    ]
+    ocr_text = "\n".join([
+        "茶碗蒸し ¥250内",
+        "★110円皿1 ¥110内",
+        "寿司皿 @115× 11 ¥1,265内",
+        "(10%内税対象 ¥1,625)",
+        "(10%内税 ¥147)",
+        "※T印は軽減税率(8%)適用商品",
+    ])
+
+    assign_tax_categories(
+        items,
+        ocr_text,
+        {"taxes": [{"rate": "10%", "label": "内税", "amount": 147}]},
+        {"10%": 1625},
+        extracted_taxes=[{"rate": "10%", "label": "内税", "amount": 147}],
+    )
+
+    assert {item["tax_category"] for item in items} == {"10%"}

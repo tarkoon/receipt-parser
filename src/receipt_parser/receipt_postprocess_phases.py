@@ -52,6 +52,7 @@ from .receipt_item_cleanup import (
 )
 from .receipt_item_repair import (
     _clean_code_prefixed_item_descriptions,
+    _clean_formal_receipt_purpose_suffix_descriptions,
     _drop_duplicate_with_embedded_price,
     _drop_phantom_from_tax_amount,
     _fix_code_table_descriptions_by_order,
@@ -1109,8 +1110,10 @@ def _run_item_name_price_cleanup_phase(extracted: dict, unified_text: str) -> No
     """Trigger: visible OCR names or embedded price suffixes repair item rows.
 
     Invariant: description, qty, unit_price, and total changes must be backed
-    by visible OCR row ownership or embedded price field consistency.
+    by visible OCR row ownership, formal purpose-line evidence, or embedded
+    price field consistency.
     """
+    _clean_formal_receipt_purpose_suffix_descriptions(extracted, unified_text)
     _fix_non_bag_items_named_as_bag(extracted, unified_text)
     _fix_embedded_price_suffix_totals(extracted, unified_text)
 

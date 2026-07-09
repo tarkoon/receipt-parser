@@ -827,6 +827,26 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                 continue
         return None
 
+    def _items_already_balance_printed_target() -> bool:
+        item_sum = sum(
+            float(item.get("total") or 0)
+            for item in items
+            if isinstance(item, dict)
+        )
+        if item_sum <= 0:
+            return False
+        targets = [
+            float(value)
+            for value in (extracted.get("total"), extracted.get("subtotal"))
+            if value is not None and float(value or 0) > 0
+        ]
+        targets.extend(
+            float(value)
+            for value in extract_rate_bases(unified_text).values()
+            if value is not None and float(value or 0) > 0
+        )
+        return any(abs(item_sum - target) <= 2 for target in targets)
+
     def _parse_unit_line_qty_detail(line: str, detail_idx: int) -> tuple[float, float] | None:
         unit_first = re.search(
             r'\(?\s*(?:[単单]|[@＠])\s*(\d[\d,]*)\s*[xX×Ⅹ]\s*(\d+)\s*[個コ点]\s*\)?',
@@ -922,6 +942,7 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
         if qty <= 1 or unit <= 0:
             continue
         expected_total = split_total if split_total is not None else qty * unit
+        items_balance_target = _items_already_balance_printed_target()
         desc_candidates = _candidate_names_before(idx, expected_total)
         if not desc_candidates:
             continue
@@ -1039,6 +1060,14 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                                 item["description"] = cleaned_desc
                         matched_item = item
                         break
+                    if (
+                        items_balance_target
+                        and abs(current_total - unit) <= 2
+                        and abs(expected_total - current_total) > 2
+                        and not _amount_appears_in_text(unified_text, expected_total)
+                        and not _has_standalone_gross_before_qty_detail(item, expected_total, idx)
+                    ):
+                        continue
                     item["qty"] = qty
                     item["unit_price"] = unit
                     expected_total = qty * unit

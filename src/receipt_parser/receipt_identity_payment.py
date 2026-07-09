@@ -652,6 +652,13 @@ def _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf):
         context_tail = context[len(line):]
         if _CARD_FOOTER_NOISE_RE.search(context_tail):
             return False
+        has_card_choice = re.search(rf'{_CARD_LABEL}|{_CREDIT_LABEL}|card', line, re.IGNORECASE)
+        if (
+            has_card_choice
+            and re.search(r'現金', line)
+            and not re.search(r'[¥￥]\s*\d|\d[\d,]*\s*円', line)
+        ):
+            return False
         if _PAYMENT_TOKEN_RE.search(line):
             return True
         return bool(

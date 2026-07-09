@@ -173,11 +173,14 @@ def adapt_line_items(
 def adapt_taxes(tax_entries: list[dict[str, Any]], currency: str) -> list[dict[str, Any]]:
     taxes = []
     for tax in tax_entries:
+        amount = money_from_minor(tax.get("amount"), currency)
+        if amount == 0 and tax.get("rate") != "0%":
+            continue
         taxes.append(
             {
                 "rate": tax.get("rate"),
                 "label": tax.get("label"),
-                "amount": money_from_minor(tax.get("amount"), currency),
+                "amount": amount,
             }
         )
     return taxes
