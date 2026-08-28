@@ -219,6 +219,22 @@ def load_manifest(path: Path) -> dict[str, Any]:
     data.setdefault("receipts", {})
     if not isinstance(data["receipts"], dict):
         raise ValueError(f"Manifest receipts must be a JSON object: {path}")
+
+    fixture_receipts: dict[str, list[str]] = {}
+    for receipt_id, entry in data["receipts"].items():
+        if fixture_name := entry.get("fixture"):
+            fixture_receipts.setdefault(fixture_name, []).append(receipt_id)
+    collisions = [
+        f"{fixture_name}: {', '.join(sorted(receipt_ids))}"
+        for fixture_name, receipt_ids in sorted(fixture_receipts.items())
+        if len(receipt_ids) > 1
+    ]
+    if collisions:
+        raise ValueError(
+            "Manifest fixture assignments must be one-to-one; collisions: "
+            f"{'; '.join(collisions)}. Assign each production receipt ID a unique fixture, or set "
+            f"ignored entries' fixture to null: {path}"
+        )
     return data
 
 

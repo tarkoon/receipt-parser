@@ -253,6 +253,37 @@ def test_manifest_freshness_uses_checksum_files_and_ignored_tombstones():
     )
 
 
+def test_export_rejects_manifest_fixture_collisions_before_allocation(tmp_path, monkeypatch):
+    manifest_path = tmp_path / "manifest.json"
+    receipts = {
+        "prod-b": {"fixture": "receipt_2"},
+        "prod-a": {"fixture": "receipt_2"},
+        "prod-d": {"fixture": "receipt_4"},
+        "prod-c": {"fixture": "receipt_4"},
+        "ignored-a": {"fixture": None, "status": flagged_exporter.IGNORED_MANIFEST_STATUS},
+        "ignored-b": {"fixture": None, "status": flagged_exporter.IGNORED_MANIFEST_STATUS},
+    }
+    manifest_path.write_text(json.dumps({"receipts": receipts}), encoding="utf-8")
+    allocate_fixture_names = MagicMock()
+    monkeypatch.setattr(flagged_exporter, "load_template_shape", lambda: {})
+    monkeypatch.setattr(flagged_exporter, "allocate_fixture_names", allocate_fixture_names)
+
+    with pytest.raises(ValueError) as error:
+        flagged_exporter.export_rows(SimpleNamespace(manifest=manifest_path), [])
+
+    assert "receipt_2: prod-a, prod-b" in str(error.value)
+    assert "receipt_4: prod-c, prod-d" in str(error.value)
+    assert "unique fixture" in str(error.value)
+    allocate_fixture_names.assert_not_called()
+
+    receipts["prod-b"]["fixture"] = "receipt_3"
+    receipts["prod-d"]["fixture"] = "receipt_5"
+    manifest_path.write_text(json.dumps({"receipts": receipts}), encoding="utf-8")
+
+    ignored = flagged_exporter.load_manifest(manifest_path)["receipts"]
+    assert ignored["ignored-a"]["fixture"] is None
+
+
 def test_manifest_freshness_accepts_matching_fixture_truth_when_manifest_checksum_is_stale(
     monkeypatch,
 ):
