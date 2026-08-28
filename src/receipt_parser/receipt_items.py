@@ -7,18 +7,27 @@ from difflib import SequenceMatcher
 from .patterns import (
     _ADMIN_FEE_DESCRIPTION_RE,
     _BANNER_PHRASE_RE,
+    _COMPANY_SUFFIX_RE,
     _GENERIC_DESC_MARKERS,
     _HEADER_LINE_RE,
     _JUNK_DESC_RE,
     _OCR_QTY_NOTATION_RE,
     _OCR_TRAILING_PRICE_RE,
     _OCR_ZONE_END_RE,
+    _SERVICE_TAX_RATE_EVIDENCE_RE,
     _SKIP_PRICE_LINE,
-    _has_service_inclusive_tax_evidence,
     _is_service_fee_description,
 )
 from .receipt_financial import (
     _parse_amount_fragment,
+    extract_financial_totals,
+    extract_rate_bases,
+)
+from .receipt_identity_payment import (
+    _CASH_CHANGE_LABEL_RE,
+    _CASH_TENDER_LABEL_RE,
+    _PAYMENT_TOKEN_RE,
+    _WAON_TENDER_RE,
 )
 from .receipt_item_cleanup import (
     _clear_discounts_without_nearby_ocr_marker,
@@ -33,8 +42,10 @@ from .receipt_item_repair import (
     _drop_banner_phantom_items,
     _expand_collapsed_items,
     _find_discounted_ocr_item_desc,
-    _fix_fuel_item_description,
+    _fix_compact_count_amount_layout,
     _fix_fuel_volume_qty,
+    _has_local_qty_unit_evidence,
+    _liter_usage_measurement,
     _fix_qty_from_ocr_patterns,
     _fix_qty_hallucinations,
     _fix_single_item_qty_from_ocr,
@@ -44,10 +55,10 @@ from .receipt_item_repair import (
     _replace_duplicate_desc_from_ocr,
     _revert_unsupported_qty_inflation,
     _strip_embedded_price_in_desc,
+    _valid_ocr_item_desc,
 )
 from .receipt_projection import (
     _clean_ocr_price_line_desc,
-    _find_ocr_item_desc,
     _fix_item_totals_from_ocr_neighborhood,
     _merge_qty_detail_into_previous,
     _project_totals_to_layout_rows,
@@ -65,36 +76,92 @@ from .receipt_totals import (
 )
 
 
+_SUMMARY_COUNT_DESC_RE = re.compile(
+    r'^(?:(?:お|御)?買上(?:げ)?(?:商品)?(?:点数|商品数)|(?:商品)?点数|商品数)$'
+)
+
+
+def _service_description_visible_on_row(description: str, unified_text: str) -> bool:
+    """Match a service name on one OCR row while ignoring separators."""
+    separators = (
+        r'[\s\u30fb\uff65:\uFF1A,\uFF0C\u3001\u3002/\uFF0F\\|\uFF5C'
+        r'()\uFF08\uFF09\[\]\u300c\u300d\u300e\u300f\u3010\u3011_\-'
+        r'\u2010\u2011\u2013\u2014]+'
+    )
+    normalized = re.sub(separators, '', description or "")
+    return bool(
+        len(normalized) >= 2
+        and any(normalized in re.sub(separators, '', line) for line in unified_text.splitlines())
+    )
+
+
+def _has_unprinted_rate_only_tax_summary(extracted, unified_text):
+    """Return true when OCR prints a tax rate but no tax or pre-tax amount."""
+    total = float(extracted.get("total") or 0)
+    if total <= 0 or not re.search(r'(?:8|10)\s*[%％]|軽減税率', unified_text):
+        return False
+    printed_financials = extract_financial_totals(unified_text)
+    printed_taxes = printed_financials.get("taxes") or []
+    if printed_taxes:
+        return False
+    printed_subtotal = float(printed_financials.get("subtotal") or 0)
+    if 0 < printed_subtotal < total - 2:
+        return False
+    if re.search(r'税抜(?:金額)?|課税対象額|対象額', unified_text):
+        return False
+    lines = [line.strip() for line in unified_text.splitlines()]
+    labeled_amount = any(
+        not re.search(r'対象商品|対象です|対象物|含', line)
+        and re.search(
+            r'消費税(?!率)(?:等|額)?|(?:内|外)税(?:額)?|税額|(?:課税)?対象額|税抜(?:金額)?',
+            line,
+        )
+        and ("税率" not in line or re.search(r'税額|対象額|課税対象', line))
+        and any(
+            _amount_from_yen_text(candidate) is not None
+            for candidate in lines[idx:min(idx + 2, len(lines))]
+        )
+        for idx, line in enumerate(lines)
+    )
+    if labeled_amount:
+        return False
+    printed_bases = [
+        float(base)
+        for base in extract_rate_bases(unified_text).values()
+        if base is not None
+    ]
+    return not printed_bases or all(abs(base - total) <= 2 for base in printed_bases)
+
+
+def _clear_unprinted_rate_only_tax_summary(extracted, unified_text):
+    """Clear inferred amounts when only a rate or gross rate target is printed."""
+    if not _has_unprinted_rate_only_tax_summary(extracted, unified_text):
+        return
+    extracted["taxes"] = []
+    extracted["subtotal"] = None
+
+
 def _fix_single_service_inclusive_tax(extracted, unified_text):
-    """Reconstruct implicit inclusive tax for single-row service-fee receipts."""
-    if extracted.get("taxes") or not extracted.get("total"):
+    """Apply a printed service tax rate without inventing unprinted amounts."""
+    if not extracted.get("total"):
         return
     total = float(extracted["total"])
     if total <= 0:
         return
     items = extracted.get("line_items") or []
-    priced_items = [
-        item for item in items
-        if isinstance(item, dict) and float(item.get("total") or 0) > 0
-    ]
-    if len(priced_items) != 1:
+    if len(items) != 1 or not isinstance(items[0], dict):
         return
-    item = priced_items[0]
+    item = items[0]
     if abs(float(item.get("total") or 0) - total) > 2:
         return
-    if not _is_service_fee_description(item.get("description")):
+    description = (item.get("description") or "").strip()
+    if (
+        not _is_service_fee_description(description)
+        or not _service_description_visible_on_row(description, unified_text)
+    ):
         return
-    if not _has_service_inclusive_tax_evidence(unified_text):
-        return
-    tax = round(total * 10 / 110)
-    if tax <= 0:
-        return
-    extracted["taxes"] = [{"rate": "10%", "label": "内税", "amount": float(tax)}]
-    extracted["subtotal"] = total - tax
-    if items:
-        for item in items:
-            if isinstance(item, dict):
-                item["tax_category"] = "10%"
+    if _SERVICE_TAX_RATE_EVIDENCE_RE.search(unified_text):
+        item["tax_category"] = "10%"
 
 
 def _fix_bare_service_receipt_without_itemization(extracted, unified_text):
@@ -123,9 +190,27 @@ def _fix_bare_service_receipt_without_itemization(extracted, unified_text):
             for item in items
             if isinstance(item, dict)
         )
-        if abs(item_sum - total) <= 2:
+        sole_visible_service = (
+            len(items) == 1
+            and isinstance(items[0], dict)
+            and _is_service_fee_description(items[0].get("description"))
+            and _service_description_visible_on_row(
+                (items[0].get("description") or "").strip(),
+                unified_text,
+            )
+        )
+        if abs(item_sum - total) <= 2 and not sole_visible_service:
             extracted["line_items"] = []
-    if not re.search(r'現金|お預り|お預かり|クレジット|カード|QUICPay|iD|PayPay|電子マネー|交通系|IC', unified_text):
+    has_cash_evidence = bool(
+        _CASH_TENDER_LABEL_RE.search(unified_text)
+        or _CASH_CHANGE_LABEL_RE.search(unified_text)
+        or re.search(r'(?m)^\s*(?:現金|現計)\s*(?:[¥￥]?\s*[\d,]+\s*円?)?\s*$', unified_text)
+    )
+    has_non_cash_evidence = bool(
+        _PAYMENT_TOKEN_RE.search(unified_text)
+        or _WAON_TENDER_RE.search(unified_text)
+    )
+    if not (has_cash_evidence or has_non_cash_evidence):
         extracted["payment_method"] = None
 
 
@@ -298,6 +383,7 @@ def _fix_junk_descriptions(items, unified_text):
 
         is_junk = (
             desc in _GENERIC_DESC_MARKERS
+            or _SUMMARY_COUNT_DESC_RE.fullmatch(desc) is not None
             or is_short_junk
             or _JUNK_DESC_RE.search(desc) is not None
             or _HEADER_LINE_RE.search(desc) is not None
@@ -305,6 +391,8 @@ def _fix_junk_descriptions(items, unified_text):
             or is_unit_price_notation
         )
         if not is_junk:
+            continue
+        if _has_local_qty_unit_evidence(item, unified_text):
             continue
 
         # Find the OCR line containing this item's price
@@ -353,6 +441,8 @@ def _fix_junk_descriptions(items, unified_text):
             if not cand or len(cand) <= 2:
                 return None
             if cand in _GENERIC_DESC_MARKERS:
+                return None
+            if _SUMMARY_COUNT_DESC_RE.fullmatch(cand):
                 return None
             if _SKIP_PRICE_LINE.search(cand):
                 return None
@@ -416,6 +506,18 @@ def _fix_item_desc_from_ocr_price_line(items, unified_text):
         desc = (item.get("description") or "").strip()
         total = item.get("total", 0)
         if not desc or not total or total <= 0:
+            continue
+
+        # This repair is for structural/non-item labels, not for choosing
+        # between two plausible product names that happen to share a price.
+        # In that case OCR ownership is ambiguous, so preserve the extraction.
+        if not (
+            desc in _GENERIC_DESC_MARKERS
+            or _SUMMARY_COUNT_DESC_RE.fullmatch(desc)
+            or _BANNER_PHRASE_RE.search(desc)
+            or _HEADER_LINE_RE.search(desc)
+            or _JUNK_DESC_RE.search(desc)
+        ):
             continue
 
         desc_lines = [i for i, line in enumerate(lines) if desc in line]
@@ -547,6 +649,7 @@ def _fix_item_desc_from_ocr_price_line(items, unified_text):
         # price match, keep current.
         viable = [(idx, cand) for idx, cand in price_matches
                   if cand and cand not in _GENERIC_DESC_MARKERS
+                  and not _SUMMARY_COUNT_DESC_RE.fullmatch(cand)
                   and not _BANNER_PHRASE_RE.search(cand)
                   and not _HEADER_LINE_RE.search(cand)]
         if not viable:
@@ -566,6 +669,100 @@ def _fix_item_desc_from_ocr_price_line(items, unified_text):
             item["description"] = price_desc
 
 
+def _normalize_single_measured_service_row(extracted, unified_text):
+    """Normalize one measured service row when volume x visible rate proves total."""
+    items = extracted.get("line_items") or []
+    if len(items) != 1 or not isinstance(items[0], dict):
+        return False
+    try:
+        total = float(extracted.get("total") or 0)
+    except (TypeError, ValueError):
+        return False
+    if total <= 0:
+        return False
+
+    lines = [line.strip() for line in unified_text.splitlines()]
+    measurements = []
+    for idx, line in enumerate(lines):
+        match = re.search(r'(\d+)\s*[.．]\s*(\d+)\s*[LＬ](?![A-Za-z])', line)
+        if match:
+            measurements.append((idx, float(f"{match.group(1)}.{match.group(2)}")))
+    if len(measurements) != 1:
+        return False
+    measurement_idx, _amount = measurements[0]
+    local_text = "\n".join(
+        lines[max(0, measurement_idx - 2):measurement_idx + 12]
+    )
+    if not _liter_usage_measurement(local_text, total):
+        return False
+
+    item = items[0]
+    description = str(item.get("description") or "").strip()
+    tax_code_re = re.compile(
+        r'[A-Z0-9]{1,4}(?:\s*[-\u2010-\u2014]\s*[A-Z0-9]{1,4})?\s*'
+        r'[\(\uff08]\s*[\u5185\u5916](?:\u7a0e)?\s*[\)\uff09]',
+        re.IGNORECASE,
+    )
+    if tax_code_re.fullmatch(description):
+        preceding = [
+            idx for idx in range(measurement_idx - 1, -1, -1) if lines[idx]
+        ][:3]
+        if (
+            len(preceding) < 2
+            or not tax_code_re.fullmatch(lines[preceding[0]])
+            or re.sub(r'\s+', '', description)
+            != re.sub(r'\s+', '', lines[preceding[0]])
+        ):
+            return False
+
+        def _owned_description(raw_line):
+            candidate = _clean_ocr_price_line_desc(raw_line)
+            return candidate if (
+                _valid_ocr_item_desc(candidate)
+                and not _HEADER_LINE_RE.search(raw_line)
+                and not _OCR_ZONE_END_RE.search(raw_line)
+                and not _PAYMENT_TOKEN_RE.search(raw_line)
+                and not _CASH_TENDER_LABEL_RE.search(raw_line)
+                and not _CASH_CHANGE_LABEL_RE.search(raw_line)
+                and not _WAON_TENDER_RE.search(raw_line)
+            ) else None
+
+        replacement = _owned_description(lines[preceding[1]])
+        parenthesized_company_marker_re = re.compile(
+            r'[\(（]\s*[\u682a\u6709\u540c]\s*[\)）]'
+        )
+        normalized_merchant = re.sub(
+            r'\W+', '',
+            _COMPANY_SUFFIX_RE.sub(
+                '', parenthesized_company_marker_re.sub(
+                    '', str(extracted.get("merchant") or "")
+                )
+            ),
+            flags=re.UNICODE,
+        ).casefold()
+        if not replacement or (
+            normalized_merchant
+            and re.sub(
+                r'\W+', '', _COMPANY_SUFFIX_RE.sub(
+                    '', parenthesized_company_marker_re.sub('', replacement)
+                ),
+                flags=re.UNICODE,
+            ).casefold()
+            == normalized_merchant
+        ) or (
+            len(preceding) == 3 and _owned_description(lines[preceding[2]])
+        ):
+            return False
+        description = replacement
+    if not description:
+        return False
+    item["description"] = description
+    item["qty"] = 1
+    item["unit_price"] = total
+    item["total"] = total
+    return True
+
+
 def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
     """Fix line item quantities, prices, and discounts using OCR evidence."""
     # Fallback: department-coded items
@@ -580,6 +777,9 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
             }]
 
     _recover_nontaxable_admin_fee_item(extracted, unified_text)
+
+    if _normalize_single_measured_service_row(extracted, unified_text):
+        return
 
     # Fallback: single-service receipt (toll, parking, single-item)
     _AMOUNT_LABELS_RE = re.compile(
@@ -605,14 +805,18 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
                     }]
                     break
 
-    # Remove zero-total items and single-char noise descriptions
+    # Remove zero-total items and unsupported single-char noise descriptions.
+    # A one-character OCR row is still data when a local qty/unit block proves it.
     if extracted.get("line_items"):
         extracted["line_items"] = [
             item for item in extracted["line_items"]
             if isinstance(item, dict) and (
                 item.get("total", 0) > 0 or
                 (item.get("unit_price") is not None and item.get("unit_price") > 0)
-            ) and len((item.get("description") or "").strip()) > 1
+            ) and (
+                len((item.get("description") or "").strip()) > 1
+                or _has_local_qty_unit_evidence(item, unified_text)
+            )
         ]
 
     # Handwritten receipt guard: remove single line item that just duplicates total
@@ -643,9 +847,15 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
     if not extracted.get("line_items"):
         return
 
-    def _rows_already_balance_total() -> bool:
+    def _rows_already_balance_summary() -> bool:
         total = extracted.get("total")
-        if total is None or len(extracted.get("line_items") or []) < 2:
+        current_items = extracted.get("line_items") or []
+        if total is None or not current_items:
+            return False
+        if (
+            len(current_items) < 2
+            and not _has_local_qty_unit_evidence(current_items[0], unified_text)
+        ):
             return False
         try:
             total_f = float(total)
@@ -662,15 +872,65 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
                 line_total = float(item.get("total") or 0)
             except (TypeError, ValueError):
                 return False
-            if abs(qty * unit - discount - line_total) > 1:
+            if discount or item.get("discount_rate"):
+                return False
+            if abs(qty * unit - line_total) > 1:
                 return False
             row_sum += line_total
-        return abs(row_sum - total_f) <= 2
+        targets = [total_f]
+        canonical_subtotal = _canonical_subtotal_from_taxes(extracted)
+        positive_taxes = []
+        for tax in extracted.get("taxes") or []:
+            if not isinstance(tax, dict):
+                continue
+            try:
+                if float(tax.get("amount") or 0) > 0:
+                    positive_taxes.append(tax)
+            except (TypeError, ValueError):
+                continue
+        subtotal = extracted.get("subtotal")
+        explicit_external = bool(re.search(r'外\s*税|税\s*抜', unified_text))
+        try:
+            stated_subtotal_matches = (
+                subtotal is not None
+                and canonical_subtotal is not None
+                and abs(float(subtotal) - float(canonical_subtotal)) <= 2
+            )
+        except (TypeError, ValueError):
+            stated_subtotal_matches = False
+        if (
+            canonical_subtotal is not None
+            and positive_taxes
+            and all(tax.get("label") == "外税" for tax in positive_taxes)
+            and (explicit_external or stated_subtotal_matches)
+        ):
+            targets.append(float(canonical_subtotal))
+        return any(abs(row_sum - target) <= 2 for target in targets)
 
-    if _rows_already_balance_total():
+    if _rows_already_balance_summary():
+        _project_totals_to_layout_rows(extracted, ocr_layout_blocks)
+        _expand_collapsed_items(extracted, unified_text)
+        original_items = [
+            dict(item) if isinstance(item, dict) else item
+            for item in extracted["line_items"]
+        ]
+        protected = {
+            idx for idx, item in enumerate(original_items)
+            if _has_local_qty_unit_evidence(item, unified_text)
+        }
         _revert_unsupported_qty_inflation(extracted["line_items"], unified_text)
-        if _rows_already_balance_total():
-            return
+        _fix_qty_from_ocr_patterns(extracted["line_items"], unified_text)
+        for idx in protected:
+            if idx < len(extracted["line_items"]):
+                extracted["line_items"][idx] = original_items[idx]
+        if not _rows_already_balance_summary():
+            # A summary-level count or nearby bare amount must not turn a fully
+            # reconciled item table into an unbalanced one.
+            extracted["line_items"] = original_items
+        _fix_compact_count_amount_layout(
+            extracted["line_items"], ocr_layout_blocks
+        )
+        return
 
     _drop_banner_phantom_items(extracted["line_items"], unified_text)
     _fix_item_desc_from_ocr_price_line(extracted["line_items"], unified_text)
@@ -703,7 +963,6 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
                          receipt_total=extracted.get("total") or extracted.get("subtotal"))
     _fix_single_item_qty_from_ocr(extracted, unified_text)
     _fix_single_service_item_from_ocr(extracted, unified_text)
-    _fix_fuel_item_description(extracted, unified_text)
     _expand_collapsed_items(extracted, unified_text)
     _fix_hallucinated_prices(extracted["line_items"], unified_text)
     _fix_zero_prices_from_ocr(extracted["line_items"], unified_text)
@@ -722,6 +981,7 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
     # gets corrected to (qty=2, unit=228, total=456) by qty-fix, but the
     # phantom stays.
     _dedup_same_total_items(extracted)
+    _fix_compact_count_amount_layout(extracted["line_items"], ocr_layout_blocks)
 
 
 # Matches qty-detail OCR fragments like "(2個 X 単70)", "2個 X70)", "(@100 × 2個)".
@@ -797,6 +1057,57 @@ def _fix_duplicate_descriptions_from_ocr(extracted, unified_text):
     }
     light_marker = chr(0x8EFD)
 
+    def _bare_amount_line(line: str) -> bool:
+        match = re.fullmatch(
+            r'\s*[¥￥]?\s*(\d[\d,]*)\s*(?:[%％][*※除軽]|[*※除軽])?\s*',
+            line,
+        )
+        if not match:
+            return False
+        # Unmarked long digit runs are product/account codes, not price rows.
+        return len(match.group(1).replace(',', '')) <= 7
+
+    ambiguous_price_lines: set[int] = set()
+    line_idx = 0
+    while line_idx < len(lines):
+        if not _bare_amount_line(lines[line_idx]):
+            line_idx += 1
+            continue
+        run_start = line_idx
+        while line_idx < len(lines) and _bare_amount_line(lines[line_idx]):
+            line_idx += 1
+        if line_idx - run_start < 2:
+            continue
+        pending_titles = 0
+        for back_idx in range(run_start - 1, max(run_start - 13, -1), -1):
+            raw = lines[back_idx].strip()
+            if _OCR_ZONE_END_RE.search(raw) or _HEADER_LINE_RE.search(raw):
+                break
+            if _bare_amount_line(raw):
+                break
+            if _valid_ocr_item_desc(_clean_ocr_price_line_desc(raw)):
+                pending_titles += 1
+        if pending_titles >= 2:
+            ambiguous_price_lines.update(range(run_start, line_idx))
+
+    def _owned_desc(price_line_idx: int) -> str | None:
+        same_line = _clean_ocr_price_line_desc(lines[price_line_idx])
+        if _valid_ocr_item_desc(same_line):
+            return same_line
+        if price_line_idx in ambiguous_price_lines:
+            return None
+        back_idx = price_line_idx - 1
+        while back_idx >= 0 and not lines[back_idx].strip():
+            back_idx -= 1
+        if back_idx >= 0 and _OCR_QTY_NOTATION_RE.search(lines[back_idx]):
+            back_idx -= 1
+            while back_idx >= 0 and not lines[back_idx].strip():
+                back_idx -= 1
+        if back_idx < 0:
+            return None
+        candidate = _clean_ocr_price_line_desc(lines[back_idx])
+        return candidate if _valid_ocr_item_desc(candidate) else None
+
     def _rate_from_price_line(line: str) -> str | None:
         return "8%" if re.search(rf'[\*※{light_marker}]', line) else None
 
@@ -814,11 +1125,7 @@ def _fix_duplicate_descriptions_from_ocr(extracted, unified_text):
         price = float(raw_price)
         if price <= 0:
             continue
-        same_line_desc = _clean_ocr_price_line_desc(line)
-        same_line_norm = _norm(same_line_desc)
-        if same_line_norm and same_line_norm in existing_norms:
-            continue
-        desc = _find_ocr_item_desc(lines, line_idx, items)
+        desc = _owned_desc(line_idx)
         if not desc:
             continue
         norm_desc = _norm(desc)
@@ -849,18 +1156,12 @@ def _fix_duplicate_descriptions_from_ocr(extracted, unified_text):
                         pass
             if not any(abs(price - total) <= 2 for price in prices):
                 continue
-            for j in range(line_idx, max(line_idx - 6, -1), -1):
-                raw = lines[j].strip()
-                if j != line_idx and _OCR_TRAILING_PRICE_RE.search(raw):
-                    break
-                if _SKIP_PRICE_LINE.search(raw) or _OCR_QTY_NOTATION_RE.search(raw):
+            cand = _owned_desc(line_idx)
+            if _norm(cand or "") == desc_norm:
+                line_rate = _rate_from_price_line(line)
+                if line_rate and tax_category in {"8%", "10%"} and line_rate != tax_category:
                     continue
-                cand = _clean_ocr_price_line_desc(raw)
-                if _norm(cand) == desc_norm:
-                    line_rate = _rate_from_price_line(line)
-                    if line_rate and tax_category in {"8%", "10%"} and line_rate != tax_category:
-                        continue
-                    return True
+                return True
         return False
 
     used_candidates: set[int] = set()
@@ -872,15 +1173,21 @@ def _fix_duplicate_descriptions_from_ocr(extracted, unified_text):
             total = float(item.get("total") or 0)
             if total <= 0:
                 continue
+            qty = float(item.get("qty") or 1)
+            unit = float(item.get("unit_price") or 0)
+            discount = float(item.get("discount") or 0)
+            target_price = qty * unit if discount > 0 and unit > 0 else total
             tax_category = str(item.get("tax_category") or "")
-            if _desc_supported_at_price(item.get("description") or "", total, tax_category):
+            if _desc_supported_at_price(
+                item.get("description") or "", target_price, tax_category
+            ):
                 continue
             match_idx = None
             fallback_idx = None
             for cand_idx, (price, desc, rate) in enumerate(ocr_candidates):
                 if cand_idx in used_candidates:
                     continue
-                if abs(price - total) > 2:
+                if abs(price - target_price) > 2:
                     continue
                 if tax_category in {"8%", "10%"} and rate == tax_category:
                     match_idx = cand_idx
@@ -896,21 +1203,39 @@ def _fix_duplicate_descriptions_from_ocr(extracted, unified_text):
             existing_norms.add(_norm(item["description"]))
 
 
-def _code_prefixed_ocr_desc_before(lines, price_line_idx, max_back=16):
+def _code_prefixed_ocr_desc_before(lines, price_line_idx, max_back=5):
     """Return the nearest product line that begins with a POS/barcode code."""
     for j in range(price_line_idx - 1, max(price_line_idx - max_back - 1, -1), -1):
         text = lines[j].strip()
-        if _OCR_TRAILING_PRICE_RE.search(text):
-            return None
-        if not text or _SKIP_PRICE_LINE.search(text) or _OCR_QTY_NOTATION_RE.search(text):
+        if not text:
             continue
-        m = re.match(r'^\d{3,}[A-Za-z0-9-]*\)?\s*(.+)$', text)
+        if (
+            _OCR_TRAILING_PRICE_RE.search(text)
+            or _OCR_ZONE_END_RE.search(text)
+            or _HEADER_LINE_RE.search(text)
+            or _OCR_QTY_NOTATION_RE.search(text)
+        ):
+            return None
+        m = re.match(
+            r'^(?:\d{3,}[A-Za-z0-9-]*\)?\s+|\d{3,}\)?)(.+)$',
+            text,
+        )
         if not m:
+            # A closer product-like row owns the quantity block; never cross
+            # it to borrow a distant coded description.
+            if _valid_ocr_item_desc(_clean_ocr_price_line_desc(text)):
+                return None
             continue
         desc = m.group(1).strip()
         desc = re.sub(r'\s*[※\*非外内]\s*$', '', desc).strip()
-        if len(desc) >= 3 and re.search(r'[ぁ-んァ-ン一-龥]', desc):
+        if (
+            len(desc) >= 3
+            and re.search(r'[ぁ-んァ-ン一-龥]', desc)
+            and not _HEADER_LINE_RE.search(desc)
+            and not _SKIP_PRICE_LINE.search(desc)
+        ):
             return desc
+        return None
     return None
 
 
@@ -941,7 +1266,7 @@ def _fix_qty_code_row_descriptions_from_ocr(extracted, unified_text):
         unit = float(qty_m.group(1).strip().lstrip('¥￥').replace(',', ''))
         qty = float(qty_m.group(2))
         total = unit * qty
-        desc = _code_prefixed_ocr_desc_before(lines, qty_idx, max_back=16)
+        desc = _code_prefixed_ocr_desc_before(lines, qty_idx)
         if not desc:
             continue
         for item in items:
@@ -966,7 +1291,7 @@ def _bag_entries_from_ocr(unified_text: str) -> list[dict]:
             return None
         if re.search(r'\d{1,2}\s*:\s*\d{2}|:', line):
             return None
-        if re.fullmatch(r'\d{5,}', stripped):
+        if re.search(r'\d{5,}', stripped):
             return None
         pm = re.search(r'[¥￥]?\s*(\d{1,2})\s*(?:[%％][*※除軽外]|[*※除軽外])?\s*$', line)
         if not pm:
@@ -1156,20 +1481,22 @@ def _recover_missing_bag_items_from_ocr(extracted, unified_text):
     if count_m:
         printed_count = int(count_m.group(1) or count_m.group(2))
 
-    bag_desc = "レジ袋"
     lines = [line.strip() for line in unified_text.split('\n')]
-    for idx in range(entry["line"], max(entry["line"] - 3, -1), -1):
-        if _is_bag_description(lines[idx]):
-            bag_desc = re.sub(r'^\s*内\s*', '', lines[idx]).strip()
-            bag_desc = _OCR_TRAILING_PRICE_RE.sub('', bag_desc).strip()
-            break
+    bag_desc = re.sub(r'^\s*内\s*', '', lines[entry["line"]]).strip()
+    bag_desc = _OCR_TRAILING_PRICE_RE.sub('', bag_desc).strip()
+    if not bag_desc:
+        return
+    matching_rates = [
+        rate for rate, base in extract_rate_bases(unified_text).items()
+        if base is not None and abs(float(base) - bag_total) <= 2
+    ]
 
     bag_item = {
         "description": bag_desc,
         "qty": entry["qty"],
         "unit_price": entry["unit_price"],
         "total": bag_total,
-        "tax_category": "10%",
+        "tax_category": matching_rates[0] if len(matching_rates) == 1 else "0%",
         "discount": 0,
         "discount_rate": "",
     }
@@ -1291,6 +1618,31 @@ def _replace_vertical_price_qty_total_rows_when_balanced(extracted, unified_text
 
     if len(rows) < 2:
         return
+    current_items = [item for item in items if isinstance(item, dict)]
+    if len(rows) == len(current_items):
+        def _monetary_signature(item: dict) -> tuple[float | None, ...]:
+            values = (
+                item.get("qty", 1),
+                item.get("unit_price"),
+                item.get("total"),
+                item.get("discount", 0),
+            )
+            signature: list[float | None] = []
+            for value in values:
+                if value is None:
+                    signature.append(None)
+                    continue
+                try:
+                    signature.append(round(float(value), 2))
+                except (TypeError, ValueError):
+                    signature.append(None)
+            return tuple(signature)
+
+        if all(
+            _monetary_signature(candidate) == _monetary_signature(current)
+            for candidate, current in zip(rows, current_items)
+        ):
+            return
     row_sum = sum(float(row["total"]) for row in rows)
     total = extracted.get("total")
     subtotal = extracted.get("subtotal")
@@ -1397,32 +1749,6 @@ def _recover_repeated_item_from_gap(extracted, unified_text):
         return
 
 
-def _fix_o_ring_descriptions_from_ocr(extracted, unified_text):
-    """Repair hardware O-ring item names when OCR/JAN context is explicit."""
-    items = extracted.get("line_items") or []
-    if not items:
-        return
-    has_o_ring_evidence = bool(re.search(r'4909730105008', unified_text)) and bool(
-        re.search(r'(?:^|\n)\s*(?:\d{3,6}\s*)?リング(?:\s|$)', unified_text)
-    )
-    if not has_o_ring_evidence:
-        return
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        desc = (item.get("description") or "").strip()
-        unit = float(item.get("unit_price") or 0)
-        total = float(item.get("total") or 0)
-        qty = float(item.get("qty") or 1)
-        price_evidence = (
-            abs(unit - 198) <= 1
-            or abs(total - 198) <= 1
-            or (qty >= 2 and abs(total - (unit * qty)) <= 2 and abs(unit - 198) <= 1)
-        )
-        if desc in {"リング", "レギュラー"} and price_evidence:
-            item["description"] = "Oリング"
-
-
 def _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text):
     """Recover a single item from a visible desc / qty x unit / total block."""
     if extracted.get("line_items"):
@@ -1462,6 +1788,8 @@ def _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text):
             continue
         desc = None
         for j in range(idx - 1, max(idx - 7, -1), -1):
+            if _OCR_ZONE_END_RE.search(lines[j]) or _HEADER_LINE_RE.search(lines[j]):
+                break
             cand = _clean_ocr_price_line_desc(lines[j])
             if not _valid_desc(cand):
                 continue
@@ -1469,8 +1797,6 @@ def _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text):
             break
         if not desc:
             continue
-        if desc == "ヘ" and re.search(r'Grand\s*Joul|美容|ヘア|サロン', unified_text, re.IGNORECASE):
-            desc = "ヘア"
         extracted["line_items"] = [{
             "description": desc,
             "qty": qty,
@@ -1493,6 +1819,20 @@ def _replace_repeated_ocr_item_block_when_balanced(extracted, unified_text):
     if total and tax_sum:
         targets.append(float(total) - tax_sum)
     if not targets:
+        return
+    existing_items = [
+        item for item in (extracted.get("line_items") or [])
+        if isinstance(item, dict)
+    ]
+    try:
+        existing_sum = sum(float(item.get("total") or 0) for item in existing_items)
+    except (TypeError, ValueError):
+        existing_sum = None
+    if (
+        existing_items
+        and existing_sum is not None
+        and any(abs(existing_sum - target) <= 2 for target in targets)
+    ):
         return
     if min(targets) > 1000:
         return
@@ -1638,6 +1978,8 @@ def _drop_non_product_line_items(extracted, unified_text):
     )
     bad_desc_re = re.compile(
         r'WAON(?:支払額|残高)|支払額|残高|取扱区分|^額$|^金\s*額$|'
+        r'^[合計]$|^(?:小|合|総)\s*計$|'
+        r'^(?:(?:お|御)?買上(?:げ)?(?:商品)?(?:点数|商品数)|(?:商品)?点数|商品数)$|'
         r'^レジ\s*\d+|^\d{4}年|買上日|カード会社|会員番号|伝票番号|承認番号|'
         r'取引内容|お取扱日|^クレジット$|^現金$|^お釣り$|^釣銭$|'
         r'^[\(（\s※＊*]*(?:\d+(?:\.\d+)?\s*[%％]\s*)?[内外]\s*(?:税)?[\)）\s]*$'
@@ -1716,7 +2058,11 @@ def _drop_non_product_line_items(extracted, unified_text):
             )
             or bool(_HEADER_LINE_RE.search(desc))
             or bool(_BANNER_PHRASE_RE.search(desc))
-            or (receipt_total and total > receipt_total * 1.2)
+            or (
+                receipt_total
+                and total > receipt_total * 1.2
+                and _drop_improves_balance(total)
+            )
             or _looks_like_header_duplicate(desc, total)
             or _looks_like_payment_context_amount(total)
         )
@@ -1724,28 +2070,6 @@ def _drop_non_product_line_items(extracted, unified_text):
             continue
         kept.append(item)
     extracted["line_items"] = kept
-
-
-def _fix_bag_description_from_ocr_code_context(extracted, unified_text):
-    """Recover bag size/price when OCR keeps the POS code line separate."""
-    items = extracted.get("line_items") or []
-    if not items:
-        return
-    code_line = re.search(r'(?:^|\n)\s*0*500\s*内?\s*レジ袋\s*(\d{1,3})\s*円', unified_text)
-    if not code_line:
-        return
-    price = float(code_line.group(1))
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        desc = (item.get("description") or "").strip()
-        if desc == "レジ袋":
-            item["description"] = "レジ袋L"
-            item["qty"] = item.get("qty") or 1
-            item["unit_price"] = price
-            item["total"] = price
-            item["tax_category"] = "10%"
-            return
 
 
 def _fix_colon_split_product_names_from_ocr(extracted, unified_text):
