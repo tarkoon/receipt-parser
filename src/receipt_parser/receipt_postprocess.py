@@ -16,7 +16,8 @@ from .receipt_postprocess_phases import (
     _run_quantity_detail_reconciliation_phase,
     _run_cash_tender_reconciliation_phase,
     _run_payment_method_repair_phase,
-    _run_toll_payment_reference_repair_phase,
+    _run_payment_reference_repair_phase,
+    _run_receipt_payer_repair_phase,
     _run_service_receipt_recovery_phase,
     _run_body_total_layout_reconstruction_phase,
     _run_coupon_discount_projection_phase,
@@ -85,6 +86,7 @@ def postprocess_receipt(
     model: str,
     ocr_layout_blocks: list[dict] | None = None,
     mutation_trace: list[dict] | None = None,
+    payment_reference_text: str | None = None,
 ) -> dict:
     """Apply all receipt-specific post-processing to the LLM extraction."""
     trace_snapshot = (
@@ -93,6 +95,12 @@ def postprocess_receipt(
         else None
     )
     _run_merchant_identity_repair_phase(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "header_identity_repair",
+        trace_snapshot,
+        extracted,
+    )
     _run_body_total_layout_reconstruction_phase(
         extracted,
         unified_text,
@@ -147,17 +155,21 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _run_payment_method_repair_phase(extracted, unified_text, ocr_conf, llm_conf)
+    _run_receipt_payer_repair_phase(extracted, unified_text)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
-        "payment_method_repair",
+        "receipt_payer_repair",
         trace_snapshot,
         extracted,
     )
-    _run_toll_payment_reference_repair_phase(extracted, unified_text)
+    _run_payment_reference_repair_phase(
+        extracted,
+        unified_text,
+        payment_reference_text=payment_reference_text,
+    )
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
-        "toll_payment_reference_repair",
+        "payment_reference_repair",
         trace_snapshot,
         extracted,
     )
@@ -210,6 +222,12 @@ def postprocess_receipt(
         extracted,
     )
     _run_bag_item_ocr_repair_phase(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "initial_item_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _run_subtotal_item_price_repair_phase(extracted, unified_text, ocr_totals)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
@@ -257,17 +275,6 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _run_ocr_description_reconciliation_phase(
-        extracted,
-        unified_text,
-        ("o_ring_descriptions",),
-    )
-    trace_snapshot = _record_receipt_phase_mutation(
-        mutation_trace,
-        "ocr_description_reconciliation",
-        trace_snapshot,
-        extracted,
-    )
     _run_adjacent_price_shift_reconciliation_phase(
         extracted,
         unified_text,
@@ -298,26 +305,27 @@ def postprocess_receipt(
         unified_text,
         ("drop_duplicate_embedded_price",),
     )
-    _run_ocr_description_reconciliation_phase(
-        extracted,
-        unified_text,
-        ("qty_code_rows", "code_table_order", "duplicate_descriptions"),
-    )
-    _run_digit_misread_item_repair_phase(extracted, unified_text)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
-        "digit_misread_item_repair",
+        "item_cleanup",
         trace_snapshot,
         extracted,
     )
     _run_ocr_description_reconciliation_phase(
         extracted,
         unified_text,
-        ("o_ring_descriptions",),
+        ("qty_code_rows", "code_table_order", "duplicate_descriptions"),
     )
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
         "ocr_description_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
+    _run_digit_misread_item_repair_phase(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "digit_misread_item_repair",
         trace_snapshot,
         extracted,
     )
@@ -351,6 +359,12 @@ def postprocess_receipt(
         unified_text,
         ("following_qty_detail",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "quantity_detail_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_prefixed_tax_marker_item_rows_phase(
         extracted,
         unified_text,
@@ -366,6 +380,12 @@ def postprocess_receipt(
         extracted,
         unified_text,
         ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "quantity_detail_reconciliation",
+        trace_snapshot,
+        extracted,
     )
     _run_bag_amount_shift_reconciliation_phase(
         extracted,
@@ -383,6 +403,12 @@ def postprocess_receipt(
         unified_text,
         ("drop_numeric_marker_description_rows",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
+    )
     _run_jan_pos_row_projection_phase(extracted, unified_text, ocr_totals)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
@@ -395,6 +421,12 @@ def postprocess_receipt(
         unified_text,
         ("drop_duplicate_embedded_price",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
+    )
     _run_ocr_description_reconciliation_phase(
         extracted,
         unified_text,
@@ -402,7 +434,6 @@ def postprocess_receipt(
             "qty_code_rows",
             "duplicate_descriptions",
             "colon_split_names",
-            "bag_code_context",
         ),
     )
     trace_snapshot = _record_receipt_phase_mutation(
@@ -417,10 +448,22 @@ def postprocess_receipt(
         ocr_totals,
         ("price_line_markers",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "tax_category_assignment",
+        trace_snapshot,
+        extracted,
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
         ("drop_non_product_line_items",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
     )
     _run_gap_item_recovery_phase(extracted, unified_text, ("repeated_ocr_block",))
     trace_snapshot = _record_receipt_phase_mutation(
@@ -495,20 +538,44 @@ def postprocess_receipt(
         unified_text,
         ("following_qty_detail",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "quantity_detail_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
         ("drop_numeric_marker_description_rows",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
     )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
         ("drop_duplicate_embedded_price",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
+    )
     _run_quantity_detail_reconciliation_phase(
         extracted,
         unified_text,
         ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "quantity_detail_reconciliation",
+        trace_snapshot,
+        extracted,
     )
     _run_bag_amount_shift_reconciliation_phase(
         extracted,
@@ -525,6 +592,12 @@ def postprocess_receipt(
         extracted,
         unified_text,
         ("drop_numeric_marker_description_rows",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
     )
     _run_gap_item_recovery_phase(extracted, unified_text, ("discounted_gap",))
     trace_snapshot = _record_receipt_phase_mutation(
@@ -565,7 +638,7 @@ def postprocess_receipt(
     _run_ocr_description_reconciliation_phase(
         extracted,
         unified_text,
-        ("o_ring_descriptions", "duplicate_descriptions"),
+        ("duplicate_descriptions",),
     )
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
@@ -592,6 +665,7 @@ def postprocess_receipt(
         extracted,
         unified_text,
         ("service_table_items",),
+        ocr_layout_blocks=ocr_layout_blocks,
     )
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
@@ -613,8 +687,15 @@ def postprocess_receipt(
 
     # Clear account_number when it's a masked card number suffix, not a real account
     acct = extracted.get("account_number")
-    if acct and re.search(r'\*{2,}' + re.escape(str(acct)), unified_text):
+    acct_suffix = str(acct).strip().lstrip('*') if acct else ""
+    if acct_suffix and re.search(r'\*{2,}\s*' + re.escape(acct_suffix), unified_text):
         extracted["account_number"] = None
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "payment_method_repair",
+        trace_snapshot,
+        extracted,
+    )
 
     # Tax categories
     rate_bases = None
@@ -640,15 +721,13 @@ def postprocess_receipt(
                 "assign_tax_categories",
                 "ocr_markers",
                 "price_line_markers",
-                "single_bag_standard_split",
                 "rebalance_rate_bases",
                 "rebalance_standard_from_reduced_markers",
-                "nonfood_packaging",
                 "ocr_markers",
-                "single_bag_standard_split",
                 "single_standard_from_small_base",
             ),
             rate_bases=rate_bases,
+            ocr_layout_blocks=ocr_layout_blocks,
         )
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
@@ -657,17 +736,6 @@ def postprocess_receipt(
         extracted,
     )
 
-    _run_service_receipt_recovery_phase(
-        extracted,
-        unified_text,
-        ("single_service_inclusive_tax",),
-    )
-    trace_snapshot = _record_receipt_phase_mutation(
-        mutation_trace,
-        "service_receipt_recovery",
-        trace_snapshot,
-        extracted,
-    )
     _run_single_rate_inclusive_tax_restoration_phase(
         extracted,
         unified_text,
@@ -898,6 +966,12 @@ def postprocess_receipt(
     )
 
     _extract_fuel_usage(extracted, unified_text)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "service_receipt_recovery",
+        trace_snapshot,
+        extracted,
+    )
     if extracted.get("line_items"):
         _run_single_item_quantity_repair_phase(extracted, unified_text)
         trace_snapshot = _record_receipt_phase_mutation(
@@ -1044,6 +1118,12 @@ def postprocess_receipt(
         unified_text,
         ("qty_totals_from_unit_lines", "qty_context_and_reduced_rate"),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "quantity_detail_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_bag_amount_shift_reconciliation_phase(
         extracted,
         unified_text,
@@ -1060,10 +1140,22 @@ def postprocess_receipt(
         unified_text,
         ("drop_numeric_marker_description_rows",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
+    )
     _run_cash_tender_reconciliation_phase(
         extracted,
         unified_text,
         ("stacked_cash_tender", "unlabeled_cash_tender_change"),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "cash_tender_reconciliation",
+        trace_snapshot,
+        extracted,
     )
     _run_low_value_bag_recovery_phase(
         extracted,
@@ -1080,10 +1172,8 @@ def postprocess_receipt(
         extracted,
         unified_text,
         (
-            "o_ring_descriptions",
             "duplicate_descriptions",
             "colon_split_names",
-            "bag_code_context",
         ),
     )
     trace_snapshot = _record_receipt_phase_mutation(
@@ -1098,15 +1188,34 @@ def postprocess_receipt(
         ocr_totals,
         ("price_line_markers",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "tax_category_assignment",
+        trace_snapshot,
+        extracted,
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
         ("drop_non_product_line_items",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
+    )
     _run_service_receipt_recovery_phase(
         extracted,
         unified_text,
         ("service_table_items",),
+        ocr_layout_blocks=ocr_layout_blocks,
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "service_receipt_recovery",
+        trace_snapshot,
+        extracted,
     )
     _run_low_value_bag_recovery_phase(
         extracted,
@@ -1124,6 +1233,12 @@ def postprocess_receipt(
         unified_text,
         ocr_totals,
         ("single_standard_from_small_base",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "tax_category_assignment",
+        trace_snapshot,
+        extracted,
     )
     _run_tax_category_assignment_phase(
         extracted,
@@ -1180,6 +1295,12 @@ def postprocess_receipt(
         computed_sub = extracted["total"] - tax_sum
         if computed_sub >= 0:
             extracted["subtotal"] = computed_sub
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "external_tax_total_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _run_low_value_bag_recovery_phase(
         extracted,
         unified_text,
@@ -1191,17 +1312,16 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _run_tax_category_assignment_phase(
-        extracted,
-        unified_text,
-        ocr_totals,
-        ("single_bag_standard_split",),
-        rate_bases=extract_rate_bases(unified_text),
-    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
         ("drop_non_product_line_items",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
     )
     _run_quantity_detail_reconciliation_phase(
         extracted,
@@ -1230,10 +1350,22 @@ def postprocess_receipt(
         unified_text,
         ("qty_totals_from_unit_lines",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "quantity_detail_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_line_item_cleanup_phase(
         extracted,
         unified_text,
         ("drop_numeric_marker_description_rows",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
     )
     if extracted.get("line_items"):
         final_rate_bases = extract_rate_bases(unified_text)
@@ -1245,13 +1377,12 @@ def postprocess_receipt(
                 "ocr_markers",
                 "rebalance_rate_bases",
                 "rebalance_standard_from_reduced_markers",
-                "nonfood_packaging",
-                "single_bag_standard_split",
                 "price_line_markers",
                 "ocr_markers",
                 "rebalance_rate_bases",
             ),
             rate_bases=final_rate_bases,
+            ocr_layout_blocks=ocr_layout_blocks,
         )
         _run_quantity_detail_reconciliation_phase(
             extracted,
@@ -1262,11 +1393,9 @@ def postprocess_receipt(
         extracted,
         unified_text,
         (
-            "o_ring_descriptions",
             "code_table_order",
             "duplicate_descriptions",
             "colon_split_names",
-            "bag_code_context",
         ),
     )
     trace_snapshot = _record_receipt_phase_mutation(
@@ -1326,6 +1455,12 @@ def postprocess_receipt(
         extracted,
         unified_text,
         ("qty_context_and_reduced_rate",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "quantity_detail_reconciliation",
+        trace_snapshot,
+        extracted,
     )
     _run_stacked_name_price_projection_phase(extracted, unified_text)
     trace_snapshot = _record_receipt_phase_mutation(
@@ -1401,6 +1536,12 @@ def postprocess_receipt(
         unified_text,
         ("external_tax_total_from_printed_subtotal",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "external_tax_total_restoration",
+        trace_snapshot,
+        extracted,
+    )
     _run_small_target_only_tax_pruning_phase(
         extracted,
         unified_text,
@@ -1416,6 +1557,12 @@ def postprocess_receipt(
         extracted,
         unified_text,
         ("drop_numeric_marker_description_rows",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "item_cleanup",
+        trace_snapshot,
+        extracted,
     )
     _run_dense_sequence_row_projection_phase(
         extracted,
@@ -1433,20 +1580,44 @@ def postprocess_receipt(
         unified_text,
         ("following_qty_detail",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "quantity_detail_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
     _run_campaign_discount_projection_phase(
         extracted,
         unified_text,
         ("campaign_discount_stream",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "discount_consistency_reconciliation",
+        trace_snapshot,
+        extracted,
     )
     _run_service_receipt_recovery_phase(
         extracted,
         unified_text,
         ("bare_service_without_itemization",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "service_receipt_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _run_quantity_detail_reconciliation_phase(
         extracted,
         unified_text,
         ("qty_totals_from_unit_lines",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "quantity_detail_reconciliation",
+        trace_snapshot,
+        extracted,
     )
     _run_bag_item_rate_base_reconciliation_phase(
         extracted,
@@ -1515,10 +1686,40 @@ def postprocess_receipt(
         llm_conf,
         ("points_payment",),
     )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "payment_points_reconciliation",
+        trace_snapshot,
+        extracted,
+    )
+    _run_service_receipt_recovery_phase(
+        extracted,
+        unified_text,
+        ("single_service_inclusive_tax", "unprinted_rate_only_tax_summary"),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "service_receipt_recovery",
+        trace_snapshot,
+        extracted,
+    )
     _run_external_tax_total_restoration_phase(
         extracted,
         unified_text,
         ("external_tax_total_from_printed_subtotal",),
+    )
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "external_tax_total_restoration",
+        trace_snapshot,
+        extracted,
+    )
+    _run_payment_method_repair_phase(extracted, unified_text, ocr_conf, llm_conf)
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "payment_method_repair",
+        trace_snapshot,
+        extracted,
     )
     if extracted.get("line_items"):
         _fill_single_qty_unit_prices_from_totals(extracted["line_items"])

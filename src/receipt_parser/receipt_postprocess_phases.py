@@ -6,6 +6,7 @@ from .patterns import should_override_field
 from .receipt_financial import (
     extract_rate_bases,
     extract_points_used,
+    normalize_tax_label,
     reconcile_points_payment_from_ocr,
 )
 from .receipt_identity_payment import (
@@ -13,21 +14,21 @@ from .receipt_identity_payment import (
     _fix_company_name_merchant,
     _fix_date,
     _fix_payment_method,
+    _fix_receipt_payer,
     _fix_time,
-    _fix_toll_payment_reference,
+    _fix_payment_reference,
     _fix_total_from_stacked_cash_tender_block,
     _fix_unlabeled_cash_tender_change_block,
 )
 from .receipt_items import (
+    _clear_unprinted_rate_only_tax_summary,
     _drop_non_product_line_items,
-    _fix_bag_description_from_ocr_code_context,
     _fix_bag_item_prices_from_ocr,
     _fix_bag_item_prices_from_rate_bases,
     _fix_bare_service_receipt_without_itemization,
     _fix_colon_split_product_names_from_ocr,
     _fix_duplicate_descriptions_from_ocr,
     _fix_line_items,
-    _fix_o_ring_descriptions_from_ocr,
     _fix_qty_code_row_descriptions_from_ocr,
     _fix_single_service_inclusive_tax,
     _fix_small_non_bag_item_prices_from_ocr,
@@ -56,6 +57,7 @@ from .receipt_item_repair import (
     _drop_duplicate_with_embedded_price,
     _drop_phantom_from_tax_amount,
     _fix_code_table_descriptions_by_order,
+    _fix_compact_count_amount_layout,
     _fix_digit_misread_items,
     _fix_priced_in_name_items,
     _revert_unsupported_qty_inflation,
@@ -68,7 +70,6 @@ from .receipt_late_repairs import (
     _fix_name_bag_amount_shift_from_ocr,
     _fix_small_bag_description_from_ocr_entry,
     _fix_split_address_location_from_ocr,
-    _fix_split_bag_price_from_nearby_single_digit,
     _recover_labeled_purchase_site_location,
     _replace_stacked_name_price_rows_when_balanced,
     _restore_single_rate_inclusive_tax_block,
@@ -107,9 +108,7 @@ from .receipt_row_projection import (
     _replace_service_table_items_when_balanced,
 )
 from .receipt_tax_categories import (
-    _apply_single_bag_standard_rate_split,
     _assign_single_standard_rate_from_small_base,
-    _fix_nonfood_packaging_tax_categories,
     _fix_tax_categories_from_ocr_markers,
     _fix_tax_categories_from_price_line_markers,
     _rebalance_standard_categories_from_reduced_rate_markers,
@@ -268,35 +267,55 @@ def _run_payment_method_repair_phase(
     _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
 
 
-def _run_toll_payment_reference_repair_phase(
+def _run_payment_reference_repair_phase(
+    extracted: dict,
+    unified_text: str,
+    payment_reference_text: str | None = None,
+) -> None:
+    """Trigger: OCR has an explicit document or transaction-reference label.
+
+    Invariant: prefer one unique printed primary document number, falling back
+    to one unique printed transaction/data/reference number.
+    """
+    _fix_payment_reference(extracted, payment_reference_text or unified_text)
+
+
+def _run_receipt_payer_repair_phase(
     extracted: dict,
     unified_text: str,
 ) -> None:
-    """Trigger: toll-road OCR markers with a printed handling/reference number.
+    """Trigger: OCR prints an explicit addressee with an honorific.
 
-    Invariant: only fill a missing payment_reference from a visible handling
-    number label, preserving any reference supplied by upstream extraction.
+    Invariant: exactly one whitespace-normalized printed identity owns payer;
+    absent or competing identities clear unsupported upstream payer values.
     """
-    _fix_toll_payment_reference(extracted, unified_text)
+    _fix_receipt_payer(extracted, unified_text)
 
 
 def _run_service_receipt_recovery_phase(
     extracted: dict,
     unified_text: str,
     repairs: tuple[str, ...],
+    ocr_layout_blocks: list[dict] | None = None,
 ) -> None:
     """Trigger: OCR service tables, bare receipt layouts, or single service rows.
 
-    Invariant: service item recovery/removal and inclusive-tax reconstruction
-    must preserve visible row layout, printed total evidence, and tax arithmetic.
+    Invariant: service item recovery/removal and printed tax-rate projection
+    must preserve visible row layout without inventing unprinted tax amounts.
     """
     for repair in repairs:
         if repair == "bare_service_without_itemization":
             _fix_bare_service_receipt_without_itemization(extracted, unified_text)
         elif repair == "service_table_items":
             _replace_service_table_items_when_balanced(extracted, unified_text)
+            _fix_compact_count_amount_layout(
+                extracted.get("line_items") or [],
+                ocr_layout_blocks,
+            )
         elif repair == "single_service_inclusive_tax":
             _fix_single_service_inclusive_tax(extracted, unified_text)
+        elif repair == "unprinted_rate_only_tax_summary":
+            _clear_unprinted_rate_only_tax_summary(extracted, unified_text)
         else:
             raise ValueError(f"Unknown service receipt recovery repair: {repair}")
 
@@ -399,7 +418,7 @@ def _run_ocr_description_reconciliation_phase(
     unified_text: str,
     repairs: tuple[str, ...],
 ) -> None:
-    """Trigger: OCR code rows, duplicated names, O-ring text, or bag context.
+    """Trigger: OCR code rows, duplicated names, or split product names.
 
     Invariant: description changes require visible OCR support and must keep
     item count, quantity, unit price, total, discount, and tax fields coherent.
@@ -411,12 +430,8 @@ def _run_ocr_description_reconciliation_phase(
             _fix_code_table_descriptions_by_order(extracted, unified_text)
         elif repair == "duplicate_descriptions":
             _fix_duplicate_descriptions_from_ocr(extracted, unified_text)
-        elif repair == "o_ring_descriptions":
-            _fix_o_ring_descriptions_from_ocr(extracted, unified_text)
         elif repair == "colon_split_names":
             _fix_colon_split_product_names_from_ocr(extracted, unified_text)
-        elif repair == "bag_code_context":
-            _fix_bag_description_from_ocr_code_context(extracted, unified_text)
         else:
             raise ValueError(f"Unknown OCR description reconciliation repair: {repair}")
 
@@ -574,20 +589,30 @@ def _run_payment_points_reconciliation_phase(
     for repair in repairs:
         if repair == "points_used":
             points = extract_points_used(unified_text)
-            if points is not None:
-                existing_points = extracted.get("points_used")
-                if (
-                    should_override_field("points_used", ocr_conf, llm_conf)
-                    or existing_points is None
-                    or (points > 0 and float(existing_points or 0) == 0)
-                ):
-                    extracted["points_used"] = points
-            elif extracted.get("points_used") is not None:
-                has_points_evidence = bool(re.search(r'ポイント利用|ポイント値引', unified_text))
-                if not has_points_evidence:
-                    extracted["points_used"] = 0
-            else:
-                extracted["points_used"] = 0
+            if points is None:
+                extracted["points_used"] = None
+                try:
+                    if extracted.get("total") is not None:
+                        extracted["amount_paid"] = float(extracted["total"])
+                except (TypeError, ValueError):
+                    pass
+                continue
+            try:
+                total = float(extracted["total"])
+            except (KeyError, TypeError, ValueError):
+                total = None
+            if points < 0 or (total is not None and points > total + 2):
+                extracted["points_used"] = None
+                if total is not None:
+                    extracted["amount_paid"] = total
+                continue
+            existing_points = extracted.get("points_used")
+            if (
+                should_override_field("points_used", ocr_conf, llm_conf)
+                or existing_points is None
+                or (points > 0 and float(existing_points or 0) == 0)
+            ):
+                extracted["points_used"] = points
         elif repair == "points_payment":
             reconcile_points_payment_from_ocr(extracted, unified_text)
         else:
@@ -923,12 +948,57 @@ def _restore_tax_entries_from_item_rate_sums(
     extracted["taxes"] = kept
 
 
+def _reconcile_tax_labels_from_item_arithmetic(extracted: dict, unified_text: str) -> None:
+    """Use final line-item arithmetic to correct stale inclusive tax labels."""
+    taxes = extracted.get("taxes") or []
+    items = extracted.get("line_items") or []
+    if not taxes or not items:
+        return
+    try:
+        total = float(extracted.get("total"))
+        subtotal = (
+            float(extracted["subtotal"])
+            if extracted.get("subtotal") is not None
+            else None
+        )
+        items_sum = sum(
+            float(item.get("total") or 0)
+            for item in items
+            if isinstance(item, dict)
+        )
+        tax_sum = sum(
+            float(tax.get("amount") or 0)
+            for tax in taxes
+            if isinstance(tax, dict) and tax.get("rate") != "0%"
+        )
+    except (TypeError, ValueError):
+        return
+    if not (
+        tax_sum > 0
+        and abs(items_sum + tax_sum - total) <= 2
+        and abs(items_sum - total) > 2
+    ):
+        return
+    for tax in taxes:
+        if not isinstance(tax, dict) or tax.get("rate") == "0%":
+            continue
+        tax["label"] = normalize_tax_label(
+            tax.get("label"),
+            text=unified_text,
+            subtotal=subtotal,
+            total=total,
+            tax_sum=tax_sum,
+            items_sum=items_sum,
+        )
+
+
 def _run_tax_category_assignment_phase(
     extracted: dict,
     unified_text: str,
     ocr_totals: dict | None,
     repairs: tuple[str, ...],
     rate_bases: dict | None = None,
+    ocr_layout_blocks: list[dict] | None = None,
 ) -> dict:
     """Trigger: OCR rate markers, rate-base summaries, or price-line flags.
 
@@ -956,9 +1026,6 @@ def _run_tax_category_assignment_phase(
                 _fix_tax_categories_from_ocr_markers(items, unified_text)
         elif repair == "price_line_markers":
             _fix_tax_categories_from_price_line_markers(extracted, unified_text)
-        elif repair == "single_bag_standard_split":
-            if items:
-                _apply_single_bag_standard_rate_split(items, merged_rate_bases)
         elif repair == "rebalance_rate_bases":
             if items:
                 _rebalance_tax_categories_to_rate_bases(
@@ -966,6 +1033,7 @@ def _run_tax_category_assignment_phase(
                     unified_text,
                     extracted.get("taxes"),
                     merged_rate_bases,
+                    ocr_layout_blocks=ocr_layout_blocks,
                 )
         elif repair == "rebalance_standard_from_reduced_markers":
             if items:
@@ -974,9 +1042,6 @@ def _run_tax_category_assignment_phase(
                     unified_text,
                     merged_rate_bases,
                 )
-        elif repair == "nonfood_packaging":
-            if items:
-                _fix_nonfood_packaging_tax_categories(items, unified_text, merged_rate_bases)
         elif repair == "single_standard_from_small_base":
             if items:
                 _assign_single_standard_rate_from_small_base(items, merged_rate_bases)
@@ -1128,10 +1193,10 @@ def _run_priced_name_item_repair_phase(extracted: dict, unified_text: str) -> No
 
 
 def _run_digit_misread_item_repair_phase(extracted: dict, unified_text: str) -> None:
-    """Trigger: a small item-sum gap matches one OCR digit-confusion marker.
+    """Trigger: a +8 gap has one local 0/8 OCR confusion candidate.
 
-    Invariant: item total changes require exactly one candidate whose corrected
-    amount closes the subtotal/total gap and whose OCR row exposes the marker.
+    Invariant: malformed percent evidence or a complete printed item count must
+    independently rule out a missing row before arithmetic changes the price.
     """
     _fix_digit_misread_items(extracted, unified_text)
 
@@ -1200,7 +1265,6 @@ def _run_bag_item_ocr_repair_phase(extracted: dict, unified_text: str) -> None:
     """
     _fix_small_non_bag_item_prices_from_ocr(extracted, unified_text)
     _fix_bag_item_prices_from_ocr(extracted, unified_text)
-    _fix_split_bag_price_from_nearby_single_digit(extracted, unified_text)
     _fix_small_bag_description_from_ocr_entry(extracted, unified_text)
 
 
