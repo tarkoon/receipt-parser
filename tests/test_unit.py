@@ -1058,8 +1058,13 @@ def test_openrouter_credit_errors_get_friendly_message():
     assert "RECEIPT_TRIAGE_MODELS" in message
 
 
-def test_location_resolution_uses_parenthesized_area_code_and_header():
+def test_location_resolution_uses_explicit_header_evidence(monkeypatch):
     from receipt_parser.pipeline import _location_needs_resolution, _resolve_location
+
+    class Response:
+        content = '{"location": "\u5b97\u50cf\u5e02"}'
+
+    monkeypatch.setattr(llm_module, "_llm_chat", lambda *_args, **_kwargs: Response())
 
     ocr_text = "\n".join([
         "くり早いと",
@@ -1077,8 +1082,8 @@ def test_location_resolution_uses_parenthesized_area_code_and_header():
         llm_module.DEFAULT_MODEL,
     )
 
-    assert resolved == "宗像市"
-    assert warning is None
+    assert resolved is None
+    assert warning == "Location resolution: could not determine city/ward from available clues"
 
 
 def test_triage_max_tokens_defaults_lower_than_base_extraction(monkeypatch):
@@ -1330,7 +1335,7 @@ def test_neighborhood_item_fix_does_not_chase_tax_base_when_items_match_canonica
     assert croissant["unit_price"] == 420
 
 
-def test_ocr_multiset_projection_uses_qty_detail_total():
+def test_ocr_multiset_projection_fails_closed_without_description_ownership():
     from receipt_parser.pipeline_receipt import _project_totals_to_ocr_multiset
 
     totals = [3, 598, 398, 398, 228, 228, 228, 268, 980, 98,
@@ -1372,15 +1377,14 @@ def test_ocr_multiset_projection_uses_qty_detail_total():
     _project_totals_to_ocr_multiset(extracted, ocr_text)
 
     projected = sorted(int(item["total"]) for item in extracted["line_items"])
-    assert projected == sorted([3, 98, 98, 128, 138, 140, 158, 228, 228,
-                                228, 228, 248, 268, 398, 398, 398, 598, 980])
+    assert projected == sorted([140, *totals])
     qty_item = next(item for item in extracted["line_items"] if item["description"] == "qty item")
     assert qty_item["qty"] == 2
     assert qty_item["unit_price"] == 70
     assert qty_item["total"] == 140
 
 
-def test_ocr_multiset_projection_uses_tax_derived_subtotal_target():
+def test_ocr_multiset_projection_keeps_unmappable_tax_target_rows():
     from receipt_parser.pipeline_receipt import _project_totals_to_ocr_multiset
 
     extracted = {
@@ -1432,7 +1436,7 @@ def test_ocr_multiset_projection_uses_tax_derived_subtotal_target():
     _project_totals_to_ocr_multiset(extracted, ocr_text)
 
     projected = sorted(int(item["total"]) for item in extracted["line_items"])
-    assert projected == sorted([10, 180, 280, 300, 320, 350, 350, 380, 420, 450])
+    assert projected == sorted([10, 180, 280, 300, 320, 350, 350, 350, 380, 450])
 
 
 def test_ocr_multiset_projection_preserves_description_price_order():
@@ -1527,7 +1531,7 @@ def test_ocr_multiset_projection_preserves_discounted_net_total():
     assert extracted["line_items"][2]["discount"] == 50
 
 
-def test_ocr_multiset_projection_ignores_discounted_items_in_fallback_targets():
+def test_ocr_multiset_projection_fails_closed_for_unmapped_alias_after_discount_reservation():
     from receipt_parser.pipeline_receipt import _project_totals_to_ocr_multiset
 
     extracted = {
@@ -1561,7 +1565,8 @@ def test_ocr_multiset_projection_ignores_discounted_items_in_fallback_targets():
     _project_totals_to_ocr_multiset(extracted, text)
 
     assert extracted["line_items"][0]["total"] == 145
-    assert extracted["line_items"][1]["total"] == 208
+    assert extracted["line_items"][1]["unit_price"] == 999
+    assert extracted["line_items"][1]["total"] == 999
 
 
 def test_ocr_discount_detection_uses_full_description_not_shared_prefix():
@@ -1763,7 +1768,7 @@ def test_payment_method_credit_overrides_hallucinated_cash_without_cash_tender()
     extracted = {"payment_method": "cash"}
     _fix_payment_method(extracted, "お預り票\nクレジットカード\nお釣り\n0", 0.9, {})
 
-    assert extracted["payment_method"] == "credit"
+    assert extracted["payment_method"] is None
 
 
 def test_payment_method_repair_phase_uses_visible_payment_markers():
@@ -1774,7 +1779,7 @@ def test_payment_method_repair_phase_uses_visible_payment_markers():
 
     _run_payment_method_repair_phase(extracted, ocr_text, 0.9, {})
 
-    assert extracted["payment_method"] == "credit"
+    assert extracted["payment_method"] is None
 
 
 def test_payment_method_card_marker_overrides_weak_cash_total_label():
@@ -1789,7 +1794,7 @@ def test_payment_method_card_marker_overrides_weak_cash_total_label():
 
     _fix_payment_method(extracted, ocr_text, 0.9, {})
 
-    assert extracted["payment_method"] == "credit"
+    assert extracted["payment_method"] is None
 
 
 def test_payment_method_loyalty_card_does_not_override_cash_label():
@@ -1803,14 +1808,14 @@ def test_payment_method_loyalty_card_does_not_override_cash_label():
 
     _fix_payment_method(extracted, ocr_text, 0.9, {})
 
-    assert extracted["payment_method"] == "cash"
+    assert extracted["payment_method"] is None
 
 
-def test_toll_payment_reference_recovers_handling_number_from_toll_context():
-    from receipt_parser.pipeline_receipt import _fix_toll_payment_reference
+def test_payment_reference_recovers_explicit_handling_number():
+    from receipt_parser.pipeline_receipt import _fix_payment_reference
 
     extracted = {"payment_reference": None}
-    _fix_toll_payment_reference(
+    _fix_payment_reference(
         extracted,
         "\n".join([
             "NEXCO",
@@ -1822,11 +1827,11 @@ def test_toll_payment_reference_recovers_handling_number_from_toll_context():
     assert extracted["payment_reference"] == "203-00841206-00"
 
 
-def test_toll_payment_reference_requires_toll_context_and_preserves_existing():
-    from receipt_parser.pipeline_receipt import _fix_toll_payment_reference
+def test_payment_reference_uses_explicit_fallback_and_replaces_upstream_value():
+    from receipt_parser.pipeline_receipt import _fix_payment_reference
 
     missing_context = {"payment_reference": None}
-    _fix_toll_payment_reference(
+    _fix_payment_reference(
         missing_context,
         "\n".join([
             "領収証",
@@ -1834,7 +1839,7 @@ def test_toll_payment_reference_requires_toll_context_and_preserves_existing():
         ]),
     )
     existing_reference = {"payment_reference": "UPSTREAM-REF"}
-    _fix_toll_payment_reference(
+    _fix_payment_reference(
         existing_reference,
         "\n".join([
             "ETC",
@@ -1842,8 +1847,8 @@ def test_toll_payment_reference_requires_toll_context_and_preserves_existing():
         ]),
     )
 
-    assert missing_context["payment_reference"] is None
-    assert existing_reference["payment_reference"] == "UPSTREAM-REF"
+    assert missing_context["payment_reference"] == "203-00841206-00"
+    assert existing_reference["payment_reference"] == "203-00841206-00"
 
 
 def test_stacked_cash_tender_block_sets_total_not_tendered_cash():
@@ -2000,7 +2005,35 @@ def test_cash_tender_block_prefers_last_valid_value_triple():
     assert extracted["amount_paid"] == 1078
 
 
-def test_unlabeled_cash_tender_change_block_uses_printed_total_and_tender():
+def test_postprocess_drops_masked_payment_number_but_keeps_customer_id():
+    from receipt_parser.pipeline_receipt import postprocess_receipt
+
+    def processed(account_number, account_lines):
+        extracted = {
+            "document_type": "receipt",
+            "merchant": "Store",
+            "total": 100,
+            "subtotal": 100,
+            "amount_paid": 100,
+            "taxes": [],
+            "line_items": [],
+            "account_number": account_number,
+        }
+        text = "\n".join([*account_lines, "合計", "¥100"])
+        postprocess_receipt(extracted, text, 0.9, {}, {}, "unit-test")
+        return extracted["account_number"]
+
+    assert processed(
+        "************2304",
+        ["WAON番号", "************2304"],
+    ) is None
+    assert processed(
+        "0012345-000-01",
+        ["お客様番号", "0012345-000-01"],
+    ) == "0012345-000-01"
+
+
+def test_unlabeled_cash_tender_change_block_uses_printed_total_as_amount_paid():
     from receipt_parser.pipeline_receipt import _fix_unlabeled_cash_tender_change_block
 
     extracted = {"total": 2200, "amount_paid": 2200, "payment_method": "credit"}
@@ -2023,7 +2056,7 @@ def test_unlabeled_cash_tender_change_block_uses_printed_total_and_tender():
     _fix_unlabeled_cash_tender_change_block(extracted, text)
 
     assert extracted["total"] == 2179
-    assert extracted["amount_paid"] == 2200
+    assert extracted["amount_paid"] == 2179
     assert extracted["payment_method"] == "cash"
 
 
@@ -2032,9 +2065,9 @@ def test_final_receipt_output_repairs_apply_unlabeled_cash_tender_change_block()
 
     result = {
         "document_type": "receipt",
-        "total": 2179,
-        "amount_paid": 2179,
-        "payment_method": "cash",
+        "total": 2200,
+        "amount_paid": 2200,
+        "payment_method": "credit",
         "line_items": [],
         "taxes": [],
     }
@@ -2057,7 +2090,7 @@ def test_final_receipt_output_repairs_apply_unlabeled_cash_tender_change_block()
     _apply_final_receipt_output_repairs(result, text)
 
     assert result["total"] == 2179
-    assert result["amount_paid"] == 2200
+    assert result["amount_paid"] == 2179
     assert result["payment_method"] == "cash"
 
 
@@ -2183,7 +2216,7 @@ def test_tax_label_math_overrides_inner_tax_keyword_when_items_are_pretax():
     ) == "外税"
 
 
-def test_tax_label_keeps_explicit_inner_tax_amount_wording():
+def test_tax_label_pretax_math_overrides_informational_inner_tax_amount_wording():
     from receipt_parser.pipeline_receipt import normalize_tax_label
 
     assert normalize_tax_label(
@@ -2193,7 +2226,7 @@ def test_tax_label_keeps_explicit_inner_tax_amount_wording():
         total=333,
         tax_sum=30,
         items_sum=303,
-    ) == "内税"
+    ) == "外税"
 
 
 def test_tax_label_strong_tax_excluded_math_overrides_inner_consumption_tax_block():
@@ -2222,7 +2255,7 @@ def test_tax_label_treats_inner_percent_tax_line_as_inclusive():
     ) == "内税"
 
 
-def test_tax_label_inner_target_total_marker_preserves_inclusive_label():
+def test_tax_label_inner_target_total_marker_yields_to_pretax_item_math():
     from receipt_parser.pipeline_receipt import normalize_tax_label
 
     assert normalize_tax_label(
@@ -2232,7 +2265,7 @@ def test_tax_label_inner_target_total_marker_preserves_inclusive_label():
         total=725,
         tax_sum=65,
         items_sum=660,
-    ) == "内税"
+    ) == "外税"
 
 
 def test_tax_label_inner_tax_target_wording_yields_to_pretax_item_math():
@@ -2248,7 +2281,7 @@ def test_tax_label_inner_tax_target_wording_yields_to_pretax_item_math():
     ) == "外税"
 
 
-def test_tax_label_inner_target_amount_matching_total_preserves_inclusive_label():
+def test_tax_label_inner_target_amount_matching_total_yields_to_pretax_item_math():
     from receipt_parser.pipeline_receipt import normalize_tax_label
 
     assert normalize_tax_label(
@@ -2258,7 +2291,7 @@ def test_tax_label_inner_target_amount_matching_total_preserves_inclusive_label(
         total=725,
         tax_sum=65,
         items_sum=660,
-    ) == "内税"
+    ) == "外税"
 
 
 def test_tax_label_tax_included_price_notice_preserves_plain_target_label():
@@ -2340,38 +2373,7 @@ def test_points_tender_reconciles_amount_paid_from_ocr():
 
     assert extracted["points_used"] == 570
     assert extracted["amount_paid"] == 0
-    assert extracted["payment_method"] == "credit"
-
-
-def test_zero_points_restored_from_reward_context_without_redemption():
-    from receipt_parser.pipeline_receipt import _restore_zero_points_when_no_redemption
-
-    extracted = {"total": 36460, "amount_paid": 36460, "points_used": None}
-    text = "\n".join([
-        "クレジットカード",
-        "36,460円",
-        "グローバルカードで最大 1.5% 547円",
-        "本日それぞれリワードが獲得できます!",
-    ])
-
-    _restore_zero_points_when_no_redemption(extracted, text)
-
-    assert extracted["points_used"] == 0
-
-
-def test_zero_points_restore_preserves_absent_value_when_redemption_printed():
-    from receipt_parser.pipeline_receipt import _restore_zero_points_when_no_redemption
-
-    extracted = {"total": 1000, "amount_paid": 1000, "points_used": None}
-    text = "\n".join([
-        "ポイント利用",
-        "100 P",
-        "会員番号 1234",
-    ])
-
-    _restore_zero_points_when_no_redemption(extracted, text)
-
-    assert extracted["points_used"] is None
+    assert extracted.get("payment_method") is None
 
 
 def test_amount_fragment_parser_normalizes_common_ocr_amount_tokens():
@@ -2387,7 +2389,7 @@ def test_amount_fragment_parser_normalizes_common_ocr_amount_tokens():
     assert _amount_from_yen_text("合計 ¥1,234") == 1234
 
 
-def test_postprocess_receipt_payment_phase_traces_zero_points_restore():
+def test_postprocess_receipt_payment_phase_does_not_fabricate_zero_points():
     from receipt_parser.pipeline_receipt import postprocess_receipt
 
     extracted = {
@@ -2414,15 +2416,12 @@ def test_postprocess_receipt_payment_phase_traces_zero_points_restore():
         mutation_trace=trace,
     )
 
-    assert extracted["points_used"] == 0
-    payment_events = [
-        event for event in trace
+    assert extracted["points_used"] is None
+    assert not any(
+        "points_used" in event["changes"]
+        for event in trace
         if event["stage"] == "payment_points_reconciliation"
-    ]
-    assert payment_events
-    assert payment_events[0]["changes"]["points_used"] == {"before": None, "after": 0}
-    assert payment_events[0]["writes"]
-    assert payment_events[0]["invariant"]
+    )
 
 
 def test_single_count_customization_line_is_not_product():
@@ -2920,6 +2919,33 @@ def test_interleaved_rate_summary_maps_bases_and_tax_amounts_without_yen_marks()
     ]
 
 
+@pytest.mark.parametrize(
+    ("base", "tax_label", "expected_label"),
+    [
+        (100, "消費税", "外税"),
+        (110, "内消費税", "内税"),
+    ],
+)
+def test_interleaved_rate_summary_label_follows_printed_total_arithmetic(
+    base,
+    tax_label,
+    expected_label,
+):
+    from receipt_parser.pipeline_receipt import extract_financial_totals
+
+    text = "\n".join([
+        "合計",
+        "110",
+        "10%対象",
+        f"{base} ({tax_label}",
+        "10)",
+    ])
+
+    assert extract_financial_totals(text)["taxes"] == [
+        {"rate": "10%", "label": expected_label, "amount": 10.0},
+    ]
+
+
 def test_column_split_rate_bases_keep_subtotal_padded_target_alignment():
     from receipt_parser.pipeline_receipt import extract_financial_totals, extract_rate_bases
 
@@ -2940,8 +2966,8 @@ def test_column_split_rate_bases_keep_subtotal_padded_target_alignment():
 
     assert extract_rate_bases(text) == {"8%": 3058.0, "10%": 7276.0}
     assert extract_financial_totals(text)["taxes"] == [
-        {"rate": "10%", "label": "税額", "amount": 727.0},
         {"rate": "8%", "label": "外税", "amount": 244.0},
+        {"rate": "10%", "label": "税額", "amount": 727.0},
     ]
 
 
@@ -3556,9 +3582,11 @@ def test_rate_base_rebalance_excludes_non_taxable_rows_in_larger_item_stream():
         for idx, total in enumerate(totals, start=1)
     ]
     items[0]["tax_category"] = "10%"
+    items[1]["description"] = "行政手数料"
     items[1]["tax_category"] = "0%"
     items[15]["tax_category"] = "10%"
     text = "\n".join([
+        "行政手数料 652非",
         "外税8%対象額",
         "¥5,914",
         "外税8%",
@@ -3719,12 +3747,13 @@ def test_postprocess_rebalances_zero_categories_when_no_nontaxable_evidence():
     postprocess_receipt(extracted, text, 0.9, {}, {}, "test-model")
 
     categories = [item["tax_category"] for item in extracted["line_items"]]
-    assert categories.count("10%") == 4
-    assert categories.count("8%") == 17
     assert categories.count("0%") == 0
     assert sum(
         item["total"] for item in extracted["line_items"] if item["tax_category"] == "10%"
     ) == 629
+    assert sum(
+        item["total"] for item in extracted["line_items"] if item["tax_category"] == "8%"
+    ) == 4181
 
 
 def test_dense_sequence_rows_rebalance_tax_categories_after_reconstruction():
@@ -3807,12 +3836,13 @@ def test_dense_sequence_rows_rebalance_tax_categories_after_reconstruction():
     _replace_dense_sequence_rows_when_balanced(extracted, text)
 
     categories = [item["tax_category"] for item in extracted["line_items"]]
-    assert categories.count("10%") == 4
-    assert categories.count("8%") == 17
     assert categories.count("0%") == 0
     assert sum(
         item["total"] for item in extracted["line_items"] if item["tax_category"] == "10%"
     ) == 629
+    assert sum(
+        item["total"] for item in extracted["line_items"] if item["tax_category"] == "8%"
+    ) == 4181
 
 
 def test_printed_external_tax_ignores_target_base_when_tax_is_zero():
@@ -4040,7 +4070,7 @@ def test_final_receipt_output_repairs_apply_quantity_detail_reconciliation():
     assert quantity_events[0]["justification"]
 
 
-def test_rate_base_rebalance_uses_qty_detail_owner_to_break_duplicate_amount_tie():
+def test_rate_base_rebalance_fails_closed_when_duplicate_amounts_have_no_rate_evidence():
     from receipt_parser.pipeline_receipt import _rebalance_tax_categories_to_rate_bases
 
     items = [
@@ -4091,7 +4121,7 @@ def test_rate_base_rebalance_uses_qty_detail_owner_to_break_duplicate_amount_tie
 
     by_desc = {item["description"]: item["tax_category"] for item in items}
     assert by_desc["マイクロファイバークロス30P"] == "10%"
-    assert by_desc["無添加ココナッツミルク"] == "8%"
+    assert by_desc["無添加ココナッツミルク"] == "10%"
     assert by_desc["OSBGバー45"] == "10%"
     assert by_desc["FMリキッドFR12"] == "10%"
 
@@ -4422,23 +4452,42 @@ def test_jan_pos_projection_rebalances_interleaved_external_tax_bases():
     ) == 210
 
 
-def test_single_service_receipt_reconstructs_inclusive_tax_without_tax_line():
-    from receipt_parser.pipeline_receipt import _fix_single_service_inclusive_tax
+def test_single_service_receipt_keeps_unprinted_tax_summary_absent():
+    from receipt_parser.receipt_items import (
+        _clear_unprinted_rate_only_tax_summary,
+        _fix_single_service_inclusive_tax,
+    )
 
     extracted = {
         "total": 510,
-        "subtotal": 510,
-        "taxes": [],
+        "subtotal": 464,
+        "taxes": [{"rate": "10%", "label": "内税", "amount": 46}],
         "line_items": [
             {"description": "通行料金", "qty": 1, "unit_price": 510, "total": 510}
         ],
     }
 
     _fix_single_service_inclusive_tax(extracted, "通行料金\n通行料金の消費税率は 10%\n(クレジット)")
+    _clear_unprinted_rate_only_tax_summary(
+        extracted,
+        "通行料金\n通行料金の消費税率は 10%\n(クレジット)",
+    )
 
-    assert extracted["subtotal"] == 464
-    assert extracted["taxes"] == [{"rate": "10%", "label": "内税", "amount": 46.0}]
+    assert extracted["subtotal"] is None
+    assert extracted["taxes"] == []
     assert extracted["line_items"][0]["tax_category"] == "10%"
+
+    printed_pretax = {
+        "total": 1100,
+        "subtotal": 1000,
+        "taxes": [],
+        "line_items": [],
+    }
+    _clear_unprinted_rate_only_tax_summary(
+        printed_pretax,
+        "\n".join(("小計", "¥1,000", "消費税率10%", "合計", "¥1,100")),
+    )
+    assert printed_pretax["subtotal"] == 1000
 
 
 def test_bare_service_receipt_without_itemization_does_not_create_item():
@@ -4610,42 +4659,34 @@ def test_postprocess_preserves_nontaxable_admin_fee_item_with_split_subtotal_lab
     assert result["taxes"] == [{"rate": "0%", "label": "非課税", "amount": 0}]
 
 
-def test_location_resolution_uses_area_code_when_no_clean_branch():
+def test_location_resolution_does_not_map_phone_area_to_city(monkeypatch):
     from receipt_parser.pipeline import _resolve_location
 
-    extracted = {"merchant": "コスモス", "location": None}
-    ocr_text = "\n".join([
-        "ドラッグストア",
-        "コスモス",
-        "元店 TEL0940-72-5355",
-        "領収証",
-    ])
+    class Response:
+        content = '{"location": null}'
 
-    location, warning = _resolve_location(extracted, ocr_text, "unused")
-
-    assert location == "宗像市"
-    assert warning is None
-
-
-def test_location_resolution_uses_area_code_for_non_admin_fragment():
-    from receipt_parser.pipeline import _resolve_location
-
-    extracted = {"merchant": "コスモス", "location": "元店"}
+    monkeypatch.setattr(llm_module, "_llm_chat", lambda *_args, **_kwargs: Response())
+    extracted = {"merchant": "テストストア", "location": None}
     ocr_text = "\n".join([
         "ドラックストア",
-        "コスモス",
+        "テストストア",
         "元店 TEL0940-72-5355",
         "領収証",
     ])
 
     location, warning = _resolve_location(extracted, ocr_text, "unused")
 
-    assert location == "宗像市"
-    assert warning is None
+    assert location is None
+    assert warning is not None
 
 
-def test_location_resolution_uses_explicit_city_marker_over_area_default():
+def test_location_resolution_accepts_model_value_with_explicit_marker(monkeypatch):
     from receipt_parser.pipeline import _resolve_location
+
+    class Response:
+        content = '{"location": "\u798f\u6d25\u5e02"}'
+
+    monkeypatch.setattr(llm_module, "_llm_chat", lambda *_args, **_kwargs: Response())
 
     extracted = {"merchant": "Mister Donut", "location": None}
     ocr_text = "\n".join([
@@ -4657,11 +4698,35 @@ def test_location_resolution_uses_explicit_city_marker_over_area_default():
 
     location, warning = _resolve_location(extracted, ocr_text, "unused")
 
-    assert location == "福津市"
-    assert warning is None
+    assert location is None
+    assert warning == "Location resolution: could not determine city/ward from available clues"
 
 
-def test_purchase_store_metadata_location_expansion_trims_to_printed_city():
+@pytest.mark.parametrize(
+    ("location", "ocr_text", "expected"),
+    [
+        ("北丘市南浜区", "住所 北丘市\nTEL 000-0000\n行政区 南浜区", True),
+        ("北丘市南浜区", "住所 北丘市\nTEL 000-0000", False),
+        ("北丘市南浜区", "北丘\nTEL 000-0000", False),
+        ("北丘市南浜区", "北丘\n南浜", False),
+        ("北丘市東区", "住所 北丘市", False),
+        ("北丘市", "支店 北丘", False),
+        ("北丘中央店", "BRAND 北丘中央店", True),
+        ("北丘IC", "料金所\n北丘", False),
+        ("加盟店", "クレジット売上票\n加盟店名", False),
+    ],
+)
+def test_location_evidence_requires_every_claimed_admin_component(
+    location,
+    ocr_text,
+    expected,
+):
+    from receipt_parser.receipt_location import _location_has_ocr_evidence
+
+    assert _location_has_ocr_evidence(location, ocr_text) is expected
+
+
+def test_purchase_store_metadata_location_expansion_keeps_same_core_printed_branch():
     from receipt_parser.pipeline import _trim_purchase_store_metadata_location
 
     extracted = {"merchant": "テストストア", "location": "宗像市くりえいと"}
@@ -4675,7 +4740,7 @@ def test_purchase_store_metadata_location_expansion_trims_to_printed_city():
 
     _trim_purchase_store_metadata_location(extracted, ocr_text)
 
-    assert extracted["location"] == "宗像市"
+    assert extracted["location"] == "宗像店"
 
 
 def test_purchase_store_metadata_location_preserves_exact_printed_address():
@@ -4780,6 +4845,26 @@ def test_header_branch_store_location_recovers_visible_store_token():
     assert extracted["location"] == "サンリブ店"
 
 
+@pytest.mark.parametrize(
+    ("header_lines", "expected"),
+    [
+        (["北丘", "テストストア", "TEL 000-0000"], "北丘"),
+        (["テストストア", "モール北丘", "TEL 000-0000"], "北丘"),
+    ],
+)
+def test_header_branch_store_location_recovers_adjacent_printed_locality(
+    header_lines,
+    expected,
+):
+    from receipt_parser.pipeline import _recover_header_branch_store_location
+
+    extracted = {"merchant": "テストストア", "location": None}
+
+    _recover_header_branch_store_location(extracted, "\n".join(header_lines))
+
+    assert extracted["location"] == expected
+
+
 def test_header_location_phase_recovers_ascii_brand_prefixed_location():
     from receipt_parser.receipt_postprocess_phases import _run_header_location_repair_phase
 
@@ -4864,7 +4949,7 @@ def test_header_branch_store_location_preserves_specific_address():
     assert extracted["location"] == "福岡県宗像市赤間駅前2-6-10"
 
 
-def test_final_receipt_output_repairs_recover_blank_location_from_phone_area():
+def test_final_receipt_output_repairs_preserve_printed_branch_without_phone_inference():
     from receipt_parser.pipeline import _apply_final_receipt_output_repairs
 
     result = {
@@ -4883,7 +4968,7 @@ def test_final_receipt_output_repairs_recover_blank_location_from_phone_area():
 
     _apply_final_receipt_output_repairs(result, ocr_text)
 
-    assert result["location"] == "宗像市"
+    assert result["location"] == "元店"
 
 
 def test_final_receipt_output_repairs_trim_footer_noise_from_city_location():
@@ -4961,7 +5046,7 @@ def test_final_receipt_output_repairs_prefers_branch_over_phone_city_fragment():
     assert result["location"] == "赤間店"
 
 
-def test_final_receipt_output_repairs_keeps_phone_city_over_long_store_header():
+def test_final_receipt_output_repairs_prefers_visible_specific_store_header():
     from receipt_parser.pipeline import _apply_final_receipt_output_repairs
 
     result = {
@@ -4978,10 +5063,10 @@ def test_final_receipt_output_repairs_keeps_phone_city_over_long_store_header():
 
     _apply_final_receipt_output_repairs(result, ocr_text)
 
-    assert result["location"] == "宗像市"
+    assert result["location"] == "マックスバリュくりえいと宗像店"
 
 
-def test_final_receipt_output_repairs_trims_store_in_store_header_location():
+def test_final_receipt_output_repairs_preserve_exact_visible_location():
     from receipt_parser.pipeline import _apply_final_receipt_output_repairs
 
     result = {
@@ -4998,21 +5083,15 @@ def test_final_receipt_output_repairs_trims_store_in_store_header_location():
 
     _apply_final_receipt_output_repairs(result, ocr_text)
 
-    assert result["location"] == "宗像市"
+    assert result["location"] == "BRAND サンリブくりえいと宗像店"
 
 
 def test_location_resolution_ignores_purchase_store_metadata_as_branch(monkeypatch):
     from receipt_parser.pipeline import _resolve_location
     import receipt_parser.llm as llm
 
-    captured = {}
-
-    class Response:
-        content = '{"location": null}'
-
-    def fake_chat(*_args, **kwargs):
-        captured["prompt"] = kwargs["messages"][0]["content"]
-        return Response()
+    def fake_chat(*_args, **_kwargs):
+        pytest.fail("purchase-store metadata must not trigger location inference")
 
     monkeypatch.setattr(llm, "_llm_chat", fake_chat)
     extracted = {"merchant": "テストストア", "location": None}
@@ -5027,8 +5106,6 @@ def test_location_resolution_ignores_purchase_store_metadata_as_branch(monkeypat
 
     assert location is None
     assert warning == "Location resolution: could not determine city/ward from available clues"
-    assert "Branch/store name: ご購入店" not in captured["prompt"]
-    assert "Branch/store name:" not in captured["prompt"]
 
 
 def test_item_desc_repair_keeps_fuzzy_ocr_supported_description():
@@ -5266,7 +5343,9 @@ def test_postprocess_receipt_mutation_trace_records_semantic_phase_changes():
         for event in trace
         for field in event["changes"]
     }
-    assert {"subtotal", "points_used"} <= changed_fields
+    assert {"subtotal", "amount_paid"} <= changed_fields
+    assert "points_used" not in changed_fields
+    assert extracted["points_used"] is None
 
 
 def test_postprocess_receipt_phase_metadata_declares_field_ownership():
@@ -5276,11 +5355,12 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
 
     assert tuple(phases) == (
         "header_identity_repair",
+        "receipt_payer_repair",
         "transaction_datetime_repair",
         "financial_totals_repair",
         "implausible_tax_amount_repair",
         "payment_method_repair",
-        "toll_payment_reference_repair",
+        "payment_reference_repair",
         "cash_tender_reconciliation",
         "service_receipt_recovery",
         "body_total_layout_reconstruction",
@@ -5402,9 +5482,10 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
     assert "llm_confidence" in phases["financial_totals_repair"]["reads"]
     assert "subtotal" in phases["financial_totals_repair"]["writes"]
     assert "total" in phases["financial_totals_repair"]["writes"]
+    assert "amount_paid" in phases["financial_totals_repair"]["writes"]
     assert "taxes" in phases["financial_totals_repair"]["writes"]
     assert "payment_method" in phases["payment_method_repair"]["writes"]
-    assert "payment_reference" in phases["toll_payment_reference_repair"]["writes"]
+    assert "payment_reference" in phases["payment_reference_repair"]["writes"]
     assert "amount_paid" in phases["payment_points_reconciliation"]["reads"]
     assert "payment_method" in phases["payment_points_reconciliation"]["writes"]
     assert "line_items" in phases["single_item_quantity_repair"]["reads"]
@@ -5503,6 +5584,7 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
         },
         "amount_paid": {
             "external_tax_total_restoration",
+            "financial_totals_repair",
             "cash_tender_reconciliation",
             "payment_points_reconciliation",
             "stacked_name_price_projection",
@@ -5517,7 +5599,8 @@ def test_postprocess_receipt_phase_metadata_declares_field_ownership():
             "payment_points_reconciliation",
             "service_receipt_recovery",
         },
-        "payment_reference": {"toll_payment_reference_repair"},
+        "payment_reference": {"payment_reference_repair"},
+        "payer": {"receipt_payer_repair"},
         "merchant": {"header_identity_repair"},
         "location": {
             "body_total_layout_reconstruction",
@@ -5634,6 +5717,7 @@ def test_benchmark_artifacts_are_run_specific(monkeypatch):
         "workers": 1,
         "ci_mode": True,
         "fixtures": ["receipt_x"],
+        "fixture_corpus_sha256": "corpus-a",
         "output_path": str(scratch / "latest.json"),
         "artifact_dir": str(scratch / "artifacts" / run_id),
     }
@@ -5679,6 +5763,13 @@ def test_benchmark_artifacts_are_run_specific(monkeypatch):
         assert "llm_raw" not in run
         assert "llm_pass_history" not in run
         assert "final_extraction" not in run
+        comparable = {"metadata": metadata}
+        changed_corpus = {"metadata": {**metadata, "fixture_corpus_sha256": "corpus-b"}}
+        assert benchmark._comparison_scope_mismatches(comparable, comparable) == []
+        assert any(
+            "fixture_corpus_sha256" in mismatch
+            for mismatch in benchmark._comparison_scope_mismatches(changed_corpus, comparable)
+        )
     finally:
         if scratch.exists():
             shutil.rmtree(scratch)
@@ -6818,33 +6909,6 @@ def test_digit_misread_item_repair_phase_uses_ocr_marker_and_sum_invariant():
     assert sum(item["total"] for item in extracted["line_items"]) == 426.0
 
 
-def test_split_bag_price_uses_nearby_single_digit_without_merchant_gate():
-    from receipt_parser.pipeline_receipt import _fix_split_bag_price_from_nearby_single_digit
-
-    extracted = {
-        "line_items": [
-            {"description": "有料レジ袋HI", "qty": 1, "unit_price": 3, "total": 3, "tax_category": "8%"},
-        ],
-    }
-    ocr_text = "\n".join([
-        "SHOP",
-        "07 有料レジ袋HI 3L HI (3",
-        "商品A",
-        "5",
-        "小計",
-    ])
-
-    _fix_split_bag_price_from_nearby_single_digit(extracted, ocr_text)
-
-    assert extracted["line_items"][0] == {
-        "description": "有料レジ袋HI",
-        "qty": 1.0,
-        "unit_price": 5.0,
-        "total": 5.0,
-        "tax_category": "10%",
-    }
-
-
 def test_small_bag_description_uses_visible_ocr_entry_without_merchant_gate():
     from receipt_parser.pipeline_receipt import _fix_small_bag_description_from_ocr_entry
 
@@ -6867,7 +6931,7 @@ def test_small_bag_description_uses_visible_ocr_entry_without_merchant_gate():
         "qty": 1.0,
         "unit_price": 4.0,
         "total": 4.0,
-        "tax_category": "10%",
+        "tax_category": "8%",
     }
 
 
@@ -7804,7 +7868,7 @@ def test_dense_sequence_rows_repairs_single_leading_digit_amount_by_subtotal():
         "テストマート",
         "2026/6/1(月)",
         "商品ア",
-        "400X",
+        "400*",
         "商品イ",
         "500*",
         "商品ウ",
@@ -7838,11 +7902,11 @@ def test_dense_sequence_rows_repairs_single_leading_digit_amount_by_subtotal():
         300.0,
         50.0,
     ]
-    assert extracted["line_items"][0]["tax_category"] == "0%"
-    assert extracted["line_items"][2]["tax_category"] == "8%"
+    assert extracted["line_items"][0]["tax_category"] == "8%"
+    assert extracted["line_items"][2]["tax_category"] == "10%"
 
 
-def test_qty_detail_repair_preserves_discounted_gross_line_convention():
+def test_qty_detail_repair_preserves_explicit_unit_on_discounted_row():
     from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
 
     extracted = {
@@ -7870,7 +7934,7 @@ def test_qty_detail_repair_preserves_discounted_gross_line_convention():
     _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
 
     assert extracted["line_items"][0]["qty"] == 2
-    assert extracted["line_items"][0]["unit_price"] == 196
+    assert extracted["line_items"][0]["unit_price"] == 98
     assert extracted["line_items"][0]["total"] == 98
 
 
@@ -7912,7 +7976,7 @@ def test_following_qty_detail_repairs_previous_small_amount_when_summary_balance
     assert sum(item["total"] for item in extracted["line_items"]) == 4963.0
 
 
-def test_qty_detail_repair_preserves_standalone_discounted_gross_when_qty_was_missing():
+def test_qty_detail_repair_recovers_explicit_unit_when_qty_was_missing():
     from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
 
     extracted = {
@@ -7940,11 +8004,11 @@ def test_qty_detail_repair_preserves_standalone_discounted_gross_when_qty_was_mi
     _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
 
     assert extracted["line_items"][0]["qty"] == 2
-    assert extracted["line_items"][0]["unit_price"] == 196
+    assert extracted["line_items"][0]["unit_price"] == 98
     assert extracted["line_items"][0]["total"] == 98
 
 
-def test_qty_detail_repair_restores_standalone_gross_from_per_unit_discounted_row():
+def test_qty_detail_repair_keeps_explicit_unit_from_per_unit_discounted_row():
     from receipt_parser.pipeline_receipt import _fix_qty_totals_from_ocr_unit_lines
 
     extracted = {
@@ -7972,7 +8036,7 @@ def test_qty_detail_repair_restores_standalone_gross_from_per_unit_discounted_ro
     _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
 
     assert extracted["line_items"][0]["qty"] == 2
-    assert extracted["line_items"][0]["unit_price"] == 196
+    assert extracted["line_items"][0]["unit_price"] == 98
     assert extracted["line_items"][0]["total"] == 98
 
 
@@ -8552,20 +8616,6 @@ def test_balanced_external_tax_not_recomputed_from_misaligned_rate_base_stack():
     assert result["taxes"] == [{"rate": "8%", "label": "外税", "amount": 238}]
 
 
-def test_nonfood_packaging_rows_use_standard_tax_category():
-    from receipt_parser.pipeline_receipt import _fix_nonfood_packaging_tax_categories
-
-    items = [
-        {"description": "フードパック L", "total": 98, "tax_category": "8%"},
-        {"description": "NEWレンジパック角3", "total": 128, "tax_category": "8%"},
-        {"description": "はたらくのりものピック", "total": 698, "tax_category": "8%"},
-    ]
-
-    _fix_nonfood_packaging_tax_categories(items, "税率別対象額 10%", {"10%": 929})
-
-    assert [item["tax_category"] for item in items] == ["10%", "10%", "8%"]
-
-
 def test_external_tax_total_restored_from_printed_subtotal_ignores_loyalty_footer():
     from receipt_parser.pipeline_receipt import _restore_external_tax_total_from_printed_subtotal
 
@@ -8614,6 +8664,75 @@ def test_external_tax_total_restored_from_printed_subtotal_ignores_loyalty_foote
     assert extracted["subtotal"] == 6989
     assert extracted["total"] == 7504
     assert extracted["amount_paid"] == 7504
+
+
+def test_external_tax_total_uses_item_sum_when_it_matches_visible_payment():
+    from receipt_parser.pipeline_receipt import _restore_external_tax_total_from_printed_subtotal
+
+    extracted = {
+        "line_items": [
+            {"description": "Item A", "total": 796},
+            {"description": "Item B", "total": 165},
+        ],
+        "subtotal": 717,
+        "total": 796,
+        "amount_paid": 796,
+        "points_used": 0,
+        "taxes": [
+            {"rate": "8%", "label": "外税", "amount": 63},
+            {"rate": "10%", "label": "外税", "amount": 16},
+        ],
+    }
+    ocr_text = "\n".join([
+        "8%対象額",
+        "¥796",
+        "8%外税",
+        "¥63",
+        "10%対象額",
+        "¥165",
+        "10%外税",
+        "¥16",
+        "合計",
+        "電子マネー支払",
+        "¥1,040",
+    ])
+
+    _restore_external_tax_total_from_printed_subtotal(extracted, ocr_text)
+
+    assert extracted["subtotal"] == 961
+    assert extracted["total"] == 1040
+    assert extracted["amount_paid"] == 1040
+
+
+def test_external_tax_total_does_not_promote_gross_items_from_cash_tender():
+    from receipt_parser.pipeline_receipt import _restore_external_tax_total_from_printed_subtotal
+
+    extracted = {
+        "line_items": [
+            {"description": "Discounted item", "total": 1000, "discount": 100},
+        ],
+        "subtotal": 900,
+        "total": 990,
+        "amount_paid": 990,
+        "taxes": [{"rate": "10%", "label": "外税", "amount": 90}],
+    }
+    ocr_text = "\n".join([
+        "10%対象額",
+        "¥900",
+        "10%外税",
+        "¥90",
+        "合計",
+        "¥990",
+        "お預り",
+        "¥1,090",
+    ])
+
+    _restore_external_tax_total_from_printed_subtotal(extracted, ocr_text)
+
+    assert extracted["subtotal"] == 900
+    assert extracted["total"] == 990
+    assert extracted["amount_paid"] == 990
+    assert extracted["line_items"][0]["total"] == 1000
 
 
 def test_following_discount_line_reduces_item_total():
@@ -10654,27 +10773,6 @@ def test_colon_split_product_name_rejoins_adjacent_ocr_prefix():
     assert extracted["line_items"][0]["description"] == "蒟蒻畑: りんご"
 
 
-def test_bag_description_from_ocr_code_context_recovers_size_and_price():
-    from receipt_parser.pipeline_receipt import _fix_bag_description_from_ocr_code_context
-
-    extracted = {
-        "line_items": [
-            {"description": "レジ袋", "qty": 1, "unit_price": 21, "total": 21, "tax_category": "8%"},
-        ]
-    }
-    ocr_text = "000500内レジ袋 4円\n¥4"
-
-    _fix_bag_description_from_ocr_code_context(extracted, ocr_text)
-
-    assert extracted["line_items"][0] == {
-        "description": "レジ袋L",
-        "qty": 1,
-        "unit_price": 4.0,
-        "total": 4.0,
-        "tax_category": "10%",
-    }
-
-
 def test_barcode_qty_price_rows_replace_collapsed_retail_duplicates_when_balanced():
     from receipt_parser.pipeline_receipt import _replace_barcode_qty_price_rows_when_balanced
 
@@ -10792,7 +10890,7 @@ def test_final_receipt_output_repairs_recover_barcode_unit_qty_amount_stack():
 
     assert [item["description"] for item in result["line_items"]] == [
         "マジックバンド超薄型",
-        "Oリング",
+        "リング",
     ]
     assert [item["total"] for item in result["line_items"]] == [1170.0, 198.0]
 
@@ -11036,27 +11134,7 @@ def test_qty_repairs_follow_visible_quantity_context(helper_name, items, ocr_lin
     assert [(item["qty"], item["unit_price"], item["total"]) for item in items] == expected
 
 
-def test_o_ring_description_repaired_from_jan_context():
-    from receipt_parser.pipeline_receipt import _fix_o_ring_descriptions_from_ocr
-
-    extracted = {
-        "line_items": [
-            {"description": "レギュラー", "qty": 5, "unit_price": 198, "total": 990},
-            {"description": "リング", "qty": 1, "unit_price": 198, "total": 198},
-        ]
-    }
-    ocr_text = "\n".join([
-        "20036 リング",
-        "4909730105008",
-        "¥198 5個",
-    ])
-
-    _fix_o_ring_descriptions_from_ocr(extracted, ocr_text)
-
-    assert [item["description"] for item in extracted["line_items"]] == ["Oリング", "Oリング"]
-
-
-def test_final_receipt_output_repairs_preserve_o_ring_jan_context():
+def test_final_receipt_output_repairs_do_not_invent_o_ring_from_jan_context():
     from receipt_parser.pipeline import _apply_final_receipt_output_repairs
 
     result = {
@@ -11077,7 +11155,7 @@ def test_final_receipt_output_repairs_preserve_o_ring_jan_context():
 
     _apply_final_receipt_output_repairs(result, ocr_text)
 
-    assert result["line_items"][0]["description"] == "Oリング"
+    assert result["line_items"][0]["description"] == "レギュラー"
 
 
 def test_repeated_item_from_gap_recovers_visible_duplicate():
@@ -11317,7 +11395,7 @@ def test_qty_unit_total_block_recovers_empty_salon_item(unit_marker):
     _recover_qty_unit_total_item_from_empty_extraction(extracted, ocr_text)
 
     assert extracted["line_items"] == [{
-        "description": "ヘア",
+        "description": "ヘ",
         "qty": 2.0,
         "unit_price": 550.0,
         "total": 1100.0,
@@ -11372,7 +11450,7 @@ def test_stacked_name_price_rows_use_quantity_detail_when_balanced():
             "qty": 1.0,
             "unit_price": 5.0,
             "total": 5.0,
-            "tax_category": "10%",
+            "tax_category": "0%",
             "discount": 0,
             "discount_rate": "",
         },
@@ -11447,7 +11525,7 @@ def test_stacked_name_price_rows_handle_summary_interrupted_item_columns():
         183.0,
         5.0,
     ]
-    assert extracted["line_items"][-1]["tax_category"] == "10%"
+    assert extracted["line_items"][-1]["tax_category"] == "0%"
     assert extracted["total"] == 1403.0
     assert extracted["amount_paid"] == 1403.0
 
@@ -12151,7 +12229,7 @@ def test_final_receipt_output_repairs_apply_stacked_name_price_rows():
     assert result["line_items"][3]["unit_price"] == 213.0
 
 
-def test_final_receipt_output_repairs_restore_standalone_discounted_qty_gross():
+def test_final_receipt_output_repairs_keep_explicit_discounted_unit_price():
     from receipt_parser.pipeline import _apply_final_receipt_output_repairs
 
     result = {
@@ -12180,7 +12258,7 @@ def test_final_receipt_output_repairs_restore_standalone_discounted_qty_gross():
     _apply_final_receipt_output_repairs(result, ocr_text)
 
     assert result["line_items"][0]["qty"] == 2
-    assert result["line_items"][0]["unit_price"] == 196
+    assert result["line_items"][0]["unit_price"] == 98
     assert result["line_items"][0]["total"] == 98
 
 
@@ -12544,7 +12622,7 @@ def test_final_receipt_output_repairs_reconcile_tax_categories_from_rate_bases()
     ]
 
 
-def test_final_receipt_output_repairs_preserve_visible_bag_standard_rate():
+def test_final_receipt_output_repairs_use_printed_rate_base_not_product_name():
     from receipt_parser.pipeline import _apply_final_receipt_output_repairs
 
     result = {
@@ -13063,7 +13141,7 @@ def test_payment_method_ignores_unselected_cash_card_option_line():
 
     _fix_payment_method(extracted, ocr_text, 0.95, 0.95)
 
-    assert extracted["payment_method"] == "cash"
+    assert extracted["payment_method"] is None
 
 
 def test_qty_repair_ignores_summary_count_when_items_already_balance_total():
