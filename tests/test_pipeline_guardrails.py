@@ -1830,7 +1830,8 @@ POSTPROCESS_PHASE_INVARIANT_CASES = (
     ("following_ocr_price_projection", FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS, FOLLOWING_OCR_PRICE_PROJECTION_PHASE_HELPER),
     ("merchant_identity_repair", MERCHANT_IDENTITY_REPAIR_REPAIRS, MERCHANT_IDENTITY_REPAIR_PHASE_HELPER),
     ("transaction_datetime_repair", TRANSACTION_DATETIME_REPAIR_REPAIRS, TRANSACTION_DATETIME_REPAIR_PHASE_HELPER),
-    ("toll_payment_reference_repair", TOLL_PAYMENT_REFERENCE_REPAIR_REPAIRS, TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER),
+    ("payment_reference_repair", PAYMENT_REFERENCE_REPAIR_REPAIRS, PAYMENT_REFERENCE_REPAIR_PHASE_HELPER),
+    ("receipt_payer_repair", RECEIPT_PAYER_REPAIR_REPAIRS, RECEIPT_PAYER_REPAIR_PHASE_HELPER),
     ("header_location_repair", HEADER_LOCATION_REPAIR_REPAIRS, HEADER_LOCATION_REPAIR_PHASE_HELPER),
     ("bag_item_ocr_repair", BAG_ITEM_OCR_REPAIR_REPAIRS, BAG_ITEM_OCR_REPAIR_PHASE_HELPER),
     ("discount_consistency_reconciliation", DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS, DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER),
@@ -1884,7 +1885,8 @@ POSTPROCESS_PHASE_OWNERSHIP_CASES = (
     ("following_ocr_price_projection", FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS, FOLLOWING_OCR_PRICE_PROJECTION_PHASE_HELPER, FOLLOWING_OCR_PRICE_PROJECTION_PHASE_CALL_LIMIT),
     ("merchant_identity_repair", MERCHANT_IDENTITY_REPAIR_REPAIRS, MERCHANT_IDENTITY_REPAIR_PHASE_HELPER, MERCHANT_IDENTITY_REPAIR_PHASE_CALL_LIMIT),
     ("transaction_datetime_repair", TRANSACTION_DATETIME_REPAIR_REPAIRS, TRANSACTION_DATETIME_REPAIR_PHASE_HELPER, TRANSACTION_DATETIME_REPAIR_PHASE_CALL_LIMIT),
-    ("toll_payment_reference_repair", TOLL_PAYMENT_REFERENCE_REPAIR_REPAIRS, TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER, TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_CALL_LIMIT),
+    ("payment_reference_repair", PAYMENT_REFERENCE_REPAIR_REPAIRS, PAYMENT_REFERENCE_REPAIR_PHASE_HELPER, PAYMENT_REFERENCE_REPAIR_PHASE_CALL_LIMIT),
+    ("receipt_payer_repair", RECEIPT_PAYER_REPAIR_REPAIRS, RECEIPT_PAYER_REPAIR_PHASE_HELPER, RECEIPT_PAYER_REPAIR_PHASE_CALL_LIMIT),
     ("header_location_repair", HEADER_LOCATION_REPAIR_REPAIRS, HEADER_LOCATION_REPAIR_PHASE_HELPER, HEADER_LOCATION_REPAIR_PHASE_CALL_LIMIT),
     ("bag_item_ocr_repair", BAG_ITEM_OCR_REPAIR_REPAIRS, BAG_ITEM_OCR_REPAIR_PHASE_HELPER, BAG_ITEM_OCR_REPAIR_PHASE_CALL_LIMIT),
     ("discount_consistency_reconciliation", DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS, DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER, DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_CALL_LIMIT),
@@ -2017,414 +2019,40 @@ def test_final_campaign_discount_projection_debt_is_phase_owned():
     )
 
 
-def test_final_structural_item_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_STRUCTURAL_ITEM_PROJECTION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_STRUCTURAL_ITEM_PROJECTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late barcode/unit/qty/amount stack projection must be owned by the "
-        f"named {FINAL_STRUCTURAL_ITEM_PROJECTION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_STRUCTURAL_ITEM_PROJECTION_HELPER} must document the visible "
-        "barcode/JAN stack trigger and item-sum arithmetic invariant."
-    )
-
-
-def test_final_structural_item_projection_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_projection_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_STRUCTURAL_ITEM_PROJECTION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_STRUCTURAL_ITEM_PROJECTION_HELPER
-    ]
-
-    assert not direct_projection_calls, (
-        "Late barcode/unit/qty/amount stack projection should run through the "
-        "named helper so OCR row-stack triggers and item-sum invariants have "
-        "one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_projection_calls}"
-    )
-    assert 0 < len(helper_calls) <= FINAL_STRUCTURAL_ITEM_PROJECTION_STAGE_LIMIT, (
-        "Late barcode/unit/qty/amount stack projection helper calls must be "
-        "explicit and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_STRUCTURAL_ITEM_PROJECTION_STAGE_LIMIT}"
-    )
-
-
-def test_final_jan_pos_item_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_JAN_POS_ITEM_PROJECTION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_JAN_POS_ITEM_PROJECTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late JAN/POS item projection must be owned by the named "
-        f"{FINAL_JAN_POS_ITEM_PROJECTION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_JAN_POS_ITEM_PROJECTION_HELPER} must document the "
-        "JAN/POS row trigger and subtotal/rate-base arithmetic invariant."
-    )
-
-
-def test_final_jan_pos_item_projection_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_jan_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_JAN_POS_ITEM_PROJECTION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_JAN_POS_ITEM_PROJECTION_HELPER
-    ]
-
-    assert not direct_jan_calls, (
-        "Late JAN/POS item projection should run through the named helper so "
-        "barcode/JAN row evidence and subtotal arithmetic have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_jan_calls}"
-    )
-    assert (
-        0
-        < len(helper_calls)
-        <= FINAL_JAN_POS_ITEM_PROJECTION_STAGE_LIMIT
-    ), (
-        "Late JAN/POS item projection helper calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_JAN_POS_ITEM_PROJECTION_STAGE_LIMIT}"
-    )
-
-
-def test_final_barcode_qty_price_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_BARCODE_QTY_PRICE_PROJECTION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_BARCODE_QTY_PRICE_PROJECTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late barcode quantity/price row projection must be owned by the "
-        f"named {FINAL_BARCODE_QTY_PRICE_PROJECTION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_BARCODE_QTY_PRICE_PROJECTION_HELPER} must document the "
-        "barcode/JAN quantity-price row trigger and arithmetic invariant."
-    )
-
-
-def test_final_barcode_qty_price_projection_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_projection_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_BARCODE_QTY_PRICE_PROJECTION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_BARCODE_QTY_PRICE_PROJECTION_HELPER
-    ]
-
-    assert not direct_projection_calls, (
-        "Late barcode quantity/price row projection should run through the "
-        "named helper so OCR row-stack triggers and item-sum invariants have "
-        "one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_projection_calls}"
-    )
-    assert (
-        0 < len(helper_calls) <= FINAL_BARCODE_QTY_PRICE_PROJECTION_STAGE_LIMIT
-    ), (
-        "Late barcode quantity/price projection helper calls must be explicit "
-        "and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_BARCODE_QTY_PRICE_PROJECTION_STAGE_LIMIT}"
-    )
-
-
-def test_final_item_price_qty_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_ITEM_PRICE_QTY_PROJECTION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_ITEM_PRICE_QTY_PROJECTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late item price/quantity row projection must be owned by the named "
-        f"{FINAL_ITEM_PRICE_QTY_PROJECTION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_ITEM_PRICE_QTY_PROJECTION_HELPER} must document the "
-        "description-price-quantity OCR trigger and subtotal/count invariant."
-    )
-
-
-def test_final_item_price_qty_projection_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_projection_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_ITEM_PRICE_QTY_PROJECTION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_ITEM_PRICE_QTY_PROJECTION_HELPER
-    ]
-
-    assert not direct_projection_calls, (
-        "Late item price/quantity row projection should run through the "
-        "named helper so OCR layout triggers and subtotal/count invariants "
-        "have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_projection_calls}"
-    )
-    assert 0 < len(helper_calls) <= FINAL_ITEM_PRICE_QTY_PROJECTION_STAGE_LIMIT, (
-        "Late item price/quantity projection helper calls must be explicit "
-        "and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_ITEM_PRICE_QTY_PROJECTION_STAGE_LIMIT}"
-    )
-
-
-def test_final_split_price_block_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_SPLIT_PRICE_BLOCK_PROJECTION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_SPLIT_PRICE_BLOCK_PROJECTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late split price block projection must be owned by the named "
-        f"{FINAL_SPLIT_PRICE_BLOCK_PROJECTION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_SPLIT_PRICE_BLOCK_PROJECTION_HELPER} must document the "
-        "split description/price OCR trigger and subtotal invariant."
-    )
-
-
-def test_final_split_price_block_projection_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_projection_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_SPLIT_PRICE_BLOCK_PROJECTION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_SPLIT_PRICE_BLOCK_PROJECTION_HELPER
-    ]
-
-    assert not direct_projection_calls, (
-        "Late split price block projection should run through the named "
-        "helper so OCR layout triggers and subtotal invariants have one "
-        "owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_projection_calls}"
-    )
-    assert 0 < len(helper_calls) <= FINAL_SPLIT_PRICE_BLOCK_PROJECTION_STAGE_LIMIT, (
-        "Late split price block projection helper calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_SPLIT_PRICE_BLOCK_PROJECTION_STAGE_LIMIT}"
-    )
 
 
 
 
 
 
-def test_final_body_total_layout_reconstruction_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late body-total layout reconstruction must be owned by the named "
-        f"{FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_HELPER} must document "
-        "the printed body-total layout trigger and subtotal/tax invariant."
-    )
 
 
-def test_final_body_total_layout_reconstruction_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_reconstruction_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_HELPER
-    ]
-
-    assert not direct_reconstruction_calls, (
-        "Late body-total layout reconstruction should run through the named "
-        "helper so printed body-total layout triggers and subtotal/tax "
-        "invariants have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_reconstruction_calls}"
-    )
-    assert 0 < len(helper_calls) <= FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_STAGE_LIMIT, (
-        "Late body-total layout reconstruction helper calls must be explicit "
-        "and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_STAGE_LIMIT}"
-    )
 
 
-def test_final_stacked_name_price_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_STACKED_NAME_PRICE_PROJECTION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_STACKED_NAME_PRICE_PROJECTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late stacked name/price projection must be owned by the named "
-        f"{FINAL_STACKED_NAME_PRICE_PROJECTION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_STACKED_NAME_PRICE_PROJECTION_HELPER} must document the "
-        "stacked description/price OCR trigger and subtotal/rate-base "
-        "invariant."
-    )
 
 
-def test_final_stacked_name_price_projection_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_projection_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_STACKED_NAME_PRICE_PROJECTION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_STACKED_NAME_PRICE_PROJECTION_HELPER
-    ]
-
-    assert not direct_projection_calls, (
-        "Late stacked name/price projection should run through the named "
-        "helper so stacked OCR row triggers and subtotal/rate-base invariants "
-        "have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_projection_calls}"
-    )
-    assert 0 < len(helper_calls) <= FINAL_STACKED_NAME_PRICE_PROJECTION_STAGE_LIMIT, (
-        "Late stacked name/price projection helper calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_STACKED_NAME_PRICE_PROJECTION_STAGE_LIMIT}"
-    )
 
 
-def test_final_dense_sequence_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_DENSE_SEQUENCE_PROJECTION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_DENSE_SEQUENCE_PROJECTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late dense sequence projection must be owned by the named "
-        f"{FINAL_DENSE_SEQUENCE_PROJECTION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_DENSE_SEQUENCE_PROJECTION_HELPER} must document the dense "
-        "OCR item/price sequence trigger and subtotal/count invariant."
-    )
 
 
-def test_final_dense_sequence_projection_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_projection_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_DENSE_SEQUENCE_PROJECTION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_DENSE_SEQUENCE_PROJECTION_HELPER
-    ]
 
-    assert not direct_projection_calls, (
-        "Late dense sequence projection should run through the named helper "
-        "so dense OCR row triggers and subtotal/count invariants have one "
-        "owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_projection_calls}"
-    )
-    assert 0 < len(helper_calls) <= FINAL_DENSE_SEQUENCE_PROJECTION_STAGE_LIMIT, (
-        "Late dense sequence projection helper calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_DENSE_SEQUENCE_PROJECTION_STAGE_LIMIT}"
-    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def test_final_header_location_repair_helper_is_named_and_invariant_backed():
@@ -2476,112 +2104,12 @@ def test_final_header_location_repair_debt_is_helper_owned():
     )
 
 
-def test_final_single_rate_inclusive_tax_restoration_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late single-rate inclusive tax restoration must be owned by the named "
-        f"{FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_HELPER} must document "
-        "the printed single-rate inclusive tax trigger and total/tax "
-        "arithmetic invariant."
-    )
 
 
-def test_final_single_rate_inclusive_tax_restoration_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_tax_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "Late single-rate inclusive tax restoration should run through the "
-        "named helper so printed target/tax triggers and total/tax invariants "
-        "have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_tax_calls}"
-    )
-    assert (
-        0
-        < len(helper_calls)
-        <= FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT
-    ), (
-        "Late single-rate inclusive tax restoration helper calls must be "
-        "explicit and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT}"
-    )
 
 
-def test_final_stacked_inclusive_tax_restoration_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late stacked inclusive tax restoration must be owned by the named "
-        f"{FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_HELPER} must document the "
-        "stacked printed inclusive tax trigger and tax summary arithmetic "
-        "invariant."
-    )
 
 
-def test_final_stacked_inclusive_tax_restoration_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_tax_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "Late stacked inclusive tax restoration should run through the named "
-        "helper so stacked summary triggers and tax arithmetic invariants have "
-        "one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_tax_calls}"
-    )
-    assert (
-        0 < len(helper_calls) <= FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT
-    ), (
-        "Late stacked inclusive tax restoration helper calls must be explicit "
-        "and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT}"
-    )
 
 
 def test_final_printed_summary_total_repair_helper_is_named_and_invariant_backed():
@@ -2659,57 +2187,8 @@ def test_postprocess_printed_summary_total_repair_helper_is_named_and_invariant_
 
 
 
-def test_final_printed_item_sum_total_repair_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPERS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late printed item-sum total repair must be owned by the named "
-        f"{FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPER} must document the "
-        "printed item-sum total trigger and item/tax/payment arithmetic "
-        "invariant."
-    )
 
 
-def test_final_printed_item_sum_total_repair_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_total_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPERS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPER
-    ]
-
-    assert not direct_total_calls, (
-        "Late printed item-sum total repair should run through the named "
-        "helper so printed total triggers and item/tax/payment arithmetic "
-        "invariants have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_total_calls}"
-    )
-    assert (
-        0 < len(helper_calls) <= FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_STAGE_LIMIT
-    ), (
-        "Late printed item-sum total repair helper calls must be explicit "
-        "and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_STAGE_LIMIT}"
-    )
 
 
 def test_postprocess_printed_item_sum_total_repair_helper_is_named_and_invariant_backed():
@@ -2734,105 +2213,12 @@ def test_postprocess_printed_item_sum_total_repair_helper_is_named_and_invariant
 
 
 
-def test_final_cash_tender_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_CASH_TENDER_RECONCILIATION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_CASH_TENDER_RECONCILIATION_HELPERS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late cash tender/change repair must be owned by the named "
-        f"{FINAL_CASH_TENDER_RECONCILIATION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_CASH_TENDER_RECONCILIATION_HELPER} must document the "
-        "visible cash tender/change trigger and printed total/tender/change "
-        "arithmetic invariant."
-    )
 
 
-def test_final_cash_tender_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_cash_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_CASH_TENDER_RECONCILIATION_HELPERS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_CASH_TENDER_RECONCILIATION_HELPER
-    ]
-
-    assert not direct_cash_calls, (
-        "Late cash tender/change repair should run through the named helper "
-        "so printed total, tendered amount, and change arithmetic have one "
-        "owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_cash_calls}"
-    )
-    assert 0 < len(helper_calls) <= FINAL_CASH_TENDER_RECONCILIATION_STAGE_LIMIT, (
-        "Late cash tender/change helper calls must be explicit and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_CASH_TENDER_RECONCILIATION_STAGE_LIMIT}"
-    )
 
 
-def test_final_payment_points_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_PAYMENT_POINTS_RECONCILIATION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_PAYMENT_POINTS_RECONCILIATION_HELPERS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late points/payment repair must be owned by the named "
-        f"{FINAL_PAYMENT_POINTS_RECONCILIATION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_PAYMENT_POINTS_RECONCILIATION_HELPER} must document the OCR "
-        "points/payment trigger and total minus points payment invariant."
-    )
 
 
-def test_final_payment_points_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_payment_points_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_PAYMENT_POINTS_RECONCILIATION_HELPERS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_PAYMENT_POINTS_RECONCILIATION_HELPER
-    ]
-
-    assert not direct_payment_points_calls, (
-        "Late points/payment repair should run through the named helper so "
-        "OCR point-use evidence and total minus points payment arithmetic "
-        "have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_payment_points_calls}"
-    )
-    assert (
-        0 < len(helper_calls) <= FINAL_PAYMENT_POINTS_RECONCILIATION_STAGE_LIMIT
-    ), (
-        "Late points/payment helper calls must be explicit and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_PAYMENT_POINTS_RECONCILIATION_STAGE_LIMIT}"
-    )
 
 
 def test_final_tax_category_reconciliation_helper_is_named_and_invariant_backed():
@@ -2939,62 +2325,8 @@ def test_final_external_tax_total_restoration_debt_is_helper_owned():
     )
 
 
-def test_final_printed_external_tax_amount_restoration_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(
-        tree,
-        FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_HELPER,
-    )
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late printed external-tax amount restoration must be owned by the "
-        f"named {FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_HELPER} must document "
-        "the printed external-tax amount trigger and tax/base/total consistency "
-        "invariant."
-    )
 
 
-def test_final_printed_external_tax_amount_restoration_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_tax_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "Late printed external-tax amount restoration should run through the "
-        "named helper so OCR tax amount evidence and tax/base/total consistency "
-        "have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_tax_calls}"
-    )
-    assert (
-        0
-        < len(helper_calls)
-        <= FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_STAGE_LIMIT
-    ), (
-        "Late printed external-tax amount helper calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_STAGE_LIMIT}"
-    )
 
 
 def test_printed_external_tax_amount_restoration_phase_is_named_and_invariant_backed():
@@ -3024,62 +2356,8 @@ def test_printed_external_tax_amount_restoration_phase_is_named_and_invariant_ba
 
 
 
-def test_final_bare_number_tax_summary_restoration_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(
-        tree,
-        FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_HELPER,
-    )
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late bare-number tax-summary restoration must be owned by the named "
-        f"{FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_HELPER} must document "
-        "the bare numeric tax-summary stack trigger and rate/tax arithmetic "
-        "invariant."
-    )
 
 
-def test_final_bare_number_tax_summary_restoration_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_tax_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "Late bare-number tax-summary restoration should run through the "
-        "named helper so numeric tax stack evidence and rate/tax arithmetic "
-        "have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_tax_calls}"
-    )
-    assert (
-        0
-        < len(helper_calls)
-        <= FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_STAGE_LIMIT
-    ), (
-        "Late bare-number tax-summary helper calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_STAGE_LIMIT}"
-    )
 
 
 def test_bare_number_tax_summary_restoration_phase_is_named_and_invariant_backed():
@@ -3108,62 +2386,8 @@ def test_bare_number_tax_summary_restoration_phase_is_named_and_invariant_backed
 
 
 
-def test_final_small_target_only_tax_pruning_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(
-        tree,
-        FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_HELPER,
-    )
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late small target-only tax pruning must be owned by the named "
-        f"{FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_HELPER} must document the "
-        "unprinted target-only tax trigger and printed tax/subtotal arithmetic "
-        "invariant."
-    )
 
 
-def test_final_small_target_only_tax_pruning_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_tax_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_HELPER
-    ]
-
-    assert not direct_tax_calls, (
-        "Late small target-only tax pruning should run through the named "
-        "helper so printed rate-base evidence and tax/subtotal consistency "
-        "have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_tax_calls}"
-    )
-    assert (
-        0
-        < len(helper_calls)
-        <= FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_STAGE_LIMIT
-    ), (
-        "Late small target-only tax pruning helper calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_STAGE_LIMIT}"
-    )
 
 
 def test_final_coupon_discount_projection_helper_is_named_and_invariant_backed():
@@ -3219,58 +2443,8 @@ def test_final_coupon_discount_projection_debt_is_helper_owned():
 
 
 
-def test_final_following_ocr_price_projection_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late following-OCR price projection must be owned by the named "
-        f"{FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER} must document the "
-        "following OCR amount trigger and item-sum/rate-base invariant."
-    )
 
 
-def test_final_following_ocr_price_projection_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_price_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER
-    ]
-
-    assert not direct_price_calls, (
-        "Late following-OCR price projection should run through the named "
-        "helper so repeated OCR amount evidence and subtotal/rate-base "
-        "arithmetic have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_price_calls}"
-    )
-    assert (
-        0
-        < len(helper_calls)
-        <= FINAL_FOLLOWING_OCR_PRICE_PROJECTION_STAGE_LIMIT
-    ), (
-        "Late following-OCR price projection helper calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_FOLLOWING_OCR_PRICE_PROJECTION_STAGE_LIMIT}"
-    )
 
 
 
@@ -3479,119 +2653,16 @@ def test_final_duplicate_row_cleanup_debt_is_removed():
     )
 
 
-def test_final_discount_consistency_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(
-        tree,
-        FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_HELPER,
-    )
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late discount consistency reconciliation must be owned by the named "
-        f"{FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_HELPER} must document "
-        "the negative-line-before-own-price trigger and item total/discount "
-        "field consistency invariant."
-    )
-
-
-def test_final_discount_consistency_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_discount_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_HELPER
-    ]
-
-    assert not direct_discount_calls, (
-        "Late discount consistency reconciliation should run through the "
-        "named helper so OCR discount placement and item discount arithmetic "
-        "have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_discount_calls}"
-    )
-    assert (
-        0
-        < len(helper_calls)
-        <= FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_STAGE_LIMIT
-    ), (
-        "Late discount consistency reconciliation helper calls must be "
-        "explicit and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_STAGE_LIMIT}"
-    )
 
 
 
 
 
 
-def test_final_quantity_detail_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_QUANTITY_DETAIL_RECONCILIATION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_QUANTITY_DETAIL_RECONCILIATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late quantity-detail reconciliation must be owned by the named "
-        f"{FINAL_QUANTITY_DETAIL_RECONCILIATION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_QUANTITY_DETAIL_RECONCILIATION_HELPER} must document the "
-        "OCR quantity/unit-line trigger and qty times unit equals total invariant."
-    )
 
 
-def test_final_quantity_detail_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_qty_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_QUANTITY_DETAIL_RECONCILIATION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_QUANTITY_DETAIL_RECONCILIATION_HELPER
-    ]
 
-    assert not direct_qty_calls, (
-        "Late quantity-detail reconciliation should run through the named "
-        "helper so OCR unit-line evidence and qty/unit/total consistency have "
-        "one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_qty_calls}"
-    )
-    assert (
-        0
-        < len(helper_calls)
-        <= FINAL_QUANTITY_DETAIL_RECONCILIATION_STAGE_LIMIT
-    ), (
-        "Late quantity-detail helper calls must be explicit and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_QUANTITY_DETAIL_RECONCILIATION_STAGE_LIMIT}"
-    )
+
 
 
 def test_final_ocr_description_reconciliation_helper_is_named_and_invariant_backed():
@@ -3706,121 +2777,25 @@ def test_final_adjacent_price_shift_reconciliation_debt_is_helper_owned():
     )
 
 
-def test_final_prefixed_tax_marker_item_rows_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(
-        tree,
-        FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER,
-    )
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late prefixed tax-marker item row projection must be owned by the "
-        f"named {FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER} must document the OCR "
-        "tax-marker row trigger and subtotal/rate-base balance invariant."
-    )
 
 
-def test_final_prefixed_tax_marker_item_rows_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_marker_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER
-    ]
-
-    assert not direct_marker_calls, (
-        "Late prefixed tax-marker item row projection should run through the "
-        "named helper so OCR marker evidence and subtotal/rate-base arithmetic "
-        "have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_marker_calls}"
-    )
-    assert (
-        0
-        < len(helper_calls)
-        <= FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_STAGE_LIMIT
-    ), (
-        "Late prefixed tax-marker item row helper calls must be explicit and "
-        "bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_STAGE_LIMIT}"
-    )
 
 
-def test_final_gap_item_recovery_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_GAP_ITEM_RECOVERY_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_GAP_ITEM_RECOVERY_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late gap item recovery must be owned by the named "
-        f"{FINAL_GAP_ITEM_RECOVERY_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_GAP_ITEM_RECOVERY_HELPER} must document the OCR gap trigger "
-        "and item-sum/subtotal balance invariant."
-    )
 
 
-def test_final_gap_item_recovery_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_gap_calls = [
-        name for name in final_calls if name in FINAL_GAP_ITEM_RECOVERY_REPAIRS
-    ]
-    helper_calls = [
-        name for name in final_calls if name == FINAL_GAP_ITEM_RECOVERY_HELPER
-    ]
-
-    assert not direct_gap_calls, (
-        "Late gap item recovery should run through the named helper so OCR "
-        "gap evidence and item-sum arithmetic have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_gap_calls}"
-    )
-    assert 0 < len(helper_calls) <= FINAL_GAP_ITEM_RECOVERY_STAGE_LIMIT, (
-        "Late gap item recovery helper calls must be explicit and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_GAP_ITEM_RECOVERY_STAGE_LIMIT}"
-    )
 
 
 def test_final_repeated_gap_item_recovery_debt_is_removed():
     tree = _parse_file(FINAL_OUTPUT_PATH)
     final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_helper = _function_def(tree, FINAL_GAP_ITEM_RECOVERY_HELPER)
     final_calls = _call_names_in_function(final_repairs)
 
     assert (
         RETIRED_FINAL_REPEATED_GAP_ITEM_RECOVERY_REPAIR
-        not in _call_names_in_function(final_helper)
+        not in final_calls
     ), (
         "Repeated item gap recovery should be owned by postprocess gap item "
-        "recovery, not by the late final gap helper."
-    )
-    assert FINAL_GAP_ITEM_RECOVERY_HELPER in final_calls, (
-        "The final gap helper should remain for missing item gap recovery only."
+        "recovery, not by final receipt-output repairs."
     )
     assert (
         RETIRED_FINAL_REPEATED_GAP_ITEM_RECOVERY_STAGE
@@ -3831,48 +2806,6 @@ def test_final_repeated_gap_item_recovery_debt_is_removed():
     )
 
 
-def test_final_basket_marker_rows_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_BASKET_MARKER_ROWS_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_BASKET_MARKER_ROWS_REPAIRS - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late basket marker row projection must be owned by the named "
-        f"{FINAL_BASKET_MARKER_ROWS_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_BASKET_MARKER_ROWS_HELPER} must document the OCR basket "
-        "marker trigger and subtotal/rate-base arithmetic invariant."
-    )
-
-
-def test_final_basket_marker_rows_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_basket_calls = [
-        name for name in final_calls if name in FINAL_BASKET_MARKER_ROWS_REPAIRS
-    ]
-    helper_calls = [
-        name for name in final_calls if name == FINAL_BASKET_MARKER_ROWS_HELPER
-    ]
-
-    assert not direct_basket_calls, (
-        "Late basket marker row projection should run through the named helper "
-        "so OCR basket marker evidence and subtotal/rate-base arithmetic have "
-        "one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_basket_calls}"
-    )
-    assert 0 < len(helper_calls) <= FINAL_BASKET_MARKER_ROWS_STAGE_LIMIT, (
-        "Late basket marker row helper calls must be explicit and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_BASKET_MARKER_ROWS_STAGE_LIMIT}"
-    )
 
 
 
@@ -3891,58 +2824,10 @@ def test_final_basket_marker_rows_debt_is_helper_owned():
 
 
 
-def test_final_bag_item_rate_base_reconciliation_helper_is_named_and_invariant_backed():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    helper = _function_def(tree, FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_HELPER)
-    docstring = ast.get_docstring(helper) or ""
-
-    missing_repairs = sorted(
-        FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS
-        - set(_call_names_in_function(helper))
-    )
-    assert not missing_repairs, (
-        "Late bag item price/rate-base reconciliation must be owned by the "
-        f"named {FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_HELPER} helper.\n"
-        f"Missing helper calls: {missing_repairs}"
-    )
-    assert "Trigger:" in docstring and "Invariant:" in docstring, (
-        f"{FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_HELPER} must document "
-        "the tiny printed 10% rate-base trigger and paid-bag total invariant."
-    )
 
 
-def test_final_bag_item_rate_base_reconciliation_debt_is_helper_owned():
-    tree = _parse_file(FINAL_OUTPUT_PATH)
-    final_repairs = _function_def(tree, "_apply_final_receipt_output_repairs")
-    final_calls = _call_names_in_function(final_repairs)
-    direct_bag_calls = [
-        name
-        for name in final_calls
-        if name in FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS
-    ]
-    helper_calls = [
-        name
-        for name in final_calls
-        if name == FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_HELPER
-    ]
 
-    assert not direct_bag_calls, (
-        "Late bag item price/rate-base reconciliation should run through the "
-        "named helper so paid-bag evidence and printed 10% rate-base "
-        "arithmetic have one owner.\n"
-        "Direct calls still in _apply_final_receipt_output_repairs: "
-        f"{direct_bag_calls}"
-    )
-    assert (
-        0
-        < len(helper_calls)
-        <= FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_STAGE_LIMIT
-    ), (
-        "Late bag item price/rate-base reconciliation helper calls must be "
-        "explicit and bounded.\n"
-        f"Current count: {len(helper_calls)}; "
-        f"limit: {FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_STAGE_LIMIT}"
-    )
+
 
 
 
@@ -4095,6 +2980,66 @@ def test_final_receipt_output_repairs_are_explicit_traced_stages():
         "phase and a non-empty reason.\n"
         f"Malformed: {malformed}"
     )
+
+
+def test_every_declared_postprocess_phase_write_is_traceable():
+    from receipt_parser.receipt_phase_trace import (
+        POSTPROCESS_MUTATION_FIELDS,
+        POSTPROCESS_PHASES,
+    )
+
+    traced = set(POSTPROCESS_MUTATION_FIELDS)
+    declared = {field for phase in POSTPROCESS_PHASES for field in phase["writes"]}
+
+    assert declared <= traced
+    assert {"time", "payment_reference", "account_number", "usage"} <= traced
+
+
+def test_structural_japanese_classifier_handles_generic_header_and_payment_regexes():
+    assert _looks_structural_japanese_gate_literal(
+        r"ご?購入店|ご来?店|支払|決済|商品(?:名)?"
+    )
+    assert _looks_structural_japanese_literal(
+        r"カード払(?:い)?で|(?:カード|クレジット).*(?:募集中|おすすめ|特典|なら)"
+    )
+    assert _looks_structural_japanese_literal(
+        r"(?:データ\s*No\.?|クレ通番|照会番号|受付番号|参照番号)"
+    )
+    assert _looks_structural_japanese_literal(r"[^\d¥￥]{2,32}カード")
+    assert _looks_structural_japanese_gate_literal(r"\d[\d,]*\s*非\s*$")
+    assert _looks_structural_japanese_gate_literal(r"(?:総)?合計|現計")
+    assert _looks_structural_japanese_gate_literal(
+        r"数量|単価|金額|料金|P[- ]?\d+"
+    )
+    assert all(
+        _looks_structural_japanese_gate_literal(value)
+        for value in (
+            "取扱番号",
+            "取引No: ",
+            "登録",
+            "伝票",
+            "領",
+            r"(?:番号|No\.?|TID)\s*[:：]?\s*$",
+            r"まとめ\s*(?:値引き?|割引き?)",
+            r"本体\s*合\s*計",
+            r"現金|フリー",
+            r"デビット(?:カード)?|銀行振込|口座振替|口座引落",
+            r"(?:給油所|サービスステーション|\bSS\b)",
+            r"会社|組合|局|水道|ガス|電力|発行(?:元|者)|請求(?:元|者)|供給(?:元|者)|事業者",
+            r"(?:様|御中)\s*$",
+        )
+    )
+
+
+def test_structural_japanese_classifier_still_rejects_product_and_location_alternations():
+    for bespoke_pattern in (
+        r"有料レジ袋|お買い物袋",
+        r"数量|有料レジ袋",
+        r"給油所|セルフ青空",
+        r"サービスステーション|青空中央",
+    ):
+        assert not _looks_structural_japanese_gate_literal(bespoke_pattern)
+        assert not _looks_structural_japanese_literal(bespoke_pattern)
 
 
 def test_no_new_suspicious_japanese_product_or_location_literals():
