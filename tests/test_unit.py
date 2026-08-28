@@ -13228,3 +13228,1293 @@ def test_reduced_rate_legend_does_not_override_single_standard_rate_base():
     )
 
     assert {item["tax_category"] for item in items} == {"10%"}
+
+
+def test_single_service_printed_numeric_tax_summary_is_not_cleared():
+    from receipt_parser.receipt_items import _fix_single_service_inclusive_tax
+
+    printed_tax = {
+        "total": 1100,
+        "subtotal": 1000,
+        "taxes": [{"rate": "10%", "label": "内税", "amount": 100}],
+        "line_items": [{"description": "通行料金", "total": 1100}],
+    }
+    _fix_single_service_inclusive_tax(
+        printed_tax,
+        "通行料金\n¥1,100\n消費税率 10%\n消費税額 ¥100",
+    )
+
+    assert printed_tax["subtotal"] == 1000
+    assert printed_tax["taxes"] == [
+        {"rate": "10%", "label": "内税", "amount": 100}
+    ]
+    assert printed_tax["line_items"][0]["tax_category"] == "10%"
+
+
+def test_bare_receipt_cleanup_keeps_visible_sole_service_item():
+    from receipt_parser.receipt_items import _fix_bare_service_receipt_without_itemization
+
+    item = {"description": "駐車料金", "qty": 1, "unit_price": 250, "total": 250}
+    extracted = {"total": 250, "line_items": [item]}
+
+    _fix_bare_service_receipt_without_itemization(
+        extracted,
+        "領収書\n受領金額\n250円\n駐車料金 消費税率 10%",
+    )
+
+    assert extracted["line_items"] == [item]
+
+
+def test_mixed_external_and_inclusive_rate_bases_keep_printed_total():
+    from receipt_parser.receipt_financial import extract_financial_totals
+
+    totals = extract_financial_totals("\n".join([
+        "合計",
+        "¥1,080",
+        "外税10%対象額 ¥700",
+        "内税8%対象額 ¥500",
+    ]))
+
+    assert totals["total"] == 1080
+
+
+def test_vertical_tax_stack_skips_leading_gross_for_valid_pair():
+    from receipt_parser.receipt_financial import _vertical_inner_tax_table_entries
+
+    entries = _vertical_inner_tax_table_entries([
+        "内税",
+        "税率",
+        "10.0",
+        "%",
+        "取引金額",
+        "2200",
+        "税抜き",
+        "2000",
+        "税額",
+        "200",
+        "担当者",
+    ])
+
+    assert entries == [("10%", "base", 2000.0), ("10%", "tax", 200.0)]
+
+
+def test_vertical_tax_stack_rejects_large_invalid_pair():
+    from receipt_parser.receipt_financial import _vertical_inner_tax_table_entries
+
+    entries = _vertical_inner_tax_table_entries([
+        "内税",
+        "税率10%",
+        "税抜き",
+        "税額",
+        "100000",
+        "10100",
+    ])
+
+    assert entries == []
+
+
+@pytest.mark.parametrize(("ocr_text", "expected"), [
+    ("預り\n釣", None),
+    ("お預かり: ￥1,000 円\nお釣り: ￥100 円", "cash"),
+])
+def test_payment_method_recognizes_bare_and_inline_cash_labels(ocr_text, expected):
+    from receipt_parser.receipt_identity_payment import _fix_payment_method
+
+    extracted = {"payment_method": None}
+    _fix_payment_method(extracted, ocr_text, 0.9, {})
+
+    assert extracted["payment_method"] == expected
+
+
+def test_waon_cash_change_pair_preserves_total_and_marks_mixed_tender():
+    from receipt_parser.receipt_identity_payment import (
+        _fix_payment_method,
+        _fix_total_from_stacked_cash_tender_block,
+    )
+    from receipt_parser.receipt_postprocess_phases import (
+        _run_payment_points_reconciliation_phase,
+    )
+
+    extracted = {"total": 500, "amount_paid": 450, "payment_method": None}
+    ocr_text = "\n".join([
+        "合計",
+        "500",
+        "WAON支払額 450",
+        "現金",
+        "100",
+        "お釣り",
+        "50",
+    ])
+
+    _fix_total_from_stacked_cash_tender_block(extracted, ocr_text)
+    _fix_payment_method(extracted, ocr_text, 0.9, {})
+    _run_payment_points_reconciliation_phase(
+        extracted,
+        ocr_text,
+        0.9,
+        {},
+        ("points_used", "points_payment"),
+    )
+
+    assert extracted["total"] == 500
+    assert extracted["amount_paid"] == 500
+    assert extracted["payment_method"] is None
+
+
+@pytest.mark.parametrize(("merchant", "ocr_text"), [
+    ("ABC", "ABC\n印\n領収書"),
+    ("青空商会", "APP 青空商会\n領収書"),
+])
+def test_valid_merchant_survives_short_stamp_and_prefix_noise(merchant, ocr_text):
+    from receipt_parser.receipt_identity_payment import _fix_company_name_merchant
+
+    extracted = {"merchant": merchant}
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == merchant
+
+
+def test_single_rate_inclusive_tax_preserves_coherent_existing_summary():
+    from receipt_parser.receipt_late_repairs import _restore_single_rate_inclusive_tax_block
+
+    extracted = {
+        "total": 110,
+        "subtotal": 100,
+        "taxes": [{"rate": "10%", "label": "内税", "amount": 10}],
+    }
+
+    _restore_single_rate_inclusive_tax_block(
+        extracted,
+        "10%対象 110 内消費税 9",
+    )
+
+    assert extracted["subtotal"] == 100
+    assert extracted["taxes"] == [
+        {"rate": "10%", "label": "内税", "amount": 10}
+    ]
+
+
+def test_single_rate_inclusive_tax_rejects_malformed_inline_candidate():
+    from receipt_parser.receipt_late_repairs import _restore_single_rate_inclusive_tax_block
+
+    extracted = {"total": 1100, "taxes": []}
+
+    _restore_single_rate_inclusive_tax_block(
+        extracted,
+        "10%対象 1100 内消費税 50",
+    )
+
+    assert extracted == {"total": 1100, "taxes": []}
+
+
+def test_single_rate_inclusive_tax_rejects_item_base_that_is_not_gross_total():
+    from receipt_parser.receipt_late_repairs import _restore_single_rate_inclusive_tax_block
+
+    extracted = {
+        "total": 1100,
+        "taxes": [],
+        "line_items": [{"description": "サービス", "total": 1000}],
+    }
+
+    _restore_single_rate_inclusive_tax_block(
+        extracted,
+        "10%対象 1000 内消費税 91",
+    )
+
+    assert extracted == {
+        "total": 1100,
+        "taxes": [],
+        "line_items": [{"description": "サービス", "total": 1000}],
+    }
+
+
+def test_line_item_cleanup_stops_when_rows_balance_canonical_subtotal(monkeypatch):
+    from receipt_parser import receipt_items
+
+    extracted = {
+        "total": 110,
+        "subtotal": 100,
+        "taxes": [{"rate": "10%", "label": "外税", "amount": 10}],
+        "line_items": [
+            {"description": "商品甲", "qty": 1, "unit_price": 40, "total": 40},
+            {"description": "商品乙", "qty": 1, "unit_price": 60, "total": 60},
+        ],
+    }
+    monkeypatch.setattr(
+        receipt_items,
+        "_fix_item_desc_from_ocr_price_line",
+        lambda *_args: pytest.fail("broad cleanup should not run for balanced rows"),
+    )
+
+    receipt_items._fix_line_items(extracted, "商品甲\n40\n商品乙\n60\n合計\n110")
+
+    assert [item["total"] for item in extracted["line_items"]] == [40, 60]
+
+
+def test_non_product_cleanup_drops_split_summary_fragments():
+    from receipt_parser.receipt_items import _drop_non_product_line_items
+
+    extracted = {
+        "total": 100,
+        "line_items": [
+            {"description": "商品甲", "total": 100},
+            {"description": "合", "total": 10},
+            {"description": "計", "total": 20},
+            {"description": "総 計", "total": 30},
+        ],
+    }
+
+    _drop_non_product_line_items(extracted, "商品甲\n¥100\n合\n計\n総 計\n合計\n¥100")
+
+    assert extracted["line_items"] == [{"description": "商品甲", "total": 100}]
+
+
+def test_repeated_header_marker_projection_uses_unique_balanced_rows():
+    from receipt_parser.receipt_row_projection import _replace_dense_item_rows_when_balanced
+
+    extracted = {
+        "total": 300,
+        "taxes": [{"rate": "10%", "label": "内税", "amount": 27}],
+        "line_items": [{"description": "既存商品", "qty": 1, "unit_price": 300, "total": 300}],
+    }
+    ocr_text = "\n".join([
+        "品目 111111",
+        "商品甲",
+        "1000",
+        "0",
+        "品目 222222",
+        "商品乙",
+        "2000",
+        "0",
+        "購入点数",
+        "2",
+        "合計",
+        "300",
+        "価格横の数字は軽減税率区分",
+    ])
+
+    _replace_dense_item_rows_when_balanced(extracted, ocr_text)
+
+    assert [item["description"] for item in extracted["line_items"]] == ["商品甲", "商品乙"]
+    assert [item["total"] for item in extracted["line_items"]] == [100.0, 200.0]
+    assert {item["tax_category"] for item in extracted["line_items"]} == {"10%"}
+
+
+@pytest.mark.parametrize(("target", "first_amount", "second_amount"), [
+    (110, "100", "100"),
+    (350, "1000", "2000"),
+])
+def test_repeated_header_marker_projection_leaves_ambiguous_or_unmatched_rows(
+    target,
+    first_amount,
+    second_amount,
+):
+    from receipt_parser.receipt_row_projection import _replace_dense_item_rows_when_balanced
+
+    existing = {"description": "既存商品", "qty": 1, "unit_price": target, "total": target}
+    extracted = {
+        "total": target,
+        "taxes": [{"rate": "10%", "label": "内税", "amount": 10}],
+        "line_items": [existing],
+    }
+    ocr_text = "\n".join([
+        "品目 111111",
+        "商品甲",
+        first_amount,
+        "0",
+        "品目 222222",
+        "商品乙",
+        second_amount,
+        "0",
+        "購入点数",
+        "2",
+        "合計",
+        str(target),
+        "価格横の数字は軽減税率区分",
+    ])
+
+    _replace_dense_item_rows_when_balanced(extracted, ocr_text)
+
+    assert extracted["line_items"] == [existing]
+
+
+@pytest.mark.parametrize(
+    ("ocr_text", "expected_taxes"),
+    [
+        (
+            "10%対象 1,100 消費税 100",
+            [{"rate": "10%", "label": "内税", "amount": 100.0}],
+        ),
+        ("10%対象 1,100 消費税 50", []),
+        ("10%対象 1,100 消費税 100\n8%対象 ¥500", []),
+    ],
+)
+def test_plain_single_rate_inclusive_tax_requires_unique_arithmetic_block(
+    ocr_text,
+    expected_taxes,
+):
+    from receipt_parser.receipt_late_repairs import _restore_single_rate_inclusive_tax_block
+
+    extracted = {"total": 1100, "taxes": []}
+
+    _restore_single_rate_inclusive_tax_block(extracted, ocr_text)
+
+    assert extracted["taxes"] == expected_taxes
+    assert extracted.get("subtotal") == (1000.0 if expected_taxes else None)
+
+
+@pytest.mark.parametrize(
+    ("printed_amounts", "expected_amount"),
+    [([1100, 100], 100), ([1100, 100, 101], 1100)],
+)
+def test_split_inclusive_tax_uses_only_unique_arithmetic_amount(
+    printed_amounts,
+    expected_amount,
+):
+    from receipt_parser.receipt_recovery import _fix_printed_tax_amounts_from_structural_blocks
+
+    extracted = {
+        "total": 1100,
+        "taxes": [{"rate": "10%", "label": "内税", "amount": 1100}],
+    }
+    ocr_text = "10%対象 ¥1,100\n" + "\n".join(
+        f"内消費税 ¥{amount:,}" for amount in printed_amounts
+    )
+
+    _fix_printed_tax_amounts_from_structural_blocks(extracted, ocr_text)
+
+    assert extracted["taxes"][0]["amount"] == expected_amount
+
+
+def test_discount_repairs_scan_through_label_and_remain_idempotent():
+    from receipt_parser.receipt_item_cleanup import (
+        _fix_discounted_item_gross_prices_from_ocr,
+        _repair_discounted_line_item_totals_when_balanced,
+    )
+    from receipt_parser.receipt_marker_projection import _fix_qty_totals_from_ocr_unit_lines
+    from receipt_parser.receipt_projection import _fix_item_totals_from_ocr_neighborhood
+
+    shifted = [{"description": "一般商品甲乙", "qty": 1, "unit_price": 130, "total": 130}]
+    _fix_item_totals_from_ocr_neighborhood(
+        shifted,
+        "一般商品甲乙\nまとめ値引\n100\n小計\n100",
+        target_subtotal=100,
+        target_total=100,
+    )
+    assert shifted[0]["total"] == 100
+
+    extracted = {
+        "subtotal": 300,
+        "total": 300,
+        "line_items": [{
+            "description": "一般商品甲乙",
+            "qty": 2,
+            "unit_price": 158,
+            "total": 300,
+            "discount": 16,
+            "discount_rate": "",
+        }],
+    }
+    ocr_text = "一般商品甲乙\n316\n(2コX単158)\n値引\n-16\n小計\n300"
+    expected = [dict(extracted["line_items"][0])]
+
+    for _ in range(2):
+        _fix_discounted_item_gross_prices_from_ocr(extracted, ocr_text)
+        _repair_discounted_line_item_totals_when_balanced(extracted, ocr_text)
+        _fix_qty_totals_from_ocr_unit_lines(extracted, ocr_text)
+
+    assert extracted["line_items"] == expected
+
+
+@pytest.mark.parametrize(("printed_total", "expected_qty"), [(596, 2.0), (595, 1)])
+def test_missing_qty_digit_requires_exact_local_multiple(printed_total, expected_qty):
+    from receipt_parser.receipt_item_repair import _fix_qty_from_ocr_patterns
+
+    items = [{
+        "description": "一般商品甲乙",
+        "qty": 1,
+        "unit_price": printed_total,
+        "total": printed_total,
+        "discount": 0,
+    }]
+
+    _fix_qty_from_ocr_patterns(
+        items,
+        f"一般商品甲乙\nコX単298\n{printed_total}*\n小計\n{printed_total}",
+    )
+
+    assert items[0]["qty"] == expected_qty
+    assert items[0]["total"] == printed_total
+    assert items[0]["unit_price"] == (298 if expected_qty == 2 else printed_total)
+
+
+def test_digit_misread_requires_independent_ocr_structure():
+    from receipt_parser.receipt_item_repair import _fix_digit_misread_items
+
+    unique = {
+        "line_items": [
+            {"description": "商品甲", "qty": 1, "unit_price": 90, "total": 90},
+            {"description": "商品乙", "qty": 1, "unit_price": 45, "total": 45},
+        ]
+    }
+    _fix_digit_misread_items(unique, "商品甲\n¥90\n商品乙\n¥45\n小計\n¥143")
+    assert [item["total"] for item in unique["line_items"]] == [90, 45]
+
+    count_complete = {
+        "line_items": [
+            {"description": "商品甲", "qty": 1, "unit_price": 90, "total": 90},
+            {"description": "商品乙", "qty": 1, "unit_price": 45, "total": 45},
+        ]
+    }
+    _fix_digit_misread_items(
+        count_complete,
+        "商品甲\n¥90\n商品乙\n¥45\n小計/ 2点\n小計\n¥143",
+    )
+    assert [item["total"] for item in count_complete["line_items"]] == [98.0, 45]
+
+    ambiguous = {
+        "line_items": [
+            {"description": "商品甲", "qty": 1, "unit_price": 90, "total": 90},
+            {"description": "商品乙", "qty": 1, "unit_price": 100, "total": 100},
+        ]
+    }
+    _fix_digit_misread_items(ambiguous, "商品甲\n¥90\n商品乙\n¥100\n小計\n¥198")
+    assert [item["total"] for item in ambiguous["line_items"]] == [90, 100]
+
+
+@pytest.mark.parametrize("boundary", ["TEL 000-0000", "2099年12月31日"])
+def test_qty_code_description_lookup_stops_at_header_boundary(boundary):
+    from receipt_parser.receipt_items import _fix_qty_code_row_descriptions_from_ocr
+
+    extracted = {
+        "line_items": [{"description": "現在の商品", "qty": 2, "unit_price": 100, "total": 200}]
+    }
+    _fix_qty_code_row_descriptions_from_ocr(
+        extracted,
+        f"123456 遠い商品\n{boundary}\n単100 x 2個\n200\n小計\n200",
+    )
+
+    assert extracted["line_items"][0]["description"] == "現在の商品"
+
+
+@pytest.mark.parametrize(
+    ("payment_method", "payment_rows", "expected"),
+    [
+        ("cash", "預り\n500\n釣\n250", "cash"),
+        ("credit", "クレジット決済 250", "credit"),
+        ("cash", "", None),
+    ],
+)
+def test_bare_service_cleanup_preserves_only_visible_payment_evidence(
+    payment_method,
+    payment_rows,
+    expected,
+):
+    from receipt_parser.receipt_postprocess_phases import _run_service_receipt_recovery_phase
+
+    extracted = {"total": 250, "payment_method": payment_method, "line_items": []}
+    ocr_text = "領収書\n受領金額 250円"
+    if payment_rows:
+        ocr_text += "\n" + payment_rows
+
+    _run_service_receipt_recovery_phase(
+        extracted,
+        ocr_text,
+        ("bare_service_without_itemization",),
+    )
+
+    assert extracted["payment_method"] == expected
+
+
+def test_repeated_header_projection_handles_joined_count_and_replaces_wrong_rows():
+    from receipt_parser.receipt_row_projection import _replace_dense_item_rows_when_balanced
+
+    extracted = {
+        "total": 300,
+        "taxes": [{"rate": "10%", "label": "内税", "amount": 27}],
+        "line_items": [
+            {"description": "誤商品甲", "qty": 1, "unit_price": 150, "total": 150},
+            {"description": "誤商品乙", "qty": 1, "unit_price": 150, "total": 150},
+        ],
+    }
+    ocr_text = "\n".join([
+        "品目 111111",
+        "商品甲",
+        "1000",
+        "0",
+        "品目 222222",
+        "商品乙",
+        "2000",
+        "0",
+        "購入点数 300",
+        "2",
+        "合計",
+        "300",
+        "価格横の数字は軽減税率区分",
+    ])
+
+    _replace_dense_item_rows_when_balanced(extracted, ocr_text)
+
+    assert [item["description"] for item in extracted["line_items"]] == ["商品甲", "商品乙"]
+    assert [item["total"] for item in extracted["line_items"]] == [100.0, 200.0]
+
+
+def test_repeated_header_projection_fails_closed_on_multi_marker_ambiguity():
+    from receipt_parser.receipt_row_projection import _replace_dense_item_rows_when_balanced
+
+    existing = [{"description": "既存商品", "qty": 1, "unit_price": 300, "total": 300}]
+    extracted = {
+        "total": 300,
+        "taxes": [{"rate": "10%", "label": "内税", "amount": 27}],
+        "line_items": [dict(existing[0])],
+    }
+    ocr_text = "\n".join([
+        "品目 111111",
+        "商品甲",
+        "1000",
+        "0",
+        "1",
+        "品目 222222",
+        "商品乙",
+        "2000",
+        "購入点数 2",
+        "合計",
+        "300",
+        "価格横の数字は軽減税率区分",
+    ])
+
+    _replace_dense_item_rows_when_balanced(extracted, ocr_text)
+
+    assert extracted["line_items"] == existing
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ["1080", "5", "80", "0"],
+        ["0", "80", "5", "1080"],
+    ],
+)
+def test_stacked_tax_table_pairs_rates_by_arithmetic_not_column_order(values):
+    from receipt_parser.receipt_financial import _stacked_rate_tax_summary_entries
+
+    lines = [
+        "8%対象額",
+        "10%対象額",
+        "8%税額",
+        "10%税額",
+        *values,
+        "合計",
+        "1085",
+    ]
+
+    assert _stacked_rate_tax_summary_entries(lines) == [
+        ("8%", "base", 1080.0),
+        ("10%", "base", 5.0),
+        ("8%", "tax", 80.0),
+    ]
+
+
+def test_bare_tax_restore_preserves_complete_summary_over_incomplete_subset(monkeypatch):
+    from receipt_parser import receipt_totals
+
+    monkeypatch.setattr(
+        receipt_totals,
+        "_bare_number_tax_summary_entries",
+        lambda _lines: [("8%", "base", 1080.0), ("8%", "tax", 80.0)],
+    )
+    monkeypatch.setattr(receipt_totals, "_interleaved_rate_tax_summary_entries", lambda _lines: [])
+    monkeypatch.setattr(
+        receipt_totals,
+        "extract_rate_bases",
+        lambda _text: {"8%": 1080.0, "10%": 550.0},
+    )
+    extracted = {
+        "total": 1630,
+        "subtotal": 1500,
+        "taxes": [
+            {"rate": "8%", "label": "内税", "amount": 80},
+            {"rate": "10%", "label": "内税", "amount": 50},
+        ],
+    }
+    expected = [dict(tax) for tax in extracted["taxes"]]
+
+    receipt_totals._restore_bare_number_tax_summary(extracted, "80\n50")
+
+    assert extracted["taxes"] == expected
+
+
+def test_bare_tax_restore_keeps_valid_nontaxable_entry_when_replacing_rates(monkeypatch):
+    from receipt_parser import receipt_totals
+
+    monkeypatch.setattr(
+        receipt_totals,
+        "_bare_number_tax_summary_entries",
+        lambda _lines: [("8%", "tax", 80.0), ("10%", "tax", 50.0)],
+    )
+    monkeypatch.setattr(receipt_totals, "_interleaved_rate_tax_summary_entries", lambda _lines: [])
+    monkeypatch.setattr(receipt_totals, "extract_rate_bases", lambda _text: {})
+    nontaxable = {"rate": "0%", "label": "非課税", "amount": 652}
+    extracted = {
+        "total": 1630,
+        "subtotal": 1520,
+        "taxes": [
+            {"rate": "8%", "label": "内税", "amount": 70},
+            {"rate": "10%", "label": "内税", "amount": 40},
+            nontaxable,
+            {"rate": "0%", "label": "非課税", "amount": "invalid"},
+        ],
+    }
+
+    receipt_totals._restore_bare_number_tax_summary(extracted, "内税\n80\n50")
+
+    assert extracted["taxes"] == [
+        {"rate": "8%", "label": "内税", "amount": 80.0},
+        {"rate": "10%", "label": "内税", "amount": 50.0},
+        nontaxable,
+    ]
+
+
+def test_small_standard_rate_base_requires_one_unique_item_total_match():
+    from receipt_parser.receipt_tax_categories import _assign_single_standard_rate_from_small_base
+
+    unit_only = [{"qty": 2, "unit_price": 5, "total": 10, "tax_category": "8%"}]
+    _assign_single_standard_rate_from_small_base(unit_only, {"10%": 5})
+    assert unit_only[0]["tax_category"] == "8%"
+
+    ambiguous = [
+        {"qty": 1, "unit_price": 5, "total": 5, "tax_category": "8%"},
+        {"qty": 1, "unit_price": 5, "total": 5, "tax_category": "8%"},
+    ]
+    _assign_single_standard_rate_from_small_base(ambiguous, {"10%": 5})
+    assert [item["tax_category"] for item in ambiguous] == ["8%", "8%"]
+
+    unique = [
+        {"qty": 1, "unit_price": 5, "total": 5, "tax_category": "8%"},
+        {"qty": 2, "unit_price": 5, "total": 10, "tax_category": "8%"},
+    ]
+    _assign_single_standard_rate_from_small_base(unique, {"10%": 5})
+    assert [item["tax_category"] for item in unique] == ["10%", "8%"]
+
+
+@pytest.mark.parametrize("rate", ["8%", "10%"])
+def test_final_tax_reconciliation_applies_separate_inner_target_to_unique_item(rate):
+    from receipt_parser.receipt_tax_categories import reconcile_tax_categories_from_rate_bases
+
+    extracted = {
+        "line_items": [
+            {
+                "description": "商品甲",
+                "total": 37,
+                "tax_category": "10%" if rate == "8%" else "8%",
+            },
+            {"description": "商品乙", "total": 100, "tax_category": rate},
+        ]
+    }
+    reconcile_tax_categories_from_rate_bases(
+        extracted,
+        f"{rate}外税対象\n¥100\n({rate}内税 タイショウ\n¥37 )",
+    )
+
+    assert [item["tax_category"] for item in extracted["line_items"]] == [rate, rate]
+
+
+def test_final_tax_reconciliation_ignores_ambiguous_inner_target_item_totals():
+    from receipt_parser.receipt_tax_categories import reconcile_tax_categories_from_rate_bases
+
+    extracted = {
+        "line_items": [
+            {"description": "商品甲", "total": 37, "tax_category": "8%"},
+            {"description": "商品乙", "total": 37, "tax_category": "8%"},
+            {"description": "商品丙", "total": 100, "tax_category": "10%"},
+        ]
+    }
+    reconcile_tax_categories_from_rate_bases(
+        extracted,
+        "10%外税対象\n¥100\n(10%内税 タイショウ\n¥37 )",
+    )
+
+    assert [item["tax_category"] for item in extracted["line_items"]] == ["8%", "8%", "10%"]
+
+
+@pytest.mark.parametrize(
+    ("lines", "expected"),
+    [
+        (
+            ["内税", "税率 8%", "税抜き", "税額", "27000", "2.000"],
+            [("8%", "base", 27000.0), ("8%", "tax", 2000.0)],
+        ),
+        (
+            ["内税", "税率 8%", "税抜き", "税額", "1000", "2.000"],
+            [],
+        ),
+        (
+            ["内税", "税率 10%", "税抜き", "税額", "2,000", "200"],
+            [("10%", "base", 2000.0), ("10%", "tax", 200.0)],
+        ),
+    ],
+)
+def test_vertical_tax_table_interprets_jpy_separators_only_when_arithmetic_holds(
+    lines,
+    expected,
+):
+    from receipt_parser.receipt_financial import _vertical_inner_tax_table_entries
+
+    assert _vertical_inner_tax_table_entries(lines) == expected
+
+
+def test_explicit_item_markers_override_ambiguous_rate_bases_and_support_modifiers():
+    from receipt_parser.receipt_tax_categories import (
+        _fix_tax_categories_from_ocr_markers,
+        reconcile_tax_categories_from_rate_bases,
+    )
+
+    extracted = {
+        "line_items": [
+            {"description": "商品甲", "total": 100, "tax_category": "10%"},
+            {"description": "商品乙", "total": 100, "tax_category": "8%"},
+        ]
+    }
+    reconcile_tax_categories_from_rate_bases(
+        extracted,
+        "*100\n100\n8%対象額 100\n10%対象額 100\n[*]マークは軽減税率対象",
+    )
+    assert [item["tax_category"] for item in extracted["line_items"]] == ["8%", "10%"]
+
+    modifier = [{"description": "商品丙 桃S", "total": 120, "tax_category": "10%"}]
+    _fix_tax_categories_from_ocr_markers(
+        modifier,
+        "商品丙\n*桃S\n120\n*印は軽減税率適用商品",
+        stacked_only=True,
+    )
+    assert modifier == [{"description": "商品丙 桃S", "total": 120, "tax_category": "8%"}]
+
+
+def test_opaque_item_suffixes_map_only_through_unique_group_sums():
+    from receipt_parser.receipt_tax_categories import _assign_tax_categories_from_opaque_suffix_groups
+
+    items = [
+        {"description": "商品甲", "total": 100, "tax_category": "10%"},
+        {"description": "商品乙", "total": 200, "tax_category": "10%"},
+        {"description": "商品丙", "total": 400, "tax_category": "8%"},
+        {"description": "商品丁", "total": 500, "tax_category": "8%"},
+    ]
+    _assign_tax_categories_from_opaque_suffix_groups(
+        items,
+        "100 E\n200 E\n400 T\n500 T",
+        {"8%": 300, "10%": 900},
+    )
+
+    assert [item["tax_category"] for item in items] == ["8%", "8%", "10%", "10%"]
+
+
+def test_final_tax_reconciliation_uses_repaired_item_arithmetic_for_label():
+    from receipt_parser.receipt_output import _run_final_tax_category_reconciliation_phase
+
+    result = {
+        "total": 330,
+        "subtotal": 300,
+        "taxes": [{"rate": "10%", "label": "内税", "amount": 30}],
+        "line_items": [
+            {"description": "商品甲", "total": 100, "tax_category": "10%"},
+            {"description": "商品乙", "total": 200, "tax_category": "10%"},
+        ],
+    }
+
+    _run_final_tax_category_reconciliation_phase(
+        result,
+        "10%対象額 300\n消費税 30\n合計 330",
+        ("tax_categories_from_rate_bases",),
+    )
+
+    assert result["taxes"] == [{"rate": "10%", "label": "外税", "amount": 30}]
+
+
+@pytest.mark.parametrize(
+    "settlement_rows",
+    [
+        "カード決済 500\n現金\n1000\nお釣り\n500",
+        "WAON支払額 500\n現金\n1000\nお釣り\n500",
+    ],
+)
+def test_named_noncash_tender_blocks_cash_triple_and_pair_inference(settlement_rows):
+    from receipt_parser.receipt_identity_payment import _fix_total_from_stacked_cash_tender_block
+
+    extracted = {"total": 500, "amount_paid": 500}
+    _fix_total_from_stacked_cash_tender_block(
+        extracted,
+        f"合計\n500\n{settlement_rows}",
+    )
+
+    assert extracted == {"total": 500, "amount_paid": 500}
+
+
+def test_payment_capability_text_is_not_a_tender_and_common_cash_labels_are():
+    from receipt_parser.receipt_identity_payment import _fix_payment_method
+
+    capability = {"payment_method": None}
+    _fix_payment_method(capability, "WAON支払いできます", 0.9, {})
+    assert capability["payment_method"] is None
+
+    cash = {"payment_method": None}
+    _fix_payment_method(cash, "お預り金額 1,000円\n釣り銭 100円", 0.9, {})
+    assert cash["payment_method"] == "cash"
+
+
+def test_one_character_merchant_validation_rejects_only_structural_stamp_token():
+    from receipt_parser.receipt_identity_payment import _merchant_looks_invalid
+
+    assert _merchant_looks_invalid("印")
+    assert not _merchant_looks_invalid("雅")
+
+
+def test_bare_waon_label_without_amount_does_not_override_cash_evidence():
+    from receipt_parser.receipt_identity_payment import _fix_payment_method
+
+    extracted = {"payment_method": "cash"}
+    _fix_payment_method(
+        extracted,
+        "WAON支払\n預り 1,000円\n釣り銭 500円",
+        0.9,
+        {},
+    )
+
+    assert extracted["payment_method"] == "cash"
+
+
+@pytest.mark.parametrize("waon_tender", ["WAON支払い 500円", "WAON支払い\n500円"])
+def test_exact_waon_settlement_with_amount_identifies_tender(waon_tender):
+    from receipt_parser.receipt_identity_payment import _fix_payment_method
+
+    extracted = {"payment_method": None}
+    _fix_payment_method(extracted, waon_tender, 0.9, {})
+
+    assert extracted["payment_method"] == "WAON"
+
+
+def test_plain_consumption_tax_label_distinguishes_external_and_inclusive_math():
+    from receipt_parser.receipt_late_repairs import _restore_single_rate_inclusive_tax_block
+
+    external = {
+        "total": 110,
+        "taxes": [],
+        "line_items": [{"description": "商品甲", "total": 100}],
+    }
+    _restore_single_rate_inclusive_tax_block(external, "10%対象 100 消費税 10")
+    assert external["taxes"] == []
+    assert external.get("subtotal") is None
+
+    inclusive = {
+        "total": 110,
+        "taxes": [],
+        "line_items": [{"description": "商品甲", "total": 110}],
+    }
+    _restore_single_rate_inclusive_tax_block(inclusive, "10%対象 110 消費税 10")
+    assert inclusive["taxes"] == [{"rate": "10%", "label": "内税", "amount": 10.0}]
+    assert inclusive["subtotal"] == 100.0
+
+
+def test_structural_tax_amount_updates_stale_rate_with_sole_ocr_rate():
+    from receipt_parser.receipt_recovery import _fix_printed_tax_amounts_from_structural_blocks
+
+    extracted = {
+        "total": 1100,
+        "taxes": [{"rate": "8%", "label": "内税", "amount": 1100}],
+    }
+
+    _fix_printed_tax_amounts_from_structural_blocks(
+        extracted,
+        "10%対象 ¥1,100\n内消費税 ¥1,100\n内消費税 ¥100",
+    )
+
+    assert extracted["taxes"] == [{"rate": "10%", "label": "内税", "amount": 100}]
+
+
+def test_qty_notation_only_expands_single_quantity_rows():
+    from receipt_parser.receipt_item_repair import _apply_qty_notation_from_ocr
+
+    coherent = [{
+        "description": "共通商品甲",
+        "qty": 2,
+        "unit_price": 158,
+        "total": 316,
+    }]
+    expected = [dict(coherent[0])]
+    _apply_qty_notation_from_ocr(
+        coherent,
+        "共通商品旧\n2個X単200\n共通商品甲\n2個X単158",
+    )
+    assert coherent == expected
+
+    missed = [{
+        "description": "別商品甲乙",
+        "qty": 1,
+        "unit_price": 158,
+        "total": 158,
+    }]
+    _apply_qty_notation_from_ocr(missed, "別商品甲乙\n2個X単158")
+    assert missed[0] == {
+        "description": "別商品甲乙",
+        "qty": 2.0,
+        "unit_price": 158.0,
+        "total": 316.0,
+    }
+
+
+def test_repeated_block_preserves_balanced_mixed_rows_but_recovers_short_parse():
+    from receipt_parser.receipt_items import _replace_repeated_ocr_item_block_when_balanced
+
+    ocr_text = "反復商品\n¥100\n反復商品\n¥100\n小計\n¥200"
+    balanced = {
+        "subtotal": 200,
+        "total": 200,
+        "line_items": [
+            {"description": "現在商品甲", "total": 80, "tax_category": "8%"},
+            {"description": "現在商品乙", "total": 120, "tax_category": "10%"},
+        ],
+    }
+    expected = [dict(item) for item in balanced["line_items"]]
+    _replace_repeated_ocr_item_block_when_balanced(balanced, ocr_text)
+    assert balanced["line_items"] == expected
+
+    short = {
+        "subtotal": 200,
+        "total": 200,
+        "line_items": [{"description": "現在商品甲", "total": 100, "tax_category": "8%"}],
+    }
+    _replace_repeated_ocr_item_block_when_balanced(short, ocr_text)
+    assert [item["description"] for item in short["line_items"]] == ["反復商品", "反復商品"]
+    assert [item["total"] for item in short["line_items"]] == [100.0, 100.0]
+
+
+def test_vertical_projector_preserves_identical_monetary_signature():
+    from receipt_parser.receipt_items import _replace_vertical_price_qty_total_rows_when_balanced
+
+    ocr_text = "\n".join([
+        "OCR商品甲", "¥100", "1点", "¥100",
+        "OCR商品乙", "¥50", "2点", "¥100",
+        "小計", "¥200",
+    ])
+    current = [
+        {
+            "description": "現在商品甲",
+            "qty": 1,
+            "unit_price": 100,
+            "total": 100,
+            "tax_category": "8%",
+            "discount": 0,
+        },
+        {
+            "description": "現在商品乙",
+            "qty": 2,
+            "unit_price": 50,
+            "total": 100,
+            "tax_category": "10%",
+            "discount": 0,
+        },
+    ]
+    extracted = {"subtotal": 200, "total": 200, "line_items": current}
+    expected = [dict(item) for item in current]
+    _replace_vertical_price_qty_total_rows_when_balanced(extracted, ocr_text)
+    assert extracted["line_items"] == expected
+
+    mismatched = {
+        "subtotal": 200,
+        "total": 200,
+        "line_items": [dict(item) for item in current],
+    }
+    mismatched["line_items"][1]["total"] = 90
+    _replace_vertical_price_qty_total_rows_when_balanced(mismatched, ocr_text)
+    assert [item["description"] for item in mismatched["line_items"]] == ["OCR商品甲", "OCR商品乙"]
+    assert [item["total"] for item in mismatched["line_items"]] == [100.0, 100.0]
+
+
+def test_rejoin_price_lines_skips_split_summary_fragments():
+    from receipt_parser.normalize import rejoin_price_lines
+
+    normalized = rejoin_price_lines(
+        "商品甲\n100軽\n合\n商品乙\n計\n200軽\n(内消費税等"
+    )
+
+    assert "商品甲  100軽" in normalized
+    assert "商品乙  200軽" in normalized
+    assert "合  200" not in normalized
+    assert "計  200" not in normalized
+
+
+def test_basket_marker_pack_continuation_preserves_row_alignment():
+    from receipt_parser.receipt_item_cleanup import _replace_basket_marker_rows_when_balanced
+
+    extracted = {
+        "subtotal": 600,
+        "total": 600,
+        "line_items": [{"description": "未解析", "total": 600}],
+    }
+    ocr_text = "\n".join([
+        ">>> BEGIN BOTTOM OF BASKET <<<",
+        "商品甲",
+        "12 PCS",
+        "100 E",
+        "商品乙",
+        "200 T",
+        "商品丙",
+        "300 E",
+        "**** 合計",
+        "600",
+        "御買上げ点数 :3",
+    ])
+
+    _replace_basket_marker_rows_when_balanced(extracted, ocr_text)
+
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "商品甲 12 PCS", "商品乙", "商品丙",
+    ]
+    assert [item["total"] for item in extracted["line_items"]] == [100.0, 200.0, 300.0]
+    assert [item["tax_category"] for item in extracted["line_items"]] == ["8%", "10%", "8%"]
+
+
+@pytest.mark.parametrize("boundary", ["ありがとうございました", "----------"])
+def test_discount_detection_stops_at_banner_or_decorative_boundary(boundary):
+    from receipt_parser.receipt_item_cleanup import _detect_ocr_discounts
+
+    separated = [{
+        "description": "商品甲",
+        "qty": 1,
+        "unit_price": 5,
+        "total": 5,
+        "discount": 0,
+    }]
+    _detect_ocr_discounts(
+        separated,
+        f"商品甲\n¥5\n{boundary}\nまとめ値引\n-16",
+    )
+    assert separated[0]["discount"] == 0
+    assert separated[0]["total"] == 5
+
+    immediate = [{
+        "description": "商品乙",
+        "qty": 1,
+        "unit_price": 100,
+        "total": 100,
+        "discount": 0,
+    }]
+    _detect_ocr_discounts(immediate, "商品乙\n¥100\n値引\n-10")
+    assert immediate[0]["discount"] == 10
+    assert immediate[0]["total"] == 90
+
+
+def test_final_single_rate_tax_reconciliation_collapses_only_unambiguous_split():
+    from receipt_parser.receipt_output import _run_final_tax_category_reconciliation_phase
+
+    def stale_split():
+        return {
+            "total": 333,
+            "subtotal": 303,
+            "taxes": [
+                {"rate": "10%", "label": "内税", "amount": 27},
+                {"rate": "8%", "label": "内税", "amount": 4},
+            ],
+            "line_items": [
+                {"description": "項目甲", "total": 200, "tax_category": "10%"},
+                {"description": "項目乙", "total": 70, "tax_category": "10%"},
+                {"description": "項目丙", "total": 33, "tax_category": "10%"},
+            ],
+        }
+
+    resolved = stale_split()
+    _run_final_tax_category_reconciliation_phase(
+        resolved,
+        "10%対象\n333(内税額30)",
+        ("tax_categories_from_rate_bases",),
+    )
+    assert resolved["taxes"] == [
+        {"rate": "10%", "label": "外税", "amount": 30.0}
+    ]
+
+    for unsupported_ocr in (
+        "10%対象",
+        "10%対象\n333(内税額31)",
+        "10%対象\n333(内税額30)\n消費税31",
+        "10%対象\n8%対象\n333(内税額30)",
+    ):
+        unresolved = stale_split()
+        _run_final_tax_category_reconciliation_phase(
+            unresolved,
+            unsupported_ocr,
+            ("tax_categories_from_rate_bases",),
+        )
+        assert [(tax["rate"], tax["amount"]) for tax in unresolved["taxes"]] == [
+            ("10%", 27), ("8%", 4),
+        ]
+
+    no_amount = stale_split()
+    no_amount["total"] = 313
+    _run_final_tax_category_reconciliation_phase(
+        no_amount,
+        "10%対象\n内税額10%",
+        ("tax_categories_from_rate_bases",),
+    )
+    assert [(tax["rate"], tax["amount"]) for tax in no_amount["taxes"]] == [
+        ("10%", 27), ("8%", 4),
+    ]
+
+
+def test_ascii_header_rejects_structural_noise_but_accepts_one_character_name():
+    from receipt_parser.receipt_identity_payment import _fix_company_name_merchant
+
+    header = {"merchant": "NORD"}
+    _fix_company_name_merchant(header, "NORD\n印紙税申告納\n付\n税")
+    assert header["merchant"] == "NORD"
+
+    expandable = {"merchant": "HEAD"}
+    _fix_company_name_merchant(expandable, "HEAD\n雅\nTEL 000-0000")
+    assert expandable["merchant"] == "雅"
+
+
+def test_deep_ascii_brand_header_restores_merchant_only_for_location_suffix():
+    from receipt_parser.receipt_identity_payment import _fix_company_name_merchant
+    from receipt_parser.receipt_location import _is_ascii_brand_location_suffix
+
+    def deep_header(suffix, brand="NORD"):
+        return "\n".join([*(str(number) for number in range(9)), f"{brand} {suffix}"])
+
+    extracted = {"merchant": "北丘中央", "location": "北丘中央"}
+    _fix_company_name_merchant(extracted, deep_header("北丘中央"))
+    assert extracted["merchant"] == "NORD"
+
+    for location in (None, "南丘中央"):
+        legitimate = {"merchant": "青空商会"}
+        if location is not None:
+            legitimate["location"] = location
+        _fix_company_name_merchant(legitimate, deep_header("青空商会", brand="APP"))
+        assert legitimate["merchant"] == "青空商会"
+
+    for invalid_suffix in ("領収書", "電子マネー"):
+        unchanged = {"merchant": invalid_suffix, "location": invalid_suffix}
+        _fix_company_name_merchant(unchanged, deep_header(invalid_suffix))
+        assert unchanged["merchant"] == invalid_suffix
+
+    assert not _is_ascii_brand_location_suffix("領収書")
+    assert not _is_ascii_brand_location_suffix("電子マネー")
+    assert not _is_ascii_brand_location_suffix("株式会社")
+
+
+def test_late_ascii_brand_header_recovers_only_exact_visible_location_suffix():
+    from receipt_parser.receipt_location import (
+        _location_needs_resolution,
+        _recover_ascii_brand_header_location,
+    )
+
+    ocr_text = "\n".join([
+        "BRAND",
+        "印紙税申告納",
+        "付",
+        "税",
+        "済",
+        "印",
+        "税務承認済",
+        "付につき",
+        "控え",
+        "BRAND 北丘中央",
+        "10:00-20:00",
+    ])
+    extracted = {"merchant": "BRAND", "location": None}
+
+    _recover_ascii_brand_header_location(extracted, ocr_text)
+
+    assert extracted["location"] == "北丘中央"
+    assert not _location_needs_resolution("北丘中央", ocr_text)
+    noisy = ocr_text.replace("BRAND 北丘中央", "BRAND 北丘中央案内")
+    assert _location_needs_resolution("北丘中央", noisy)
+
+    for invalid_suffix in ("領収書", "株式会社"):
+        invalid_text = f"BRAND {invalid_suffix}"
+        invalid = {"merchant": "BRAND", "location": None}
+        _recover_ascii_brand_header_location(invalid, invalid_text)
+        assert invalid["location"] is None
+        assert _location_needs_resolution(invalid_suffix, invalid_text)
+
+
+def test_balanced_rows_use_arithmetic_valid_garbled_qty_evidence_only():
+    from receipt_parser.receipt_items import _fix_line_items
+
+    def balanced_items():
+        return [
+            {
+                "description": "項目甲",
+                "qty": 1,
+                "unit_price": 306,
+                "total": 306,
+                "discount": 0,
+                "discount_rate": "",
+            },
+            {
+                "description": "項目乙",
+                "qty": 1,
+                "unit_price": 294,
+                "total": 294,
+                "discount": 0,
+                "discount_rate": "",
+            },
+        ]
+
+    ocr_lines = [
+        "項目甲", "306*", "項目乙", "294*",
+        "小計", "¥600", "外税10%", "¥60", "合計", "¥660",
+    ]
+    repaired = {
+        "total": 660,
+        "subtotal": 600,
+        "taxes": [{"rate": "10%", "label": "外税", "amount": 60}],
+        "line_items": balanced_items(),
+    }
+    _fix_line_items(repaired, "\n".join(ocr_lines[:4] + ["(31 X #98)"] + ocr_lines[4:]))
+    assert repaired["line_items"][1]["qty"] == 3.0
+    assert repaired["line_items"][1]["unit_price"] == 98.0
+    assert repaired["line_items"][1]["total"] == 294.0
+
+    unchanged = {
+        "total": 660,
+        "subtotal": 600,
+        "taxes": [{"rate": "10%", "label": "外税", "amount": 60}],
+        "line_items": balanced_items(),
+    }
+    expected = [dict(item) for item in unchanged["line_items"]]
+    _fix_line_items(unchanged, "\n".join(ocr_lines))
+    assert unchanged["line_items"] == expected
+
+    equal_rows = {
+        "total": 440,
+        "subtotal": 400,
+        "taxes": [{"rate": "10%", "label": "外税", "amount": 40}],
+        "line_items": [
+            {
+                "description": "項目甲",
+                "qty": 1,
+                "unit_price": 200,
+                "total": 200,
+                "discount": 0,
+                "discount_rate": "",
+            },
+            {
+                "description": "項目乙",
+                "qty": 1,
+                "unit_price": 200,
+                "total": 200,
+                "discount": 0,
+                "discount_rate": "",
+            },
+        ],
+    }
+    owned_ocr = "\n".join([
+        "項目甲", "200", "項目乙", "200", "(2個X単100)",
+        "小計", "¥400", "外税10%", "¥40", "合計", "¥440",
+    ])
+    first_row = dict(equal_rows["line_items"][0])
+    _fix_line_items(equal_rows, owned_ocr)
+    assert equal_rows["line_items"][0] == first_row
+    assert equal_rows["line_items"][1]["qty"] == 2.0
+    assert equal_rows["line_items"][1]["unit_price"] == 100.0
+    once = [dict(item) for item in equal_rows["line_items"]]
+    _fix_line_items(equal_rows, owned_ocr)
+    assert equal_rows["line_items"] == once
