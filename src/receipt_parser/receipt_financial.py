@@ -7,58 +7,16 @@ from .patterns import YEN_INLINE, YEN_SUFFIX
 
 
 _STOP_FINANCIAL = re.compile(
-    r'小\s*計|現\s*計|お釣り|お釣銭|釣\s*銭|お預り|お預り金|^預$|支払い?方法|支払い?\s|現金|釣銭|クレジット'
+    r'小\s*計|現\s*計|お釣り|お釣銭|釣\s*銭|(?:お\s*)?預\s*(?:り|かり)(?:金)?|^預$|'
+    r'支払い?方法|支払い?\s|現金|釣銭|クレジット'
 )
-_STOP_BASIC = re.compile(r'合\s*計|現\s*計|お釣り|お預り')
-_STOP_TAX = re.compile(r'合\s*計|小\s*計|現\s*計|お釣り|お釣銭|釣\s*銭|お預り|お預り金')
+_STOP_BASIC = re.compile(r'合\s*計|現\s*計|お釣り|(?:お\s*)?預\s*(?:り|かり)(?:金)?')
+_STOP_TAX = re.compile(
+    r'合\s*計|小\s*計|現\s*計|お釣り|お釣銭|釣\s*銭|'
+    r'(?:お\s*)?預\s*(?:り|かり)(?:金)?'
+)
 _TOTALS_VALUE_RE = re.compile(r'^[¥￥]\s*[\d,]+\s*$')
 _YEN_AMOUNT_LINE_RE = re.compile(r'^[¥￥]\s*([\d,]+)(?:\s*税)?\s*[\)）]?\s*$')
-
-
-def _inner_tax_target_amount_matches_total(text: str, total: float | None) -> bool:
-    if total is None:
-        return False
-    lines = [line.strip() for line in (text or "").splitlines()]
-    for idx, line in enumerate(lines):
-        if not re.search(r'内\s*税\s*対象|内税対象', line):
-            continue
-        for following in lines[idx + 1:min(idx + 5, len(lines))]:
-            if not following:
-                continue
-            if re.search(r'税合計|消費税|合計|小計|対象', following):
-                break
-            m = re.search(r'[¥￥]?\s*([\d,]+)', following)
-            if not m:
-                continue
-            try:
-                amount = float(m.group(1).replace(',', ''))
-            except ValueError:
-                continue
-            if abs(amount - float(total)) <= 2:
-                window = lines[idx:min(idx + 8, len(lines))]
-                if any(re.search(r'\d+\s*%\s*内(?!税対象)', candidate) for candidate in window):
-                    return True
-                for marker_idx in range(idx + 1, min(idx + 8, len(lines))):
-                    marker = lines[marker_idx]
-                    if not re.search(r'合\s*計|総\s*合\s*計', marker):
-                        continue
-                    inline = re.search(r'[¥￥]?\s*([\d,]+)', marker)
-                    if inline:
-                        try:
-                            if abs(float(inline.group(1).replace(',', '')) - float(total)) <= 2:
-                                return True
-                        except ValueError:
-                            pass
-                    if marker_idx + 1 < len(lines):
-                        next_amount = re.search(r'[¥￥]?\s*([\d,]+)', lines[marker_idx + 1])
-                        if next_amount:
-                            try:
-                                if abs(float(next_amount.group(1).replace(',', '')) - float(total)) <= 2:
-                                    return True
-                            except ValueError:
-                                pass
-            break
-    return False
 
 
 def _text_says_displayed_prices_are_tax_included(text: str) -> bool:
@@ -97,12 +55,14 @@ def normalize_tax_label(
 
     Priority order:
       1. 非課税 in label (always definitive)
-      2. Explicit OCR text keywords (外税 / 内税)
-      3. 対象 pattern without 外税 keyword → 内税 (most JP receipts that
+      2. Unambiguous pre-tax item arithmetic → 外税, unless printed evidence
+         says the displayed prices are inclusive
+      3. Explicit OCR text keywords (外税 / 内税)
+      4. 対象 pattern without 外税 keyword → 内税 (most JP receipts that
          break out per-rate base in '(N%対象 …)' form are tax-inclusive)
-      4. Items-sum signal: items add to total → 内税; items add to subtotal → 外税
-      5. LLM-supplied label as last resort
-      6. Default 内税 (most common in JP receipts)
+      5. Remaining items-sum signal: items add to total → 内税
+      6. LLM-supplied label as last resort
+      7. Default 内税 (most common in JP receipts)
 
     Under the canonical 'subtotal = total - tax' convention, the receipt's
     item-sum shape distinguishes labels: items that already add to total are
@@ -111,7 +71,6 @@ def normalize_tax_label(
     arithmetic proves the printed item prices are pre-tax.
     """
     label = label or ""
-    has_inclusive_target_amount = _inner_tax_target_amount_matches_total(text, total)
     prices_are_marked_tax_included = _text_says_displayed_prices_are_tax_included(text)
 
     if '非課税' in label:
@@ -124,8 +83,6 @@ def normalize_tax_label(
         and tax_sum > 0
         and abs(items_sum + tax_sum - total) <= 2
         and abs(items_sum - total) > 2
-        and not re.search(r'内\s*税額|内税額', text)
-        and not has_inclusive_target_amount
         and not prices_are_marked_tax_included
     ):
         return '外税'
@@ -174,7 +131,6 @@ def normalize_tax_label(
         if (
             abs(items_sum - subtotal) <= 2
             and abs(items_sum - total) > 2
-            and not has_inclusive_target_amount
             and not prices_are_marked_tax_included
         ):
             return '外税'
@@ -707,11 +663,10 @@ def _extract_financial_totals_impl(text: str) -> dict:
                 if val is not None:
                     taxes.append({'rate': rate, 'label': '内税', 'amount': val})
 
-        # Non-taxable (非課税) detection. Truth files store the non-taxable
-        # target/base amount in the amount field, not zero tax.
+        # Non-taxable (非課税) detection. Preserve the explicit 0% row, but do
+        # not mistake its printed target/base for a tax amount.
         if '非課税' in line and not any(t.get('rate') == '0%' for t in taxes):
-            non_tax_amount = _extract_yen_nearby(lines, i, look_ahead=3)
-            taxes.append({'rate': '0%', 'label': '非課税', 'amount': non_tax_amount or 0})
+            taxes.append({'rate': '0%', 'label': '非課税', 'amount': 0})
 
         m_inline_tax = re.search(r'消費税[等額]?\s*\(?\s*(\d+(?:\.\d+)?)\s*%\s*\)?\s*(\d[\d,]*)\s*円', line)
         if m_inline_tax:
@@ -728,30 +683,63 @@ def _extract_financial_totals_impl(text: str) -> dict:
                     tax_val = float(amt_m.group(1).replace(',', ''))
                     taxes.append({'rate': rate_str, 'label': '消費税等', 'amount': tax_val})
 
-    for rate, kind, value in _bare_number_tax_summary_entries(lines):
+    bare_entries = _bare_number_tax_summary_entries(lines)
+    stacked_entries = _stacked_rate_tax_summary_entries(lines)
+    if stacked_entries:
+        stacked_rates = {rate for rate, kind, _value in stacked_entries if kind == "base"}
+        stacked_tax = {
+            rate: value for rate, kind, value in stacked_entries if kind == "tax"
+        }
+        taxes = [
+            tax for tax in taxes
+            if tax.get('rate') not in stacked_rates
+            or (
+                tax.get('rate') in stacked_tax
+                and float(tax.get('amount') or 0) == stacked_tax[tax.get('rate')]
+            )
+        ]
+    for rate, kind, value in bare_entries:
         if kind != "tax":
             continue
         if any(t.get('rate') == rate and t.get('amount') == value for t in taxes):
             continue
         taxes = [t for t in taxes if not (t.get('rate') == rate and (t.get('amount') or 0) == 0)]
-        taxes.append({'rate': rate, 'label': '内税', 'amount': value})
+        rate_number = re.escape(rate.rstrip('%'))
+        has_external_label = re.search(
+            rf'(?:外税|外枠).*{rate_number}\s*[%％年]|{rate_number}\s*[%％年].*(?:外税|外枠)',
+            text,
+        )
+        has_inclusive_label = re.search(r'内税|内\s*消費税', text)
+        label = "外税" if has_external_label or not has_inclusive_label else "内税"
+        taxes.append({'rate': rate, 'label': label, 'amount': value})
 
-    for label, value in _column_split_label_value_pairs(lines):
-        tax_m = re.search(r'(\d+(?:\.\d+)?)\s*[%％年]\s*税額', label)
+    column_pairs = _column_split_label_value_pairs(lines)
+    for label, value in column_pairs:
+        compact_label = re.sub(r'\s+', '', label)
+        amount_options = _jpy_summary_amount_options(value)
+        if not amount_options:
+            continue
+        amount = amount_options[0]
+        if re.fullmatch(r'小計', compact_label):
+            result['subtotal'] = amount
+            continue
+        if re.fullmatch(r'(?:総)?合計|現計', compact_label):
+            result['total'] = amount
+            continue
+        tax_m = re.search(
+            r'(\d+(?:\.\d+)?)\s*[%％年].*(?:税額|外税|外枠|内\s*[)）]?\s*$)',
+            label,
+        )
         if not tax_m:
             continue
-        vm = re.search(r'[¥￥]\s*([\d,]+)', value)
-        if not vm:
-            continue
         rate = normalize_tax_rate(tax_m.group(1) + '%')
-        amount = float(vm.group(1).replace(',', ''))
         if amount <= 0:
             continue
         taxes = [
             t for t in taxes
             if not (t.get('rate') == rate and t.get('amount') != amount)
         ]
-        label_kind = "内税" if re.search(r'内税|内\s*消費税', label) else "外税"
+        label_kind = "内税" if re.search(r'内税|内\s*消費税|%\s*内\s*[)）]?\s*$', label) else "外税"
         if not any(t.get('rate') == rate and t.get('amount') == amount for t in taxes):
             taxes.append({'rate': rate, 'label': label_kind, 'amount': amount})
 
@@ -824,47 +812,144 @@ def _extract_financial_totals_impl(text: str) -> dict:
             taxes = breakdown_taxes
 
     interleaved_tax_entries = _interleaved_rate_tax_summary_entries(lines)
-    interleaved_taxes = [
+    interleaved_bases = {
+        rate: value for rate, kind, value in interleaved_tax_entries if kind == "base"
+    }
+    interleaved_amounts = {
+        rate: value for rate, kind, value in interleaved_tax_entries if kind == "tax"
+    }
+    visible_target_rates: set[str] = set()
+    target_order: dict[str, int] = {}
+    for raw in lines:
+        target_match = re.search(
+            r'(\d+(?:\.\d+)?)\s*[%％年].*(?:課税)?(?:対象|タイショウ)|'
+            r'内訳\s*[（(]\s*(\d+(?:\.\d+)?)\s*[%％年]',
+            raw,
+        )
+        if target_match:
+            target_rate = normalize_tax_rate(
+                (target_match.group(1) or target_match.group(2)) + "%"
+            )
+            visible_target_rates.add(target_rate)
+            target_order.setdefault(target_rate, len(target_order))
+    interleaved_complete = visible_target_rates <= set(interleaved_bases)
+    base_sum = sum(interleaved_bases.values())
+    tax_sum = sum(interleaved_amounts.values())
+    def _summary_amount_distance(target: float) -> int | None:
+        distances: list[int] = []
+        for idx, raw in enumerate(lines):
+            if re.search(r'本体\s*合\s*計', raw):
+                continue
+            if not re.search(r'(?<!税)合\s*計|総\s*合\s*計|現\s*計|領収金額', raw):
+                continue
+            for nearby_idx in range(max(0, idx - 7), min(len(lines), idx + 8)):
+                nearby = lines[nearby_idx]
+                if any(abs(value - target) <= 2 for value in _jpy_summary_amount_options(nearby)):
+                    # Summary values normally follow their label. A nearby
+                    # pre-label amount is commonly the tax base/body total.
+                    distances.append(abs(nearby_idx - idx) + (100 if nearby_idx < idx else 0))
+        return min(distances) if distances else None
+
+    summary_label = None
+    summary_total = None
+    if tax_sum > 0 and interleaved_complete:
+        exclusive_distance = _summary_amount_distance(base_sum + tax_sum)
+        inclusive_distance = _summary_amount_distance(base_sum)
+        if exclusive_distance is not None and (
+            inclusive_distance is None or exclusive_distance < inclusive_distance
+        ):
+            summary_label = "外税"
+            summary_total = base_sum + tax_sum
+        elif inclusive_distance is not None and (
+            exclusive_distance is None or inclusive_distance < exclusive_distance
+        ):
+            summary_label = "内税"
+            summary_total = base_sum
+    printed_total = result.get("total")
+    if summary_total is not None and (
+        printed_total is None or abs(float(printed_total) - summary_total) <= 2
+    ):
+        result["total"] = summary_total
+        result["subtotal"] = summary_total - tax_sum
+    interleaved_taxes = []
+    for rate, amount in interleaved_amounts.items():
+        label = summary_label
+        if label is None:
+            rate_number = re.escape(rate.rstrip('%'))
+            if re.search(
+                rf'(?:外税|外枠).*{rate_number}\s*[%％年]|'
+                rf'{rate_number}\s*[%％年].*(?:外税|外枠)',
+                text,
+            ):
+                label = "外税"
+            elif re.search(
+                rf'{rate_number}\s*[%％年][^\n]*内\s*消費税|'
+                rf'内\s*消費税[^\n]*{rate_number}\s*[%％年]',
+                text,
+            ):
+                label = "内税"
+            else:
+                rate_pct = float(rate.rstrip('%')) / 100.0
+                base = interleaved_bases[rate]
+                exclusive_error = abs(amount - round(base * rate_pct))
+                inclusive_error = abs(amount - round(base * rate_pct / (1 + rate_pct)))
+                if min(exclusive_error, inclusive_error) <= 2 and exclusive_error != inclusive_error:
+                    label = "外税" if exclusive_error < inclusive_error else "内税"
+        if label is not None and amount > 0:
+            interleaved_taxes.append({"rate": rate, "label": label, "amount": amount})
+    if interleaved_taxes:
+        replacements = {entry["rate"]: entry for entry in interleaved_taxes}
+        replaced_rates: set[str] = set()
+        merged_taxes = []
+        for tax in taxes:
+            rate = tax.get("rate")
+            if rate in replacements:
+                if rate not in replaced_rates:
+                    replacement = replacements[rate]
+                    merged_taxes.append(
+                        tax
+                        if (
+                            tax.get("amount") == replacement.get("amount")
+                            and tax.get("label") == "税額"
+                        )
+                        else replacement
+                    )
+                    replaced_rates.add(rate)
+                continue
+            merged_taxes.append(tax)
+        merged_taxes.extend(
+            entry for rate, entry in replacements.items() if rate not in replaced_rates
+        )
+        taxes = [
+            tax for _idx, tax in sorted(
+                enumerate(merged_taxes),
+                key=lambda pair: (
+                    target_order.get(pair[1].get("rate"), len(target_order) + pair[0]),
+                    pair[0],
+                ),
+            )
+        ]
+        if result.get("subtotal") is None and result.get("total") is not None:
+            total_value = float(result["total"])
+            if 0 < tax_sum < total_value:
+                result["subtotal"] = total_value - tax_sum
+
+    vertical_entries = _vertical_inner_tax_table_entries(lines)
+    vertical_taxes = [
         {"rate": rate, "label": "内税", "amount": value}
-        for rate, kind, value in interleaved_tax_entries
+        for rate, kind, value in vertical_entries
         if kind == "tax" and value > 0
     ]
-    if interleaved_taxes:
+    if {tax["rate"] for tax in vertical_taxes} >= {"8%", "10%"}:
         taxes = [
-            t for t in taxes
-            if t.get("rate") == "0%" or t.get("rate") not in {entry["rate"] for entry in interleaved_taxes}
+            tax for tax in taxes
+            if tax.get("rate") not in {entry["rate"] for entry in vertical_taxes}
         ]
-        taxes.extend(interleaved_taxes)
-
-    if re.search(r'内税', text) and re.search(r'税率', text) and re.search(r'税抜き', text):
-        stack_lines: list[str] = []
-        in_stack = False
-        for raw in lines:
-            line = raw.strip()
-            if '税率' in line:
-                in_stack = True
-            if in_stack:
-                if re.search(r'担当者|日付|時間|店舗|登録番号', line):
-                    break
-                stack_lines.append(line)
-        nums = [
-            float(m.group(0).replace(',', ''))
-            for line in stack_lines
-            if not re.search(r'[\*xX年月日:/-]', line)
-            for m in re.finditer(r'(?<![\d.])\d+(?:\.\d+)?(?![\d.])', line)
-        ]
-        if {8.0, 10.0}.issubset(set(nums)):
-            ints = [int(n) for n in nums if n == int(n) and n not in {8.0, 10.0}]
-            if len(ints) >= 4:
-                stack_taxes = [
-                    {"rate": "10%", "label": "内税", "amount": float(ints[-2])},
-                    {"rate": "8%", "label": "内税", "amount": float(ints[-1])},
-                ]
-                if all(t["amount"] > 0 for t in stack_taxes):
-                    taxes = [t for t in taxes if t.get("rate") not in {"8%", "10%"}]
-                    taxes.extend(stack_taxes)
-                    if result.get("total"):
-                        result["subtotal"] = float(result["total"]) - sum(t["amount"] for t in stack_taxes)
+        taxes.extend(vertical_taxes)
+        if result.get("total"):
+            result["subtotal"] = float(result["total"]) - sum(
+                tax["amount"] for tax in vertical_taxes
+            )
 
     # Sum per-rate subtotals when present (e.g., "小計(税抜8%)" + "小計(税抜10%)")
     per_rate_subs = result.pop('_per_rate_subtotals', None)
@@ -878,7 +963,11 @@ def _extract_financial_totals_impl(text: str) -> dict:
         if total_val and total_first < total_val and total_first >= total_val * 0.5:
             result['subtotal'] = total_first
 
-    if _rate_bases_seen and re.search(r'内税|内\s*消費税', text):
+    if (
+        _rate_bases_seen
+        and re.search(r'内税|内\s*消費税', text)
+        and not re.search(r'外税', text)
+    ):
         inclusive_base_total = sum(
             value for value in _rate_bases_seen.values()
             if value is not None and value > 0
@@ -918,6 +1007,41 @@ def _extract_financial_totals_impl(text: str) -> dict:
                 by_amount[key] = t
         taxes = list(by_amount.values())
 
+    taxable_taxes = [
+        tax for tax in taxes
+        if tax.get('rate') != '0%' and float(tax.get('amount') or 0) > 0
+    ]
+    tax_sum = sum(float(tax['amount']) for tax in taxable_taxes)
+    total_first = result.get('total_first')
+    subtotal = result.get('subtotal')
+    if (
+        result.get('total') is None
+        and total_first is not None
+        and subtotal is not None
+        and tax_sum > 0
+        and abs(float(subtotal) + tax_sum - float(total_first)) <= 2
+    ):
+        result['total'] = float(total_first)
+    total = result.get('total')
+    if total is not None and tax_sum > 0:
+        total_value = float(total)
+        subtotal_value = float(subtotal) if subtotal is not None else None
+        subset_tax_matches = (
+            len(taxable_taxes) > 1
+            and subtotal_value is not None
+            and any(
+                abs(subtotal_value + float(tax['amount']) - total_value) <= 2
+                for tax in taxable_taxes
+            )
+        )
+        if (
+            subtotal_value is None
+            or abs(subtotal_value - total_value) <= 2
+            or abs(subtotal_value + tax_sum - total_value) <= 5
+            or subset_tax_matches
+        ):
+            result['subtotal'] = total_value - tax_sum
+
     if taxes:
         result['taxes'] = taxes
 
@@ -948,8 +1072,10 @@ def _is_tax_summary_stack_label(line: str) -> bool:
     compact = re.sub(r'\s+', '', line or '')
     if re.search(r'軽減税率|対象商品|対象です|対象物|店内飲食', compact):
         return False
+    if re.search(r'税合計|消費税合計', compact):
+        return True
     if re.search(r'\d+(?:\.\d+)?\s*[%％年]', compact) and re.search(
-        r'外税|外枠|内税|対象|タイショウ|税',
+        r'外税|外枠|内税|対象|タイショウ|税|内[)）]?$',
         compact,
     ):
         return True
@@ -983,6 +1109,10 @@ def _column_split_label_value_pairs(lines: list[str]) -> list[tuple[str, str]]:
             if _is_tax_summary_stack_label(s) and not re.search(r'[¥￥]\s*\d', s):
                 labels.append(s)
                 j += 1
+            elif labels and re.fullmatch(r'(?:お買上)?点数|お買上点数|\d+\s*点', re.sub(r'\s+', '', s)):
+                # Column OCR can insert the item-count footer between the
+                # summary labels and their parallel value column.
+                j += 1
             else:
                 break
         if len(labels) < 3:
@@ -990,21 +1120,250 @@ def _column_split_label_value_pairs(lines: list[str]) -> list[tuple[str, str]]:
             continue
         values: list[str] = []
         k = j
+        allow_closing_value = any(
+            re.search(r'\d+(?:\.\d+)?\s*[%％年]\s*内\s*[)）]?\s*$', label)
+            or re.search(r'(?:消費)?税合計', label)
+            for label in labels
+        )
         while k < n:
             s = lines[k].strip()
             if not s:
                 k += 1
                 continue
-            if _TOTALS_VALUE_RE.match(s):
+            if _TOTALS_VALUE_RE.match(s) or (
+                allow_closing_value
+                and re.fullmatch(r'[¥￥]\s*[\d,]+\s*[)）]', s)
+            ):
                 values.append(s)
                 k += 1
             else:
                 break
         if len(values) >= 3 and len(labels) >= 3:
+            rate_labels: dict[str, dict[str, str]] = {}
+            rate_order: list[str] = []
+            for label in labels:
+                rate_m = re.search(r'(\d+(?:\.\d+)?)\s*[%％年]', label)
+                if not rate_m:
+                    continue
+                rate = normalize_tax_rate(rate_m.group(1) + '%')
+                kind = "base" if re.search(r'対象|タイショウ', label) else "tax"
+                if kind == "tax" and not re.search(r'税|外枠', label):
+                    continue
+                if rate not in rate_labels:
+                    rate_labels[rate] = {}
+                    rate_order.append(rate)
+                rate_labels[rate].setdefault(kind, label)
+            if len(rate_order) > 1 and all(
+                {"base", "tax"} <= set(rate_labels[rate]) for rate in rate_order
+            ):
+                amount_options = [_jpy_summary_amount_options(value) for value in values]
+                entries = _solve_stacked_rate_pairs(
+                    rate_order,
+                    amount_options,
+                    _printed_summary_amounts(lines),
+                )
+                if not entries:
+                    return []
+                return [
+                    (rate_labels[rate][kind], f"¥{int(value) if value.is_integer() else value}")
+                    for rate, kind, value in entries
+                ]
             pair_count = min(len(labels), len(values))
             return list(zip(labels[:pair_count], values[:pair_count]))
         i = max(k, i + 1)
     return []
+
+
+def _rate_base_tax_pair_is_valid(rate: str, base: float, tax: float) -> bool:
+    """Accept a summary pair only when exclusive or inclusive rate math holds."""
+    try:
+        rate_pct = float(rate.rstrip('%')) / 100.0
+    except (AttributeError, ValueError):
+        return False
+    if rate_pct <= 0 or base <= 0 or tax < 0 or tax >= base:
+        return False
+    expected = (base * rate_pct, base * rate_pct / (1 + rate_pct))
+    if tax == 0:
+        return any(round(value) == 0 for value in expected)
+    return min(abs(tax - round(value)) for value in expected) <= 2.0
+
+
+def _jpy_summary_amount_options(text: str) -> tuple[float, ...]:
+    """Return possible JPY values for one isolated summary amount token."""
+    token = (text or "").strip()
+    token = re.sub(r'^[¥￥]\s*|\s*円?\s*[)）]?\s*$', '', token)
+    if re.fullmatch(r'\d{1,3}(?:,\d{3})+', token):
+        return (float(token.replace(',', '')),)
+    if re.fullmatch(r'\d[\d,]*', token) and ',' in token:
+        # OCR occasionally shifts a thousands separator ("6,90" -> 690).
+        # This helper only receives isolated JPY summary tokens; rate/base
+        # arithmetic still has to validate the resulting amount.
+        return (float(token.replace(',', '')),)
+    if re.fullmatch(r'\d+\.\d{3}', token):
+        decimal = float(token)
+        thousands = float(token.replace('.', ''))
+        return (decimal, thousands) if decimal != thousands else (decimal,)
+    if re.fullmatch(r'\d+', token):
+        return (float(token),)
+    return ()
+
+
+def _printed_summary_amounts(lines: list[str]) -> tuple[float, ...]:
+    """Read amounts directly attached to printed subtotal/total labels."""
+    amounts: list[float] = []
+    for idx, raw in enumerate(lines):
+        line = raw.strip()
+        compact = re.sub(r'\s+', '', line)
+        is_summary = bool(
+            re.search(r'小計|総合計|(?<!税)合計|現計|領収金額', compact)
+            and not re.search(r'税合計|消費税', compact)
+        )
+        if re.fullmatch(r'\u8a08', compact) and idx > 0:
+            is_summary = bool(re.fullmatch(
+                r'[\u5c0f\u5408]', re.sub(r'\s+', '', lines[idx - 1])
+            ))
+        if not is_summary:
+            continue
+        inline = re.search(
+            r'[¥￥]?\s*(\d{1,3}(?:,\d{3})+|\d+\.\d{3}|\d+)\s*円?\s*$',
+            line,
+        )
+        options = _jpy_summary_amount_options(inline.group(1)) if inline else ()
+        if not options:
+            for following in lines[idx + 1:min(idx + 4, len(lines))]:
+                if not following.strip():
+                    continue
+                options = _jpy_summary_amount_options(following)
+                break
+        amounts.extend(options)
+    return tuple(dict.fromkeys(amounts))
+
+
+def _complete_rate_pair_entries(
+    rate_order: list[str],
+    candidates: dict[str, list[tuple[float, float, frozenset[int]]]],
+    summary_amounts: tuple[float, ...],
+) -> list[tuple[str, str, float]]:
+    """Choose the sole complete arithmetic-valid rate/base/tax mapping."""
+    if not rate_order or any(not candidates.get(rate) for rate in rate_order):
+        return []
+    solutions: dict[tuple[tuple[str, float, float], ...], dict[str, tuple[float, float]]] = {}
+
+    def visit(pos: int, used: frozenset[int], picked: dict[str, tuple[float, float]]) -> None:
+        if len(solutions) > 1:
+            return
+        if pos == len(rate_order):
+            base_sum = sum(base for base, _tax in picked.values())
+            tax_sum = sum(tax for _base, tax in picked.values())
+            if summary_amounts and not any(
+                abs(target - base_sum) <= 2 or abs(target - base_sum - tax_sum) <= 2
+                for target in summary_amounts
+            ):
+                return
+            key = tuple((rate, *picked[rate]) for rate in rate_order)
+            solutions[key] = dict(picked)
+            return
+        rate = rate_order[pos]
+        for base, tax, token_ids in candidates[rate]:
+            if used & token_ids:
+                continue
+            picked[rate] = (base, tax)
+            visit(pos + 1, used | token_ids, picked)
+            picked.pop(rate, None)
+
+    visit(0, frozenset(), {})
+    if len(solutions) != 1:
+        return []
+    solution = next(iter(solutions.values()))
+    return (
+        [(rate, "base", solution[rate][0]) for rate in rate_order]
+        + [
+            (rate, "tax", solution[rate][1])
+            for rate in rate_order
+            if solution[rate][1] > 0
+        ]
+    )
+
+
+def _solve_stacked_rate_pairs(
+    rate_order: list[str],
+    amount_options: list[tuple[float, ...]],
+    summary_amounts: tuple[float, ...],
+    implicit_zero_rates: set[str] | None = None,
+) -> list[tuple[str, str, float]]:
+    """Pair a label stack with values by rate arithmetic, not OCR position."""
+    # ponytail: fail closed above 12 tokens; spatial OCR grouping is the upgrade path.
+    if not rate_order or len(rate_order) > 3 or len(amount_options) > 12:
+        return []
+    candidates: dict[str, list[tuple[float, float, frozenset[int]]]] = {
+        rate: [] for rate in rate_order
+    }
+    for rate in rate_order:
+        seen: set[tuple[float, float, frozenset[int]]] = set()
+        for base_idx, base_options in enumerate(amount_options):
+            if rate in (implicit_zero_rates or set()):
+                for base in base_options:
+                    zero_candidate = (base, 0.0, frozenset((base_idx,)))
+                    if (
+                        zero_candidate not in seen
+                        and _rate_base_tax_pair_is_valid(rate, base, 0.0)
+                    ):
+                        seen.add(zero_candidate)
+                        candidates[rate].append(zero_candidate)
+            for tax_idx, tax_options in enumerate(amount_options):
+                if base_idx == tax_idx:
+                    continue
+                for base in base_options:
+                    for tax in tax_options:
+                        candidate = (base, tax, frozenset((base_idx, tax_idx)))
+                        if candidate not in seen and _rate_base_tax_pair_is_valid(rate, base, tax):
+                            seen.add(candidate)
+                            candidates[rate].append(candidate)
+    return _complete_rate_pair_entries(rate_order, candidates, summary_amounts)
+
+
+def _stacked_rate_tax_summary_entries(lines: list[str]) -> list[tuple[str, str, float]]:
+    """Recover multi-rate summaries whose labels and values are column-split."""
+    targets: list[tuple[int, str]] = []
+    for idx, raw in enumerate(lines):
+        match = re.search(r'^\(?\s*(\d+(?:\.\d+)?)\s*[%％年].*(?:対象|タイショウ)', raw.strip())
+        if match:
+            rate = normalize_tax_rate(match.group(1) + '%')
+            if rate not in {known for _pos, known in targets}:
+                targets.append((idx, rate))
+    if len(targets) < 2:
+        return []
+    start = targets[0][0]
+    region = lines[start:min(len(lines), start + 32)]
+    first_amount = next(
+        (idx for idx, line in enumerate(region) if _jpy_summary_amount_options(line)),
+        len(region),
+    )
+    label_region = region[:first_amount]
+    target_rates_before_values = {
+        normalize_tax_rate(match.group(1) + '%')
+        for line in label_region
+        if (match := re.search(
+            r'^\(?\s*(\d+(?:\.\d+)?)\s*[%％年].*(?:対象|タイショウ)',
+            line.strip(),
+        ))
+    }
+    tax_label_count = sum(
+        bool(re.search(r'消費税|税額|外税|外枠', line) and not re.search(r'対象|タイショウ', line))
+        for line in label_region
+    )
+    if target_rates_before_values != {rate for _idx, rate in targets} or tax_label_count < len(targets):
+        return []
+    amount_options = [
+        options
+        for line in region
+        if (options := _jpy_summary_amount_options(line))
+    ]
+    return _solve_stacked_rate_pairs(
+        [rate for _idx, rate in targets],
+        amount_options,
+        _printed_summary_amounts(lines),
+    )
 
 
 def _vertical_inner_tax_table_entries(lines: list[str]) -> list[tuple[str, str, float]]:
@@ -1022,25 +1381,57 @@ def _vertical_inner_tax_table_entries(lines: list[str]) -> list[tuple[str, str, 
             if stack_lines and re.search(r'担当者|日付|時間|店舗|登録番号', line):
                 break
             stack_lines.append(line)
-        nums = [
-            float(m.group(0).replace(',', ''))
-            for line in stack_lines
-            if not re.search(r'[\*xX年月日:/-]', line)
-            for m in re.finditer(r'(?<![\d.])\d+(?:\.\d+)?(?![\d.])', line)
-        ]
-        rates = [
-            normalize_tax_rate(f"{num}%")
-            for num in nums
-            if num in {8.0, 10.0}
-        ]
-        values = [float(num) for num in nums if num == int(num) and num not in {8.0, 10.0}]
-        if rates and len(values) >= len(rates) * 2:
-            bases = values[:len(rates)]
-            taxes = values[len(rates):len(rates) * 2]
-            return (
-                [(rate, "base", value) for rate, value in zip(rates, bases)]
-                + [(rate, "tax", value) for rate, value in zip(rates, taxes)]
+        rates: list[str] = []
+        value_lines = list(stack_lines)
+        for idx, line in enumerate(stack_lines):
+            rate_m = re.search(r'(?<![\d.])(8|10)(?:\.0+)?\s*[%％年]', line)
+            if rate_m:
+                rates.append(normalize_tax_rate(f"{rate_m.group(1)}%"))
+                value_lines[idx] = line[:rate_m.start()] + line[rate_m.end():]
+                continue
+            bare_rate = re.fullmatch(r'\s*(8|10)\.0+\s*', line)
+            next_nonempty = next(
+                (candidate.strip() for candidate in stack_lines[idx + 1:] if candidate.strip()),
+                "",
             )
+            if not bare_rate and re.fullmatch(r'[%％年]', next_nonempty):
+                bare_rate = re.fullmatch(r'\s*(8|10)\s*', line)
+            if bare_rate:
+                rates.append(normalize_tax_rate(f"{bare_rate.group(1)}%"))
+                value_lines[idx] = ""
+        value_options: list[tuple[float, ...]] = []
+        for line in value_lines:
+            if re.search(r'[\*xX年月日:/-]', line):
+                continue
+            for match in re.finditer(
+                r'(?<![\d.,])(?:\d{1,3}(?:,\d{3})+|\d+\.\d{3}|\d+)(?![\d.,])',
+                line,
+            ):
+                options = _jpy_summary_amount_options(match.group(0))
+                if options:
+                    value_options.append(options)
+        pair_count = len(rates)
+        matches: dict[tuple[tuple[str, str, float], ...], list[tuple[str, str, float]]] = {}
+        for start in range(len(value_options) - pair_count * 2 + 1):
+            option_window = value_options[start:start + pair_count * 2]
+            windows: list[tuple[float, ...]] = [()]
+            for options in option_window:
+                windows = [prefix + (value,) for prefix in windows for value in options]
+            for window in windows:
+                bases, taxes = window[:pair_count], window[pair_count:]
+                if all(
+                    base > 0
+                    and tax > 0
+                    and _rate_base_tax_pair_is_valid(rate, base, tax)
+                    for rate, base, tax in zip(rates, bases, taxes)
+                ):
+                    entries = (
+                        [(rate, "base", value) for rate, value in zip(rates, bases)]
+                        + [(rate, "tax", value) for rate, value in zip(rates, taxes)]
+                    )
+                    matches[tuple(entries)] = entries
+        if len(matches) == 1:
+            return next(iter(matches.values()))
     return []
 
 
@@ -1049,6 +1440,9 @@ def _bare_number_tax_summary_entries(lines: list[str]) -> list[tuple[str, str, f
     vertical_entries = _vertical_inner_tax_table_entries(lines)
     if vertical_entries:
         return vertical_entries
+    stacked_entries = _stacked_rate_tax_summary_entries(lines)
+    if stacked_entries:
+        return stacked_entries
     labels: list[tuple[int, str, str]] = []
     for idx, raw in enumerate(lines):
         line = raw.strip()
@@ -1085,46 +1479,170 @@ def _bare_number_tax_summary_entries(lines: list[str]) -> list[tuple[str, str, f
 
     if len(values) < len(labels):
         return []
-    return [
+    entries = [
         (rate, kind, value)
         for (_idx, rate, kind), value in zip(labels, values)
+    ]
+    bases = {rate: value for rate, kind, value in entries if kind == "base"}
+    return [
+        entry for entry in entries
+        if entry[1] == "base"
+        or (
+            entry[0] in bases
+            and _rate_base_tax_pair_is_valid(entry[0], bases[entry[0]], entry[2])
+        )
     ]
 
 
 def _interleaved_rate_tax_summary_entries(lines: list[str]) -> list[tuple[str, str, float]]:
-    """Map rate target rows followed by base/tax values in-place."""
-    entries: list[tuple[str, str, float]] = []
-    for idx, raw in enumerate(lines):
-        line = raw.strip()
-        target_m = re.search(r'^\(?\s*(\d+(?:\.\d+)?)\s*[%％年]\s*(?:対象|タイショウ)', line)
-        if not target_m:
+    """Map rate targets and explicit tax labels despite OCR column reordering."""
+    if re.search(r'小計\s*\(?\s*税抜\s*\d+\s*%', "\n".join(lines)):
+        # The established per-rate tax-excluded restorer owns this layout.
+        return []
+
+    target_pattern = re.compile(
+        r'(\d+(?:\.\d+)?)\s*[%％年].*(?:課税)?(?:対象|タイショウ)|'
+        r'内訳\s*[（(]\s*(\d+(?:\.\d+)?)\s*[%％年]'
+    )
+
+    def _target(line: str) -> tuple[str, int] | None:
+        match = target_pattern.search(line)
+        if not match:
+            return None
+        number = match.group(1) or match.group(2)
+        return normalize_tax_rate(number + "%"), match.end()
+
+    def _tax_label_rate(line: str) -> str | None | bool:
+        if re.search(r'対象|タイショウ', line):
+            return False
+        if not re.search(r'消費税|税額|外税|外枠|\d+(?:\.\d+)?\s*[%％年]\s*内\s*[)）]?\s*$', line):
+            return False
+        rate_match = re.search(r'(\d+(?:\.\d+)?)\s*[%％年]', line)
+        return normalize_tax_rate(rate_match.group(1) + "%") if rate_match else None
+
+    def _printed_options(fragment: str) -> set[float]:
+        options = set(_jpy_summary_amount_options(fragment))
+        for amount_match in re.finditer(
+            r'[¥￥]\s*(\d{1,3}(?:,\d{3})+|\d+\.\d{3}|\d+)', fragment
+        ):
+            options.update(_jpy_summary_amount_options(amount_match.group(1)))
+        return options
+
+    targets = [
+        (idx, *target)
+        for idx, raw in enumerate(lines)
+        if (target := _target(raw.strip()))
+    ]
+    tax_labels = [
+        (idx, rate)
+        for idx, raw in enumerate(lines)
+        if (rate := _tax_label_rate(raw.strip())) is not False
+    ]
+    solutions: dict[str, set[tuple[float, float]]] = {}
+    implicit_zero_rates: set[str] = set()
+    multiple_target_rates = len({rate for _idx, rate, _end in targets}) > 1
+    for target_pos, rate, target_end in targets:
+        next_target = next((pos for pos, _rate, _end in targets if pos > target_pos), len(lines))
+        next_boundary = next(
+            (
+                pos for pos in range(target_pos + 1, len(lines))
+                if re.search(r'総\s*合\s*計|(?<!税)合\s*計|現\s*計|お預り|お釣り', lines[pos])
+            ),
+            len(lines),
+        )
+        window_end = min(
+            next_target,
+            next_boundary if multiple_target_rates else len(lines),
+            target_pos + 24,
+        )
+        exact = [
+            pos for pos, label_rate in tax_labels
+            if target_pos < pos < window_end and label_rate == rate
+        ]
+        unqualified = [
+            pos for pos, label_rate in tax_labels
+            if target_pos < pos < window_end and label_rate is None
+        ]
+        tax_pos = exact[0] if exact else (unqualified[0] if unqualified else None)
+        if tax_pos is None:
+            implicit_zero_rates.add(rate)
             continue
-        rate_num = float(target_m.group(1))
-        rate = f"{int(rate_num)}%" if rate_num == int(rate_num) else f"{rate_num}%"
-        try:
-            rate_pct = float(rate.rstrip('%')) / 100.0
-        except ValueError:
-            continue
-        if rate_pct <= 0:
+        if tax_pos - target_pos > 24:
             continue
 
-        window = [candidate.strip() for candidate in lines[idx:min(len(lines), idx + 5)]]
-        joined = " ".join(window)
-        m = re.search(
-            r'([\d,]+)\s*(?:円)?\s*[（(]?\s*(?:内)?消費税(?:等|額)?\s*([\d,]+)\s*(?:円)?\s*[）)]?',
-            joined,
-        )
-        if not m:
+        base_options = _printed_options(lines[target_pos][target_end:])
+        for pos in range(target_pos + 1, tax_pos + 1):
+            line = lines[pos].strip()
+            if pos == tax_pos:
+                label_match = re.search(r'消費税|税額|外税|外枠|\d+(?:\.\d+)?\s*[%％年]\s*内', line)
+                line = (
+                    re.sub(r'\s*[（(]\s*内?\s*$', '', line[:label_match.start()])
+                    if label_match else ""
+                )
+            base_options.update(_printed_options(line))
+
+        next_tax = next((pos for pos, _rate in tax_labels if pos > tax_pos), min(len(lines), tax_pos + 24))
+        tax_options: set[float] = set()
+        tax_line = lines[tax_pos].strip()
+        label_match = re.search(r'消費税(?:等|額)?|税額|外税|外枠|\d+(?:\.\d+)?\s*[%％年]\s*内', tax_line)
+        if label_match:
+            tax_options.update(_printed_options(tax_line[label_match.end():]))
+        for pos in range(tax_pos + 1, min(len(lines), next_tax)):
+            tax_options.update(_printed_options(lines[pos].strip()))
+
+        valid = {
+            (base, amount)
+            for base in base_options
+            for amount in tax_options
+            if _rate_base_tax_pair_is_valid(rate, base, amount)
+        }
+        if not valid:
+            # Some column readers place the last per-rate value after a later
+            # aggregate-tax label. Widen only after the local window fails;
+            # arithmetic still has to identify one printed pair uniquely.
+            for pos in range(tax_pos + 1, min(len(lines), tax_pos + 24)):
+                tax_options.update(_printed_options(lines[pos].strip()))
+            valid = {
+                (base, amount)
+                for base in base_options
+                for amount in tax_options
+                if _rate_base_tax_pair_is_valid(rate, base, amount)
+            }
+        if valid:
+            solutions.setdefault(rate, set()).update(valid)
+
+    entries: list[tuple[str, str, float]] = []
+    for rate, pairs in solutions.items():
+        if len(pairs) != 1:
             continue
-        base = float(m.group(1).replace(',', ''))
-        amount = float(m.group(2).replace(',', ''))
-        if base <= amount or amount <= 0:
-            continue
-        expected = round(base * rate_pct / (1 + rate_pct))
-        if abs(amount - expected) > max(2.0, amount * 0.02):
-            continue
+        base, amount = next(iter(pairs))
         entries.append((rate, "base", base))
-        entries.append((rate, "tax", amount))
+        if amount > 0:
+            entries.append((rate, "tax", amount))
+
+    rate_order = list(dict.fromkeys(rate for _idx, rate, _end in targets))
+    if len(rate_order) >= 2:
+        start = min(idx for idx, _rate, _end in targets)
+        stop = next(
+            (
+                idx for idx in range(max(idx for idx, _rate, _end in targets) + 1, len(lines))
+                if re.search(r'総\s*合\s*計|(?<!税)合\s*計|現\s*計|お預り|お釣り', lines[idx])
+            ),
+            min(len(lines), start + 32),
+        )
+        amount_options = [
+            tuple(sorted(_printed_options(line)))
+            for line in lines[start:stop]
+            if _printed_options(line)
+        ]
+        complete = _solve_stacked_rate_pairs(
+            rate_order,
+            amount_options,
+            _printed_summary_amounts(lines),
+            implicit_zero_rates,
+        )
+        if {rate for rate, kind, _value in complete if kind == "base"} == set(rate_order):
+            return complete
     return entries
 
 
@@ -1386,8 +1904,9 @@ def extract_rate_bases(text: str) -> dict[str, float | None]:
                 bases[rate] = value
                 paren_rates.add(rate)
 
+    stacked_entries = _stacked_rate_tax_summary_entries(lines)
     for rate, kind, value in _bare_number_tax_summary_entries(lines):
-        if kind == "base" and rate not in paren_rates:
+        if kind == "base" and (stacked_entries or rate not in paren_rates):
             bases[rate] = value
     for rate, kind, value in _interleaved_rate_tax_summary_entries(lines):
         if kind == "base" and rate not in paren_rates:
@@ -1471,14 +1990,35 @@ def reconcile_points_payment_from_ocr(extracted: dict, unified_text: str) -> Non
     except (TypeError, ValueError):
         return
     if points < 0 or points > total + 2:
+        try:
+            current_points = float(extracted.get("points_used"))
+        except (TypeError, ValueError):
+            current_points = None
+        if current_points is not None and (
+            current_points < 0 or current_points > total + 2
+        ):
+            extracted["points_used"] = None
+            extracted["amount_paid"] = total
         return
+    try:
+        existing_points_value = (
+            float(existing_points) if existing_points is not None else None
+        )
+    except (TypeError, ValueError):
+        existing_points_value = None
     if (
-        existing_points is None
-        or float(existing_points or 0) == 0
-        or abs(float(existing_points or 0) - points) <= 2
+        existing_points_value is None
+        or existing_points_value == 0
+        or abs(existing_points_value - points) <= 2
     ):
         extracted["points_used"] = points
-    expected_paid = max(0.0, total - points)
+    try:
+        effective_points = float(extracted["points_used"])
+    except (KeyError, TypeError, ValueError):
+        return
+    if effective_points < 0 or effective_points > total + 2:
+        return
+    expected_paid = max(0.0, total - effective_points)
     if (
         amount_paid is None
         or existing_amount is None
@@ -1487,14 +2027,6 @@ def reconcile_points_payment_from_ocr(extracted: dict, unified_text: str) -> Non
         or existing_amount > total
     ):
         extracted["amount_paid"] = expected_paid
-    if (
-        points > 0
-        and expected_paid <= 2
-        and not re.search(r'現金|現計|(?:お預り金?|お預かり)(?!票)|(?<![お\w])預\s*[¥￥]', unified_text)
-    ):
-        extracted["payment_method"] = "credit"
-
-
 def _find_subset_sum(items, target, max_k=3, tolerance=5.0):
     # Prefer near-exact (≤2) matches at small k (k ≤ 2) before accepting a
     # fuzzy match. Stops a loose 1-item match from shadowing a real 2-item

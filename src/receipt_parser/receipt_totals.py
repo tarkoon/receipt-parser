@@ -1,10 +1,13 @@
 """Receipt total and tax-summary arithmetic helpers."""
 
 import re
+from math import isfinite
 
 from .receipt_financial import (
     _bare_number_tax_summary_entries,
     _interleaved_rate_tax_summary_entries,
+    _jpy_summary_amount_options,
+    _rate_base_tax_pair_is_valid,
     extract_financial_totals,
     extract_rate_bases,
     normalize_tax_label,
@@ -24,7 +27,7 @@ def _canonical_subtotal_from_taxes(extracted) -> float | None:
 
 
 def _sum_taxable_amounts(taxes) -> float:
-    """Sum actual tax amounts, excluding 0% entries that store exempt bases."""
+    """Sum positive-rate tax amounts, excluding explicit 0% rows."""
     return sum(
         float(t.get("amount") or 0)
         for t in (taxes or [])
@@ -40,6 +43,17 @@ def _line_items_sum(extracted) -> float:
         for item in (extracted.get("line_items") or [])
         if isinstance(item, dict)
     )
+
+
+def _yen_after_summary_label(lines, label_idx: int, lookahead: int = 3) -> float | None:
+    """Return a nearby standalone yen amount before tender/receipt details."""
+    for line in lines[label_idx + 1:min(len(lines), label_idx + 1 + lookahead)]:
+        match = re.fullmatch(r'[¥￥]\s*([\d,]+)\s*[\)）]?', line)
+        if match:
+            return float(match.group(1).replace(',', ''))
+        if re.search(r'お預り|お釣|ポイント|伝票|レシート', line):
+            break
+    return None
 
 
 def _printed_amount_targets(extracted, unified_text, *, include_rate_bases: bool = True) -> list[float]:
@@ -133,12 +147,150 @@ def _restore_bare_number_tax_summary(extracted, unified_text):
     lines = [line.strip() for line in unified_text.split('\n')]
     entries = _bare_number_tax_summary_entries(lines)
     entries.extend(_interleaved_rate_tax_summary_entries(lines))
-    taxes = [(rate, value) for rate, kind, value in entries if kind == "tax" and value > 0]
+    taxes = list(dict.fromkeys(
+        (rate, value) for rate, kind, value in entries if kind == "tax" and value > 0
+    ))
     total = extracted.get("total")
     try:
         total_f = float(total) if total is not None else None
     except (TypeError, ValueError):
         total_f = None
+    current_taxes: list[tuple[str, float]] = []
+    preserved_nontaxable: list[dict] = []
+    for tax in (extracted.get("taxes") or []):
+        if not isinstance(tax, dict):
+            continue
+        try:
+            amount = float(tax["amount"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if normalize_tax_rate(str(tax.get("rate") or "")) == "0%":
+            if isfinite(amount) and amount >= 0:
+                preserved_nontaxable.append(tax)
+            continue
+        if amount > 0:
+            current_taxes.append((normalize_tax_rate(str(tax.get("rate") or "")), amount))
+    current_by_rate = dict(current_taxes)
+    parsed_rates = {rate for rate, _value in taxes}
+    try:
+        subtotal_f = float(extracted["subtotal"])
+    except (KeyError, TypeError, ValueError):
+        subtotal_f = None
+    current_is_complete = (
+        len(current_by_rate) == len(current_taxes) >= 2
+        and total_f is not None
+        and subtotal_f is not None
+        and abs(subtotal_f + sum(current_by_rate.values()) - total_f) <= 2
+    )
+    if current_is_complete:
+        tax_sum = sum(current_by_rate.values())
+        printed_rate_amounts = True
+        printed_external_rates: set[str] = set()
+        for rate, amount in current_by_rate.items():
+            rate_number = re.escape(rate.rstrip("%"))
+            rate_has_external_label = any(
+                re.search(rf'(?<![\d.]){rate_number}\s*[%％](?![\d.])', line)
+                and re.search(r'外税|外枠', line)
+                for line in lines
+            )
+            amount_is_printed = False
+            amount_is_external = False
+            for idx, line in enumerate(lines):
+                if not re.search(rf'(?<![\d.]){rate_number}\s*[%％](?![\d.])', line):
+                    continue
+                if re.search(r'対象|タイショウ', line):
+                    continue
+                label_idx = idx
+                external_label = bool(re.search(r'外税|外枠', line))
+                if not re.search(r'外税|内税|消費税|税額|^\s*税\s*$', line):
+                    label_idx = next(
+                        (
+                            candidate_idx
+                            for candidate_idx in range(idx + 1, min(len(lines), idx + 3))
+                            if lines[candidate_idx]
+                        ),
+                        idx,
+                    )
+                    if not re.fullmatch(r'\s*(?:消費)?税(?:額|等)?\s*', lines[label_idx]):
+                        continue
+                    external_label = rate_has_external_label
+                elif re.search(
+                    rf'{rate_number}\s*[%％]\s*税(?:額)?(?![一-龥])',
+                    line,
+                ):
+                    external_label = rate_has_external_label
+                for candidate in lines[label_idx:min(len(lines), label_idx + 3)]:
+                    if any(
+                        abs(value - amount) <= 2
+                        for value in _jpy_summary_amount_options(candidate)
+                    ):
+                        amount_is_printed = True
+                        amount_is_external = external_label
+                        break
+                if amount_is_printed:
+                    break
+            if amount_is_external:
+                printed_external_rates.add(rate)
+            if not amount_is_printed:
+                printed_rate_amounts = False
+        unmatched_amounts = list(current_by_rate.values())
+        for line in lines:
+            options = _jpy_summary_amount_options(line)
+            match_idx = next(
+                (
+                    idx
+                    for idx, amount in enumerate(unmatched_amounts)
+                    if any(abs(value - amount) <= 2 for value in options)
+                ),
+                None,
+            )
+            if match_idx is not None:
+                unmatched_amounts.pop(match_idx)
+            if not unmatched_amounts:
+                break
+        rate_bases = {}
+        for rate, base in extract_rate_bases(unified_text).items():
+            try:
+                rate_bases[normalize_tax_rate(str(rate))] = float(base)
+            except (TypeError, ValueError):
+                continue
+        bare_rate_summary_corroborates = (
+            parsed_rates < set(current_by_rate)
+            and not unmatched_amounts
+            and set(current_by_rate) <= set(rate_bases)
+            and all(
+                _rate_base_tax_pair_is_valid(rate, rate_bases[rate], amount)
+                for rate, amount in current_by_rate.items()
+            )
+        )
+        printed_tax_total = any(
+            abs(value - tax_sum) <= 2
+            for idx, line in enumerate(lines)
+            if re.search(r'(?:消費)?税合計', line)
+            for candidate in lines[idx:min(len(lines), idx + 4)]
+            for value in _jpy_summary_amount_options(candidate)
+        )
+        current_is_complete = (
+            printed_rate_amounts
+            or printed_tax_total
+            or bare_rate_summary_corroborates
+        )
+        if current_is_complete and printed_external_rates:
+            for tax in extracted.get("taxes") or []:
+                if not isinstance(tax, dict):
+                    continue
+                rate = normalize_tax_rate(str(tax.get("rate") or ""))
+                try:
+                    amount = float(tax.get("amount") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    rate in printed_external_rates
+                    and abs(amount - current_by_rate[rate]) <= 2
+                ):
+                    tax["label"] = "外税"
+    if current_is_complete and parsed_rates < set(current_by_rate):
+        return
     if not taxes and total_f is not None:
         amounts = []
         for line in lines:
@@ -177,7 +329,15 @@ def _restore_bare_number_tax_summary(extracted, unified_text):
     extracted["taxes"] = [
         {"rate": rate, "label": label, "amount": value}
         for rate, value in taxes
-    ]
+    ] + preserved_nontaxable
+    if current_is_complete:
+        for tax in extracted["taxes"]:
+            rate = normalize_tax_rate(str(tax.get("rate") or ""))
+            if (
+                rate in printed_external_rates
+                and abs(float(tax.get("amount") or 0) - current_by_rate[rate]) <= 2
+            ):
+                tax["label"] = "外税"
     if total_f is not None and total_f >= tax_sum:
         extracted["subtotal"] = total_f - tax_sum
 
@@ -208,6 +368,17 @@ def _prefer_printed_item_sum_total_when_balanced(extracted, unified_text):
         return
     if current_total_f is not None and _items_plus_tax_matches_total(extracted):
         return
+    printed_financials = extract_financial_totals(unified_text)
+    printed_total = printed_financials.get("total")
+    printed_tax_sum = _sum_taxable_amounts(printed_financials.get("taxes") or [])
+    if (
+        current_total_f is not None
+        and printed_total is not None
+        and abs(float(printed_total) - current_total_f) <= 2
+        and printed_tax_sum > 0
+        and abs(item_sum + printed_tax_sum - current_total_f) <= 2
+    ):
+        return
     printed_amounts = [
         float(m.group(1).replace(',', ''))
         for m in re.finditer(r'[¥￥]\s*([\d,]+)\s*-?', unified_text)
@@ -216,15 +387,6 @@ def _prefer_printed_item_sum_total_when_balanced(extracted, unified_text):
         return
 
     lines = [line.strip() for line in unified_text.split('\n') if line.strip()]
-
-    def _yen_after(label_idx: int, lookahead: int = 3) -> float | None:
-        for j in range(label_idx + 1, min(len(lines), label_idx + 1 + lookahead)):
-            vm = re.fullmatch(r'[¥￥]\s*([\d,]+)\s*[\)）]?', lines[j])
-            if vm:
-                return float(vm.group(1).replace(',', ''))
-            if re.search(r'お預り|お釣|ポイント|伝票|レシート', lines[j]):
-                break
-        return None
 
     subtotal_label = chr(0x5C0F) + chr(0x8A08)
     total_label = chr(0x5408) + chr(0x8A08)
@@ -247,7 +409,7 @@ def _prefer_printed_item_sum_total_when_balanced(extracted, unified_text):
                 lines[j] == total_head and j + 1 < len(lines) and lines[j + 1] == total_tail
             ):
                 label_idx = j + 1 if lines[j] == total_head else j
-                printed_total = _yen_after(label_idx)
+                printed_total = _yen_after_summary_label(lines, label_idx)
                 if printed_total is not None and printed_total > item_sum + 2:
                     return
 
@@ -273,15 +435,6 @@ def _restore_printed_summary_total_when_tax_balanced(extracted, unified_text):
         return
     lines = [line.strip() for line in unified_text.split('\n')]
 
-    def _yen_after(label_idx: int, lookahead: int = 3) -> float | None:
-        for j in range(label_idx + 1, min(len(lines), label_idx + 1 + lookahead)):
-            vm = re.fullmatch(r'[¥￥]\s*([\d,]+)\s*[\)）]?', lines[j])
-            if vm:
-                return float(vm.group(1).replace(',', ''))
-            if re.search(r'お預り|お釣|ポイント|伝票|レシート', lines[j]):
-                break
-        return None
-
     printed_subtotal = None
     printed_total = None
     total_candidates: list[float] = []
@@ -294,7 +447,7 @@ def _restore_printed_summary_total_when_tax_balanced(extracted, unified_text):
             )
         ):
             label_idx = idx + 1 if line == "小" else idx
-            printed_subtotal = _yen_after(label_idx)
+            printed_subtotal = _yen_after_summary_label(lines, label_idx)
             continue
         if (
             printed_total is None
@@ -304,7 +457,7 @@ def _restore_printed_summary_total_when_tax_balanced(extracted, unified_text):
             )
         ):
             label_idx = idx + 1 if line == "合" else idx
-            printed_total = _yen_after(label_idx)
+            printed_total = _yen_after_summary_label(lines, label_idx)
             if printed_total is not None:
                 total_candidates.append(printed_total)
             continue
@@ -428,7 +581,7 @@ def _restore_printed_summary_total_when_tax_balanced(extracted, unified_text):
 
 
 def _restore_external_tax_total_from_printed_subtotal(extracted, unified_text):
-    """Restore total when printed subtotal plus external taxes matches a visible total."""
+    """Restore total from a printed subtotal or complete external-rate bases."""
     taxes = [tax for tax in (extracted.get("taxes") or []) if isinstance(tax, dict)]
     tax_sum = _sum_taxable_amounts(taxes)
     if tax_sum <= 0:
@@ -454,10 +607,33 @@ def _restore_external_tax_total_from_printed_subtotal(extracted, unified_text):
             label_idx = idx + 1 if line == "小" else idx
             printed_subtotal = _yen_after(label_idx)
             break
-    if printed_subtotal is None or printed_subtotal <= 0:
-        return
     item_sum = _line_items_sum(extracted)
-    if item_sum > 0 and abs(item_sum - printed_subtotal) > 5:
+    if printed_subtotal is None:
+        positive_taxes: list[tuple[str, float]] = []
+        for tax in taxes:
+            rate = normalize_tax_rate(str(tax.get("rate") or ""))
+            try:
+                amount = float(tax.get("amount") or 0)
+            except (TypeError, ValueError):
+                return
+            if rate == "0%" or amount <= 0:
+                continue
+            if str(tax.get("label") or "") != "外税":
+                return
+            positive_taxes.append((rate, amount))
+        if not positive_taxes or len({rate for rate, _amount in positive_taxes}) != len(positive_taxes):
+            return
+        rate_bases = extract_rate_bases(unified_text)
+        printed_bases = []
+        for rate, amount in positive_taxes:
+            base = rate_bases.get(rate)
+            if base is None or not _rate_base_tax_pair_is_valid(rate, float(base), amount):
+                return
+            printed_bases.append(float(base))
+        if abs(sum(printed_bases) - item_sum) > 5:
+            return
+        printed_subtotal = item_sum
+    if printed_subtotal <= 0 or (item_sum > 0 and abs(item_sum - printed_subtotal) > 5):
         return
     expected_total = printed_subtotal + tax_sum
 
@@ -507,6 +683,5 @@ def _restore_external_tax_total_from_printed_subtotal(extracted, unified_text):
         amount_paid_f is None
         or (old_total is not None and abs(amount_paid_f - old_total) <= 5)
         or abs(amount_paid_f - expected_paid) <= 5
-        or amount_paid_f < expected_paid
     ):
         extracted["amount_paid"] = expected_paid
