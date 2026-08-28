@@ -15,7 +15,9 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -26,13 +28,20 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
+import cv2
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from receipt_parser.checks import get_checks_for
 from receipt_parser.llm import check_model_available, DEFAULT_MODEL
-from receipt_parser.ocr import init_cloud_vision, get_api_usage
+from receipt_parser.ocr import (
+    _OCR_CACHE_DIR,
+    _ocr_cache_key,
+    get_api_usage,
+    init_cloud_vision,
+)
 from receipt_parser.pipeline import process_document, process_ocr_text
+from receipt_parser.preprocess import load_image, try_extract_text_layer
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -44,6 +53,16 @@ VARIANTS_DIR = Path(__file__).resolve().parent.parent / ".data" / "ocr_cache" / 
 RESULTS_DIR = Path(__file__).resolve().parent / "results" / "benchmark"
 DEFAULT_OUTPUT = RESULTS_DIR / "latest.json"
 DEFAULT_BUDGET_LIMIT = 200
+REPO_ROOT = Path(__file__).resolve().parent.parent
+OCR_CACHE_DIR = _OCR_CACHE_DIR
+
+
+class _CacheOnlyOCREngine:
+    def annotate_image(self, **_kwargs):
+        raise RuntimeError("Cached OCR required; refusing a Vision API call")
+
+    def document_text_detection(self, **_kwargs):
+        raise RuntimeError("Cached OCR required; refusing a Vision API call")
 
 # DeepSeek pricing — imported from the canonical source
 from receipt_parser.usage import (
@@ -71,7 +90,7 @@ def discover_fixtures(names: list[str] | None = None) -> list[tuple[str, Path, d
         if "_public_truth" in truth_file.name:
             continue
         base = truth_file.stem.replace("_truth", "")
-        if names and base not in names:
+        if names is not None and base not in names:
             continue
         image = None
         for ext in (".jpg", ".jpeg", ".png", ".pdf", ".tiff", ".bmp"):
@@ -90,7 +109,7 @@ def discover_fixtures(names: list[str] | None = None) -> list[tuple[str, Path, d
         base = truth_file.stem.replace("_public_truth", "")
         if base in discovered:
             continue
-        if names and base not in names:
+        if names is not None and base not in names:
             continue
         ocr_file = OCR_FIXTURES_DIR / f"{base}.txt"
         if not ocr_file.exists():
@@ -100,6 +119,93 @@ def discover_fixtures(names: list[str] | None = None) -> list[tuple[str, Path, d
         discovered.add(base)
 
     return fixtures
+
+
+def _select_fixtures(names: list[str] | None) -> list[tuple[str, Path, dict]]:
+    if names is None:
+        return discover_fixtures()
+    if not names:
+        raise ValueError("--fixtures requires at least one fixture name")
+    requested = list(dict.fromkeys(names))
+    fixtures = discover_fixtures(requested)
+    resolved = {name for name, _source, _truth in fixtures}
+    unresolved = [name for name in requested if name not in resolved]
+    if unresolved:
+        raise ValueError(f"Unknown or unavailable fixture(s): {', '.join(unresolved)}")
+    return fixtures
+
+
+def _cached_ocr_artifacts(source: Path) -> list[tuple[str, Path]]:
+    """Return cache text/layout files that the cached OCR path will read."""
+    if source.suffix.lower() == ".pdf" and try_extract_text_layer(str(source)):
+        return []
+    artifacts = []
+    for page, image in enumerate(load_image(source)):
+        key = _ocr_cache_key(image)
+        text_path = OCR_CACHE_DIR / f"{key}.txt"
+        artifacts.append((f"page:{page}:ocr_text", text_path))
+        if not text_path.exists():
+            continue
+        artifacts.append((f"page:{page}:ocr_layout", OCR_CACHE_DIR / f"{key}.layout.json"))
+        block_count = len([line for line in text_path.read_text(encoding="utf-8").splitlines() if line.strip()])
+        if block_count >= 3:
+            continue
+        best_count = block_count
+        best_confidence = 0.9 if block_count else 0.0
+        rotations = (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        for rotation_index, rotation in enumerate(rotations, 1):
+            rotated_key = _ocr_cache_key(cv2.rotate(image, rotation))
+            rotated_text = OCR_CACHE_DIR / f"{rotated_key}.txt"
+            prefix = f"page:{page}:rotation:{rotation_index}"
+            artifacts.append((f"{prefix}:ocr_text", rotated_text))
+            if not rotated_text.exists():
+                break
+            artifacts.append((f"{prefix}:ocr_layout", OCR_CACHE_DIR / f"{rotated_key}.layout.json"))
+            rotated_count = len([
+                line for line in rotated_text.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ])
+            rotated_confidence = 0.9 if rotated_count else 0.0
+            if rotated_count > best_count or rotated_confidence > best_confidence:
+                best_count = rotated_count
+                best_confidence = rotated_confidence
+            if best_confidence >= 0.85:
+                break
+    return artifacts
+
+
+def _update_path_fingerprint(digest, label: str, path: Path) -> None:
+    digest.update(label.encode())
+    digest.update(b"\0")
+    if path.is_file():
+        digest.update(b"present\0")
+        digest.update(path.read_bytes())
+    else:
+        digest.update(b"missing\0")
+
+
+def _fixture_corpus_sha256(
+    fixtures: list[tuple[str, Path, dict]], *, cached_ocr: bool = False,
+) -> str:
+    digest = hashlib.sha256()
+    for name, source, truth in fixtures:
+        digest.update(name.encode())
+        digest.update(source.read_bytes())
+        digest.update(json.dumps(truth, ensure_ascii=False, sort_keys=True).encode())
+        if cached_ocr and source.suffix != ".txt":
+            for label, path in _cached_ocr_artifacts(source):
+                _update_path_fingerprint(digest, label, path)
+    return digest.hexdigest()
+
+
+def _missing_cached_ocr(fixtures: list[tuple[str, Path, dict]]) -> list[Path]:
+    return [
+        path
+        for _name, source, _truth in fixtures
+        if source.suffix != ".txt"
+        for label, path in _cached_ocr_artifacts(source)
+        if label.endswith("ocr_text") and not path.is_file()
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +237,7 @@ def _attribute_failure(failed_field: str, failed_run: dict, ref_run: dict) -> st
         "subtotal": "subtotal", "payment_method": "payment_method",
         "line_items_count": "line_items", "line_items_totals": "line_items",
         "line_items_qty": "line_items", "line_items_unit_price": "line_items",
+        "line_items_discounts": "line_items",
         "tax_amount": "taxes", "tax_rates": "taxes", "tax_labels": "taxes",
         "merchant_similarity": "merchant",
         "tax_categories": "line_items", "document_type": "document_type",
@@ -265,7 +372,7 @@ def _run_fixture(
         # Build run record
         run_record = {
             "run": run_idx,
-            "passed": pass_count == total_fields,
+            "passed": error is None and pass_count == total_fields,
             "pass_count": pass_count,
             "total_fields": total_fields,
             "wall_time_s": round(wall_time, 2),
@@ -493,13 +600,66 @@ def _print_summary(summary: dict, metadata: dict):
 # Results I/O
 # ---------------------------------------------------------------------------
 
-def _get_git_sha() -> str:
+def _git_output(*args: str) -> bytes | None:
     try:
-        result = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                                capture_output=True, text=True, timeout=5)
-        return result.stdout.strip() if result.returncode == 0 else "unknown"
+        result = subprocess.run(
+            ["git", *args], capture_output=True, cwd=REPO_ROOT, timeout=10,
+        )
+        return result.stdout if result.returncode == 0 else None
     except Exception:
-        return "unknown"
+        return None
+
+
+def _untracked_sha256() -> str | None:
+    paths = _git_output("ls-files", "--others", "--exclude-standard", "-z")
+    if paths is None:
+        return None
+    root = REPO_ROOT.resolve()
+    digest = hashlib.sha256()
+    for raw_path in sorted(path for path in paths.split(b"\0") if path):
+        digest.update(raw_path)
+        digest.update(b"\0")
+        candidate = REPO_ROOT / os.fsdecode(raw_path)
+        try:
+            if candidate.is_symlink():
+                digest.update(b"symlink\0")
+                digest.update(os.fsencode(os.readlink(candidate)))
+                continue
+            candidate.resolve().relative_to(root)
+            digest.update(b"file\0")
+            digest.update(candidate.read_bytes())
+        except (OSError, ValueError):
+            digest.update(b"unreadable-or-outside\0")
+    return digest.hexdigest()
+
+
+def _get_git_state() -> dict:
+    """Fingerprint tracked changes plus untracked contents inside this repo."""
+    sha = _git_output("rev-parse", "--short", "HEAD")
+    status = _git_output("status", "--porcelain=v1", "--untracked-files=normal")
+    diff = _git_output("diff", "--binary", "HEAD", "--")
+    untracked_sha = _untracked_sha256()
+    if diff is None and untracked_sha is not None:
+        diff = b""  # Unborn repositories have no HEAD yet.
+    dirty_sha = None
+    if diff is not None and untracked_sha is not None:
+        dirty_sha = hashlib.sha256(diff + b"\0" + untracked_sha.encode()).hexdigest()
+    return {
+        "git_sha": sha.decode(errors="replace").strip() if sha else "unknown",
+        "git_dirty": bool(status) if status is not None else None,
+        "git_status_sha256": hashlib.sha256(status).hexdigest() if status is not None else None,
+        "git_tracked_diff_sha256": hashlib.sha256(diff).hexdigest() if diff is not None else None,
+        "git_untracked_sha256": untracked_sha,
+        "git_diff_sha256": dirty_sha,
+        "git_dirty_tree_sha256": dirty_sha,
+        "git_diff_scope": "tracked_changes_plus_untracked_contents",
+    }
+
+
+def _get_git_sha() -> str:
+    """Backwards-compatible SHA helper for callers outside this script."""
+    sha = _git_output("rev-parse", "--short", "HEAD")
+    return sha.decode(errors="replace").strip() if sha else "unknown"
 
 
 def _artifact_report_path(path: Path) -> str:
@@ -607,6 +767,68 @@ def _save_results(results: dict, output_path: Path):
 # Comparison
 # ---------------------------------------------------------------------------
 
+def _comparison_scope(report: dict) -> dict:
+    metadata = report.get("metadata", {})
+    fixtures = metadata.get("fixtures")
+    if fixtures is None and report.get("per_fixture"):
+        fixtures = list(report["per_fixture"])
+    return {
+        "fixtures": frozenset(fixtures) if fixtures is not None else None,
+        "fixture_corpus_sha256": metadata.get("fixture_corpus_sha256"),
+        "model": metadata.get("model"),
+        "passes": metadata.get("passes"),
+        "runs_per_fixture": metadata.get("runs_per_fixture"),
+        "ci_mode": metadata.get("ci_mode"),
+    }
+
+
+def _fixture_scope_mismatch(current: frozenset | None, previous: frozenset | None) -> str | None:
+    if current is None or previous is None:
+        return f"fixtures: missing scope metadata (previous={previous}, current={current})"
+    if current == previous:
+        return None
+
+    def _sample(names: set[str]) -> str:
+        ordered = sorted(names)
+        suffix = f", +{len(ordered) - 8} more" if len(ordered) > 8 else ""
+        return ", ".join(ordered[:8]) + suffix
+
+    if current < previous:
+        omitted = set(previous - current)
+        return (f"fixtures: current is a subset ({len(current)}/{len(previous)}); "
+                f"omitted {_sample(omitted)}")
+    if previous < current:
+        added = set(current - previous)
+        return (f"fixtures: previous is a subset ({len(previous)}/{len(current)}); "
+                f"new in current {_sample(added)}")
+    return (f"fixtures: sets differ (removed {_sample(set(previous - current))}; "
+            f"added {_sample(set(current - previous))})")
+
+
+def _comparison_scope_mismatches(current: dict, previous: dict) -> list[str]:
+    curr_scope = _comparison_scope(current)
+    prev_scope = _comparison_scope(previous)
+    mismatches = []
+    fixture_mismatch = _fixture_scope_mismatch(
+        curr_scope["fixtures"], prev_scope["fixtures"],
+    )
+    if fixture_mismatch:
+        mismatches.append(fixture_mismatch)
+    for key in ("fixture_corpus_sha256", "model", "passes", "runs_per_fixture", "ci_mode"):
+        current_value = curr_scope[key]
+        previous_value = prev_scope[key]
+        if current_value is None or previous_value is None:
+            mismatches.append(
+                f"{key}: missing scope metadata "
+                f"(previous={previous_value!r}, current={current_value!r})"
+            )
+        elif current_value != previous_value:
+            mismatches.append(
+                f"{key}: previous={previous_value!r}, current={current_value!r}"
+            )
+    return mismatches
+
+
 def _compare_results(current: dict, previous: dict):
     curr = current.get("summary", {})
     prev = previous.get("summary", previous.get("overall", {}))
@@ -614,6 +836,13 @@ def _compare_results(current: dict, previous: dict):
     print(f"\n{'=' * 70}")
     print("=== Comparison vs Previous ===")
     print(f"{'=' * 70}")
+
+    mismatches = _comparison_scope_mismatches(current, previous)
+    if mismatches:
+        print("Comparison refused: benchmark scopes are not comparable.")
+        for mismatch in mismatches:
+            print(f"  - {mismatch}")
+        return False
 
     curr_score = curr.get("score", curr.get("robustness_score", 0))
     prev_score = prev.get("score", prev.get("robustness_score", 0))
@@ -630,6 +859,7 @@ def _compare_results(current: dict, previous: dict):
         print(f"Regressed: {', '.join(sorted(regressed))}")
     if not fixed and not regressed:
         print("No fixture status changes.")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +886,11 @@ def run_benchmark(
     if ci:
         runs = 1
 
-    fixtures = discover_fixtures(fixture_names)
+    try:
+        fixtures = _select_fixtures(fixture_names)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        raise SystemExit(2) from exc
     if not fixtures:
         print("No fixtures found. Exiting.")
         sys.exit(1)
@@ -671,6 +905,12 @@ def run_benchmark(
     if ci:
         print(f"CI mode: cached OCR, 1 run, exit non-zero on failure")
 
+    if ci:
+        missing_cache = _missing_cached_ocr(fixtures)
+        if missing_cache:
+            print(f"ERROR: cached OCR is missing for {len(missing_cache)} image page(s).")
+            raise SystemExit(1)
+
     # Preflight
     check_model_available(model)
 
@@ -678,11 +918,14 @@ def run_benchmark(
     has_image_fixtures = any(f[1].suffix != ".txt" for f in fixtures)
     cv_client = None
     if has_image_fixtures:
-        try:
-            cv_client = init_cloud_vision()
-        except Exception as e:
-            print(f"ERROR: Cloud Vision init failed: {e}")
-            sys.exit(1)
+        if ci:
+            cv_client = _CacheOnlyOCREngine()
+        else:
+            try:
+                cv_client = init_cloud_vision()
+            except Exception as e:
+                print(f"ERROR: Cloud Vision init failed: {e}")
+                sys.exit(1)
 
         # Budget check (skip in CI mode — uses cached OCR)
         if not ci:
@@ -693,17 +936,24 @@ def run_benchmark(
     else:
         print("All fixtures use OCR text — no Cloud Vision needed.")
 
-    git_sha = _get_git_sha()
     run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
     metadata = {
         "timestamp": datetime.now().isoformat(),
         "run_id": run_id,
-        "git_sha": git_sha,
+        **_get_git_state(),
         "model": model,
         "runs_per_fixture": runs,
         "passes": passes,
         "workers": workers,
         "ci_mode": ci,
+        "fixture_scope": "selected" if fixture_names is not None else "all_discovered",
+        "fixture_filter": list(fixture_names) if fixture_names is not None else None,
+        "fixture_count": n_fixtures,
+        "fixture_corpus_sha256": _fixture_corpus_sha256(fixtures, cached_ocr=ci),
+        "fixture_source_counts": {
+            "image": sum(1 for _, source, _ in fixtures if source.suffix != ".txt"),
+            "ocr_text": sum(1 for _, source, _ in fixtures if source.suffix == ".txt"),
+        },
         "fixtures": fixture_name_list,
         "output_path": str(output_path),
         "artifact_dir": str(RESULTS_DIR / "artifacts" / run_id),
@@ -767,11 +1017,20 @@ def _run_fixture_sequential(
                     apply_user_rules=False,
                 )
             else:
+                digital_pdf = (
+                    fixture_source.suffix.lower() == ".pdf"
+                    and bool(try_extract_text_layer(str(fixture_source)))
+                )
                 result = process_document(
                     fixture_source, model=model, passes=passes,
                     apply_user_rules=False, skip_ocr_cache=skip_cache,
                     ocr_engine=cv_client,
                 )
+                if not skip_cache and not digital_pdf and result.get("_ocr_source") != "cache":
+                    raise RuntimeError(
+                        "Cached benchmark received non-cache OCR source: "
+                        f"{result.get('_ocr_source', 'missing')}"
+                    )
         except Exception as e:
             error = str(e)
         wall_time = time.perf_counter() - wall_start
@@ -790,7 +1049,7 @@ def _run_fixture_sequential(
 
         run_record = {
             "run": run_idx,
-            "passed": pass_count == total_fields,
+            "passed": error is None and pass_count == total_fields,
             "pass_count": pass_count,
             "total_fields": total_fields,
             "wall_time_s": round(wall_time, 2),
@@ -855,6 +1114,11 @@ def main():
                         help="CI mode: cached OCR, 1 run, exit non-zero on failure")
     args = parser.parse_args()
 
+    compare_path = Path(args.compare) if args.compare else None
+    if compare_path is not None and not compare_path.exists():
+        print(f"Comparison file not found: {compare_path}")
+        raise SystemExit(1)
+
     results = run_benchmark(
         runs=args.runs,
         fixture_names=args.fixtures,
@@ -867,13 +1131,10 @@ def main():
         ci=args.ci,
     )
 
-    if args.compare:
-        compare_path = Path(args.compare)
-        if compare_path.exists():
-            previous = json.loads(compare_path.read_text(encoding="utf-8"))
-            _compare_results(results, previous)
-        else:
-            print(f"Comparison file not found: {compare_path}")
+    if compare_path is not None:
+        previous = json.loads(compare_path.read_text(encoding="utf-8"))
+        if not _compare_results(results, previous):
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

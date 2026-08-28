@@ -14,18 +14,38 @@ Run with:
     python -m pytest tests/test_accuracy.py -v --json-report --json-report-file=tests/results/accuracy/latest.json
 """
 
+import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import cv2
 import pytest
+from receipt_parser.llm import DEFAULT_MODEL
+from receipt_parser.ocr import _OCR_CACHE_DIR, _ocr_cache_key
+from receipt_parser.preprocess import load_image, try_extract_text_layer
 
 FIXTURES = Path(__file__).parent / "fixtures"
 OCR_FIXTURES = Path(__file__).parent / "ocr_fixtures"
 VARIANTS = Path(__file__).resolve().parent.parent / ".data" / "ocr_cache" / "variants"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+OCR_CACHE_DIR = _OCR_CACHE_DIR
+ACCURACY_PASSES = 3
+
+
+class _CacheOnlyOCREngine:
+    def annotate_image(self, **_kwargs):
+        raise RuntimeError("Cached OCR required; refusing a Vision API call")
+
+    def document_text_detection(self, **_kwargs):
+        raise RuntimeError("Cached OCR required; refusing a Vision API call")
+
+
+_CACHE_ONLY_OCR = _CacheOnlyOCREngine()
 
 # Skip if Cloud Vision is not configured (needed for image fixtures)
 _cv_available = True
@@ -56,24 +76,28 @@ def _extract_base_name(variant_stem: str) -> str:
     return re.sub(r'_v\d+$', '', variant_stem)
 
 
-def _discover_test_cases():
+def _discover_test_cases_with_exclusions():
     cases = []
     discovered_bases = set()
+    unavailable_images = []
 
     # Image fixtures (process_document with original truth, full pipeline)
-    if _cv_available:
-        for truth_file in sorted(FIXTURES.glob("*_truth.json")):
-            if truth_file.name == "_truth_template.json":
-                continue
-            if "_public_truth" in truth_file.name:
-                continue
-            base = truth_file.stem.replace("_truth", "")
-            image = _find_image(base)
-            if not image:
-                continue
-            truth = json.loads(truth_file.read_text(encoding="utf-8"))
-            cases.append((base, {"type": "image", "path": image}, truth))
-            discovered_bases.add(base)
+    for truth_file in sorted(FIXTURES.glob("*_truth.json")):
+        if truth_file.name == "_truth_template.json":
+            continue
+        if "_public_truth" in truth_file.name:
+            continue
+        base = truth_file.stem.replace("_truth", "")
+        image = _find_image(base)
+        if not image:
+            continue
+        truth = json.loads(truth_file.read_text(encoding="utf-8"))
+        case = (base, {"type": "image", "path": image}, truth)
+        if _missing_cached_ocr([case]):
+            unavailable_images.append(base)
+            continue
+        cases.append(case)
+        discovered_bases.add(base)
 
     # Public fixtures (anonymized truth + named OCR text, no images needed)
     for truth_file in sorted(FIXTURES.glob("*_public_truth.json")):
@@ -100,7 +124,11 @@ def _discover_test_cases():
             truth = json.loads(truth_file.read_text(encoding="utf-8"))
             cases.append((stem, {"type": "ocr_text", "path": variant_file}, truth))
 
-    return cases
+    return cases, unavailable_images
+
+
+def _discover_test_cases():
+    return _discover_test_cases_with_exclusions()[0]
 
 
 def _receipt_number(case_id: str) -> int | None:
@@ -108,13 +136,33 @@ def _receipt_number(case_id: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _filter_by_receipt_ceiling(cases):
-    raw_limit = os.environ.get("RECEIPT_MAX_FIXTURE")
-    if not raw_limit:
-        return cases
+def _receipt_ceiling() -> int | None:
+    raw = os.environ.get("RECEIPT_MAX_FIXTURE")
+    if raw is None:
+        return None
     try:
-        limit = int(raw_limit)
-    except ValueError:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid RECEIPT_MAX_FIXTURE: {raw!r}") from exc
+
+
+def _requested_fixture_names() -> set[str] | None:
+    raw = os.environ.get("RECEIPT_FIXTURES")
+    if raw is None:
+        return None
+    requested = {
+        name.strip()
+        for name in re.split(r'[,;\s]+', raw)
+        if name.strip()
+    }
+    if not requested:
+        raise ValueError("RECEIPT_FIXTURES was set but selected no fixture names")
+    return requested
+
+
+def _filter_by_receipt_ceiling(cases):
+    limit = _receipt_ceiling()
+    if limit is None:
         return cases
     return [
         case for case in cases
@@ -122,27 +170,202 @@ def _filter_by_receipt_ceiling(cases):
     ]
 
 
-def _filter_by_requested_fixtures(cases):
-    raw_names = os.environ.get("RECEIPT_FIXTURES")
-    if not raw_names:
-        return cases
-    requested = {
-        name.strip()
-        for name in re.split(r'[,;\s]+', raw_names)
-        if name.strip()
-    }
-    if not requested:
+def _resolve_requested_fixtures(cases, requested: set[str] | None):
+    if requested is None:
         return cases
 
     def _matches(case_id: str) -> bool:
         base = _extract_base_name(case_id)
         return case_id in requested or base in requested
 
-    return [case for case in cases if _matches(case[0])]
+    selected = [case for case in cases if _matches(case[0])]
+    resolved = {
+        requested_name
+        for requested_name in requested
+        if any(
+            case_id == requested_name or _extract_base_name(case_id) == requested_name
+            for case_id, _source, _truth in cases
+        )
+    }
+    unresolved = sorted(requested - resolved)
+    if unresolved:
+        raise ValueError(f"Unknown or unavailable fixture(s): {', '.join(unresolved)}")
+    if not selected:
+        raise ValueError("Fixture filters selected no cases")
+    return selected
 
 
-_CASES = _filter_by_requested_fixtures(_filter_by_receipt_ceiling(_discover_test_cases()))
+def _filter_by_requested_fixtures(cases):
+    return _resolve_requested_fixtures(cases, _requested_fixture_names())
+
+
+def _cached_ocr_artifacts(source: Path) -> list[tuple[str, Path]]:
+    """Return cache text/layout files that the cached OCR path will read."""
+    if source.suffix.lower() == ".pdf" and try_extract_text_layer(str(source)):
+        return []
+    artifacts = []
+    for page, image in enumerate(load_image(source)):
+        key = _ocr_cache_key(image)
+        text_path = OCR_CACHE_DIR / f"{key}.txt"
+        artifacts.append((f"page:{page}:ocr_text", text_path))
+        if not text_path.exists():
+            continue
+        artifacts.append((f"page:{page}:ocr_layout", OCR_CACHE_DIR / f"{key}.layout.json"))
+        block_count = len([line for line in text_path.read_text(encoding="utf-8").splitlines() if line.strip()])
+        if block_count >= 3:
+            continue
+        best_count = block_count
+        best_confidence = 0.9 if block_count else 0.0
+        rotations = (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        for rotation_index, rotation in enumerate(rotations, 1):
+            rotated_key = _ocr_cache_key(cv2.rotate(image, rotation))
+            rotated_text = OCR_CACHE_DIR / f"{rotated_key}.txt"
+            prefix = f"page:{page}:rotation:{rotation_index}"
+            artifacts.append((f"{prefix}:ocr_text", rotated_text))
+            if not rotated_text.exists():
+                break
+            artifacts.append((f"{prefix}:ocr_layout", OCR_CACHE_DIR / f"{rotated_key}.layout.json"))
+            rotated_count = len([
+                line for line in rotated_text.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ])
+            rotated_confidence = 0.9 if rotated_count else 0.0
+            if rotated_count > best_count or rotated_confidence > best_confidence:
+                best_count = rotated_count
+                best_confidence = rotated_confidence
+            if best_confidence >= 0.85:
+                break
+    return artifacts
+
+
+def _update_path_fingerprint(digest, label: str, path: Path) -> None:
+    digest.update(label.encode())
+    digest.update(b"\0")
+    if path.is_file():
+        digest.update(b"present\0")
+        digest.update(path.read_bytes())
+    else:
+        digest.update(b"missing\0")
+
+
+def _corpus_sha256(cases) -> str:
+    digest = hashlib.sha256()
+    for case_id, source, truth in cases:
+        digest.update(case_id.encode())
+        digest.update(source["type"].encode())
+        digest.update(source["path"].read_bytes())
+        digest.update(json.dumps(truth, ensure_ascii=False, sort_keys=True).encode())
+        if source["type"] == "image":
+            for label, path in _cached_ocr_artifacts(source["path"]):
+                _update_path_fingerprint(digest, label, path)
+    return digest.hexdigest()
+
+
+def _missing_cached_ocr(cases) -> list[Path]:
+    return [
+        path
+        for _case_id, source, _truth in cases
+        if source["type"] == "image"
+        for label, path in _cached_ocr_artifacts(source["path"])
+        if label.endswith("ocr_text") and not path.is_file()
+    ]
+
+
+def _git_output(*args: str) -> bytes | None:
+    try:
+        result = subprocess.run(
+            ["git", *args], capture_output=True, cwd=REPO_ROOT, timeout=10,
+        )
+        return result.stdout if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _untracked_sha256() -> str | None:
+    paths = _git_output("ls-files", "--others", "--exclude-standard", "-z")
+    if paths is None:
+        return None
+    root = REPO_ROOT.resolve()
+    digest = hashlib.sha256()
+    for raw_path in sorted(path for path in paths.split(b"\0") if path):
+        digest.update(raw_path)
+        digest.update(b"\0")
+        candidate = REPO_ROOT / os.fsdecode(raw_path)
+        try:
+            if candidate.is_symlink():
+                digest.update(b"symlink\0")
+                digest.update(os.fsencode(os.readlink(candidate)))
+                continue
+            candidate.resolve().relative_to(root)
+            digest.update(b"file\0")
+            digest.update(candidate.read_bytes())
+        except (OSError, ValueError):
+            digest.update(b"unreadable-or-outside\0")
+    return digest.hexdigest()
+
+
+def _git_state() -> dict:
+    sha = _git_output("rev-parse", "--short", "HEAD")
+    status = _git_output("status", "--porcelain=v1", "--untracked-files=normal")
+    diff = _git_output("diff", "--binary", "HEAD", "--")
+    untracked_sha = _untracked_sha256()
+    if diff is None and untracked_sha is not None:
+        diff = b""  # Unborn repositories have no HEAD yet.
+    dirty_sha = None
+    if diff is not None and untracked_sha is not None:
+        dirty_sha = hashlib.sha256(diff + b"\0" + untracked_sha.encode()).hexdigest()
+    return {
+        "git_sha": sha.decode(errors="replace").strip() if sha else "unknown",
+        "git_dirty": bool(status) if status is not None else None,
+        "git_status_sha256": hashlib.sha256(status).hexdigest() if status is not None else None,
+        "git_tracked_diff_sha256": hashlib.sha256(diff).hexdigest() if diff is not None else None,
+        "git_untracked_sha256": untracked_sha,
+        "git_diff_sha256": dirty_sha,
+        "git_dirty_tree_sha256": dirty_sha,
+        "git_diff_scope": "tracked_changes_plus_untracked_contents",
+    }
+
+
+try:
+    _REQUESTED_FIXTURES = _requested_fixture_names()
+    _RECEIPT_CEILING = _receipt_ceiling()
+    _ALL_CASES, _UNAVAILABLE_IMAGE_CASES = _discover_test_cases_with_exclusions()
+    _CASES = _resolve_requested_fixtures(
+        _filter_by_receipt_ceiling(_ALL_CASES), _REQUESTED_FIXTURES,
+    )
+    if (_REQUESTED_FIXTURES is not None or _RECEIPT_CEILING is not None) and not _CASES:
+        raise ValueError("Fixture filters selected no cases")
+except ValueError as exc:
+    raise pytest.UsageError(str(exc)) from exc
+
 _CASE_IDS = [c[0] for c in _CASES]
+_FILTERED_SCOPE = _REQUESTED_FIXTURES is not None or _RECEIPT_CEILING is not None
+_ACCURACY_SCOPE = {
+    **_git_state(),
+    "fixture_scope": (
+        "selected" if _FILTERED_SCOPE
+        else "available_discovered" if _UNAVAILABLE_IMAGE_CASES
+        else "all_discovered"
+    ),
+    "fixture_filter": sorted(_REQUESTED_FIXTURES) if _REQUESTED_FIXTURES else None,
+    "receipt_max_fixture": _RECEIPT_CEILING,
+    "available_case_count": len(_ALL_CASES),
+    "unavailable_image_case_count": len(_UNAVAILABLE_IMAGE_CASES),
+    "discovery_exclusions": {
+        "cached_ocr_missing": len(_UNAVAILABLE_IMAGE_CASES),
+    },
+    "selected_case_count": len(_CASES),
+    "selected_case_ids_sha256": hashlib.sha256("\n".join(_CASE_IDS).encode()).hexdigest(),
+    "fixture_corpus_sha256": _corpus_sha256(_CASES),
+    "source_counts": {
+        source_type: sum(1 for _, source, _ in _CASES if source["type"] == source_type)
+        for source_type in ("image", "ocr_text")
+    },
+    "cloud_vision_available": _cv_available,
+    "model": DEFAULT_MODEL,
+    "passes": ACCURACY_PASSES,
+    "apply_user_rules": False,
+}
 _RESULTS_CACHE: dict[str, dict] = {}
 
 # Collect check results for summary plugin
@@ -154,11 +377,25 @@ def _process_one(case_id: str, source: dict) -> tuple[str, dict, float]:
     t0 = time.perf_counter()
     if source["type"] == "image":
         from receipt_parser.pipeline import process_document
-        result = process_document(source["path"], passes=3, apply_user_rules=False)
+        digital_pdf = (
+            source["path"].suffix.lower() == ".pdf"
+            and bool(try_extract_text_layer(str(source["path"])))
+        )
+        result = process_document(
+            source["path"], passes=ACCURACY_PASSES, apply_user_rules=False,
+            ocr_engine=_CACHE_ONLY_OCR,
+        )
+        if not digital_pdf and result.get("_ocr_source") != "cache":
+            raise RuntimeError(
+                "Cached accuracy run received non-cache OCR source: "
+                f"{result.get('_ocr_source', 'missing')}"
+            )
     else:
         from receipt_parser.pipeline import process_ocr_text
         ocr_text = source["path"].read_text(encoding="utf-8")
-        result = process_ocr_text(ocr_text, passes=3, apply_user_rules=False)
+        result = process_ocr_text(
+            ocr_text, passes=ACCURACY_PASSES, apply_user_rules=False,
+        )
     elapsed = time.perf_counter() - t0
     return case_id, result, elapsed
 
@@ -174,17 +411,28 @@ def _get_result(case_id: str, source: dict) -> dict:
 def preprocess_fixtures(request):
     """Pre-process all fixtures concurrently before tests run."""
     workers = request.config.getoption("--workers", default=4)
+    scope = {**_ACCURACY_SCOPE, "workers": workers}
+    request.config._metadata = {
+        **(getattr(request.config, "_metadata", {}) or {}),
+        "accuracy_scope": scope,
+    }
     if not _CASES:
         return
 
-    if _cv_available:
-        from receipt_parser.ocr import init_cloud_vision
-        try:
-            init_cloud_vision()
-        except Exception:
-            return
+    missing_cache = _missing_cached_ocr(_CASES)
+    if missing_cache:
+        pytest.fail(
+            f"Cached OCR is missing for {len(missing_cache)} image page(s)",
+            pytrace=False,
+        )
 
     n = len(_CASES)
+    print(
+        f"\nAccuracy scope: {_ACCURACY_SCOPE['fixture_scope']}, "
+        f"{n}/{_ACCURACY_SCOPE['available_case_count']} discovered cases, "
+        f"passes={ACCURACY_PASSES}, git_dirty={_ACCURACY_SCOPE['git_dirty']}, "
+        f"diff={str(_ACCURACY_SCOPE['git_diff_sha256'] or 'unknown')[:12]}"
+    )
     if workers <= 1:
         print(f"\nProcessing {n} fixtures sequentially...")
         for name, source, _truth in _CASES:
