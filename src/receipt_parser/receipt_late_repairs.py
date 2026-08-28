@@ -13,6 +13,7 @@ from .receipt_item_repair import _clean_code_prefixed_item_descriptions
 from .receipt_items import (
     _bag_entries_from_ocr,
 )
+from .receipt_location import _PURCHASE_STORE_METADATA_RE
 from .receipt_projection import _clean_ocr_price_line_desc
 from .receipt_tax_categories import (
     _is_bag_description,
@@ -23,6 +24,9 @@ from .receipt_totals import _sum_taxable_amounts
 
 def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
     """Parse receipts that stack item names first, then matching price rows."""
+    def _rate_from_marker(marker: str) -> str:
+        return "10%" if marker == "外" else "8%" if marker == "軽" else "0%"
+
     total = extracted.get("total")
     subtotal = extracted.get("subtotal")
     if not total and not subtotal:
@@ -110,7 +114,7 @@ def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
                 "qty": qty,
                 "unit_price": unit,
                 "total": total_price,
-                "tax_category": "10%" if marker == "外" or _is_bag_description(desc) else "8%",
+                "tax_category": _rate_from_marker(marker),
                 "discount": 0,
                 "discount_rate": "",
             })
@@ -139,7 +143,7 @@ def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
                 "qty": 1.0,
                 "unit_price": price,
                 "total": price,
-                "tax_category": "10%" if marker == "外" or _is_bag_description(desc) else "8%",
+                "tax_category": _rate_from_marker(marker),
                 "discount": 0,
                 "discount_rate": "",
             })
@@ -164,7 +168,7 @@ def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
                 "qty": qty,
                 "unit_price": unit_price,
                 "total": price,
-                "tax_category": "10%" if _is_bag_description(desc) else "8%",
+                "tax_category": _rate_from_marker(pm.group(2) or ""),
                 "discount": 0,
                 "discount_rate": "",
             }
@@ -189,7 +193,7 @@ def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
                     "qty": 1.0,
                     "unit_price": price,
                     "total": price,
-                    "tax_category": "10%" if _is_bag_description(desc) else "8%",
+                    "tax_category": _rate_from_marker(marker),
                     "discount": 0,
                     "discount_rate": "",
                 })
@@ -292,10 +296,6 @@ def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
     )
     if usable_rate_bases and has_two_rate_tax_amounts:
         _rebalance_tax_categories_to_rate_bases(rows, unified_text, extracted.get("taxes"), rate_bases)
-    else:
-        for row in rows:
-            if _is_bag_description(row.get("description") or ""):
-                row["tax_category"] = "10%"
     extracted["line_items"] = rows
     if target_kind == "subtotal":
         return
@@ -318,33 +318,6 @@ def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
             or amount_paid_f < target
         ):
             extracted["amount_paid"] = target
-
-
-def _fix_split_bag_price_from_nearby_single_digit(extracted, unified_text):
-    """Repair tiny bag totals when OCR splits the bag row from a nearby single-digit price."""
-    items = extracted.get("line_items") or []
-    bag_items = [
-        item for item in items
-        if isinstance(item, dict) and _is_bag_description(item.get("description") or "")
-    ]
-    if len(bag_items) != 1:
-        return
-    item = bag_items[0]
-    if float(item.get("total") or 0) > 10:
-        return
-    if not re.search(r'有料レジ袋[^\n]*\(\s*3', unified_text):
-        return
-    lines = [line.strip() for line in unified_text.split('\n')]
-    for idx, line in enumerate(lines):
-        if "有料レジ袋" not in line:
-            continue
-        for nearby in lines[idx + 1:idx + 8]:
-            if re.fullmatch(r'5', nearby):
-                item["qty"] = 1.0
-                item["unit_price"] = 5.0
-                item["total"] = 5.0
-                item["tax_category"] = "10%"
-                return
 
 
 def _fix_small_bag_description_from_ocr_entry(extracted, unified_text):
@@ -378,7 +351,6 @@ def _fix_small_bag_description_from_ocr_entry(extracted, unified_text):
         item["qty"] = entry["qty"]
         item["unit_price"] = entry["unit_price"]
         item["total"] = entry["total"]
-        item["tax_category"] = "10%"
         return
 
 
@@ -675,26 +647,19 @@ def _restore_single_rate_inclusive_tax_block(extracted, unified_text):
     rate_m = re.search(r'\(\s*内\s*(\d+(?:\.\d+)?)\s*%\s*税', unified_text)
     rate = None
     expected = None
+    base = total
     if rate_m:
         rate = normalize_tax_rate(rate_m.group(1) + "%")
-        try:
-            rate_pct = float(rate.rstrip('%')) / 100.0
-        except ValueError:
-            return
-        expected = round(total * rate_pct / (1 + rate_pct))
-        if expected <= 0:
-            return
         idx = unified_text.find(rate_m.group(0))
         tail = unified_text[idx:] if idx >= 0 else unified_text
         values = [
             float(m.group(1).replace(',', ''))
             for m in re.finditer(r'[¥￥]\s*([\d,]+)\s*[\)）]?', tail)
         ]
-        if not any(abs(value - expected) <= 2 for value in values):
-            return
     else:
         inline_m = re.search(
-            r'(\d+(?:\.\d+)?)\s*%\s*対象\s*[¥￥]?\s*([\d,]+)\s*内消費税\s*[¥￥]?\s*([\d,]+)',
+            r'(\d+(?:\.\d+)?)\s*%\s*対象\s*[¥￥]?\s*([\d,]+)\s*'
+            r'(?P<tax_label>(?:内\s*)?消費税等?)\s*[¥￥]?\s*(?P<tax_amount>[\d,]+)',
             unified_text,
             flags=re.S,
         )
@@ -702,25 +667,53 @@ def _restore_single_rate_inclusive_tax_block(extracted, unified_text):
             return
         rate = normalize_tax_rate(inline_m.group(1) + "%")
         base = float(inline_m.group(2).replace(',', ''))
-        expected = float(inline_m.group(3).replace(',', ''))
+        expected = float(inline_m.group("tax_amount").replace(',', ''))
         rate_bases = {
             r: b for r, b in extract_rate_bases(unified_text).items()
             if r != "0%" and b
         }
         if set(rate_bases) - {rate}:
             return
-        item_sum = sum(
-            float(item.get("total") or 0)
-            for item in extracted.get("line_items") or []
-            if isinstance(item, dict)
-        )
-        if not (
-            abs(base - total) <= 2
-            or (item_sum > 0 and abs(base - item_sum) <= 2)
-        ):
+        if abs(base - total) > 2:
             return
-    extracted["taxes"] = [{"rate": rate, "label": "内税", "amount": float(expected)}]
-    extracted["subtotal"] = total - float(expected)
+    try:
+        rate_pct = float(rate.rstrip('%')) / 100.0
+    except ValueError:
+        return
+    arithmetic_tax = round(base * rate_pct / (1 + rate_pct))
+    if arithmetic_tax <= 0:
+        return
+    if rate_m:
+        expected = arithmetic_tax
+        if not any(abs(value - expected) <= 2 for value in values):
+            return
+    elif abs(float(expected) - arithmetic_tax) > 2:
+        return
+
+    current_taxes = [
+        tax for tax in (extracted.get("taxes") or [])
+        if isinstance(tax, dict)
+        and tax.get("rate") != "0%"
+        and tax.get("amount") is not None
+    ]
+    preserve_existing = False
+    if len(current_taxes) == 1 and extracted.get("subtotal") is not None:
+        current_tax = current_taxes[0]
+        try:
+            current_amount = float(current_tax["amount"])
+            current_subtotal = float(extracted["subtotal"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        else:
+            preserve_existing = (
+                current_tax.get("label") == "内税"
+                and normalize_tax_rate(str(current_tax.get("rate") or "")) == rate
+                and abs(current_amount - arithmetic_tax) <= 2
+                and abs(current_subtotal + current_amount - total) <= 2
+            )
+    if not preserve_existing:
+        extracted["taxes"] = [{"rate": rate, "label": "内税", "amount": float(expected)}]
+        extracted["subtotal"] = total - float(expected)
     items = extracted.get("line_items") or []
     if len(items) == 1 and isinstance(items[0], dict):
         items[0]["tax_category"] = rate
@@ -773,59 +766,124 @@ def _fix_header_store_line_location(extracted, unified_text):
 
 
 def _fix_split_address_location_from_ocr(extracted, unified_text):
-    """Recover addresses split across admin-area and street-number OCR lines."""
+    """Recover one printed address that uniquely extends an admin fragment."""
     existing = re.sub(r'\s+', '', extracted.get("location") or "")
     lines = [line.strip() for line in unified_text.split('\n')]
+    address_chars = r'[\u3040-\u30ff\u3400-\u9fff々〆ー]'
+    noise = re.compile(
+        r'TEL|電話|FAX|☎|登録番号|営業時間|領収|合計|小計|消費税|'
+        r'本社|本店所在地|所在地|住所|配送先|請求先|お問い合わせ|〒|'
+        r'株式会社|有限会社|合同会社|㈱|㈲',
+        re.IGNORECASE,
+    )
+    scoped_label = re.compile(
+        r'(?:本社(?:所在地|住所)?|本店所在地|会社所在地|配送先|請求先|'
+        r'送付先|お届け先|返送先|お問い合わせ(?:先|窓口)?)[:：]?'
+    )
+    candidates = []
+    if existing and re.search(r'[都道府県市区町村郡]$', existing):
+        for idx, line in enumerate(lines):
+            compact = re.sub(r'\s+', '', line)
+            previous = next(
+                (
+                    re.sub(r'\s+', '', lines[pos])
+                    for pos in range(idx - 1, -1, -1)
+                    if lines[pos]
+                ),
+                "",
+            )
+            if (
+                not noise.search(compact)
+                and not scoped_label.fullmatch(previous)
+                and compact.startswith(existing)
+                and re.fullmatch(
+                    rf'{address_chars}+[都道府県市区町村郡]'
+                    rf'{address_chars}+[\d０-９]{{1,6}}',
+                    compact,
+                )
+                and compact not in candidates
+            ):
+                candidates.append(compact)
     for idx, line in enumerate(lines[:-1]):
-        if not re.fullmatch(r'.*[都道府県].*[市区町村]', line):
+        first = re.sub(r'\s+', '', line)
+        if noise.search(first):
             continue
-        nxt = lines[idx + 1].strip()
-        if re.search(r'TEL|電話|登録番号|営業時間', nxt, re.IGNORECASE):
+        previous = next(
+            (re.sub(r'\s+', '', lines[pos]) for pos in range(idx - 1, -1, -1) if lines[pos]),
+            "",
+        )
+        if scoped_label.fullmatch(previous):
             continue
-        if not re.fullmatch(r'[^¥￥\s]+?\d+(?:[-－]\d+)+', nxt):
+        admin_only = re.fullmatch(
+            rf'{address_chars}+[都道府県]{address_chars}+[市区町村]',
+            first,
+        )
+        ward_with_locality = re.fullmatch(
+            rf'{address_chars}+[都道府県]{address_chars}+区{address_chars}+',
+            first,
+        )
+        if not (admin_only or ward_with_locality):
             continue
-        candidate = re.sub(r'\s+', '', line + nxt)
-        if not existing or existing in candidate or len(candidate) > len(existing) + 4:
-            extracted["location"] = candidate
-            return
+        nxt = re.sub(r'\s+', '', lines[idx + 1])
+        if noise.search(nxt):
+            continue
+        numeric_street = bool(
+            re.fullmatch(r'[\d０-９][\d０-９丁目番号地\-－‐―ー]*', nxt)
+            and re.search(r'丁目|番(?:地)?|号|[-－‐―ー]', nxt)
+        )
+        locality_street = bool(
+            admin_only
+            and re.fullmatch(
+                rf'{address_chars}+[\d０-９][\d０-９丁目番号地\-－‐―ー]*',
+                nxt,
+            )
+            and re.search(r'丁目|番(?:地)?|号|[-－‐―ー]', nxt)
+        )
+        if not (numeric_street or locality_street):
+            continue
+        if re.fullmatch(
+            r'[0０][\d０-９]{1,4}[-－‐―ー][\d０-９]{1,4}'
+            r'[-－‐―ー][\d０-９]{2,4}',
+            nxt,
+        ) or re.fullmatch(
+            r'[\d０-９]{3}[-－‐―ー][\d０-９]{4}|'
+            r'[\d０-９]{4}[-－‐―ー][\d０-９]{1,2}[-－‐―ー][\d０-９]{1,2}',
+            nxt,
+        ):
+            continue
+        candidate = first + nxt
+        if candidate not in candidates:
+            candidates.append(candidate)
+    if len(candidates) != 1:
+        return
+    candidate = candidates[0]
+    if not existing or existing in candidate or len(candidate) > len(existing) + 4:
+        extracted["location"] = candidate
 
 
 def _recover_labeled_purchase_site_location(extracted, unified_text):
-    """Recover a printed site-area token from a labeled purchase-site line."""
+    """Recover the exact site named by a bounded purchase-site label."""
     existing = re.sub(r'\s+', '', extracted.get("location") or "")
     lines = [line.strip() for line in unified_text.split('\n') if line.strip()]
     for line in lines:
-        m = re.search(
-            r'購入倉庫店\s*[:：]\s*'
-            r'([^\s:：¥￥,，。()（）]+?倉庫店)',
-            line,
-        )
-        if not m:
-            continue
-        site = re.sub(r'\s+', '', m.group(1))
-        candidate = re.sub(r'倉庫店$', '', site)
-        if not re.fullmatch(r'[\u3040-\u30ff\u3400-\u9fffA-Za-z0-9・ー]{2,20}', candidate):
+        metadata = _PURCHASE_STORE_METADATA_RE.match(line)
+        if metadata:
+            candidate = re.sub(r'\s+', '', metadata.group("store"))
+        else:
+            warehouse = re.search(
+                r'購入倉庫店\s*[:：]\s*'
+                r'([^\s:：¥￥,，。()（）]+?倉庫店)',
+                line,
+            )
+            if not warehouse:
+                continue
+            site = re.sub(r'\s+', '', warehouse.group(1))
+            candidate = re.sub(r'倉庫店$', '', site)
+        if not re.fullmatch(r'[\u3040-\u30ff\u3400-\u9fffA-Za-z0-9・ー]{2,30}', candidate):
             continue
         if re.search(r'TEL|電話|登録番号|会員番号|領収|合計|小計|対象|消費税', candidate, re.IGNORECASE):
             continue
-        if existing and (candidate in existing or existing in candidate):
+        if metadata is None and existing and (candidate in existing or existing in candidate):
             return
         extracted["location"] = candidate
         return
-
-
-def _restore_zero_points_when_no_redemption(extracted, unified_text):
-    """Restore explicit zero point usage when payment math shows no redemption."""
-    if extracted.get("points_used") is not None:
-        return
-    if re.search(r'ポイント利用|利用ポイント|ポイント値引|ポイント\s*-', unified_text):
-        return
-    if not re.search(r'ポイント|リワード|会員', unified_text):
-        return
-    try:
-        total = float(extracted.get("total"))
-        amount_paid = float(extracted.get("amount_paid"))
-    except (TypeError, ValueError):
-        return
-    if abs(total - amount_paid) <= 2:
-        extracted["points_used"] = 0

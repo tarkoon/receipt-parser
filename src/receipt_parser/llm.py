@@ -718,16 +718,6 @@ def _has_item_sum_warning(warnings: list[str]) -> bool:
     )
 
 
-def _validator_visible_item_sum_gap(extracted: dict, warnings: list[str]) -> float | None:
-    """Return the item-sum gap only when validation has surfaced that issue."""
-    if not _has_item_sum_warning(warnings):
-        return None
-    gap = _items_sum_gap(extracted)
-    if gap is None or gap <= 5:
-        return None
-    return gap
-
-
 def _item_sum_gap_if_validator_flagged(
     extracted: dict,
     *warning_sets: list[str],

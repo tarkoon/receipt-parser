@@ -57,8 +57,6 @@ _SERVICE_TAX_RATE_EVIDENCE_RE = re.compile(
 )
 _ADMIN_FEE_DESCRIPTION_RE = re.compile(r'証明|住民票|戸籍|印鑑|所得|課税|納税|手数料|電申')
 
-_FUEL_KEYWORDS = ('ガソリン', 'レギュラー', 'ハイオク', '軽油', 'ENEOS', '出光', 'コスモ')
-
 _SKIP_PRICE_LINE = re.compile(r'対象|内税|外税|合計|小計|消費税|お預り|お釣|お預かり')
 _GENERIC_DESC_MARKERS = frozenset({
     '消耗', '食料品', '飲料', '雑貨', '文具', '日配', '冷蔵', '冷凍',
@@ -126,13 +124,8 @@ _OCR_QTY_NOTATION_RE = re.compile(
     r'(?:単|@)\s*\d[\d,]*\s*[xX×Ⅹ]\s*\d+\s*[コ個点]'
     r')'
 )
-_BAG_DESC_RE = re.compile(
+_PAID_CONTAINER_DESC_RE = re.compile(
     r'レジ[ブフ]クロ|レジ袋|有料レジ袋|食品ポリ袋|ポリ袋|ショッピングバッグ|紙袋|バイオ.*袋|フクロHK'
-)
-_FOOD_DESC_RE = re.compile(
-    r'バナナ|だし|餃子|肉|ミンチ|キャベツ|にんじん|大根|ハム|コマツナ|春雨|'
-    r'ピーチ|ねぎ|オオバ|パン|ホシイモ|米|牛|豚|鶏|チキン|弁当|おにぎり|'
-    r'茶|ココア|コーヒー|天然水|オイル不使用|食品'
 )
 
 
