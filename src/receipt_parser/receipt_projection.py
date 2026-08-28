@@ -17,6 +17,15 @@ from .receipt_financial import (
 from .receipt_totals import _canonical_subtotal_from_taxes, _line_items_sum
 
 
+_CODE_ANCHOR_RE = re.compile(
+    r'^(?:(?P<pos>\d{3,6}(?:-\d{3,6})+)(?:\s+(?P<title>.+))?'
+    r'|(?P<barcode>\d{10,14})(?:\s+\d{1,3})?)$'
+)
+_CODE_STREAM_END_RE = re.compile(
+    r'^(?:小\s*計|合\s*計|現\s*計|お預り|お釣り|釣銭|クレジット|お会計)'
+)
+
+
 def _merge_qty_detail_into_previous(items, unified_text):
     """Collapse qty-detail phantom items into the preceding product.
 
@@ -233,6 +242,27 @@ def _fix_item_totals_from_ocr_neighborhood(
 
     lines = unified_text.split('\n')
 
+    def _is_discount_label(line: str) -> bool:
+        return bool(re.fullmatch(
+            r'(?:\u307e\u3068\u3081)?(?:\u5024\u5f15|\u5272\u5f15)'
+            r'(?:\u304d)?(?:\s*[*\uff0a]+)?',
+            line,
+        ))
+
+    def _is_scan_boundary(line: str) -> bool:
+        if _is_discount_label(line) or _OCR_QTY_NOTATION_RE.search(line):
+            return False
+        return bool(
+            _OCR_ZONE_END_RE.match(line)
+            or _SKIP_PRICE_LINE.search(line)
+            or re.search(
+                r'支払|決済|現金|カード|電子マネー|Pay|VISA|Master',
+                line,
+                re.IGNORECASE,
+            )
+            or re.search(r'[ぁ-んァ-ン一-龥]{2,}', line)
+        )
+
     def _ocr_price_after(li: int) -> tuple[float | None, int | None]:
         # Look for a clean ¥-bearing or plain numeric line within next 6 lines.
         # Stop on another item-like line (Japanese text, no ¥).
@@ -240,10 +270,14 @@ def _fix_item_totals_from_ocr_neighborhood(
             s = lines[j].strip()
             if not s:
                 continue
-            if _SKIP_PRICE_LINE.search(s):
+            if _is_discount_label(s):
+                continue
+            if _is_scan_boundary(s):
                 return None, None
             m = re.match(r'^[¥￥]?\s*([\d,]+)\s*[※\*除]?\s*$', s)
             if m:
+                if re.fullmatch(r'[1-9]', s):
+                    continue
                 try:
                     return float(m.group(1).replace(',', '')), j
                 except ValueError:
@@ -278,18 +312,22 @@ def _fix_item_totals_from_ocr_neighborhood(
             s = lines[j].strip()
             if not s:
                 continue
+            if _is_discount_label(s):
+                continue
+            if j > li and _is_scan_boundary(s):
+                return False
             inline = _ocr_price_inline(s)
             if inline is not None and abs(inline - price) <= 1:
                 return True
             m = re.match(r'^[¥￥]?\s*([\d,]+)\s*[※\*除]?\s*$', s)
             if m:
+                if re.fullmatch(r'[1-9]', s):
+                    continue
                 try:
                     if abs(float(m.group(1).replace(',', '')) - price) <= 1:
                         return True
                 except ValueError:
                     pass
-            if j > li and re.search(r'[ぁ-んァ-ン一-龥]{2,}', s):
-                return False
         return False
 
     def _ocr_window_supports_qty(li: int, price_li: int | None, item: dict) -> bool:
@@ -402,8 +440,15 @@ def _fix_item_totals_from_ocr_neighborhood(
                 break  # first matching OCR line for this item
         if not candidates:
             break
-        candidates.sort(reverse=True)  # largest improvement first
-        improvement, idx, new_total, match_li, price_li = candidates[0]
+        best_improvement = max(candidate[0] for candidate in candidates)
+        best = {
+            candidate[1:]
+            for candidate in candidates
+            if abs(candidate[0] - best_improvement) <= 0.01
+        }
+        if len(best) != 1:
+            break
+        idx, new_total, match_li, price_li = best.pop()
         item = items[idx]
         item["total"] = new_total
         try:
@@ -1106,12 +1151,12 @@ def _project_totals_to_ocr_multiset(extracted, unified_text):
         text = re.sub(r'[^\wぁ-んァ-ン一-龥]', '', text, flags=re.UNICODE)
         return text.lower()
 
-    def _ocr_line_for_desc(desc: str) -> int | None:
+    def _ocr_lines_for_desc(desc: str, start: int) -> list[tuple[float, int]]:
         nd = _norm_desc(desc)
         if len(nd) < 3:
-            return None
-        best: tuple[float, int] | None = None
-        for li in range(zone_start, zone_end):
+            return []
+        matches: list[tuple[float, int]] = []
+        for li in range(start, zone_end):
             nl = _norm_desc(lines[li])
             if len(nl) < 3 or re.match(r'^\d+$', nl):
                 continue
@@ -1119,24 +1164,42 @@ def _project_totals_to_ocr_multiset(extracted, unified_text):
                 score = 1.0
             else:
                 score = SequenceMatcher(None, nd, nl).ratio()
-            if score >= 0.72 and (best is None or score > best[0]):
-                best = (score, li)
-        return best[1] if best else None
+            if score >= 0.72:
+                matches.append((score, li))
+        return matches
 
-    # Prefer row-order projection when descriptions can be matched uniquely to
-    # OCR item lines. This keeps description↔price pairing intact on receipts
-    # that print several descriptions before their price column.
+    # Match every extracted row to one OCR description in sequence. This
+    # handles repeated descriptions by occurrence while rejecting missing or
+    # out-of-order ownership; geometry projection gets the next chance.
     desc_order: list[tuple[int, int]] = []
-    used_lines: set[int] = set()
+    cursor = zone_start
     for idx, item in enumerate(items):
-        if not isinstance(item, dict) or (item.get("qty") or 1) != 1:
-            continue
-        line_idx = _ocr_line_for_desc(item.get("description") or "")
-        if line_idx is None or line_idx in used_lines:
+        if not isinstance(item, dict):
             desc_order = []
             break
-        used_lines.add(line_idx)
-        desc_order.append((line_idx, idx))
+        matches = _ocr_lines_for_desc(item.get("description") or "", cursor)
+        if not matches:
+            desc_order = []
+            break
+        best_score = max(score for score, _line_idx in matches)
+        best_lines = [
+            line_idx
+            for score, line_idx in matches
+            if abs(score - best_score) <= 0.01
+        ]
+        item_norm = _norm_desc(item.get("description") or "")
+        remaining_same = sum(
+            _norm_desc(later.get("description") or "") == item_norm
+            for later in items[idx:]
+            if isinstance(later, dict)
+        )
+        if len(best_lines) > 1 and len(best_lines) != remaining_same:
+            desc_order = []
+            break
+        line_idx = min(best_lines)
+        cursor = line_idx + 1
+        if (item.get("qty") or 1) == 1 and (item.get("discount") or 0) == 0:
+            desc_order.append((line_idx, idx))
 
     if len(desc_order) == len(qty_1_items):
         for (_, idx), (_, new_total) in zip(
@@ -1145,47 +1208,6 @@ def _project_totals_to_ocr_multiset(extracted, unified_text):
         ):
             items[idx]["total"] = new_total
             items[idx]["unit_price"] = new_total
-        return
-
-    qty1_current_idxs = [
-        idx for idx, item in enumerate(items)
-        if (
-            isinstance(item, dict)
-            and (item.get("qty") or 1) == 1
-            and (item.get("discount") or 0) == 0
-        )
-    ]
-    if not qty_n_items and len(qty1_current_idxs) == len(chosen_pairs):
-        for idx, (_, new_total) in zip(
-            qty1_current_idxs,
-            sorted(chosen_pairs, key=lambda p: p[0]),
-        ):
-            items[idx]["total"] = new_total
-            items[idx]["unit_price"] = new_total
-        return
-
-    if sorted_qty1_totals == sorted_chosen or items_sum_already_matches:
-        return
-
-    # Fallback: assign sorted-OCR totals to qty=1 items by their current total-rank.
-    qty1_sorted_idxs = sorted(
-        range(len(items)),
-        key=lambda j: (
-            -1 if not isinstance(items[j], dict) or (items[j].get("qty") or 1) > 1 else 0,
-            items[j].get("total", 0) if isinstance(items[j], dict) else 0,
-        ),
-    )
-    qty1_sorted_idxs = [j for j in qty1_sorted_idxs
-                        if (
-                            isinstance(items[j], dict)
-                            and (items[j].get("qty") or 1) == 1
-                            and (items[j].get("discount") or 0) == 0
-                        )]
-
-    for k, idx in enumerate(qty1_sorted_idxs):
-        new_total = sorted_chosen[k]
-        items[idx]["total"] = new_total
-        items[idx]["unit_price"] = new_total
 
 
 def _layout_block_height(block: dict) -> float:
@@ -1202,6 +1224,26 @@ def _layout_block_center_y(block: dict) -> float:
     if ys:
         return (max(ys) + min(ys)) / 2
     return float(block.get("y") or 0)
+
+
+def _layout_rows_are_local(first: list[dict], second: list[dict]) -> bool:
+    """Require ordered ownership rows to be on-page and physically nearby."""
+    if (
+        not first
+        or not second
+        or first[0].get("page", 0) != second[0].get("page", 0)
+    ):
+        return False
+    first_ys = sorted(_layout_block_center_y(block) for block in first)
+    second_ys = sorted(_layout_block_center_y(block) for block in second)
+    heights = sorted(
+        height
+        for block in first + second
+        if (height := _layout_block_height(block)) > 0
+    )
+    row_height = heights[len(heights) // 2] if heights else 20.0
+    gap = second_ys[len(second_ys) // 2] - first_ys[len(first_ys) // 2]
+    return 0 < gap <= max(8.0, row_height * 3)
 
 
 def _group_layout_rows(layout_blocks: list[dict]) -> list[list[dict]]:
@@ -1235,7 +1277,7 @@ def _group_layout_rows(layout_blocks: list[dict]) -> list[list[dict]]:
 
 def _layout_price_value(text: str, *, allow_small: bool = False) -> int | None:
     s = (text or "").strip()
-    m = re.match(r'^[¥￥]?\s*(\d[\d,]*)\s*[*※除軽]?\s*$', s)
+    m = re.match(r'^[¥￥]?\s*(\d[\d,]*)\s*(?:[*＊※%％除軽xX]+)?\s*$', s)
     if not m:
         return None
     try:
@@ -1274,8 +1316,109 @@ def _norm_layout_desc(text: str) -> str:
     return text.lower()
 
 
+def _adjacent_layout_description(rows: list[list[dict]], raw: dict):
+    """Own a preceding title only for a code/qty/unit/total detail row.
+
+    The two rightmost numeric columns must repeat the same qty=1 unit/total;
+    this keeps ASCII-only titles usable without treating arbitrary prior rows
+    as product descriptions.
+    """
+    row_idx = raw["row_idx"]
+    row = raw["row"]
+    ordered = sorted(
+        raw["price_positions"],
+        key=lambda pair: float(row[pair[0]].get("x") or 0),
+    )
+    if (
+        row_idx <= 0
+        or len(ordered) < 3
+        or not _layout_rows_are_local(rows[row_idx - 1], row)
+    ):
+        return None
+    (_qty_idx, qty), (unit_idx, unit), (total_idx, total) = ordered[-3:]
+    if qty != 1 or unit != total:
+        return None
+    unit_x = float(row[unit_idx].get("x") or 0)
+    total_x = float(row[total_idx].get("x") or 0)
+    if total_x - unit_x < 30:
+        return None
+    current_prefix = "".join(str(block.get("text") or "") for block in row[:unit_idx])
+    if re.search(r"[A-Za-zぁ-んァ-ン一-龥]", current_prefix):
+        return None
+    description = "".join(
+        str(block.get("text") or "") for block in rows[row_idx - 1]
+    ).strip()
+    if (
+        not re.search(r"[A-Za-zぁ-んァ-ン一-龥]", description)
+        or _SKIP_PRICE_LINE.search(description)
+        or _OCR_ZONE_END_RE.match(description)
+    ):
+        return None
+    return description, total_idx, total
+
+
 def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]:
     rows = _group_layout_rows(layout_blocks or [])
+    row_texts = [
+        "".join(str(block.get("text") or "") for block in row).strip()
+        for row in rows
+    ]
+
+    # Some POS receipts print each title above a barcode, then put the gross
+    # price (and optional discount) below it. Preserve that geometry instead of
+    # trusting the flattened OCR order, which may move the price column later.
+    barcode_anchors: list[tuple[int, int, str]] = []
+    for row_idx in range(len(rows) - 1):
+        description = row_texts[row_idx]
+        barcode = re.sub(r'\s+', '', row_texts[row_idx + 1])
+        if (
+            _layout_rows_are_local(rows[row_idx], rows[row_idx + 1])
+            and re.fullmatch(r'\d{10,14}', barcode)
+            and re.search(r'[A-Za-zぁ-んァ-ン一-龥]', description)
+            and not _SKIP_PRICE_LINE.search(description)
+            and not _OCR_ZONE_END_RE.match(description)
+        ):
+            barcode_anchors.append((row_idx, row_idx + 1, description))
+
+    barcode_candidates: list[dict] = []
+    for anchor_idx, (desc_idx, barcode_idx, description) in enumerate(barcode_anchors):
+        end_idx = (
+            barcode_anchors[anchor_idx + 1][0]
+            if anchor_idx + 1 < len(barcode_anchors)
+            else len(rows)
+        )
+        gross: int | None = None
+        discount = 0
+        price_row_idx: int | None = None
+        for row_idx in range(barcode_idx + 1, end_idx):
+            owner_row_idx = price_row_idx if price_row_idx is not None else barcode_idx
+            if not _layout_rows_are_local(rows[owner_row_idx], rows[row_idx]):
+                break
+            compact = re.sub(r'\s+', '', row_texts[row_idx])
+            if _OCR_ZONE_END_RE.match(compact):
+                break
+            positive = re.fullmatch(r'[¥￥](\d[\d,]*)', compact)
+            negative = re.fullmatch(r'[^\d¥￥]*-[¥￥](\d[\d,]*)', compact)
+            if positive and gross is None:
+                gross = int(positive.group(1).replace(',', ''))
+                price_row_idx = row_idx
+            elif negative and gross is not None and discount == 0:
+                discount = int(negative.group(1).replace(',', ''))
+        if gross is None or price_row_idx is None or not (0 <= discount < gross):
+            continue
+        price_row = rows[price_row_idx]
+        barcode_candidates.append({
+            "description": description,
+            "value": gross - discount,
+            "gross": gross,
+            "discount": discount,
+            "y": _layout_block_center_y(price_row[-1]),
+            "x": float(price_row[-1].get("x") or 0),
+            "reduced_marker": False,
+        })
+    if len(barcode_candidates) >= 2 and len(barcode_candidates) == len(barcode_anchors):
+        return barcode_candidates
+
     raw_rows: list[dict] = []
     for row_idx, row in enumerate(rows):
         row_text = "".join(str(b.get("text") or "") for b in row).strip()
@@ -1328,10 +1471,21 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
             key=lambda pair: float(row[pair[0]].get("x") or 0),
         )
         price_x = float(row[price_idx].get("x") or 0)
+        price_text = str(row[price_idx].get("text") or "").strip()
+        marker_text = re.sub(
+            r'^[¥￥]?\s*\d[\d,]*\s*',
+            '',
+            price_text,
+        ) + ''.join(str(block.get("text") or "") for block in row[price_idx + 1:])
+        marker_text = re.sub(r'\s+', '', marker_text)
         desc_text = "".join(str(b.get("text") or "") for b in row[:price_idx]).strip()
+        adjacent = _adjacent_layout_description(rows, raw)
+        if adjacent is not None:
+            desc_text, price_idx, value = adjacent
+            price_x = float(row[price_idx].get("x") or 0)
         if not desc_text or _SKIP_PRICE_LINE.search(desc_text):
             continue
-        if not re.search(r'[ぁ-んァ-ン一-龥]', desc_text):
+        if adjacent is None and not re.search(r'[ぁ-んァ-ン一-龥]', desc_text):
             continue
         next_row_text = ""
         next_row_idx = raw["row_idx"] + 1
@@ -1345,6 +1499,10 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
             "value": int(value),
             "y": _layout_block_center_y(row[price_idx]),
             "x": price_x,
+            "reduced_marker": bool(
+                marker_text
+                and re.fullmatch(r'[*＊※%％xX軽]+', marker_text)
+            ),
         })
     return candidates
 
@@ -1352,9 +1510,10 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
 def _project_totals_to_layout_rows(extracted, ocr_layout_blocks):
     """Use preserved OCR row geometry to resolve price-token swaps.
 
-    This is intentionally conservative and only fires when the geometric row
-    prices form a subtotal/total-matching multiset while the current extraction
-    does not.
+    A balanced extraction may be repaired only as a pure permutation: at least
+    two unique, strongly matched qty=1 rows must change while their exact value
+    multiset stays unchanged.  Otherwise this remains the existing conservative
+    off-balance repair whose geometric prices must match a financial target.
     """
     items = extracted.get("line_items") or []
     if not items or not ocr_layout_blocks:
@@ -1368,8 +1527,7 @@ def _project_totals_to_layout_rows(extracted, ocr_layout_blocks):
         return
 
     item_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
-    if any(abs(item_sum - t) <= 2 for t in targets):
-        return
+    items_sum_already_matches = any(abs(item_sum - t) <= 2 for t in targets)
 
     qty_n_items = [i for i in items if isinstance(i, dict) and (i.get("qty") or 1) > 1]
     discounted_items = [
@@ -1389,6 +1547,155 @@ def _project_totals_to_layout_rows(extracted, ocr_layout_blocks):
 
     candidates = _layout_row_price_candidates(ocr_layout_blocks)
     if not candidates:
+        return
+
+    barcode_candidates = [
+        candidate for candidate in candidates
+        if candidate.get("gross") is not None
+    ]
+    barcode_item_indices = [
+        idx for idx, item in enumerate(items)
+        if isinstance(item, dict) and (item.get("qty") or 1) == 1
+    ]
+    if barcode_candidates:
+        if not (
+            len(barcode_candidates) >= 2
+            and len(barcode_candidates) == len(items) == len(barcode_item_indices)
+        ):
+            return
+        assignments: dict[int, dict] = {}
+        used_candidate_idxs: set[int] = set()
+        item_descs = [
+            _norm_layout_desc(items[idx].get("description") or "")
+            for idx in barcode_item_indices
+        ]
+        if all(len(desc) >= 3 for desc in item_descs) and len(item_descs) == len(set(item_descs)):
+            for item_idx, item_desc in zip(barcode_item_indices, item_descs, strict=False):
+                matches = []
+                for candidate_idx, candidate in enumerate(barcode_candidates):
+                    if candidate_idx in used_candidate_idxs:
+                        continue
+                    candidate_desc = _norm_layout_desc(candidate["description"])
+                    if len(candidate_desc) < 3:
+                        continue
+                    score = (
+                        1.0
+                        if item_desc in candidate_desc or candidate_desc in item_desc
+                        else SequenceMatcher(None, item_desc, candidate_desc).ratio()
+                    )
+                    if score >= 0.86:
+                        matches.append((score, candidate_idx))
+                if not matches:
+                    assignments = {}
+                    break
+                best_score = max(score for score, _ in matches)
+                best = [idx for score, idx in matches if abs(score - best_score) <= 0.01]
+                if len(best) != 1:
+                    assignments = {}
+                    break
+                candidate_idx = best[0]
+                used_candidate_idxs.add(candidate_idx)
+                assignments[item_idx] = barcode_candidates[candidate_idx]
+
+        if len(assignments) != len(items):
+            return
+        projected_sum = sum(float(candidate["value"]) for candidate in assignments.values())
+        current_gap = min(abs(float(item_sum) - float(target)) for target in targets)
+        projected_gap = min(abs(projected_sum - float(target)) for target in targets)
+
+        def _bundle(item: dict) -> tuple[float, float, float]:
+            return (
+                round(float(item.get("unit_price") or 0), 2),
+                round(float(item.get("total") or 0), 2),
+                round(float(item.get("discount") or 0), 2),
+            )
+
+        current_bundles = sorted(_bundle(item) for item in items)
+        projected_bundles = sorted(
+            (
+                round(float(candidate["gross"]), 2),
+                round(float(candidate["value"]), 2),
+                round(float(candidate["discount"]), 2),
+            )
+            for candidate in assignments.values()
+        )
+        changed = sum(
+            _bundle(items[idx])
+            != (
+                round(float(candidate["gross"]), 2),
+                round(float(candidate["value"]), 2),
+                round(float(candidate["discount"]), 2),
+            )
+            for idx, candidate in assignments.items()
+        )
+        if (
+            projected_gap <= 2
+            and (
+                (changed >= 1 and projected_gap + 0.5 < current_gap)
+                or (changed >= 2 and current_bundles == projected_bundles)
+            )
+        ):
+            for idx, candidate in assignments.items():
+                items[idx]["unit_price"] = float(candidate["gross"])
+                items[idx]["total"] = float(candidate["value"])
+                items[idx]["discount"] = float(candidate["discount"])
+                items[idx]["discount_rate"] = ""
+        return
+
+    if items_sum_already_matches:
+        item_descs = {
+            idx: _norm_layout_desc(items[idx].get("description") or "")
+            for idx in qty_1_indices
+        }
+        matchable_descs = [desc for desc in item_descs.values() if len(desc) >= 3]
+        if len(matchable_descs) != len(set(matchable_descs)):
+            return
+
+        assignments: dict[int, int] = {}
+        used_candidate_idxs: set[int] = set()
+        for item_idx, item_desc in item_descs.items():
+            if len(item_desc) < 3:
+                continue
+            matches: list[int] = []
+            for cand_idx, cand in enumerate(candidates):
+                cand_desc = _norm_layout_desc(cand["description"])
+                if len(cand_desc) < 3:
+                    continue
+                score = (
+                    1.0
+                    if item_desc in cand_desc or cand_desc in item_desc
+                    else SequenceMatcher(None, item_desc, cand_desc).ratio()
+                )
+                if score >= 0.86:
+                    matches.append(cand_idx)
+            if len(matches) > 1:
+                return
+            if not matches:
+                continue
+            candidate_idx = matches[0]
+            if candidate_idx in used_candidate_idxs:
+                return
+            used_candidate_idxs.add(candidate_idx)
+            assignments[item_idx] = candidates[candidate_idx]["value"]
+
+        if len(assignments) < 2:
+            return
+        try:
+            current_values = [float(items[idx].get("total")) for idx in assignments]
+        except (TypeError, ValueError):
+            return
+        projected_values = [float(assignments[idx]) for idx in assignments]
+        if sorted(current_values) != sorted(projected_values):
+            return
+        changed = sum(
+            current != projected
+            for current, projected in zip(current_values, projected_values)
+        )
+        if changed < 2:
+            return
+        for idx, value in assignments.items():
+            items[idx]["total"] = value
+            items[idx]["unit_price"] = value
         return
 
     fixed_total = sum(
@@ -1427,7 +1734,7 @@ def _project_totals_to_layout_rows(extracted, ocr_layout_blocks):
         if len(item_desc) < 3:
             assignments = {}
             break
-        best: tuple[float, int] | None = None
+        matches: list[tuple[float, int]] = []
         for cand_idx, cand in enumerate(chosen):
             if cand_idx in used_candidate_idxs:
                 continue
@@ -1436,13 +1743,28 @@ def _project_totals_to_layout_rows(extracted, ocr_layout_blocks):
                 score = 1.0
             else:
                 score = SequenceMatcher(None, item_desc, cand_desc).ratio()
-            if score >= 0.72 and (best is None or score > best[0]):
-                best = (score, cand_idx)
-        if best is None:
+            if score >= 0.72:
+                matches.append((score, cand_idx))
+        if not matches:
             assignments = {}
             break
-        used_candidate_idxs.add(best[1])
-        assignments[item_idx] = chosen[best[1]]["value"]
+        best_score = max(score for score, _cand_idx in matches)
+        best_indices = [
+            cand_idx
+            for score, cand_idx in matches
+            if abs(score - best_score) <= 0.01
+        ]
+        remaining_same = sum(
+            _norm_layout_desc(items[later_idx].get("description") or "") == item_desc
+            for later_idx in qty_1_indices
+            if later_idx >= item_idx
+        )
+        if len(best_indices) > 1 and len(best_indices) != remaining_same:
+            assignments = {}
+            break
+        candidate_idx = min(best_indices)
+        used_candidate_idxs.add(candidate_idx)
+        assignments[item_idx] = chosen[candidate_idx]["value"]
 
     if len(assignments) != n_qty1:
         return
@@ -1457,6 +1779,129 @@ def _project_totals_to_layout_rows(extracted, ocr_layout_blocks):
     for idx, value in assignments.items():
         items[idx]["total"] = value
         items[idx]["unit_price"] = value
+
+
+def _ocr_code_title_piece(text: str) -> str:
+    """Return a title fragment while rejecting count, price, and summary rows."""
+    text = str(text or "").strip()
+    anchor = _CODE_ANCHOR_RE.fullmatch(text)
+    if anchor:
+        text = (anchor.group("title") or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(
+        r'[¥￥]?\s*\d[\d,]*\s*(?:[%％*＊※除軽非内外])?',
+        text,
+    ) or re.fullmatch(r'\d{1,3}\s*(?:点|個|コ)?', text):
+        return ""
+    if _OCR_QTY_NOTATION_RE.search(text) or _SKIP_PRICE_LINE.search(text):
+        return ""
+    if _OCR_ZONE_END_RE.search(text) or re.search(
+        r'軽減税率|適用商品|営業時間|^注[)）]|^特$|^金額$|^品名$|^コード$',
+        text,
+    ):
+        return ""
+    text = _clean_ocr_price_line_desc(text)
+    if not text or not re.search(r'[ぁ-んァ-ン一-龥]', text):
+        return ""
+    return text
+
+
+def _code_anchored_ocr_descriptions(lines: list[str]) -> list[tuple[int, str]]:
+    """Read one title per ordered POS/barcode anchor up to the next summary.
+
+    The structural trigger is two or more code anchors.  The invariant is one
+    non-numeric title per anchor; otherwise the whole stream is rejected.
+    """
+    anchors: list[tuple[int, re.Match[str]]] = []
+    for idx, raw in enumerate(lines):
+        line = str(raw or "").strip()
+        if anchors and _CODE_STREAM_END_RE.search(line):
+            break
+        match = _CODE_ANCHOR_RE.fullmatch(line)
+        if match:
+            anchors.append((idx, match))
+    if len(anchors) < 2:
+        return []
+
+    descriptions: list[tuple[int, str]] = []
+    for pos, (anchor_idx, anchor) in enumerate(anchors):
+        next_idx = anchors[pos + 1][0] if pos + 1 < len(anchors) else len(lines)
+        parts: list[str] = []
+        inline = _ocr_code_title_piece(anchor.group("title") or "")
+        if inline:
+            parts.append(inline)
+        for raw in lines[anchor_idx + 1:next_idx]:
+            if _CODE_STREAM_END_RE.search(str(raw or "").strip()):
+                break
+            part = _ocr_code_title_piece(raw)
+            if part:
+                parts.append(part)
+        description = "".join(parts)
+        if len(description) < 2:
+            return []
+        descriptions.append((anchor_idx, description))
+    return descriptions
+
+
+def _ocr_desc_fragment_owned_by_existing(
+    lines: list[str],
+    line_idx: int,
+    existing_items: list[dict],
+) -> bool:
+    """Reject only a locally joined fragment that exactly names an existing row."""
+    if not (0 <= line_idx < len(lines)) or not existing_items:
+        return False
+
+    def _norm(text: str) -> str:
+        return re.sub(
+            r'[^\wぁ-んァ-ン一-龥]',
+            '',
+            _clean_ocr_price_line_desc(str(text or "")),
+            flags=re.UNICODE,
+        ).lower()
+
+    candidate = _norm(_ocr_code_title_piece(lines[line_idx]))
+    if not candidate:
+        return False
+    existing = [
+        (_norm(item.get("description") or ""), item.get("total"))
+        for item in existing_items
+        if isinstance(item, dict) and item.get("description")
+    ]
+
+    def _printed_amount(text: str) -> float | None:
+        match = re.search(
+            r'(?:^|\s)[¥￥]?\s*(\d[\d,]*)\s*[%％*＊※除軽非内外]?\s*$',
+            str(text or "").strip(),
+        )
+        return float(match.group(1).replace(',', '')) if match else None
+
+    for neighbor_idx in (line_idx - 1, line_idx + 1):
+        if not (0 <= neighbor_idx < len(lines)):
+            continue
+        neighbor = _norm(_ocr_code_title_piece(lines[neighbor_idx]))
+        if not neighbor:
+            continue
+        combined = neighbor + candidate if neighbor_idx < line_idx else candidate + neighbor
+        for owned, total in existing:
+            if candidate == owned or candidate not in owned or combined != owned:
+                continue
+            try:
+                total = float(total)
+            except (TypeError, ValueError):
+                total = 0
+            local_amounts = (
+                _printed_amount(lines[line_idx]),
+                _printed_amount(lines[neighbor_idx]),
+            )
+            if total > 0 and any(
+                amount is not None and abs(amount - total) <= 2
+                for amount in local_amounts
+            ):
+                continue
+            return True
+    return False
 
 
 def _find_ocr_item_desc(lines, price_line_idx, existing_items):
@@ -1504,13 +1949,21 @@ def _find_ocr_item_desc(lines, price_line_idx, existing_items):
 
     # Same-line first (rejoin merged item+price)
     cand = _clean(lines[price_line_idx])
-    if _is_valid(cand) and cand not in existing_descs:
+    if (
+        _is_valid(cand)
+        and cand not in existing_descs
+        and not _ocr_desc_fragment_owned_by_existing(lines, price_line_idx, existing_items)
+    ):
         return cand
     # Search backward up to 15 lines, then forward up to 5
     for j in list(range(price_line_idx - 1, max(price_line_idx - 16, -1), -1)) + \
              list(range(price_line_idx + 1, min(price_line_idx + 6, len(lines)))):
         cand = _clean(lines[j])
-        if _is_valid(cand) and cand not in existing_descs:
+        if (
+            _is_valid(cand)
+            and cand not in existing_descs
+            and not _ocr_desc_fragment_owned_by_existing(lines, j, existing_items)
+        ):
             return cand
     return None
 
@@ -1518,8 +1971,9 @@ def _find_ocr_item_desc(lines, price_line_idx, existing_items):
 def _clean_ocr_price_line_desc(text: str) -> str:
     """Remove OCR row prefixes/suffix prices from a candidate item name."""
     text = text.strip()
+    text = re.sub(r'^[*※＊]\s*', '', text).strip()
     text = _OCR_TRAILING_PRICE_RE.sub("", text).strip()
     text = re.sub(r'(?:^|\s)[¥￥]?\s*\d[\d,]*\s+[A-ZＡ-Ｚ]\s*$', '', text).strip()
-    text = re.sub(r'^\d{3,}[A-Za-z0-9-]*\)?\s*', '', text).strip()
+    text = re.sub(r'^(?!\d+\s*円)\d{3,}[A-Za-z0-9-]*\)?\s*', '', text).strip()
     text = re.sub(r'\s*[※\*非外内]\s*$', '', text).strip()
     return text
