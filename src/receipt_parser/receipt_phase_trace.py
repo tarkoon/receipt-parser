@@ -5,9 +5,11 @@ from copy import deepcopy
 
 POSTPROCESS_MUTATION_FIELDS = (
     "date",
+    "time",
     "line_items",
     "location",
     "merchant",
+    "payer",
     "taxes",
     "tax_entries",
     "subtotal",
@@ -15,6 +17,11 @@ POSTPROCESS_MUTATION_FIELDS = (
     "amount_paid",
     "points_used",
     "payment_method",
+    "payment_reference",
+    "account_number",
+    "service_type",
+    "billing_period",
+    "usage",
 )
 
 POSTPROCESS_PHASES = (
@@ -23,6 +30,12 @@ POSTPROCESS_PHASES = (
         "reads": ("merchant", "date", "time", "location", "ocr_text"),
         "writes": ("merchant", "date", "time", "location"),
         "invariant": "Header fields must be backed by visible OCR header/address/date evidence.",
+    },
+    {
+        "name": "receipt_payer_repair",
+        "reads": ("payer", "ocr_text"),
+        "writes": ("payer",),
+        "invariant": "Receipt payer recovery requires exactly one explicit printed addressee, normalized across same-line or immediately split honorific layout.",
     },
     {
         "name": "transaction_datetime_repair",
@@ -35,13 +48,14 @@ POSTPROCESS_PHASES = (
         "reads": (
             "subtotal",
             "total",
+            "amount_paid",
             "taxes",
             "ocr_totals",
             "ocr_confidence",
             "llm_confidence",
         ),
-        "writes": ("subtotal", "total", "taxes"),
-        "invariant": "Reliable OCR subtotal, total, and tax overrides must preserve subtotal plus tax equals total arithmetic.",
+        "writes": ("subtotal", "total", "amount_paid", "taxes"),
+        "invariant": "Reliable OCR subtotal, total, tax, and matching paid-amount overrides must preserve receipt arithmetic.",
     },
     {
         "name": "implausible_tax_amount_repair",
@@ -51,15 +65,15 @@ POSTPROCESS_PHASES = (
     },
     {
         "name": "payment_method_repair",
-        "reads": ("payment_method", "ocr_text", "ocr_confidence", "llm_confidence"),
-        "writes": ("payment_method",),
-        "invariant": "Payment method repair requires visible OCR cash or card/e-money markers and preserves payment_method field consistency.",
+        "reads": ("payment_method", "account_number", "ocr_text", "ocr_confidence", "llm_confidence"),
+        "writes": ("payment_method", "account_number"),
+        "invariant": "Payment method repair requires visible OCR cash or card/e-money markers; masked card suffixes are not retained as account numbers.",
     },
     {
-        "name": "toll_payment_reference_repair",
+        "name": "payment_reference_repair",
         "reads": ("payment_reference", "ocr_text"),
         "writes": ("payment_reference",),
-        "invariant": "Toll payment-reference repair requires visible toll-road OCR context and a printed handling-number label, and preserves existing references.",
+        "invariant": "Payment-reference repair requires one unique printed primary document number, or one unique printed transaction/data/reference number when no primary number is printed.",
     },
     {
         "name": "cash_tender_reconciliation",
@@ -69,9 +83,18 @@ POSTPROCESS_PHASES = (
     },
     {
         "name": "service_receipt_recovery",
-        "reads": ("line_items", "subtotal", "total", "taxes", "payment_method", "ocr_text"),
-        "writes": ("line_items", "taxes", "subtotal", "payment_method"),
-        "invariant": "Service receipt recovery requires visible service/table or bare-receipt OCR layout and item/tax arithmetic consistency.",
+        "reads": (
+            "line_items",
+            "subtotal",
+            "total",
+            "taxes",
+            "payment_method",
+            "usage",
+            "ocr_text",
+            "ocr_layout_blocks",
+        ),
+        "writes": ("line_items", "taxes", "subtotal", "payment_method", "usage"),
+        "invariant": "Service receipt recovery requires visible service/table, bare-receipt, or fuel-usage OCR evidence and preserves item/tax or usage consistency.",
     },
     {
         "name": "body_total_layout_reconstruction",
@@ -101,7 +124,7 @@ POSTPROCESS_PHASES = (
         "name": "low_value_bag_recovery",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
-        "invariant": "Low-value bag recovery requires visible small-bag or numeric OCR context and subtotal/total item-sum arithmetic.",
+        "invariant": "Low-value row recovery requires visible OCR context and item-sum arithmetic.",
     },
     {
         "name": "adjacent_price_shift_reconciliation",
@@ -273,7 +296,15 @@ POSTPROCESS_PHASES = (
     },
     {
         "name": "tax_category_assignment",
-        "reads": ("line_items", "taxes", "subtotal", "total", "ocr_totals", "ocr_text"),
+        "reads": (
+            "line_items",
+            "taxes",
+            "subtotal",
+            "total",
+            "ocr_totals",
+            "ocr_text",
+            "ocr_layout_blocks",
+        ),
         "writes": ("line_items", "taxes"),
         "invariant": "Item tax categories and tax entries must agree with printed rate bases or tax summaries.",
     },
@@ -395,6 +426,12 @@ def _record_receipt_phase_mutation(
     after = _record_receipt_mutation(mutation_trace, phase_name, before, extracted)
     if mutation_trace is not None and len(mutation_trace) > trace_len:
         phase = POSTPROCESS_PHASE_BY_NAME[phase_name]
+        undeclared = set(mutation_trace[-1]["changes"]) - set(phase["writes"])
+        if undeclared:
+            raise AssertionError(
+                f"Receipt phase {phase_name!r} mutated undeclared fields: "
+                f"{sorted(undeclared)}"
+            )
         mutation_trace[-1]["reads"] = phase["reads"]
         mutation_trace[-1]["writes"] = phase["writes"]
         mutation_trace[-1]["invariant"] = phase["invariant"]

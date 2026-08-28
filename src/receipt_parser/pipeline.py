@@ -32,21 +32,26 @@ from .patterns import (
     UTILITY_BILL_KEYWORDS, PAYMENT_SLIP_KEYWORDS, RECEIPT_KEYWORDS,
     LOCATION_CLUE_RE,
 )
-from .receipt_financial import extract_financial_totals, extract_points_used
+from .receipt_financial import extract_financial_totals, reconcile_points_payment_from_ocr
 from .receipt_postprocess import postprocess_receipt
 from .pipeline_bill import postprocess_utility_bill
 from .pipeline_slip import postprocess_payment_slip
 from .receipt_location import (
     _location_has_ocr_evidence,
+    _location_is_replaceable_header_noise,
     _location_needs_resolution,
     _recover_header_branch_store_location,  # noqa: F401 - legacy private import surface
     _resolve_location,
     _trim_purchase_store_metadata_location,
-    _trim_store_in_store_header_location,
 )
 from .receipt_output import (
     _apply_final_receipt_output_repairs,  # noqa: F401 - legacy private import surface
     _prepare_receipt_output_payload,
+)
+from .receipt_phase_trace import (
+    POSTPROCESS_MUTATION_FIELDS,
+    _record_receipt_mutation,
+    _snapshot_receipt_mutation_fields,
 )
 
 import inspect
@@ -139,6 +144,106 @@ def detect_document_type(text: str) -> str:
 
 
 _USER_RULES_PATH = Path(__file__).parent / "user_rules.json"
+
+
+_PIPELINE_RECEIPT_MUTATION_PHASES = {
+    "document_type_location_policy": {
+        "reads": ("document_type", "location"),
+        "writes": ("location",),
+        "invariant": "Utility bills and payment slips must not retain receipt purchase locations.",
+    },
+    "utility_bill_postprocess": {
+        "reads": (
+            "merchant",
+            "date",
+            "payment_method",
+            "service_type",
+            "billing_period",
+            "payer",
+            "payment_reference",
+            "ocr_text",
+            "raw_text",
+        ),
+        "writes": (
+            "merchant",
+            "date",
+            "payment_method",
+            "service_type",
+            "billing_period",
+            "payer",
+            "payment_reference",
+        ),
+        "invariant": "Utility identity, tender, date, reference, and service fields must remain backed by printed bill evidence.",
+    },
+    "payment_slip_postprocess": {
+        "reads": ("date", "payer", "payment_reference", "ocr_text", "raw_text"),
+        "writes": ("date", "payer", "payment_reference"),
+        "invariant": "Payment-slip payer and reference changes require one unique printed candidate; issue dates are not payment dates.",
+    },
+    "common_points_payment_reconciliation": {
+        "reads": ("total", "points_used", "amount_paid", "ocr_text"),
+        "writes": ("points_used", "amount_paid"),
+        "invariant": "OCR-backed points and out-of-pocket payment must preserve total minus points arithmetic.",
+    },
+    "location_resolution_validation": {
+        "reads": ("merchant", "location", "ocr_text", "document_type"),
+        "writes": ("location",),
+        "invariant": "Resolved locations must remain supported by printed branch or address evidence.",
+    },
+    "postprocess_schema_canonicalization": {
+        "reads": POSTPROCESS_MUTATION_FIELDS,
+        "writes": POSTPROCESS_MUTATION_FIELDS,
+        "invariant": "Postprocessed receipt values must satisfy the schema before common arithmetic runs.",
+    },
+    "user_rule_alias": {
+        "reads": ("merchant", "user_rules"),
+        "writes": ("merchant",),
+        "invariant": "Configured aliases may change only the matched merchant receipt field.",
+    },
+    "final_schema_canonicalization": {
+        "reads": POSTPROCESS_MUTATION_FIELDS,
+        "writes": POSTPROCESS_MUTATION_FIELDS,
+        "invariant": "Final serialization may only normalize schema-owned receipt fields and must return a valid canonical payload.",
+    },
+}
+
+
+def _record_pipeline_receipt_mutation(
+    mutation_trace: list[dict] | None,
+    owner_phase: str,
+    before: dict | None,
+    result: dict,
+) -> None:
+    """Record one contiguous pipeline-owned receipt mutation."""
+    trace_len = len(mutation_trace) if mutation_trace is not None else 0
+    _record_receipt_mutation(mutation_trace, owner_phase, before, result)
+    if mutation_trace is None or len(mutation_trace) == trace_len:
+        return
+    phase = _PIPELINE_RECEIPT_MUTATION_PHASES[owner_phase]
+    event = mutation_trace[-1]
+    undeclared = set(event["changes"]) - set(phase["writes"])
+    if undeclared:
+        raise AssertionError(
+            f"Pipeline trace owner {owner_phase!r} changed undeclared fields: "
+            f"{sorted(undeclared)}"
+        )
+    event.update(
+        owner_phase=owner_phase,
+        reads=phase["reads"],
+        writes=phase["writes"],
+        invariant=phase["invariant"],
+    )
+
+
+def _canonicalize_extracted_receipt(
+    extracted: dict,
+) -> tuple[dict | None, Receipt | None, str | None]:
+    """Return canonical receipt data/model, or one public schema error."""
+    try:
+        receipt = Receipt(**extracted)
+    except Exception as exc:
+        return None, None, f"Receipt schema validation failed: {exc}"
+    return receipt.model_dump(), receipt, None
 
 
 def _apply_user_rules(result: dict) -> dict:
@@ -297,6 +402,21 @@ def _build_classify_payload(doc_type: str, source: str) -> dict:
     }
 
 
+_UNRELIABLE_LINE_ITEM_WARNING_PREFIXES = (
+    "Line ",
+    "Sum of line items",
+    "Items sum",
+    "Final payload validation failed",
+)
+
+
+def _line_items_are_reliable(warnings: list[str]) -> bool:
+    return not any(
+        warning.startswith(_UNRELIABLE_LINE_ITEM_WARNING_PREFIXES)
+        for warning in warnings
+    )
+
+
 def _build_result(receipt_payload, final_warnings, pass_history, model, debug=False, trace=None,
                   ocr_confidence=None, llm_confidence=None,
                   ocr_source=None, ocr_retried=None, ocr_retry_reason=None,
@@ -307,8 +427,7 @@ def _build_result(receipt_payload, final_warnings, pass_history, model, debug=Fa
     result["_pass_history"] = pass_history
     result["_model"] = model
     result["_pipeline_version"] = _PIPELINE_VERSION
-    line_item_warnings = [w for w in final_warnings if "Line " in w]
-    result["_line_items_reliable"] = len(line_item_warnings) == 0
+    result["_line_items_reliable"] = _line_items_are_reliable(final_warnings)
     if ocr_confidence is not None:
         result["_ocr_confidence"] = round(ocr_confidence, 4)
     if llm_confidence is not None:
@@ -324,9 +443,86 @@ def _build_result(receipt_payload, final_warnings, pass_history, model, debug=Fa
     if debug and trace:
         result["_debug_dir"] = str(trace.debug_dir)
         result["_trace"] = trace.summary()
-    if debug and mutation_trace:
+    if debug and mutation_trace is not None:
         result["_receipt_mutation_trace"] = mutation_trace
     return result
+
+
+def _validate_and_serialize_final_receipt_payload(
+    receipt_payload: dict,
+    prior_warnings: list[str] | None = None,
+) -> tuple[dict | None, list[str]]:
+    """Return canonical receipt fields and warnings after final repairs."""
+    try:
+        receipt = Receipt(**receipt_payload)
+    except Exception as exc:
+        return None, [f"Final payload validation failed: {exc}"]
+
+    canonical_payload = receipt.model_dump()
+    warnings = validate_receipt(receipt)
+    for warning in receipt._soft_warnings:
+        if warning not in warnings:
+            warnings.append(warning)
+    for warning in prior_warnings or []:
+        if (
+            warning.startswith("Location resolution")
+            and not canonical_payload.get("location")
+            and warning not in warnings
+        ):
+            warnings.append(warning)
+    return canonical_payload, warnings
+
+
+def _finalize_receipt_result(
+    result: dict,
+    apply_user_rules: bool,
+    mutation_trace: list[dict] | None = None,
+) -> dict:
+    """Apply optional user rules, then refresh validation-derived metadata."""
+    try:
+        last_valid_payload = Receipt(**result).model_dump()
+    except Exception:
+        last_valid_payload = Receipt().model_dump()
+    if apply_user_rules:
+        before = (
+            _snapshot_receipt_mutation_fields(result)
+            if mutation_trace is not None
+            else None
+        )
+        result = _apply_user_rules(result)
+        _record_pipeline_receipt_mutation(
+            mutation_trace,
+            "user_rule_alias",
+            before,
+            result,
+        )
+    metadata = {key: value for key, value in result.items() if key.startswith("_")}
+    before = (
+        _snapshot_receipt_mutation_fields(result)
+        if mutation_trace is not None
+        else None
+    )
+    canonical_payload, warnings = _validate_and_serialize_final_receipt_payload(
+        result,
+        result.get("_warnings"),
+    )
+    finalized = (
+        canonical_payload
+        if canonical_payload is not None
+        else last_valid_payload
+    )
+    _record_pipeline_receipt_mutation(
+        mutation_trace,
+        "final_schema_canonicalization",
+        before,
+        finalized,
+    )
+    finalized.update(metadata)
+    finalized["_warnings"] = warnings
+    finalized["_line_items_reliable"] = _line_items_are_reliable(warnings)
+    if mutation_trace is not None:
+        finalized["_receipt_mutation_trace"] = mutation_trace
+    return finalized
 
 
 def process_document(
@@ -388,11 +584,29 @@ def process_document(
                     "SKIPPED: Digital PDF fast path — no OCR performed.")
 
             _notify(on_stage, "extract", "LLM extraction (digital PDF)", 0.40)
-            extracted, pass_history = extract_with_verification(
-                digital_text, model=model, passes=passes,
-                validate_fn=validate_receipt, doc_type=doc_type,
+            receipt_mutation_trace: list[dict] | None = [] if debug else None
+            extracted, pass_history, final_warnings, receipt = _run_extraction_pipeline(
+                unified_text=digital_text,
+                raw_text=digital_text,
+                ocr_conf=1.0,
+                doc_type=doc_type,
+                model=model,
+                passes=passes,
+                ocr_layout_blocks=None,
                 on_stage=on_stage,
+                mutation_trace=receipt_mutation_trace,
+                payment_reference_text=digital_text,
             )
+
+            if "_error" in extracted:
+                extracted.update({
+                    "_warnings": final_warnings,
+                    "_pass_count": 0,
+                    "_model": model,
+                    "_pipeline_version": _PIPELINE_VERSION,
+                    "_line_items_reliable": False,
+                })
+                return extracted
 
             if debug:
                 for entry in pass_history:
@@ -401,24 +615,7 @@ def process_document(
                     if entry["warnings"]:
                         trace.log_step(f"pass{n}_warnings", data="\n".join(entry["warnings"]))
 
-            llm_conf_pdf = extracted.pop("_confidence", None)
-
-            # Location resolution for PDF path
-            if "error" not in extracted and _location_needs_resolution(extracted.get("location"), digital_text):
-                resolved, _loc_warn = _resolve_location(extracted, digital_text, model)
-                if resolved:
-                    extracted["location"] = resolved
-            _trim_purchase_store_metadata_location(extracted, digital_text)
-
-            try:
-                receipt = Receipt(**extracted)
-            except Exception:
-                receipt = Receipt()
-            _notify(on_stage, "validate", _build_validate_detail(extracted), 0.95)
-            final_warnings = validate_receipt(receipt)
-            for w in receipt._soft_warnings:
-                if w not in final_warnings:
-                    final_warnings.append(w)
+            assert receipt is not None
 
             if debug:
                 assert debug_dir is not None
@@ -426,11 +623,25 @@ def process_document(
                     "SKIPPED: Digital PDF fast path — no OCR bounding boxes available.")
                 (debug_dir / "pipeline_trace.txt").write_text(trace.summary())
 
-            receipt_payload = _prepare_receipt_output_payload(receipt)
+            receipt_payload = _prepare_receipt_output_payload(
+                receipt,
+                digital_text,
+                mutation_trace=receipt_mutation_trace,
+            )
             result = _build_result(receipt_payload, final_warnings, pass_history, model, debug=debug, trace=trace,
-                                   ocr_confidence=1.0, llm_confidence=llm_conf_pdf)
-            if apply_user_rules:
-                result = _apply_user_rules(result)
+                                   ocr_confidence=1.0, ocr_source="digital_pdf",
+                                   ocr_text=digital_text,
+                                   mutation_trace=receipt_mutation_trace)
+            result = _finalize_receipt_result(
+                result,
+                apply_user_rules,
+                mutation_trace=receipt_mutation_trace,
+            )
+            _notify(on_stage, "validate", _build_validate_detail(result), 0.95)
+            result["_llm_confidence"] = _compute_posthoc_confidence(
+                result,
+                result["_warnings"],
+            )
             _notify(on_stage, "done", "Complete", 1.0)
             return result
 
@@ -542,17 +753,18 @@ def process_document(
             block_with_page["page"] = page_idx
             all_layout_blocks.append(block_with_page)
     receipt_mutation_trace: list[dict] | None = [] if debug else None
-    extracted, pass_history, final_warnings = _run_extraction_pipeline(
+    extracted, pass_history, final_warnings, receipt = _run_extraction_pipeline(
         unified_text=unified_text, raw_text=raw_text,
         ocr_conf=ocr_conf, doc_type=doc_type,
         model=model, passes=passes,
         ocr_layout_blocks=all_layout_blocks,
         on_stage=on_stage,
         mutation_trace=receipt_mutation_trace,
+        payment_reference_text=raw_text,
     )
 
     if "_error" in extracted:
-        extracted.update({"_warnings": [], "_pass_count": 0, "_model": model,
+        extracted.update({"_warnings": final_warnings, "_pass_count": 0, "_model": model,
                           "_pipeline_version": _PIPELINE_VERSION, "_line_items_reliable": False})
         return extracted
 
@@ -563,37 +775,37 @@ def process_document(
             if entry["warnings"]:
                 trace.log_step(f"pass{n}_warnings", data="\n".join(entry["warnings"]))
 
-    # Compute post-hoc confidence from validation results
-    posthoc_conf = _compute_posthoc_confidence(extracted, final_warnings)
-
     if debug and images:
         assert debug_dir is not None
         draw_field_overlay(images[0], all_ocr_results[0].blocks, extracted, debug_dir / "10_field_overlay.png")
         (debug_dir / "pipeline_trace.txt").write_text(trace.summary())
 
     # Aggregate OCR metadata from first page result
-    try:
-        receipt = Receipt(**extracted)
-    except Exception:
-        receipt = Receipt()
+    assert receipt is not None
     primary_ocr = all_ocr_results[0] if all_ocr_results else None
     repair_ocr_text = primary_ocr.chosen_text if primary_ocr else None
     receipt_payload = _prepare_receipt_output_payload(
         receipt,
         repair_ocr_text,
         mutation_trace=receipt_mutation_trace,
+        ocr_layout_blocks=all_layout_blocks,
     )
     result = _build_result(
         receipt_payload, final_warnings, pass_history, model, debug=debug, trace=trace,
-        ocr_confidence=ocr_conf, llm_confidence=posthoc_conf,
+        ocr_confidence=ocr_conf,
         ocr_source=primary_ocr.source if primary_ocr else None,
         ocr_retried=primary_ocr.retried if primary_ocr else None,
         ocr_retry_reason=primary_ocr.retry_reason if primary_ocr else None,
         ocr_text=repair_ocr_text,
         mutation_trace=receipt_mutation_trace,
     )
-    if apply_user_rules:
-        result = _apply_user_rules(result)
+    result = _finalize_receipt_result(
+        result,
+        apply_user_rules,
+        mutation_trace=receipt_mutation_trace,
+    )
+    _notify(on_stage, "validate", _build_validate_detail(result), 0.95)
+    result["_llm_confidence"] = _compute_posthoc_confidence(result, result["_warnings"])
     _notify(on_stage, "done", "Complete", 1.0)
     return result
 
@@ -679,10 +891,26 @@ def _receipt_candidate_score(extracted: dict, warnings: list[str], unified_text:
         1 for warning in warnings
         if "line items" in warning or "Items sum" in warning
     )
-    item_count = len([
+    items = [
         item for item in (extracted.get("line_items") or [])
         if isinstance(item, dict)
-    ])
+    ]
+    item_count = len(items)
+    qty_count = sum(float(item.get("qty") if item.get("qty") is not None else 1) for item in items)
+    printed_counts = {
+        int(match.group(1))
+        for match in re.finditer(
+            r'(?:購入点数|(?:お|御)買上(?:商品数|点数|げ点数))\s*[:：]?\s*(\d+)',
+            unified_text,
+        )
+    }
+    count_gap = 0.0
+    if len(printed_counts) == 1:
+        printed_count = printed_counts.pop()
+        count_gap = min(
+            abs(item_count - printed_count),
+            abs(qty_count - printed_count),
+        )
     return (
         gap_value > 2,
         gap_value,
@@ -690,6 +918,8 @@ def _receipt_candidate_score(extracted: dict, warnings: list[str], unified_text:
         tax_gap,
         item_warning_count,
         len(warnings),
+        count_gap > 0,
+        count_gap,
         -item_count,
     )
 
@@ -703,6 +933,7 @@ def _select_receipt_postprocessed_candidate(
     model: str,
     ocr_layout_blocks: list[dict] | None,
     mutation_trace: list[dict] | None = None,
+    payment_reference_text: str | None = None,
 ) -> dict:
     """Post-process all captured receipt candidates and keep the cleanest one.
 
@@ -722,6 +953,31 @@ def _select_receipt_postprocessed_candidate(
         postprocessed = deepcopy(candidate)
         llm_conf = postprocessed.get("_confidence")
         candidate_trace: list[dict] | None = [] if mutation_trace is not None else None
+        before = (
+            _snapshot_receipt_mutation_fields(postprocessed)
+            if candidate_trace is not None
+            else None
+        )
+        canonical, _receipt, schema_error = _canonicalize_extracted_receipt(
+            postprocessed
+        )
+        if schema_error:
+            warnings = [schema_error]
+            if history_idx is not None:
+                entry = pass_history[history_idx]
+                entry["postprocess_items_sum_gap"] = None
+                entry["postprocess_warning_count"] = 1
+                entry["postprocess_warnings"] = warnings
+                entry["postprocess_selected"] = False
+            continue
+        assert canonical is not None
+        postprocessed = canonical
+        _record_pipeline_receipt_mutation(
+            candidate_trace,
+            "postprocess_schema_canonicalization",
+            before,
+            postprocessed,
+        )
         postprocessed = postprocess_receipt(
             postprocessed,
             unified_text,
@@ -731,15 +987,37 @@ def _select_receipt_postprocessed_candidate(
             model,
             ocr_layout_blocks=ocr_layout_blocks,
             mutation_trace=candidate_trace,
+            payment_reference_text=payment_reference_text,
         )
-        try:
-            receipt = Receipt(**postprocessed)
-            warnings = validate_receipt(receipt)
-            for warning in receipt._soft_warnings:
-                if warning not in warnings:
-                    warnings.append(warning)
-        except Exception as exc:
-            warnings = [f"Schema validation failed after postprocess: {exc}"]
+        before = (
+            _snapshot_receipt_mutation_fields(postprocessed)
+            if candidate_trace is not None
+            else None
+        )
+        canonical, receipt, schema_error = _canonicalize_extracted_receipt(
+            postprocessed
+        )
+        if schema_error:
+            warnings = [schema_error]
+            if history_idx is not None:
+                entry = pass_history[history_idx]
+                entry["postprocess_items_sum_gap"] = None
+                entry["postprocess_warning_count"] = 1
+                entry["postprocess_warnings"] = warnings
+                entry["postprocess_selected"] = False
+            continue
+        assert canonical is not None and receipt is not None
+        postprocessed = canonical
+        _record_pipeline_receipt_mutation(
+            candidate_trace,
+            "postprocess_schema_canonicalization",
+            before,
+            postprocessed,
+        )
+        warnings = validate_receipt(receipt)
+        for warning in receipt._soft_warnings:
+            if warning not in warnings:
+                warnings.append(warning)
         score = _receipt_candidate_score(postprocessed, warnings, unified_text)
 
         if history_idx is not None:
@@ -774,13 +1052,14 @@ def _run_extraction_pipeline(
     ocr_layout_blocks: list[dict] | None = None,
     on_stage: StageCallback = None,
     mutation_trace: list[dict] | None = None,
-) -> tuple[dict, list[dict], list[str]]:
+    payment_reference_text: str | None = None,
+) -> tuple[dict, list[dict], list[str], Receipt | None]:
     """Shared extraction logic: LLM extraction → post-processing → location → validation.
 
     Used by both process_document() and process_ocr_text() to avoid code
     duplication and ensure fixes are applied consistently.
 
-    Returns (extracted_dict, pass_history, final_warnings).
+    Returns (extracted_dict, pass_history, final_warnings, validated_receipt).
     """
     # Receipt-specific pre-processing
     ocr_totals = {}
@@ -806,6 +1085,7 @@ def _run_extraction_pipeline(
             {"_error": "OCR text is empty."},
             [],
             [],
+            None,
         )
 
     # LLM extraction with verification — emits per-pass beats internally.
@@ -814,6 +1094,10 @@ def _run_extraction_pipeline(
         validate_fn=validate_receipt, doc_type=doc_type,
         on_stage=on_stage,
     )
+    if "error" in extracted or "_error" in extracted:
+        return {
+            "_error": extracted.get("_error") or extracted.get("error")
+        }, pass_history, [], None
 
     if "error" not in extracted:
         extracted["document_type"] = doc_type
@@ -837,66 +1121,92 @@ def _run_extraction_pipeline(
             model,
             ocr_layout_blocks,
             mutation_trace=mutation_trace,
+            payment_reference_text=payment_reference_text,
         )
     elif doc_type == "utility_bill" and "error" not in extracted:
-        extracted = postprocess_utility_bill(extracted, unified_text)
-    elif doc_type == "payment_slip" and "error" not in extracted:
-        extracted = postprocess_payment_slip(extracted, unified_text, raw_text=raw_text)
-
-    # Universal cash detection (all document types). For handwritten 領収証
-    # forms, accept either explicit tender markers (お預り, 現金, 現計, お釣り)
-    # OR the formal cash-receipt acknowledgement (上記正に領収/受領いたしました)
-    # as long as nothing electronic or transfer-related contradicts it.
-    # The acknowledgement phrase on a small handwritten receipt with no other
-    # tender info is the standard Japanese signal that cash was tendered.
-    _ELECTRONIC_PAY_RE = re.compile(
-        r'クレジット|カード|PayPay|電子マネー|iD|QUICPay|Suica|WAON|nanaco|'
-        r'PASMO|楽天Edy|LINE\s*Pay|au\s*PAY|d払い|メルペイ|交通系'
-    )
-    if "error" not in extracted and not extracted.get("payment_method"):
-        is_handwritten = (
-            re.search(r'領収証|領収書', unified_text)
-            and not re.search(r'小計|合計|対象|税率', unified_text)
+        before = (
+            _snapshot_receipt_mutation_fields(extracted)
+            if mutation_trace is not None
+            else None
         )
-        if is_handwritten:
-            has_tender = bool(re.search(
-                r'(?:お預り金?|お預かり)(?!票)|現金|現計|お釣り|釣銭',
-                unified_text,
-            ))
-            has_acknowledgement = bool(
-                re.search(r'上記正に\s*(?:領収|受領)', unified_text)
-            )
-            has_electronic = bool(_ELECTRONIC_PAY_RE.search(unified_text))
-            has_transfer = bool(re.search(r'振込|振替|送金|口座', unified_text))
-            if has_tender or (has_acknowledgement and not has_electronic and not has_transfer):
-                extracted["payment_method"] = "cash"
-
-    # Final cash fallback
-    if "error" not in extracted and not extracted.get("payment_method"):
-        has_tender_label = bool(re.search(r'(?:お預り金?|お預かり)(?!票)', unified_text))
-        has_change_label_final = bool(re.search(r'釣', unified_text))
-        has_electronic = bool(_ELECTRONIC_PAY_RE.search(unified_text))
-        if has_tender_label and has_change_label_final and not has_electronic:
-            extracted["payment_method"] = "cash"
+        extracted = postprocess_utility_bill(
+            extracted,
+            unified_text,
+            payment_reference_text=payment_reference_text or raw_text,
+        )
+        _record_pipeline_receipt_mutation(
+            mutation_trace,
+            "utility_bill_postprocess",
+            before,
+            extracted,
+        )
+    elif doc_type == "payment_slip" and "error" not in extracted:
+        before = (
+            _snapshot_receipt_mutation_fields(extracted)
+            if mutation_trace is not None
+            else None
+        )
+        extracted = postprocess_payment_slip(extracted, unified_text, raw_text=raw_text)
+        _record_pipeline_receipt_mutation(
+            mutation_trace,
+            "payment_slip_postprocess",
+            before,
+            extracted,
+        )
 
     # Location: clear for utility bills and payment slips
     if "error" not in extracted and doc_type in ("utility_bill", "payment_slip"):
+        before = (
+            _snapshot_receipt_mutation_fields(extracted)
+            if mutation_trace is not None
+            else None
+        )
         extracted["location"] = None
+        _record_pipeline_receipt_mutation(
+            mutation_trace,
+            "document_type_location_policy",
+            before,
+            extracted,
+        )
+
+    before = (
+        _snapshot_receipt_mutation_fields(extracted)
+        if mutation_trace is not None
+        else None
+    )
+    canonical_extracted, _receipt, schema_error = _canonicalize_extracted_receipt(
+        extracted
+    )
+    if schema_error:
+        return {"_error": schema_error}, pass_history, [schema_error], None
+    assert canonical_extracted is not None
+    extracted = canonical_extracted
+    _record_pipeline_receipt_mutation(
+        mutation_trace,
+        "postprocess_schema_canonicalization",
+        before,
+        extracted,
+    )
 
     # Common post-processing
     if "error" not in extracted:
+        before = (
+            _snapshot_receipt_mutation_fields(extracted)
+            if mutation_trace is not None
+            else None
+        )
         if doc_type == "receipt":
-            ocr_points = extract_points_used(unified_text)
-            existing_points = extracted.get("points_used")
-            if (
-                ocr_points is not None
-                and (existing_points is None or (ocr_points > 0 and float(existing_points or 0) == 0))
-            ):
-                extracted["points_used"] = ocr_points
+            reconcile_points_payment_from_ocr(extracted, unified_text)
         total = extracted.get("total")
         points = extracted.get("points_used")
         if total is not None:
             extracted["amount_paid"] = total - points if points else total
+        _record_pipeline_receipt_mutation(
+            mutation_trace,
+            "common_points_payment_reconciliation",
+            before,
+            extracted,
+        )
 
     # Strip _confidence if present
     extracted.pop("_confidence", None)
@@ -904,6 +1214,11 @@ def _run_extraction_pipeline(
     # Location resolution (confidence-gated, receipts only)
     _notify(on_stage, "resolve_location", "Resolving location", 0.85)
     location_warnings: list[str] = []
+    before = (
+        _snapshot_receipt_mutation_fields(extracted)
+        if mutation_trace is not None
+        else None
+    )
     if "error" not in extracted and doc_type == "receipt" and _location_needs_resolution(extracted.get("location"), unified_text):
         # Check OCR evidence first — skip expensive LLM call if no evidence
         has_evidence = _location_has_ocr_evidence(
@@ -918,17 +1233,10 @@ def _run_extraction_pipeline(
                 location_warnings.append(loc_warning)
 
     _trim_purchase_store_metadata_location(extracted, unified_text)
-    _trim_store_in_store_header_location(extracted, unified_text)
-
     # Location validation: clear if no OCR evidence supports it
     if "error" not in extracted and doc_type == "receipt" and extracted.get("location"):
         if not _location_has_ocr_evidence(extracted["location"], unified_text):
             extracted["location"] = None
-    if "error" not in extracted and doc_type == "receipt" and not extracted.get("location"):
-        city_m = re.search(r'(宗像市)', unified_text)
-        if city_m:
-            extracted["location"] = city_m.group(1)
-
     # Expand truncated location when OCR has a more detailed address
     if "error" not in extracted and doc_type == "receipt" and extracted.get("location"):
         loc = extracted["location"]
@@ -936,23 +1244,38 @@ def _run_extraction_pipeline(
         for line in unified_text.split('\n'):
             line_norm = re.sub(r'\s+', '', line.strip())
             if (len(line_norm) > len(loc_norm) and loc_norm in line_norm
-                    and re.search(r'\d+-\d+|丁目|番地', line_norm)):
+                    and re.search(r'\d+-\d+|丁目|番地', line_norm)
+                    and not _location_is_replaceable_header_noise(
+                        line_norm,
+                        unified_text,
+                    )):
+                previous_location = extracted["location"]
                 extracted["location"] = line_norm
-                break
+                if _location_has_ocr_evidence(extracted["location"], unified_text):
+                    break
+                extracted["location"] = previous_location
+    _record_pipeline_receipt_mutation(
+        mutation_trace,
+        "location_resolution_validation",
+        before,
+        extracted,
+    )
 
-    # Final validation — preview the result so consumers can flash it before "done".
-    _notify(on_stage, "validate", _build_validate_detail(extracted), 0.95)
-    try:
-        receipt = Receipt(**extracted)
-    except Exception:
-        receipt = Receipt()
+    # Initial validation; callers emit the preview after final output repairs.
+    canonical_extracted, receipt, schema_error = _canonicalize_extracted_receipt(
+        extracted
+    )
+    if schema_error:
+        return {"_error": schema_error}, pass_history, [schema_error], None
+    assert canonical_extracted is not None and receipt is not None
+    extracted = canonical_extracted
     final_warnings = validate_receipt(receipt)
     for w in receipt._soft_warnings:
         if w not in final_warnings:
             final_warnings.append(w)
     final_warnings.extend(location_warnings)
 
-    return extracted, pass_history, final_warnings
+    return extracted, pass_history, final_warnings, receipt
 
 
 def process_ocr_text(
@@ -973,8 +1296,8 @@ def process_ocr_text(
     check_model_available(model)
 
     # Normalize text
-    unified_text = normalize_fullwidth(ocr_text)
-    unified_text = strip_barcode_lines(unified_text)
+    payment_reference_text = normalize_fullwidth(ocr_text)
+    unified_text = strip_barcode_lines(payment_reference_text)
     doc_type = detect_document_type(unified_text)
     ocr_conf = 0.9  # default confidence for injected text
 
@@ -999,21 +1322,21 @@ def process_ocr_text(
     )
     _notify(on_stage, "extract", "LLM extraction", 0.40)
     receipt_mutation_trace: list[dict] | None = [] if debug else None
-    extracted, pass_history, final_warnings = _run_extraction_pipeline(
+    extracted, pass_history, final_warnings, receipt = _run_extraction_pipeline(
         unified_text=unified_text, raw_text=ocr_text,
         ocr_conf=ocr_conf, doc_type=doc_type,
         model=model, passes=passes,
         on_stage=on_stage,
         mutation_trace=receipt_mutation_trace,
+        payment_reference_text=payment_reference_text,
     )
 
     if "_error" in extracted:
-        extracted.update({"_warnings": [], "_pass_count": 0, "_model": model,
+        extracted.update({"_warnings": final_warnings, "_pass_count": 0, "_model": model,
                           "_pipeline_version": _PIPELINE_VERSION, "_line_items_reliable": False})
         return extracted
 
-    _notify(on_stage, "done", "Complete", 1.0)
-    receipt = Receipt(**extracted) if "error" not in extracted else Receipt()
+    assert receipt is not None
     receipt_payload = _prepare_receipt_output_payload(
         receipt,
         ocr_text,
@@ -1026,8 +1349,13 @@ def process_ocr_text(
         ocr_text=ocr_text,
         mutation_trace=receipt_mutation_trace,
     )
-    if apply_user_rules:
-        result = _apply_user_rules(result)
+    result = _finalize_receipt_result(
+        result,
+        apply_user_rules,
+        mutation_trace=receipt_mutation_trace,
+    )
+    _notify(on_stage, "validate", _build_validate_detail(result), 0.95)
+    _notify(on_stage, "done", "Complete", 1.0)
     return result
 
 
