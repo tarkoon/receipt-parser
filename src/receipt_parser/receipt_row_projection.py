@@ -1,15 +1,23 @@
 """Receipt structural row projection helpers."""
 
 import re
+from collections import Counter
+from itertools import combinations
 
 from .patterns import (
-    _FOOD_DESC_RE,
     _HEADER_LINE_RE,
     _OCR_TRAILING_PRICE_RE,
     _SKIP_PRICE_LINE,
 )
 from .receipt_financial import extract_rate_bases, normalize_tax_rate
-from .receipt_projection import _clean_ocr_price_line_desc
+from .receipt_item_cleanup import _clear_discounts_without_nearby_ocr_marker
+from .receipt_projection import (
+    _CODE_ANCHOR_RE,
+    _CODE_STREAM_END_RE,
+    _clean_ocr_price_line_desc,
+    _code_anchored_ocr_descriptions,
+)
+from .receipt_recovery import _apply_coupon_discount_blocks
 from .receipt_tax_categories import (
     _assign_single_standard_rate_from_small_base,
     _fix_tax_categories_from_ocr_markers,
@@ -17,7 +25,6 @@ from .receipt_tax_categories import (
     _rebalance_tax_categories_to_rate_bases,
 )
 from .receipt_totals import _sum_taxable_amounts
-from .schema import STANDARD_RATE
 
 
 def _replace_barcode_qty_price_rows_when_balanced(extracted, unified_text):
@@ -38,7 +45,7 @@ def _replace_barcode_qty_price_rows_when_balanced(extracted, unified_text):
             return False
         return True
 
-    def _row(desc: str, qty: float, unit: float, tax_category: str = "10%") -> dict:
+    def _row(desc: str, qty: float, unit: float, tax_category: str = "0%") -> dict:
         return {
             "description": desc,
             "qty": qty,
@@ -103,7 +110,7 @@ def _replace_barcode_qty_price_rows_when_balanced(extracted, unified_text):
         desc = lines[idx + 2]
         if not _is_bag_description(desc):
             continue
-        rows.append(_row(desc, 1.0, float(price_m.group(1)), "10%"))
+        rows.append(_row(desc, 1.0, float(price_m.group(1))))
 
     if unbarcoded_rows:
         row_sum_with_bags = sum(float(row.get("total") or 0) for row in rows)
@@ -116,6 +123,9 @@ def _replace_barcode_qty_price_rows_when_balanced(extracted, unified_text):
     row_sum = sum(float(row.get("total") or 0) for row in rows)
     current_count = len([item for item in (extracted.get("line_items") or []) if isinstance(item, dict)])
     if len(rows) > current_count and abs(row_sum - float(total)) <= 2:
+        rate_bases = extract_rate_bases(unified_text)
+        _fix_tax_categories_from_ocr_markers(rows, unified_text)
+        _rebalance_tax_categories_to_rate_bases(rows, unified_text, extracted.get("taxes"), rate_bases)
         extracted["line_items"] = rows
 
 
@@ -489,19 +499,6 @@ def _fix_qty_context_and_reduced_rate_from_ocr(extracted, unified_text):
         elif reduced_base and abs(first_price_value - float(reduced_base)) <= 1:
             item["tax_category"] = "8%"
 
-    if reduced_base and reduced_base > 0:
-        candidates = [
-            item for item in items
-            if (
-                isinstance(item, dict)
-                and abs(float(item.get("total") or 0) - float(reduced_base)) <= 1
-                and _FOOD_DESC_RE.search(item.get("description") or "")
-            )
-        ]
-        if len(candidates) == 1:
-            candidates[0]["tax_category"] = "8%"
-
-
 def _fix_numeric_desc_from_ocr_price_context(extracted, unified_text):
     """Replace pure numeric item descriptions with nearby OCR product names."""
     items = extracted.get("line_items") or []
@@ -635,16 +632,11 @@ def _replace_overage_item_with_low_value_bag(extracted, unified_text):
     ]
     if not candidates:
         return
-    standard_candidates = [
-        item for item in candidates
-        if (item.get("tax_category") or "") in (STANDARD_RATE, "10%")
-    ]
-    chosen = standard_candidates[-1] if standard_candidates else candidates[-1]
+    chosen = candidates[-1]
     chosen["description"] = bag_desc
     chosen["qty"] = 1.0
     chosen["unit_price"] = bag_price
     chosen["total"] = bag_price
-    chosen["tax_category"] = STANDARD_RATE
     chosen["discount"] = 0.0
     chosen["discount_rate"] = ""
 
@@ -666,20 +658,26 @@ def _append_missing_low_value_bag_from_gap(extracted, unified_text):
     desc, price = bag_rows[0]
     if not any(abs(float(target) - items_sum - price) <= 2 for target in targets):
         return
-    items.append({
+    row = {
         "description": desc,
         "qty": 1.0,
         "unit_price": price,
         "total": price,
-        "tax_category": STANDARD_RATE,
         "discount": 0.0,
         "discount_rate": "",
-    })
+    }
+    matching_rates = [
+        rate for rate, base in extract_rate_bases(unified_text).items()
+        if base is not None and abs(float(base) - price) <= 2
+    ]
+    if len(matching_rates) == 1:
+        row["tax_category"] = matching_rates[0]
+    items.append(row)
     extracted["line_items"] = items
 
 
 def _replace_service_table_items_when_balanced(extracted, unified_text):
-    """Use OCR service-table rows when they balance to the receipt total."""
+    """Use balanced OCR service rows; split compact count/amounts only by proof."""
     items = extracted.get("line_items") or []
     total = extracted.get("total")
     subtotal = extracted.get("subtotal")
@@ -734,6 +732,8 @@ def _replace_service_table_items_when_balanced(extracted, unified_text):
         return re.sub(r'\s+', ' ', text)
 
     rows: list[dict] = []
+    pending_group = None
+    pending_group_line = None
     idx = start + 1
     while idx < end:
         line = lines[idx]
@@ -756,6 +756,8 @@ def _replace_service_table_items_when_balanced(extracted, unified_text):
                 saw_next_desc = True
                 break
         if price is None or saw_next_desc:
+            pending_group = desc if saw_next_desc else None
+            pending_group_line = idx if saw_next_desc else None
             idx += 1
             continue
         rows.append({
@@ -767,7 +769,11 @@ def _replace_service_table_items_when_balanced(extracted, unified_text):
             "discount": 0,
             "discount_rate": "",
             "_line": idx,
+            "_group": pending_group,
+            "_group_line": pending_group_line,
         })
+        pending_group = None
+        pending_group_line = None
         idx = (price_idx or idx) + 1
 
     if len(rows) < len(items):
@@ -805,6 +811,8 @@ def _replace_service_table_items_when_balanced(extracted, unified_text):
         best["discount_rate"] = f"{int(rate * 100)}%" if rate is not None else ""
         best["total"] = float(best["unit_price"]) - discount
 
+    _apply_coupon_discount_blocks({"line_items": rows}, unified_text)
+
     def _row_sum() -> float:
         return sum(float(row.get("total") or 0) for row in rows)
 
@@ -818,25 +826,83 @@ def _replace_service_table_items_when_balanced(extracted, unified_text):
 
     current_sum = _row_sum()
     if not any(abs(current_sum - target) <= 5 for target in targets):
-        for row in rows:
+        proposals = set()
+        summary_lines = lines[end:min(len(lines), end + 6)]
+        for row_idx, row in enumerate(rows):
             desc = row.get("description") or ""
             if not re.search(r'付加|手数料|サービス料|追加|加算', desc):
                 continue
+            if float(row.get("discount") or 0):
+                continue
+            owned_start = int(row.get("_group_line") or row.get("_line") or start)
+            if row_idx + 1 < len(rows):
+                next_row = rows[row_idx + 1]
+                owned_end = int(
+                    next_row.get("_group_line")
+                    or next_row.get("_line")
+                    or end
+                )
+            else:
+                owned_end = end
+            if any(
+                re.search(
+                    r'(?:-\s*[¥￥]?\s*\d[\d,]*|'
+                    r'[¥￥]?\s*\d[\d,]*\s*-)\s*[A-Za-zＡ-Ｚ]*$',
+                    owned_line,
+                )
+                for owned_line in lines[owned_start:owned_end]
+            ):
+                continue
+            group = re.sub(r'\s+', '', str(row.get("_group") or ""))
+            if not group:
+                continue
+            printed_counts = set()
+            for line_idx, line in enumerate(summary_lines):
+                compact_line = re.sub(r'\s+', '', line)
+                group_pos = compact_line.find(group)
+                if group_pos < 0:
+                    continue
+                after_group = compact_line[group_pos + len(group):]
+                count_match = re.match(r'(\d{1,3})点', after_group)
+                if count_match:
+                    printed_counts.add(int(count_match.group(1)))
+                    continue
+                for nearby in summary_lines[line_idx + 1:line_idx + 3]:
+                    count_match = re.fullmatch(r'\s*(\d{1,3})\s*点\s*', nearby)
+                    if count_match:
+                        printed_counts.add(int(count_match.group(1)))
+                        break
+            if not printed_counts:
+                continue
             value = int(round(float(row.get("unit_price") or 0)))
             raw = str(value)
-            if len(raw) < 3 or raw[0] not in "23456789":
+            if len(raw) < 3 or abs(float(row.get("total") or 0) - value) > 0.01:
                 continue
-            corrected = float(int(raw[1:]))
-            if corrected <= 0:
-                continue
-            adjusted = current_sum - value + corrected
-            if any(abs(adjusted - target) <= 5 for target in targets):
-                row["unit_price"] = corrected
-                row["total"] = corrected
-                row["discount"] = 0
-                row["discount_rate"] = ""
-                current_sum = adjusted
-                break
+            for split_idx in range(1, min(3, len(raw))):
+                count = int(raw[:split_idx])
+                corrected_text = raw[split_idx:]
+                if corrected_text.startswith("0"):
+                    continue
+                corrected = int(corrected_text)
+                if (
+                    count <= 1
+                    or count not in printed_counts
+                    or corrected <= 0
+                    or corrected % count
+                ):
+                    continue
+                adjusted = current_sum - value + corrected
+                if any(abs(adjusted - target) <= 2 for target in targets):
+                    proposals.add(
+                        (row_idx, count, corrected // count, corrected, adjusted)
+                    )
+
+        if len(proposals) == 1:
+            row_idx, count, unit, corrected, adjusted = proposals.pop()
+            rows[row_idx]["qty"] = float(count)
+            rows[row_idx]["unit_price"] = float(unit)
+            rows[row_idx]["total"] = float(corrected)
+            current_sum = adjusted
 
     if not any(abs(current_sum - target) <= 5 for target in targets):
         return
@@ -855,20 +921,172 @@ def _replace_service_table_items_when_balanced(extracted, unified_text):
     extracted["line_items"] = cleaned_rows
 
 
+def _labeled_marker_rows_when_balanced(extracted, lines, unified_text):
+    """Project repeated labeled rows only when count and amount evidence is unique."""
+    if not re.search(r'価格\s*横.*数字.*(?:軽減税率|税率)', unified_text):
+        return None
+    rates = {
+        normalize_tax_rate(str(tax.get("rate") or ""))
+        for tax in (extracted.get("taxes") or [])
+        if isinstance(tax, dict)
+    } & {"8%", "10%"}
+    if len(rates) != 1:
+        return None
+
+    header_re = re.compile(r'([^\W\d_]{2,6})(?:\s+(\d{6,14}))?')
+    matches = [(idx, match) for idx, line in enumerate(lines) if (match := header_re.fullmatch(line))]
+    counts = Counter(match.group(1) for _idx, match in matches)
+    labels = {
+        match.group(1) for _idx, match in matches if match.group(2) and counts[match.group(1)] >= 2
+    }
+    if len(labels) != 1:
+        return None
+    label = labels.pop()
+    headers = [idx for idx, match in matches if match.group(1) == label]
+    summary_idx = next(
+        (
+            idx for idx in range(headers[0] + 1, len(lines))
+            if re.fullmatch(r'(?:合計|小計|合\s+計|小\s+計)', lines[idx])
+        ),
+        None,
+    )
+    if summary_idx is None:
+        return None
+    headers = [idx for idx in headers if idx < summary_idx]
+    if not 2 <= len(headers) <= 32:
+        return None
+
+    amount_re = re.compile(r'[¥￥]?\s*(\d[\d,]*)\s*[¥￥]?')
+    visible_amounts = {
+        float(match.group(1).replace(',', ''))
+        for line in lines[summary_idx + 1:min(len(lines), summary_idx + 12)]
+        for match in [amount_re.fullmatch(line)]
+        if match
+    }
+    targets = {
+        float(value)
+        for value in (extracted.get("subtotal"), extracted.get("total"))
+        if value is not None
+        and float(value) > 0
+        and any(abs(float(value) - visible) <= 2 for visible in visible_amounts)
+    }
+    count_start = max(headers[0], summary_idx - 5)
+    count_end = min(len(lines), summary_idx + 12)
+    expected_count = str(len(headers))
+    count_evidence = any(
+        '購入点数' in line
+        and (
+            re.search(rf'購入点数\s*[:：]?\s*{expected_count}\b', line)
+            or any(re.fullmatch(expected_count, candidate) for candidate in lines[count_start:count_end])
+        )
+        for line in lines[count_start:count_end]
+    )
+    for idx in range(count_start, count_end):
+        if count_evidence:
+            break
+        line = lines[idx]
+        if not re.search(r'購入点数', line):
+            continue
+        joined = re.fullmatch(r'購入点数\s*[:：]?\s*[¥￥]?\s*(\d[\d,]*)\s*[¥￥]?', line)
+        if not joined:
+            continue
+        joined_amount = float(joined.group(1).replace(',', ''))
+        nearby = lines[max(count_start, idx - 2):min(count_end, idx + 4)]
+        if any(abs(joined_amount - target) <= 2 for target in targets) and any(
+            candidate != line
+            and re.search(rf'(?:^|[\s:：]){expected_count}\s*$', candidate)
+            for candidate in nearby
+        ):
+            count_evidence = True
+            break
+    if not targets or not count_evidence:
+        return None
+
+    item_end = next(
+        (idx for idx in range(headers[-1] + 1, summary_idx) if '購入点数' in lines[idx]),
+        summary_idx,
+    )
+    marker_digits = {
+        line for line in lines[headers[0]:item_end]
+        if re.fullmatch(r'\d', line)
+    }
+    if not marker_digits:
+        return None
+
+    row_choices: list[list[tuple[str, float]]] = []
+    for header_idx, section_end in zip(headers, headers[1:] + [item_end], strict=False):
+        row_marker_digits = {
+            line for line in lines[header_idx + 1:section_end]
+            if re.fullmatch(r'\d', line)
+        }
+        if len(marker_digits) > 1 and len(row_marker_digits) != 1:
+            return None
+        allowed_marker_digits = row_marker_digits if len(marker_digits) > 1 else marker_digits
+        desc = None
+        for line in lines[header_idx + 1:section_end]:
+            match = amount_re.fullmatch(line)
+            if desc and match:
+                digits = match.group(1).replace(',', '')
+                amounts = {float(digits)}
+                if len(digits) >= 2 and digits[-1] in allowed_marker_digits:
+                    amounts.add(float(digits[:-1]))
+                break
+            if re.search(r'[^\W\d_]', line) and match is None:
+                desc = line
+        else:
+            amounts = set()
+        choices = [(desc, amount) for amount in sorted(amounts) if 0 < amount <= max(targets) + 2]
+        if not choices:
+            return None
+        row_choices.append(choices)
+
+    solutions: list[tuple[tuple[str, float], ...]] = []
+    stack: list[tuple[int, float, tuple[tuple[str, float], ...]]] = [(0, 0.0, ())]
+    steps = 0
+    # ponytail: fail closed to the legacy projector if ambiguity exceeds 256 states.
+    while stack and len(solutions) < 2 and steps < 256:
+        pos, total, rows = stack.pop()
+        steps += 1
+        if pos == len(row_choices):
+            if any(abs(total - target) <= 2 for target in targets):
+                solutions.append(rows)
+            continue
+        stack.extend(
+            (pos + 1, total + choice[1], rows + (choice,))
+            for choice in row_choices[pos]
+            if total + choice[1] <= max(targets) + 2
+        )
+    if stack or len(solutions) != 1:
+        return None
+    tax_category = next(iter(rates))
+    return [
+        dict(description=desc, qty=1.0, unit_price=amount, total=amount,
+             tax_category=tax_category, discount=0, discount_rate="")
+        for desc, amount in solutions[0]
+    ]
+
+
 def _replace_dense_item_rows_when_balanced(extracted, unified_text):
     """Parse dense item rows directly when OCR rows balance."""
+    lines = [line.strip() for line in unified_text.split('\n')]
+    labeled_rows = _labeled_marker_rows_when_balanced(extracted, lines, unified_text)
+    if labeled_rows is not None:
+        extracted["line_items"] = labeled_rows
+        return
+
     subtotal = extracted.get("subtotal")
     if not subtotal:
         return
-    lines = [line.strip() for line in unified_text.split('\n')]
     end = next((i for i, line in enumerate(lines) if re.fullmatch(r'小\s*計', line)), None)
     if end is None:
         return
-    start = next(
-        (i for i, line in enumerate(lines[:end])
-         if re.search(r'\d{1,2}:\d{2}', line) or re.search(r'\d{1,2}/\s*\d{1,2}', line)),
-        0,
-    )
+    anchors = [
+        i for i, line in enumerate(lines[:end])
+        if re.search(r'\d{1,2}:\d{2}', line)
+        or re.search(r'\d{1,2}/\s*\d{1,2}', line)
+        or re.search(r'\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}', line)
+    ]
+    start = max(anchors) if anchors else 0
     zone = lines[start + 1:end]
 
     def _plausible_item_amount(amount: float) -> bool:
@@ -1023,22 +1241,220 @@ def _replace_dense_item_rows_when_balanced(extracted, unified_text):
         extracted["line_items"] = rows
 
 
+def _code_anchored_detached_rows_when_balanced(extracted, unified_text):
+    """Project a complete code/title/amount queue only when one basket balances.
+
+    Trigger: ordered hyphenated POS codes or 10-14 digit barcodes each own one
+    title.  Invariant: exactly one ordered amount subset has the same cardinality
+    and balances to subtotal, total, or total less printed tax.
+    """
+    lines = [line.strip() for line in unified_text.split('\n')]
+    anchor_indices = [
+        idx for idx, line in enumerate(lines)
+        if _CODE_ANCHOR_RE.fullmatch(line)
+    ]
+    if len(anchor_indices) < 2:
+        return None
+    first_code = anchor_indices[0]
+    date_anchors = [
+        idx for idx, line in enumerate(lines[:first_code])
+        if re.search(
+            r'\d{4}\s*[/年-]\s*\d{1,2}\s*[/月-]\s*\d{1,2}|'
+            r'\d{1,2}\s*[:時]\s*\d{2}',
+            line,
+        )
+    ]
+    start = (max(date_anchors) + 1) if date_anchors else 0
+    zone = lines[start:]
+    code_rows = _code_anchored_ocr_descriptions(zone)
+    if len(code_rows) < 2:
+        return None
+
+    first_anchor = code_rows[0][0]
+    stream_end = next(
+        (
+            idx for idx in range(first_anchor + 1, len(zone))
+            if _CODE_STREAM_END_RE.search(zone[idx])
+        ),
+        len(zone),
+    )
+    last_anchor = code_rows[-1][0]
+    amount_end = next(
+        (
+            idx for idx in range(last_anchor + 1, stream_end)
+            if re.search(
+                r'内消費税|外消費税|税額|^注[)）].*税率|^[*※].*軽減税率',
+                zone[idx],
+            )
+        ),
+        stream_end,
+    )
+
+    taxes = extracted.get("taxes") or []
+    has_positive_external_tax = any(
+        isinstance(tax, dict)
+        and tax.get("label") == "外税"
+        and float(tax.get("amount") or 0) > 0
+        for tax in taxes
+    )
+    target_values = [extracted.get("subtotal")]
+    if not has_positive_external_tax:
+        target_values.append(extracted.get("total"))
+
+    targets: list[float] = []
+    for value in target_values:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and not any(abs(value - seen) <= 0.5 for seen in targets):
+            targets.append(value)
+    try:
+        total = float(extracted.get("total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    tax_sum = _sum_taxable_amounts(taxes)
+    pretax = total - tax_sum
+    if pretax > 0 and not any(abs(pretax - seen) <= 0.5 for seen in targets):
+        targets.append(pretax)
+    if not targets:
+        return None
+
+    candidates: list[tuple[int, float]] = []
+    for idx, line in enumerate(zone[first_anchor:amount_end], first_anchor):
+        if _CODE_ANCHOR_RE.fullmatch(line):
+            continue
+        amount = re.fullmatch(
+            r'[¥￥]?\s*(\d[\d,]*)\s*([%％*＊※除軽非内外]?)',
+            line,
+        )
+        if not amount:
+            continue
+        value = float(amount.group(1).replace(',', ''))
+        marker = amount.group(2) or ""
+        if value < 10 and not marker:
+            continue
+        if value <= 0 or value > max(targets) + 2:
+            continue
+        candidates.append((idx, value))
+
+    row_count = len(code_rows)
+    # ponytail: receipt queues get at most five stray numeric rows; use DP if
+    # dense numeric tables ever need a larger search space.
+    if len(candidates) < row_count or len(candidates) > row_count + 5:
+        return None
+    solutions: dict[tuple[float, ...], tuple[tuple[int, float], ...]] = {}
+    for choice in combinations(candidates, row_count):
+        values = tuple(value for _idx, value in choice)
+        if any(abs(sum(values) - target) <= 2 for target in targets):
+            solutions.setdefault(tuple(round(value, 2) for value in values), choice)
+            if len(solutions) > 1:
+                return None
+    if len(solutions) != 1:
+        return None
+    amounts = next(iter(solutions))
+
+    existing_rates = Counter(
+        item.get("tax_category")
+        for item in (extracted.get("line_items") or [])
+        if isinstance(item, dict) and item.get("tax_category")
+    )
+    rate_bases = extract_rate_bases(unified_text)
+    nonzero_rates = [
+        rate for rate in ("8%", "10%")
+        if float(rate_bases.get(rate) or 0) > 0
+    ]
+    default_rate = (
+        existing_rates.most_common(1)[0][0]
+        if existing_rates
+        else (nonzero_rates[0] if len(nonzero_rates) == 1 else "0%")
+    )
+    rows = [
+        {
+            "description": description,
+            "qty": 1.0,
+            "unit_price": amount,
+            "total": amount,
+            "tax_category": default_rate,
+            "discount": 0,
+            "discount_rate": "",
+        }
+        for (_anchor_idx, description), amount in zip(code_rows, amounts, strict=True)
+    ]
+    _assign_single_standard_rate_from_small_base(rows, rate_bases)
+    _fix_tax_categories_from_ocr_markers(rows, unified_text)
+    _rebalance_tax_categories_to_rate_bases(
+        rows,
+        unified_text,
+        extracted.get("taxes"),
+        rate_bases,
+    )
+    _assign_single_standard_rate_from_small_base(rows, rate_bases)
+    return rows
+
+
 def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
     """Reconstruct dense item streams with name queues and price queues."""
+    code_rows = _code_anchored_detached_rows_when_balanced(extracted, unified_text)
+    if code_rows is not None:
+        extracted["line_items"] = code_rows
+        return
     subtotal = extracted.get("subtotal")
     if not subtotal:
-        return
-    if not re.search(r'お買上商品数\s*[:：]?\s*\d+', unified_text):
         return
     lines = [line.strip() for line in unified_text.split('\n')]
     end = next((i for i, line in enumerate(lines) if re.fullmatch(r'小\s*計', line)), None)
     if end is None:
         return
-    start = next(
-        (i for i, line in enumerate(lines[:end])
-         if re.search(r'\d{4}/\d{1,2}/\d{1,2}|\d{1,2}:\d{2}', line)),
-        0,
+    inline_count = re.search(
+        r'お買上(?:商品数|点数|げ点数)\s*[:：]?\s*(\d+)',
+        unified_text,
     )
+    count_label = re.search(r'お買上(?:商品数|点数|げ点数)', unified_text)
+    vertical_count = None
+    if end + 2 < len(lines):
+        count_match = re.fullmatch(r'(\d{1,2})\s*(?:点|個|コ)?', lines[end + 1])
+        amount_match = re.fullmatch(r'[¥￥]?\s*(\d[\d,]*)', lines[end + 2])
+        if (
+            count_match
+            and amount_match
+            and abs(float(amount_match.group(1).replace(',', '')) - float(subtotal)) <= 2
+        ):
+            vertical_count = int(count_match.group(1))
+    if not count_label and vertical_count is None:
+        return
+    printed_count = int(inline_count.group(1)) if inline_count else vertical_count
+    current_items = [
+        item for item in (extracted.get("line_items") or [])
+        if isinstance(item, dict)
+    ]
+    if current_items and all(
+        (item.get("description") or "").strip()
+        and item.get("qty") is not None
+        and item.get("unit_price") is not None
+        and item.get("total") is not None
+        for item in current_items
+    ):
+        current_sum = sum(float(item["total"]) for item in current_items)
+        current_qty = sum(float(item["qty"]) for item in current_items)
+        if (
+            abs(current_sum - float(subtotal)) <= 2
+            and (
+                printed_count is None
+                or len(current_items) == printed_count
+                or abs(current_qty - printed_count) <= 0.1
+            )
+        ):
+            return
+    anchors = [
+        i for i, line in enumerate(lines[:end])
+        if re.search(
+            r'\d{4}\s*[/年]\s*\d{1,2}\s*[/月]\s*\d{1,2}|'
+            r'\d{1,2}\s*[:時]\s*\d{2}',
+            line,
+        )
+    ]
+    start = max(anchors) if anchors else 0
     zone = lines[start + 1:end]
     merged_zone: list[str] = []
     idx = 0
@@ -1059,6 +1475,7 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
     def _clean_desc(text: str) -> str:
         text = _clean_ocr_price_line_desc(text)
         text = re.sub(r'\s+', ' ', text).strip()
+        text = re.sub(r'^[*\u203b\uff0a]\s*', '', text).strip()
         text = re.sub(r'^(?:内\s*)?', '', text).strip()
         text = re.sub(r'(有料レジ袋)[しシ]$', r'\1', text)
         return text
@@ -1071,7 +1488,7 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
             return False
         if re.search(r'\d{1,2}\s*:\s*\d{2}|:', text):
             return False
-        if re.search(r'TEL|FAX|http|領収|登録番号|株式会社|毎月|ぜひ|取\d|登\s*:|お買上', text, re.IGNORECASE):
+        if re.search(r'TEL|FAX|http|領収|登録番号|株式会社|毎月|ぜひ|取\d|登\s*:|お買上|^点数$|^商品数$', text, re.IGNORECASE):
             return False
         if re.search(r'レジ|クレジット|現金|お釣り|釣銭|合計|税', text) and not _is_bag_description(text):
             return False
@@ -1112,10 +1529,7 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
         desc = _clean_desc(desc)
         marker = marker.strip()
         locked_tax_category = None
-        if _is_bag_description(desc):
-            tax_category = "10%"
-            locked_tax_category = tax_category
-        elif re.search(r'[Xx]', marker):
+        if re.search(r'[Xx]', marker):
             tax_category = "8%" if re.search(r'軽減税率|※印|[*＊].*軽減', unified_text) else "0%"
             locked_tax_category = tax_category
         else:
@@ -1393,12 +1807,49 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
             _apply_discount(float(discount_m.group(1).replace(',', '')))
             continue
 
+        split_inline = re.match(
+            r'^(.+?[ぁ-んァ-ン一-龥].*?)\s+(\d[\d,]*)\s*([%％*＊※除軽非]*)'
+            r'\s+(\d[\d,]*)\s*([%％*＊※除軽非]*)$',
+            line,
+        )
+        if split_inline:
+            desc = _clean_desc(split_inline.group(1))
+            first = float(split_inline.group(2).replace(',', ''))
+            second = float(split_inline.group(4).replace(',', ''))
+            if _valid_desc(desc) and 0 < first <= float(subtotal) and 0 < second <= float(subtotal):
+                if pending_names:
+                    pending_desc = pending_names.pop(0)
+                    for row_desc, value, marker in (
+                        (desc, first, split_inline.group(3)),
+                        (pending_desc, second, split_inline.group(5)),
+                    ):
+                        row = _make_row(row_desc, value, marker)
+                        rows.append(row)
+                        _remember_marker_row(row)
+                        last_row = row
+                    continue
+                if first < 10 and _is_bag_description(desc):
+                    row = _make_row(desc, first, split_inline.group(3))
+                    rows.append(row)
+                    _remember_marker_row(row)
+                    pending_leading_amounts.append((second, split_inline.group(5)))
+                    last_row = row
+                    continue
+
         inline = _parse_inline(line)
         if inline:
             flushed = _flush_pending_qty_detail_row(source_idx)
             if flushed is not None:
                 last_row = flushed
             desc, amount, marker = inline
+            if pending_names and re.match(r'^\d{3,}', line):
+                pending_desc = pending_names.pop(0)
+                row = _make_row(pending_desc, amount, marker)
+                rows.append(row)
+                _remember_marker_row(row)
+                pending_names.append(desc)
+                last_row = row
+                continue
             row = _make_row(desc, amount, marker)
             rows.append(row)
             _remember_marker_row(row)
@@ -1409,12 +1860,32 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
         if amount:
             value, marker = amount
             if not pending_names:
+                next_line = zone[source_idx + 1] if source_idx + 1 < len(zone) else ""
+                recent_codes = [
+                    match.group(1)
+                    for previous in zone[max(0, source_idx - 6):source_idx]
+                    if (match := re.match(r'^(\d{6,})', previous))
+                ]
+                if (
+                    value >= 10
+                    and last_row is not None
+                    and (_parse_inline(next_line) is not None or _valid_desc(next_line))
+                    and len(recent_codes) != len(set(recent_codes))
+                ):
+                    row = _make_row(str(last_row.get("description") or ""), value, marker)
+                    rows.append(row)
+                    _remember_marker_row(row)
+                    last_row = row
+                    continue
                 if value >= 10:
                     pending_leading_amounts.append((value, marker))
                     pending_leading_amounts = pending_leading_amounts[-3:]
                 continue
             desc = pending_names.pop(0)
             if value < 10 and not _is_bag_description(desc):
+                if vertical_count is not None:
+                    pending_names.insert(0, desc)
+                    continue
                 pending_names.clear()
                 last_row = None
                 continue
@@ -1446,12 +1917,17 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
             pending_names.append(desc)
             if len(pending_names) > 6:
                 pending_names = pending_names[-6:]
+        elif re.fullmatch(r'\d{6,}(?:\s+\d{1,3})?', line):
+            continue
         elif not amount and not _is_discount_control(line):
             pending_names.clear()
             pending_leading_amounts.clear()
             last_row = None
 
-    if len(rows) < 5:
+    minimum_rows = 2 if vertical_count is not None else 5
+    if len(rows) < minimum_rows:
+        return
+    if vertical_count is not None and len(rows) != vertical_count:
         return
     _apply_marker_summaries()
     row_sum = sum(float(row["total"]) for row in rows)
@@ -1460,7 +1936,8 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
     def _repair_percent_marker_amount_from_arithmetic() -> None:
         nonlocal row_sum
         gap = float(subtotal) - row_sum
-        if gap <= 0 or gap > 50:
+        base_sum = sum(float(base) for base in rate_bases.values() if base is not None)
+        if abs(gap - 8) > 0.01 or abs(base_sum - float(subtotal)) > 2:
             return
         candidates = [
             row for row in rows
@@ -1469,43 +1946,14 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
             and not float(row.get("discount") or 0)
             and float(row.get("total") or 0) >= 10
         ]
-        if not candidates:
+        if len(candidates) != 1:
             return
-
-        def _rate_sums() -> dict[str, float]:
-            sums: dict[str, float] = {}
-            for row in rows:
-                rate = normalize_tax_rate(str(row.get("tax_category") or "unknown"))
-                sums[rate] = sums.get(rate, 0.0) + float(row.get("total") or 0)
-            return sums
-
-        for row in candidates:
-            old_total = float(row.get("total") or 0)
-            corrected = old_total + gap
-            if corrected <= old_total or corrected > float(subtotal):
-                continue
-            row["unit_price"] = corrected
-            row["total"] = corrected
-            row["_printed_amount"] = corrected
-            adjusted_sum = row_sum + gap
-            if abs(adjusted_sum - float(subtotal)) > 2:
-                row["unit_price"] = old_total
-                row["total"] = old_total
-                row["_printed_amount"] = old_total
-                continue
-            if rate_bases:
-                rate_sums = _rate_sums()
-                mismatched = [
-                    rate for rate, base in rate_bases.items()
-                    if base is not None and abs(rate_sums.get(rate, 0.0) - float(base)) > 2
-                ]
-                if mismatched:
-                    row["unit_price"] = old_total
-                    row["total"] = old_total
-                    row["_printed_amount"] = old_total
-                    continue
-            row_sum = adjusted_sum
-            return
+        row = candidates[0]
+        corrected = float(row.get("total") or 0) + gap
+        row["unit_price"] = corrected
+        row["total"] = corrected
+        row["_printed_amount"] = corrected
+        row_sum += gap
 
     def _repair_leading_digit_amount_from_subtotal() -> None:
         nonlocal row_sum
@@ -1539,8 +1987,6 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
         row["unit_price"] = corrected
         row["total"] = corrected
         row["_printed_amount"] = corrected
-        row["tax_category"] = "8%"
-        row["_tax_category_locked"] = "8%"
         row_sum = sum(float(row["total"]) for row in rows)
 
     _repair_leading_digit_amount_from_subtotal()
@@ -1574,8 +2020,111 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
             or current_count - len(rows) > 4
         ):
             return
+    _assign_single_standard_rate_from_small_base(rows, rate_bases)
     _fix_tax_categories_from_ocr_markers(rows, unified_text)
     _rebalance_tax_categories_to_rate_bases(rows, unified_text, extracted.get("taxes"), rate_bases)
+    _assign_single_standard_rate_from_small_base(rows, rate_bases)
+
+    def _rate_base_sums_match() -> bool:
+        category_sums: dict[str, float] = {}
+        for row in rows:
+            rate = normalize_tax_rate(str(row.get("tax_category") or "unknown"))
+            category_sums[rate] = category_sums.get(rate, 0.0) + float(row.get("total") or 0)
+        return all(
+            base is None or abs(category_sums.get(rate, 0.0) - float(base)) <= 2
+            for rate, base in rate_bases.items()
+        )
+
+    def _assign_unique_rate_base_subset() -> None:
+        valid_rates = [
+            rate for rate in ("8%", "10%")
+            if rate_bases.get(rate) is not None and float(rate_bases[rate]) > 0
+        ]
+        if (
+            len(valid_rates) != 2
+            or abs(sum(float(rate_bases[rate]) for rate in valid_rates) - row_sum) > 2
+        ):
+            return
+        locked = {
+            idx: row.get("_tax_category_locked")
+            for idx, row in enumerate(rows)
+            if row.get("_tax_category_locked") in valid_rates
+        }
+        unlocked = [
+            (idx, float(row.get("total") or 0))
+            for idx, row in enumerate(rows)
+            if idx not in locked
+        ]
+        locked_sums = {
+            rate: sum(
+                float(rows[idx].get("total") or 0)
+                for idx, locked_rate in locked.items()
+                if locked_rate == rate
+            )
+            for rate in valid_rates
+        }
+        original = [row.get("tax_category") for row in rows]
+        for rate in sorted(
+            valid_rates,
+            key=lambda candidate: float(rate_bases[candidate]) - locked_sums[candidate],
+        ):
+            other_rate = next(candidate for candidate in valid_rates if candidate != rate)
+            target = float(rate_bases[rate]) - locked_sums[rate]
+            if target < -2:
+                continue
+            match = None
+            for size in range(0, min(len(unlocked), 9) + 1):
+                candidates = []
+                for combo in combinations(unlocked, size):
+                    gap = abs(sum(amount for _idx, amount in combo) - target)
+                    if gap <= 2:
+                        candidates.append((gap, tuple(idx for idx, _amount in combo)))
+                if not candidates:
+                    continue
+                best_gap = min(gap for gap, _indices in candidates)
+                best = [indices for gap, indices in candidates if abs(gap - best_gap) <= 0.01]
+                if len(best) == 1:
+                    match = set(best[0])
+                break
+            if match is None:
+                continue
+            for idx, _amount in unlocked:
+                rows[idx]["tax_category"] = rate if idx in match else other_rate
+            if _rate_base_sums_match():
+                return
+            for row, category in zip(rows, original):
+                row["tax_category"] = category
+
+    if rate_bases and not _rate_base_sums_match():
+        _assign_unique_rate_base_subset()
+    if rate_bases and abs(
+        sum(float(base) for base in rate_bases.values() if base is not None)
+        - float(subtotal)
+    ) <= 2:
+        if not _rate_base_sums_match():
+            return
+    _clear_discounts_without_nearby_ocr_marker(rows, unified_text, rates_only=True)
+    if abs(sum(float(row.get("total") or 0) for row in rows) - float(subtotal)) > 2:
+        return
+    if len(rows) == len(current_items):
+        def _money_signature(item: dict) -> tuple[float, ...]:
+            return tuple(
+                round(float(item.get(key) or default), 2)
+                for key, default in (
+                    ("qty", 1),
+                    ("unit_price", 0),
+                    ("total", 0),
+                    ("discount", 0),
+                )
+            )
+
+        if all(
+            _money_signature(candidate) == _money_signature(current)
+            for candidate, current in zip(rows, current_items)
+        ):
+            for current, candidate in zip(current_items, rows):
+                current["discount_rate"] = candidate.get("discount_rate") or ""
+            return
     for row in rows:
         locked_tax_category = row.get("_tax_category_locked")
         if locked_tax_category:
