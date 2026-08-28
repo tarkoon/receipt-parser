@@ -11,17 +11,21 @@ from .patterns import (
     _JUNK_DESC_RE,
     _OCR_QTY_NOTATION_RE,
     _OCR_TRAILING_PRICE_RE,
+    _OCR_ZONE_END_RE,
     _SKIP_PRICE_LINE,
 )
 from .receipt_financial import _parse_amount_fragment, extract_rate_bases, normalize_tax_rate
 from .receipt_item_cleanup import _fill_single_qty_unit_prices_from_totals
 from .receipt_item_repair import _valid_ocr_item_desc
 from .receipt_projection import (
+    _code_anchored_ocr_descriptions,
     _clean_ocr_price_line_desc,
     _find_ocr_item_desc,
+    _ocr_desc_fragment_owned_by_existing,
 )
 from .receipt_tax_categories import (
     _assign_single_standard_rate_from_small_base,
+    _fix_tax_categories_from_ocr_markers,
     _is_bag_description,
     _rebalance_tax_categories_to_rate_bases,
 )
@@ -31,6 +35,23 @@ from .receipt_totals import (
     _printed_amount_targets,
     _sum_taxable_amounts,
 )
+
+
+def _item_zone_bounds(lines):
+    """Return the local transaction-item zone, excluding header and summary rows."""
+    end = next(
+        (idx for idx, line in enumerate(lines) if _OCR_ZONE_END_RE.search(line.strip())),
+        len(lines),
+    )
+    anchors = [
+        idx for idx, line in enumerate(lines[:end])
+        if re.search(
+            r'\d{4}\s*[/年]\s*\d{1,2}\s*[/月]\s*\d{1,2}|'
+            r'\d{1,2}\s*[:時]\s*\d{2}',
+            line,
+        )
+    ]
+    return ((max(anchors) + 1) if anchors else 0), end
 
 
 def _recover_multiple_missing_items_from_gap(
@@ -63,9 +84,11 @@ def _recover_multiple_missing_items_from_gap(
         text = re.sub(r'\s*[※\*＊非外内除軽]\s*$', '', text).strip()
         return text
 
-    def _valid_orphan_desc(text: str) -> bool:
+    def _valid_orphan_desc(text: str, desc_idx: int) -> bool:
         text = _clean_desc(text)
         if not _valid_ocr_item_desc(text):
+            return False
+        if _ocr_desc_fragment_owned_by_existing(lines, desc_idx, items):
             return False
         if _norm_desc(text) in existing_descs:
             return False
@@ -80,15 +103,7 @@ def _recover_multiple_missing_items_from_gap(
             return False
         return True
 
-    end_idx = next((idx for idx, line in enumerate(lines) if re.fullmatch(r'\s*小\s*計\s*', line.strip())), len(lines))
-    start_idx = next(
-        (
-            idx + 1
-            for idx, line in enumerate(lines[:end_idx])
-            if re.search(r'\d{4}/\d{1,2}/\d{1,2}|\d{1,2}:\d{2}', line)
-        ),
-        0,
-    )
+    start_idx, end_idx = _item_zone_bounds(lines)
     item_zone = range(start_idx, end_idx)
     unmatched_by_idx = {
         idx: amount for idx, amount in unmatched_prices
@@ -99,7 +114,7 @@ def _recover_multiple_missing_items_from_gap(
     fragment_candidates: list[dict] = []
     for desc_idx in item_zone:
         desc = _clean_desc(lines[desc_idx])
-        if not _valid_orphan_desc(desc):
+        if not _valid_orphan_desc(desc, desc_idx):
             continue
         desc_norm = _norm_desc(desc)
         line_has_own_amount = bool(
@@ -138,16 +153,14 @@ def _recover_multiple_missing_items_from_gap(
                 })
                 break
 
-    def _tax_category_from_marker(marker: str, desc: str) -> str:
-        if _is_bag_description(desc):
-            return "10%"
+    def _tax_category_from_marker(marker: str) -> str | None:
         if re.search(r'非', marker):
             return "0%"
         if re.search(r'除', marker):
             return "10%"
         if re.search(r'[%％*＊※軽]', marker):
             return "8%"
-        return "8%"
+        return None
 
     def _make_item(candidate: dict, amount: float) -> dict:
         desc = candidate["desc"]
@@ -156,7 +169,7 @@ def _recover_multiple_missing_items_from_gap(
             "qty": 1,
             "unit_price": float(amount),
             "total": float(amount),
-            "tax_category": _tax_category_from_marker(str(candidate.get("marker") or ""), desc),
+            "tax_category": _tax_category_from_marker(str(candidate.get("marker") or "")),
             "discount": 0,
             "discount_rate": "",
         }
@@ -210,7 +223,21 @@ def _recover_multiple_missing_items_from_gap(
 
         rate_bases = extract_rate_bases(unified_text)
         _assign_single_standard_rate_from_small_base(proposed, rate_bases)
+        _fix_tax_categories_from_ocr_markers(proposed, unified_text)
+        taxable_base_sum = sum(
+            float(base) for rate, base in rate_bases.items()
+            if rate in {"8%", "10%"} and base is not None
+        )
+        nontaxable_gap = float(target) - taxable_base_sum
+        nontaxable_matches = [
+            item for item in proposed
+            if nontaxable_gap > 0
+            and abs(float(item.get("total") or 0) - nontaxable_gap) <= 2
+        ]
+        if len(nontaxable_matches) == 1:
+            nontaxable_matches[0]["tax_category"] = "0%"
         _rebalance_tax_categories_to_rate_bases(proposed, unified_text, extracted.get("taxes"), rate_bases)
+        _assign_single_standard_rate_from_small_base(proposed, rate_bases)
         if rate_bases:
             checked_rates = [rate for rate, base in rate_bases.items() if base is not None and rate in {"8%", "10%"}]
             if checked_rates:
@@ -222,7 +249,14 @@ def _recover_multiple_missing_items_from_gap(
                     )
                     for rate in checked_rates
                 }
-                if any(abs(rate_sums.get(rate, 0.0) - float(rate_bases[rate] or 0)) > 2 for rate in checked_rates):
+                categories_complete = all(
+                    item.get("tax_category") in {*checked_rates, "0%"}
+                    for item in proposed
+                )
+                if categories_complete and any(
+                    abs(rate_sums.get(rate, 0.0) - float(rate_bases[rate] or 0)) > 2
+                    for rate in checked_rates
+                ):
                     continue
         successful.append((target, ordered))
 
@@ -236,7 +270,7 @@ def _recover_multiple_missing_items_from_gap(
         if not desc:
             return None
         best: tuple[float, int] | None = None
-        for idx, line in enumerate(lines[:end_idx]):
+        for idx, line in enumerate(lines[start_idx:end_idx], start_idx):
             line_norm = _norm_desc(_clean_desc(line))
             if not line_norm:
                 continue
@@ -320,6 +354,7 @@ def _recover_missing_items_from_gap(extracted, unified_text):
         return
 
     lines = unified_text.split('\n')
+    item_start, item_end = _item_zone_bounds(lines)
     if any(
         abs(float(target) - float(items_sum)) <= 2
         for target in _printed_amount_targets(extracted, unified_text)
@@ -330,7 +365,7 @@ def _recover_missing_items_from_gap(extracted, unified_text):
     # omit the yen symbol on product rows, so use the same trailing-price
     # detector as the projection code.
     ocr_prices: list[tuple[int, float]] = []
-    for i, line in enumerate(lines):
+    for i, line in enumerate(lines[item_start:item_end], item_start):
         s = line.strip()
         if _SKIP_PRICE_LINE.search(s) or _OCR_QTY_NOTATION_RE.search(s):
             continue
@@ -376,9 +411,6 @@ def _recover_missing_items_from_gap(extracted, unified_text):
             ocr_prices.append((i, amt))
 
     # Multiset diff: remove one OCR entry per extracted item amount
-    item_amounts = [
-        i.get("total", 0) for i in items if isinstance(i, dict)
-    ]
     unmatched = list(ocr_prices)
     for item in items:
         if not isinstance(item, dict):
@@ -391,7 +423,9 @@ def _recover_missing_items_from_gap(extracted, unified_text):
             for j, (idx, oa) in enumerate(unmatched):
                 if abs(oa - amt) >= 1:
                     continue
-                cand = _find_ocr_item_desc(lines, idx, [])
+                cand = _find_ocr_item_desc(
+                    lines[item_start:item_end], idx - item_start, []
+                )
                 cand_norm = re.sub(r'\s+', '', str(cand or ""))
                 if not cand_norm:
                     continue
@@ -440,6 +474,28 @@ def _recover_missing_items_from_gap(extracted, unified_text):
             continue
         if not any(abs(float(candidate_target) - float(seen)) <= 0.5 for seen in try_targets):
             try_targets.append(candidate_target)
+
+    code_rows = _code_anchored_ocr_descriptions(lines[item_start:item_end])
+    if code_rows:
+        existing_norms = [
+            re.sub(r'\W+', '', str(item.get("description") or "")).lower()
+            for item in items
+            if isinstance(item, dict) and item.get("description")
+        ]
+        unowned = []
+        for _idx, description in code_rows:
+            normalized = re.sub(r'\W+', '', description).lower()
+            if not any(
+                normalized in existing
+                or existing in normalized
+                or SequenceMatcher(None, normalized, existing).ratio() >= 0.72
+                for existing in existing_norms
+                if existing
+            ):
+                unowned.append(normalized)
+        if len(set(unowned)) > 1:
+            return
+
     if _recover_multiple_missing_items_from_gap(
         extracted,
         unified_text,
@@ -461,7 +517,9 @@ def _recover_missing_items_from_gap(extracted, unified_text):
             viable = []
             seen_descs = set()
             for idx, amt in matches:
-                cand_desc = _find_ocr_item_desc(lines, idx, items)
+                cand_desc = _find_ocr_item_desc(
+                    lines[item_start:item_end], idx - item_start, items
+                )
                 if not cand_desc:
                     continue
                 norm_desc = re.sub(r'\s+', '', cand_desc)
@@ -536,29 +594,42 @@ def _recover_missing_items_from_gap(extracted, unified_text):
         # Skip lines without any Japanese (logos, store names, English-only)
         if not re.search(r'[ぁ-んァ-ン一-龥]', text):
             return False
-        # Short fragments (<5 chars) are usually OCR garbage when adding a new
-        # item — unless they start with a product code (e.g., "0011W) X").
-        if len(text) < 5 and not re.match(r'^\d{3,}', text):
+        # A short local name is valid when its unmatched amount uniquely closes
+        # the basket gap; one-character fragments remain too ambiguous.
+        if len(text) < 2:
             return False
         if re.match(r'^単?\s*\d', text) and ('×' in text or 'x' in text or '個' in text):
             return False
         return True
 
-    desc = _find_ocr_item_desc(lines, price_line_idx, items)
+    desc = _find_ocr_item_desc(
+        lines[item_start:item_end], price_line_idx - item_start, items
+    )
 
     # First check the price line itself — rejoin_price_lines often merges
     # the item name with its price on a single line.
     line_text = lines[price_line_idx]
     cand = _clean_candidate(line_text)
-    if _is_valid_desc(cand) and not _is_existing_desc(cand):
+    if (
+        _is_valid_desc(cand)
+        and not _is_existing_desc(cand)
+        and not _ocr_desc_fragment_owned_by_existing(lines, price_line_idx, items)
+    ):
         desc = cand
 
     # Else search backward up to 15 lines, then forward up to 5 lines.
     # Prefer product-code-prefixed lines (e.g. "20060SAミタメスッキリ ロック")
     # since they're unambiguous item starts even when surrounded by OCR garbage.
     if not desc:
-        candidates_idx = list(range(price_line_idx - 1, max(price_line_idx - 16, -1), -1))
-        candidates_idx += list(range(price_line_idx + 1, min(price_line_idx + 6, len(lines))))
+        candidates_idx = list(range(
+            price_line_idx - 1,
+            max(price_line_idx - 16, item_start - 1),
+            -1,
+        ))
+        candidates_idx += list(range(
+            price_line_idx + 1,
+            min(price_line_idx + 6, item_end),
+        ))
 
         # First pass: lines with a leading product code (e.g. "20060SA…").
         # Check the prefix on the raw line, then clean it for the description.
@@ -567,14 +638,22 @@ def _recover_missing_items_from_gap(extracted, unified_text):
             if not re.match(r'^\d{4,}', raw):
                 continue
             cand = _clean_candidate(raw)
-            if _is_valid_desc(cand) and not _is_existing_desc(cand):
+            if (
+                _is_valid_desc(cand)
+                and not _is_existing_desc(cand)
+                and not _ocr_desc_fragment_owned_by_existing(lines, j, items)
+            ):
                 desc = cand
                 break
         # Second pass: any valid candidate
         if not desc:
             for j in candidates_idx:
                 cand = _clean_candidate(lines[j])
-                if _is_valid_desc(cand) and not _is_existing_desc(cand):
+                if (
+                    _is_valid_desc(cand)
+                    and not _is_existing_desc(cand)
+                    and not _ocr_desc_fragment_owned_by_existing(lines, j, items)
+                ):
                     desc = cand
                     break
 
@@ -631,7 +710,7 @@ def _recover_missing_items_from_gap(extracted, unified_text):
         if not e_total:
             continue
         existing_price_line = None
-        for li, line in enumerate(lines):
+        for li, line in enumerate(lines[item_start:item_end], item_start):
             if _SKIP_PRICE_LINE.search(line):
                 continue
             for m in re.finditer(r'[¥￥]\s*([\d,]+)', line):
@@ -670,6 +749,11 @@ def _fix_items_from_subtotal(extracted, unified_text, ocr_totals):
     taxes = extracted.get("taxes") or []
     total = extracted.get("total")
     tax_sum = _sum_taxable_amounts(taxes)
+    # Item rows on tax-inclusive receipts carry their printed gross prices.
+    # A schema subtotal may exclude the included tax, so it is not a valid
+    # target when the visible item rows already reconcile to the receipt total.
+    if total is not None and abs(item_sum - float(total)) <= 2:
+        return
     # OCR may expose per-rate taxable bases (e.g. "8%対象") as subtotal-like
     # candidates. If the items already match the canonical subtotal, do not
     # rewrite correct item prices toward that tax-base value.
@@ -685,6 +769,16 @@ def _fix_items_from_subtotal(extracted, unified_text, ocr_totals):
     for item in items:
         if not isinstance(item, dict) or item.get("qty", 1) != 1:
             continue
+        try:
+            discount = float(item.get("discount") or 0)
+            net = (
+                float(item.get("qty") or 1) * float(item.get("unit_price") or 0)
+                - discount
+            )
+            if discount > 0 and abs(net - float(item.get("total") or 0)) <= 1:
+                continue
+        except (TypeError, ValueError):
+            pass
         desc = item.get("description", "")
         desc_key = desc[:8] if len(desc) >= 8 else desc
         if not desc_key:
@@ -880,8 +974,35 @@ def _fix_printed_tax_amounts_from_structural_blocks(extracted, unified_text):
         if value is not None and value > 0
     ]
     if inclusive_amounts and re.search(r'内[、,]?\s*消費税|円を含みます|税込|内税', unified_text):
-        amount = max(inclusive_amounts)
+        amount = inclusive_amounts[0]
+        # Split label/value columns can attach both the base and tax to 消費税.
+        if len(set(inclusive_amounts)) > 1:
+            rate_bases = extract_rate_bases(unified_text)
+            if len(rate_bases) != 1:
+                return
+            rate, printed_base = next(iter(rate_bases.items()))
+            try:
+                rate_pct = float(rate.rstrip("%")) / 100.0
+            except (AttributeError, ValueError, ZeroDivisionError):
+                return
+            bases = [value for value in (printed_base, total) if value and value > 0]
+            plausible = [
+                candidate
+                for candidate in set(inclusive_amounts)
+                if any(
+                    min(
+                        abs(candidate - base * rate_pct),
+                        abs(candidate - base * rate_pct / (1 + rate_pct)),
+                    ) <= 2
+                    for base in bases
+                )
+            ]
+            if len(plausible) != 1:
+                return
+            amount = plausible[0]
         if total and amount < total:
+            if len(set(inclusive_amounts)) > 1:
+                target["rate"] = rate
             target["amount"] = round(amount)
             target["label"] = "内税"
         return

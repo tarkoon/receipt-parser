@@ -4,12 +4,12 @@ import re
 from difflib import SequenceMatcher
 
 from .patterns import (
-    _FOOD_DESC_RE,
     _OCR_QTY_NOTATION_RE,
     _OCR_TRAILING_PRICE_RE,
     _SKIP_PRICE_LINE,
 )
-from .receipt_financial import extract_rate_bases
+from .receipt_financial import extract_financial_totals, extract_rate_bases, normalize_tax_label
+from .receipt_item_cleanup import _clear_discounts_without_nearby_ocr_marker
 from .receipt_item_repair import (
     _ocr_line_index_for_item,
     _valid_ocr_item_desc,
@@ -130,6 +130,34 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
         if locked:
             row["_tax_category_locked"] = tax_category
         return row
+
+    def _update_rates_when_money_matches(candidate_rows: list[dict]) -> bool:
+        current_rows = [
+            item for item in (extracted.get("line_items") or [])
+            if isinstance(item, dict)
+        ]
+        if len(current_rows) != len(candidate_rows):
+            return False
+
+        def _signature(item: dict) -> tuple[float, ...]:
+            return tuple(
+                round(float(item.get(key) or default), 2)
+                for key, default in (
+                    ("qty", 1),
+                    ("unit_price", 0),
+                    ("total", 0),
+                    ("discount", 0),
+                )
+            )
+
+        if not all(
+            _signature(current) == _signature(candidate)
+            for current, candidate in zip(current_rows, candidate_rows)
+        ):
+            return False
+        for current, candidate in zip(current_rows, candidate_rows):
+            current["discount_rate"] = candidate.get("discount_rate") or ""
+        return True
 
     rows: list[dict] = []
     pending_names: list[str] = []
@@ -295,6 +323,13 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
                             extracted.get("taxes"),
                             rate_bases,
                         )
+                        _clear_discounts_without_nearby_ocr_marker(
+                            rebuilt, unified_text, rates_only=True
+                        )
+                        if abs(sum(float(row.get("total") or 0) for row in rebuilt) - subtotal_target) > 2:
+                            return False
+                        if _update_rates_when_money_matches(rebuilt):
+                            return True
                         extracted["line_items"] = [
                             {key: value for key, value in row.items() if not key.startswith("_")}
                             for row in rebuilt
@@ -372,6 +407,13 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
             return False
         rate_bases = extract_rate_bases(unified_text)
         _rebalance_tax_categories_to_rate_bases(rebuilt, unified_text, extracted.get("taxes"), rate_bases)
+        _clear_discounts_without_nearby_ocr_marker(
+            rebuilt, unified_text, rates_only=True
+        )
+        if abs(sum(float(row.get("total") or 0) for row in rebuilt) - subtotal_target) > 2:
+            return False
+        if _update_rates_when_money_matches(rebuilt):
+            return True
         extracted["line_items"] = [
             {key: value for key, value in row.items() if not key.startswith("_")}
             for row in rebuilt
@@ -459,11 +501,18 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
 
     rate_bases = extract_rate_bases(unified_text)
     _rebalance_tax_categories_to_rate_bases(rows, unified_text, extracted.get("taxes"), rate_bases)
+    _clear_discounts_without_nearby_ocr_marker(
+        rows, unified_text, rates_only=True
+    )
+    if abs(sum(float(row.get("total") or 0) for row in rows) - subtotal_target) > 2:
+        return
     for row in rows:
         locked_tax_category = row.get("_tax_category_locked")
         if locked_tax_category:
             row["tax_category"] = locked_tax_category
     rows.sort(key=lambda row: int(row.get("_source_idx", 0)))
+    if _update_rates_when_money_matches(rows):
+        return
     extracted["line_items"] = [
         {key: value for key, value in row.items() if not key.startswith("_")}
         for row in rows
@@ -992,8 +1041,17 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                     break
                 if desc_rank < 2:
                     discount = float(item.get("discount") or 0)
+                    current_qty = float(item.get("qty") or 1)
                     current_unit = float(item.get("unit_price") or 0)
                     current_total = float(item.get("total") or 0)
+                    if (
+                        discount > 0
+                        and abs(current_qty - qty) <= 0.01
+                        and abs(current_unit - unit) <= 2
+                        and abs(current_qty * current_unit - discount - current_total) <= 2
+                    ):
+                        matched_item = item
+                        break
                     gross_is_standalone_before_qty_detail = _has_standalone_gross_before_qty_detail(
                         item, expected_total, idx
                     )
@@ -1003,12 +1061,8 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                         and abs(current_unit - unit) <= 2
                         and abs(current_total - (expected_total - discount)) <= 2
                     ):
-                        half_off_gross_line = (
-                            abs(discount - unit) <= 2
-                            and abs(current_total - unit) <= 2
-                        )
                         item["qty"] = qty
-                        item["unit_price"] = expected_total if half_off_gross_line else unit
+                        item["unit_price"] = unit
                         item["total"] = current_total
                         matched_item = item
                         break
@@ -1027,7 +1081,6 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                         and abs(current_unit - expected_total) <= 2
                         and abs(current_total - (current_unit - discount)) <= 2
                     ):
-                        current_qty = float(item.get("qty") or 1)
                         item_desc = _norm(item.get("description") or "")
                         desc_has_gross = _amount_appears_in_text(item.get("description") or "", expected_total)
                         ocr_line_idx = _ocr_line_index_for_item(lines, item)
@@ -1037,20 +1090,15 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                             and item_desc in _norm(lines[ocr_line_idx])
                         )
                         item["qty"] = qty
-                        half_off_gross_line = (
-                            abs(discount - unit) <= 2
-                            and abs(current_total - unit) <= 2
-                        )
                         if (
                             current_qty > 1
                             and gross_is_standalone_before_qty_detail
-                            and not half_off_gross_line
                             and abs(current_total - (qty * unit - discount)) <= 2
                         ):
                             item["unit_price"] = unit
                             item["total"] = current_total
                         if current_qty <= 1 and gross_is_standalone_before_qty_detail:
-                            item["unit_price"] = expected_total
+                            item["unit_price"] = unit
                             item["total"] = current_unit - discount
                         elif current_qty <= 1 or desc_has_gross or gross_is_inline_with_name:
                             item["unit_price"] = unit
@@ -1153,18 +1201,19 @@ def _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals):
     orphan_prices: list[float] = []
     in_items = False
 
-    def _clean_desc(line: str) -> tuple[str, str]:
+    def _clean_desc(line: str) -> tuple[str, str, bool]:
         marker = "10%"
-        if "*" in line or "＊" in line:
+        locked = "*" in line or "＊" in line
+        if locked:
             marker = "8%"
         text = re.sub(r'^\d{3,6}\s*', '', line).strip()
         text = text.lstrip('*＊').strip()
-        return text, marker
+        return text, marker, locked
 
     def _finish(row: dict | None):
         if not row or row.get("total") is None:
             return
-        rows.append({
+        projected = {
             "description": row["description"],
             "qty": row.get("qty", 1.0),
             "unit_price": row.get("unit_price", row["total"]),
@@ -1172,7 +1221,10 @@ def _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals):
             "tax_category": row.get("tax_category", "8%"),
             "discount": row.get("discount", 0),
             "discount_rate": row.get("discount_rate", ""),
-        })
+        }
+        if row.get("_tax_category_locked"):
+            projected["_tax_category_locked"] = row["_tax_category_locked"]
+        rows.append(projected)
 
     def _discount_rate_value(row: dict) -> float | None:
         m = re.search(r'(\d+(?:\.\d+)?)\s*%', str(row.get("discount_rate") or ""))
@@ -1271,7 +1323,10 @@ def _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals):
 
         inline_m = re.match(r'^\d{3,6}\*?\s*(.+?)\s+[¥￥]\s*([\d,]+)\s*$', line)
         if inline_m:
-            desc, cat = _clean_desc(inline_m.group(1))
+            desc, cat, locked = _clean_desc(inline_m.group(1))
+            locked = locked or "*" in line or "＊" in line
+            if locked:
+                cat = "8%"
             _finish(pending)
             pending = {
                 "description": desc,
@@ -1280,13 +1335,15 @@ def _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals):
                 "total": float(inline_m.group(2).replace(',', '')),
                 "tax_category": cat,
             }
+            if locked:
+                pending["_tax_category_locked"] = cat
             continue
 
         desc_m = re.match(r'^\d{3,6}\*?\s*(.+?[ぁ-んァ-ン一-龥].*)$', line)
         if not desc_m:
             continue
 
-        desc, cat = _clean_desc(line)
+        desc, cat, locked = _clean_desc(line)
         if not desc:
             continue
         if re.search(r'JAN|スキャン|会計|No\d', desc):
@@ -1301,6 +1358,8 @@ def _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals):
             "total": None,
             "tax_category": cat,
         }
+        if locked:
+            pending["_tax_category_locked"] = cat
         if orphan_prices:
             price = orphan_prices.pop(0)
             pending["unit_price"] = price
@@ -1311,15 +1370,8 @@ def _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals):
         return
     for row in rows:
         desc = row["description"]
-        if "100円均一" in unified_text and re.search(r'[xX×Ⅹ]\s*単?\s*5', desc) and abs(float(row.get("total") or 0) - 100) <= 2:
-            row["description"] = "100円均一"
-            desc = row["description"]
-        if _is_bag_description(desc) or "100円均一" in desc:
-            if _is_bag_description(desc):
-                row["description"] = re.sub(r'\s*\d+\s*円\s*$', '', desc).strip() or desc
-            row["tax_category"] = "10%"
-        elif _FOOD_DESC_RE.search(desc) or "ミート" in desc or "精肉" in desc:
-            row["tax_category"] = "8%"
+        if _is_bag_description(desc):
+            row["description"] = re.sub(r'\s*\d+\s*円\s*$', '', desc).strip() or desc
     row_sum = sum(float(row.get("total") or 0) for row in rows)
     try:
         total_f = float(total)
@@ -1349,21 +1401,6 @@ def _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals):
             if amount_paid_f is None or (total_f is not None and abs(amount_paid_f - total_f) <= 2) or amount_paid_f < projected_total:
                 extracted["amount_paid"] = projected_total
             total_f = projected_total
-    if total_f is not None and re.search(r'税率\s*8%|8%\s*課税|税率\s*10%|10%\s*課税', unified_text):
-        external_tax_total = total_f - row_sum
-        standard_rows = [row for row in rows if _is_bag_description(row.get("description") or "")]
-        if external_tax_total > 0 and standard_rows:
-            standard_base = sum(float(row.get("total") or 0) for row in standard_rows)
-            reduced_base = row_sum - standard_base
-            standard_tax = int(standard_base * 0.10)
-            reduced_tax = int(reduced_base * 0.08)
-            if reduced_base > 0 and abs((standard_tax + reduced_tax) - external_tax_total) <= 2:
-                for row in rows:
-                    row["tax_category"] = "10%" if _is_bag_description(row.get("description") or "") else "8%"
-                extracted["taxes"] = [
-                    {"rate": "10%", "label": "外税", "amount": float(standard_tax)},
-                    {"rate": "8%", "label": "外税", "amount": float(reduced_tax)},
-                ]
     current_count = len([item for item in (extracted.get("line_items") or []) if isinstance(item, dict)])
     current_item_sum = sum(
         float(item.get("total") or 0)
@@ -1377,5 +1414,36 @@ def _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals):
         rate_bases = extract_rate_bases(unified_text)
         _fix_tax_categories_from_ocr_markers(rows, unified_text)
         _rebalance_tax_categories_to_rate_bases(rows, unified_text, extracted.get("taxes"), rate_bases)
-        extracted["line_items"] = rows
+        extracted["line_items"] = [
+            {key: value for key, value in row.items() if not key.startswith("_")}
+            for row in rows
+        ]
         extracted["subtotal"] = row_sum
+        printed = extract_financial_totals(unified_text)
+        printed_taxes = [
+            tax for tax in (printed.get("taxes") or [])
+            if isinstance(tax, dict)
+            and re.fullmatch(r'(?:8|10)%', str(tax.get("rate") or ""))
+            and float(tax.get("amount") or 0) > 0
+        ]
+        printed_subtotal = printed.get("subtotal")
+        printed_total = printed.get("total")
+        printed_tax_sum = _sum_taxable_amounts(printed_taxes)
+        if (
+            printed_taxes
+            and printed_subtotal is not None
+            and printed_total is not None
+            and abs(row_sum - float(printed_subtotal)) <= 2
+            and abs(row_sum + printed_tax_sum - float(printed_total)) <= 2
+        ):
+            for tax in printed_taxes:
+                tax["label"] = normalize_tax_label(
+                    tax.get("label"), unified_text,
+                    subtotal=row_sum, total=float(printed_total),
+                    tax_sum=printed_tax_sum, items_sum=row_sum,
+                )
+            extracted["taxes"] = sorted(
+                printed_taxes,
+                key=lambda tax: int(str(tax["rate"]).rstrip('%')),
+                reverse=True,
+            )
