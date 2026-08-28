@@ -312,7 +312,11 @@ def rejoin_price_lines(text: str) -> str:
         return None
 
     # Markers that signal the END of the item section
-    _SECTION_END = re.compile(r'小計|合計|現計|税率|外税|内税|消費税|WAON|クレジット|お預り|お釣り')
+    _SECTION_END = re.compile(
+        r'小計|合計|現計|税率|外税|内税|消費税|'
+        r'支払|決済|現金|カード|電子マネー|Pay|VISA|Master|'
+        r'WAON|クレジット|お預り|お釣り'
+    )
 
     # Pattern for inline price suffix: digit(s) + tax marker at end of line
     # e.g. "食品ポリ袋L (バイオマス30 3除" has "3除" = inline price
@@ -332,6 +336,10 @@ def rejoin_price_lines(text: str) -> str:
         if '¥' in s or '￥' in s:
             return False
         if _SECTION_END.search(s):
+            return False
+        # OCR can split the summary label 合計 across columns and interleave
+        # its fragments with the final item row. Neither fragment is an item.
+        if s in {'合', '計'}:
             return False
         # Qty/price detail lines like "(@100 × 2個)" or "<2個 X 単248)" — the
         # OCR sometimes reads "(" as "<" so accept either as the open bracket,
@@ -377,6 +385,13 @@ def rejoin_price_lines(text: str) -> str:
         running_sum = 0.0
         for j in range(marker_idx + 1, min(marker_idx + needed * 3 + 5, len(lines))):
             stripped = lines[j].strip()
+            if (
+                _SECTION_END.search(stripped)
+                or stripped in {'合', '計'}
+                or _BANNER_PHRASE_RE.search(stripped)
+                or _is_item_candidate(stripped)
+            ):
+                break
             if _is_price(stripped) or _BARE_DIGIT_PRICE_RE.match(stripped):
                 val = _price_value(stripped)
                 if val is not None and len(found) >= 2 and abs(val - running_sum) < 1:
@@ -401,12 +416,11 @@ def rejoin_price_lines(text: str) -> str:
                 # read items in one column and prices in another.
                 # Directly join trailing priceless items with post-marker prices.
                 trailing = _count_trailing_priceless(i - 1)
-                if trailing > 0:
+                if trailing == 1:
                     price_indices = _collect_prices_after(i, trailing)
-                    if price_indices:
-                        n_pairs = min(trailing, len(price_indices))
-                        for k in range(n_pairs):
-                            item_idx = i - n_pairs + k
+                    if len(price_indices) == trailing:
+                        for k in range(trailing):
+                            item_idx = i - trailing + k
                             price_idx = price_indices[k]
                             lines[item_idx] += '  ' + lines[price_idx].strip()
                             lines[price_idx] = ''
@@ -418,12 +432,11 @@ def rejoin_price_lines(text: str) -> str:
             # items and their prices when it reads a two-column layout.
             # Directly join trailing priceless items with post-marker prices.
             trailing = _count_trailing_priceless(i - 1, item_start)
-            if trailing > 0:
+            if trailing == 1:
                 price_indices = _collect_prices_after(i, trailing)
-                if price_indices:
-                    n_pairs = min(trailing, len(price_indices))
-                    for k in range(n_pairs):
-                        item_idx = i - n_pairs + k
+                if len(price_indices) == trailing:
+                    for k in range(trailing):
+                        item_idx = i - trailing + k
                         price_idx = price_indices[k]
                         lines[item_idx] += '  ' + lines[price_idx].strip()
                         lines[price_idx] = ''
@@ -490,7 +503,9 @@ def rejoin_price_lines(text: str) -> str:
         pend = i
 
         pairs = min(iend - istart, pend - pstart)
-        if pairs == 0:
+        # Text order alone cannot prove ownership for stacked name/price
+        # columns. Leave multi-row blocks intact for layout-aware projection.
+        if pairs != 1 or iend - istart != pend - pstart:
             continue
 
         for j in range(pairs):
@@ -502,20 +517,32 @@ def rejoin_price_lines(text: str) -> str:
 
     # --- Step 3: Single orphan pass within the item section ---
     result: list[str] = []
-    for line in section:
+    for line_idx, line in enumerate(section):
         stripped = line.strip()
         if not _is_price(stripped):
             result.append(line)
             continue
 
-        # Look back for nearest priceless item candidate
-        joined = False
+        # A run of prices belongs to a separate column; nearest-neighbour
+        # attachment would invent row ownership.
+        if (
+            (line_idx > 0 and _is_price(section[line_idx - 1].strip()))
+            or (
+                line_idx + 1 < len(section)
+                and _is_price(section[line_idx + 1].strip())
+            )
+        ):
+            result.append(line)
+            continue
+
+        # A single orphan is safe only when exactly one unresolved item is in
+        # the local run above it.
+        candidates: list[int] = []
         for back in range(1, min(4, len(result) + 1)):
             prev = result[-back].strip()
-            if _is_item_candidate(prev):
-                result[-back] += '  ' + stripped
-                joined = True
-                break
+            if _needs_price(prev):
+                candidates.append(len(result) - back)
+                continue
             # Stop at pure price lines or non-Japanese content
             if _is_price(prev):
                 break  # Pure price line = boundary
@@ -523,7 +550,9 @@ def rejoin_price_lines(text: str) -> str:
                 break  # Non-Japanese line = boundary
             # Lines with ¥ AND Japanese text = priced items → skip over them
 
-        if not joined:
+        if len(candidates) == 1:
+            result[candidates[0]] += '  ' + stripped
+        else:
             result.append(line)
 
     # --- Step 4: Handle orphan prices at section start ---
@@ -531,20 +560,22 @@ def rejoin_price_lines(text: str) -> str:
     # start), their prices land inside the section as unmatched orphans.
     # E.g.: "ミルクカスタードシュー" (before) → "¥138軽" (section orphan).
     # Attach leading orphan prices to trailing item candidates in "before".
-    while result and before and _is_price(result[0].strip()):
-        # Find the last item candidate in "before"
-        attached = False
-        for bi in range(len(before) - 1, -1, -1):
-            if _is_item_candidate(before[bi].strip()):
-                before[bi] += '  ' + result[0].strip()
-                result.pop(0)
-                attached = True
-                break
-            # Stop at non-candidate lines that aren't blank
+    leading_prices = 0
+    for line in result:
+        if not _is_price(line.strip()):
+            break
+        leading_prices += 1
+    if leading_prices == 1 and before:
+        candidates: list[int] = []
+        for bi in range(len(before) - 1, max(-1, len(before) - 4), -1):
+            if _needs_price(before[bi].strip()):
+                candidates.append(bi)
+                continue
             if before[bi].strip():
                 break
-        if not attached:
-            break
+        if len(candidates) == 1:
+            before[candidates[0]] += '  ' + result[0].strip()
+            result.pop(0)
 
     return '\n'.join(before + result + after)
 
@@ -556,10 +587,11 @@ _TOTALS_LABEL_RE = re.compile(
     r'内税(?:\s*\d+\s*%)?(?:\s*対象?額?)?|'
     r'\d+\s*%\s*対象(?:額)?|消費税[等額]?(?:\s*\d+\s*%)?(?:\s*対象?額?)?|'
     r'税率\s*\d+\s*%\s*(?:(?:課税)?対象?額?|税額)|'
-    r'内\s*消費税(?:\s*\d+\s*%)?|内\s*ガソリン税|内\s*石油|内\s*税分|'
+    r'内\s*消費税等?(?:\s*\d+\s*%)?|内\s*ガソリン税|内\s*石油|内\s*税分|'
     r'非課税対象|非課税|軽減?税率?|'
     r'お預り|お預\s*り|お釣り|お釣\s*り|おつり|釣銭|'
-    r'現金|電子マネー|WAON支払|クレジット|カード'
+    r'現金|電子マネー|WAON支払|クレジット|カード|'
+    r'(?:[A-Za-zぁ-んァ-ヶ一-龥]+[ \t]*)?(?:支払(?:い|額)?|決済)'
     r')\s*[\)）]?\s*[※\*]?\s*$'
 )
 _VALUE_LINE_RE = re.compile(r'^[\d\s\)\]コX]*\s*([¥￥])?\s*([\d,]+)\s*[\)）]?\s*$')

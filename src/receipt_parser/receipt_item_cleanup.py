@@ -1,11 +1,16 @@
 """Receipt item and discount cleanup helpers."""
 
 import re
+from collections import Counter
 from difflib import SequenceMatcher
+from itertools import combinations
 
 from .patterns import (
+    _BANNER_PHRASE_RE,
+    _DECORATIVE_RE,
     _OCR_QTY_NOTATION_RE,
     _OCR_TRAILING_PRICE_RE,
+    _OCR_ZONE_END_RE,
     _SKIP_PRICE_LINE,
 )
 from .receipt_financial import extract_rate_bases, normalize_tax_label, normalize_tax_rate
@@ -40,6 +45,22 @@ _CATALOG_METADATA_RE = re.compile(
     ),
     re.IGNORECASE,
 )
+_DISCOUNT_LABEL_RE = re.compile(
+    r'\u5272\u5f15|\u5024\u5f15|'
+    r'\u4f1a\u54e1(?:\u69d8)?\u5272(?:\u5f15)?(?=\s|[:\uff1a]|\d|$)'
+)
+
+
+def _discount_line_price(line: str) -> float | None:
+    match = _OCR_TRAILING_PRICE_RE.search(line) or re.search(
+        r'(?:^|\s)([¥￥]?\s*\d[\d,]*)\s*[A-ZＡ-Ｚ]\s*$', line
+    )
+    if not match:
+        return None
+    try:
+        return float(match.group(1).strip().lstrip('¥￥').replace(',', ''))
+    except ValueError:
+        return None
 
 
 def _fix_non_bag_items_named_as_bag(extracted, unified_text):
@@ -137,7 +158,17 @@ def _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text):
     count_match = re.search(r'お買上商品数\s*[:：]?\s*(\d+)', unified_text)
     if count_match:
         printed_count = int(count_match.group(1))
-    if current_gap <= 2 and (printed_count is None or len(items) == printed_count):
+    try:
+        extracted_unit_count = sum(float(item.get("qty") or 1) for item in items)
+    except (TypeError, ValueError):
+        extracted_unit_count = None
+    if current_gap <= 2 and (
+        printed_count is None
+        or (
+            extracted_unit_count is not None
+            and abs(extracted_unit_count - printed_count) < 0.01
+        )
+    ):
         return
 
     lines = [line.strip() for line in unified_text.split('\n')]
@@ -244,7 +275,12 @@ def _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text):
         new_sum = current_sum - first_total - second_total + first_amount + second_amount
         new_gap = min(abs(new_sum - target) for target in targets)
         remove_idx = None
-        if new_gap >= current_gap and printed_count is not None and len(items) == printed_count + 1:
+        if (
+            new_gap >= current_gap
+            and printed_count is not None
+            and extracted_unit_count is not None
+            and abs(extracted_unit_count - printed_count - 1) < 0.01
+        ):
             seen: dict[tuple[str, float], int] = {}
             for candidate_idx, candidate in enumerate(items):
                 if candidate_idx in (idx, idx + 1):
@@ -287,17 +323,6 @@ def _fix_discounted_item_gross_prices_from_ocr(extracted, unified_text):
     """Restore gross unit price when a discount was applied twice."""
     lines = [line.strip() for line in unified_text.split('\n')]
 
-    def _line_price(line: str) -> float | None:
-        pm = _OCR_TRAILING_PRICE_RE.search(line)
-        if not pm:
-            pm = re.search(r'(?:^|\s)([¥￥]?\s*\d[\d,]*)\s*[A-ZＡ-Ｚ]\s*$', line)
-        if not pm:
-            return None
-        try:
-            return float(pm.group(1).strip().lstrip('¥￥').replace(',', ''))
-        except ValueError:
-            return None
-
     def _rate_matches(gross: float, discount: float, discount_rate: str) -> bool:
         m = re.search(r'(\d+(?:\.\d+)?)\s*%', str(discount_rate or ""))
         if not m:
@@ -326,11 +351,20 @@ def _fix_discounted_item_gross_prices_from_ocr(extracted, unified_text):
         discount = float(item.get("discount") or 0)
         if discount <= 0:
             continue
+        try:
+            qty = float(item.get("qty") or 1)
+            unit = float(item.get("unit_price"))
+            total = float(item.get("total"))
+        except (TypeError, ValueError):
+            pass
+        else:
+            if abs(qty * unit - discount - total) <= 1:
+                continue
         desc = item.get("description") or ""
         for idx, line in enumerate(lines):
             if desc and desc not in line:
                 continue
-            inline_gross = _line_price(line)
+            inline_gross = _discount_line_price(line)
             if inline_gross is not None:
                 window = "\n".join(lines[idx:min(idx + 6, len(lines))])
                 if (
@@ -341,7 +375,7 @@ def _fix_discounted_item_gross_prices_from_ocr(extracted, unified_text):
                     break
                 continue
             for j in range(idx + 1, min(idx + 6, len(lines))):
-                gross = _line_price(lines[j])
+                gross = _discount_line_price(lines[j])
                 if gross is None:
                     continue
                 window = "\n".join(lines[j:j + 5])
@@ -410,17 +444,6 @@ def _repair_discounted_ocr_pair_descriptions(extracted, unified_text):
         return
     lines = [line.strip() for line in unified_text.split('\n')]
 
-    def _line_price(line: str) -> float | None:
-        pm = _OCR_TRAILING_PRICE_RE.search(line)
-        if not pm:
-            pm = re.search(r'(?:^|\s)([¥￥]?\s*\d[\d,]*)\s*[A-ZＡ-Ｚ]\s*$', line)
-        if not pm:
-            return None
-        try:
-            return float(pm.group(1).strip().lstrip('¥￥').replace(',', ''))
-        except ValueError:
-            return None
-
     def _norm(text: str) -> str:
         return re.sub(r'\s+', '', str(text or ""))
 
@@ -432,7 +455,7 @@ def _repair_discounted_ocr_pair_descriptions(extracted, unified_text):
                 desc_counts[key] = desc_counts.get(key, 0) + 1
 
     for idx, line in enumerate(lines):
-        gross = _line_price(line)
+        gross = _discount_line_price(line)
         if gross is None:
             continue
         discount = None
@@ -850,6 +873,8 @@ def _replace_basket_marker_rows_when_balanced(extracted, unified_text):
             return False
         return bool(re.search(r'[A-Za-zぁ-んァ-ン一-龥]', cleaned))
 
+    pack_size_re = re.compile(r'\d{1,4}\s*(?:PC(?:S)?|個\s*入)', re.IGNORECASE)
+
     def _make_row(desc: str, amount: float, marker: str) -> dict:
         tax_category = "10%" if marker == "T" else "8%"
         return {
@@ -866,7 +891,7 @@ def _replace_basket_marker_rows_when_balanced(extracted, unified_text):
     pending_descs: list[str] = []
     last_regular_row: dict | None = None
     coupon_mode = False
-    for line in item_lines:
+    for line_idx, line in enumerate(item_lines):
         marked = _parse_marked_amount(line)
         if marked is not None:
             amount, marker, is_coupon = marked
@@ -892,6 +917,16 @@ def _replace_basket_marker_rows_when_balanced(extracted, unified_text):
 
         if re.fullmatch(r'CPN', line, flags=re.IGNORECASE):
             coupon_mode = True
+            continue
+        if (
+            pack_size_re.fullmatch(line)
+            and pending_descs
+            and line_idx > 0
+            and _clean_desc(item_lines[line_idx - 1]) == pending_descs[-1]
+            and line_idx + 1 < len(item_lines)
+            and _is_control_or_numeric(item_lines[line_idx + 1])
+        ):
+            pending_descs[-1] = f"{pending_descs[-1]} {_clean_desc(line)}"
             continue
         if _valid_desc(line):
             if coupon_mode:
@@ -1098,7 +1133,7 @@ def _fix_misattributed_discounts(items):
                 item["total"] = expected
 
 
-def _clear_discounts_without_nearby_ocr_marker(items, unified_text):
+def _clear_discounts_without_nearby_ocr_marker(items, unified_text, *, rates_only=False):
     """Clear LLM discounts when OCR does not place a discount by that item."""
     if not items:
         return
@@ -1120,11 +1155,293 @@ def _clear_discounts_without_nearby_ocr_marker(items, unified_text):
     def _next_item_started(line: str) -> bool:
         if not re.search(r'[ぁ-んァ-ン一-龥]', line):
             return False
-        if re.search(r'割引|値引|%|％|[¥￥]|単|JAN|Code128', line):
+        if _DISCOUNT_LABEL_RE.search(line) or re.search(
+            r'割引|値引|%|％|[¥￥]|単|JAN|Code128', line
+        ):
             return False
         return True
 
+    # Own percentage markers and amount-only discounts by item occurrence.
+    # A unique local amount has an effective rate; repeated/group amounts do
+    # not, unless the OCR explicitly labels the item's local bundle.
+    owner_lines: dict[int, int] = {}
+    cursor = 0
+    for item_idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        desc_norm = _norm(item.get("description") or "")
+        if len(desc_norm) < 2:
+            continue
+        candidates: list[tuple[float, int]] = []
+        for line_idx in range(cursor, len(lines)):
+            line_norm = _norm(lines[line_idx])
+            if len(line_norm) < 2:
+                continue
+            if desc_norm in line_norm or line_norm in desc_norm:
+                score = 1.0
+            else:
+                score = SequenceMatcher(None, desc_norm, line_norm).ratio()
+            if score >= 0.8:
+                candidates.append((score, line_idx))
+        if not candidates:
+            continue
+        best_score = max(score for score, _line_idx in candidates)
+        owner = min(
+            line_idx
+            for score, line_idx in candidates
+            if abs(score - best_score) <= 0.01
+        )
+        owner_lines[item_idx] = owner
+        cursor = owner + 1
+
+    def _negative_amounts(block: list[str]) -> list[float]:
+        return [
+            float(match.group(1).replace(',', ''))
+            for line in block
+            for match in re.finditer(r'-\s*[¥￥\\]?\s*(\d[\d,]*)', line)
+        ]
+
+    zone_start = min(owner_lines.values(), default=0)
+    boundary_start = max(owner_lines.values(), default=-1) + 1
+    zone_end = next(
+        (
+            idx
+            for idx in range(boundary_start, len(lines))
+            if _OCR_ZONE_END_RE.match(lines[idx].strip())
+        ),
+        len(lines),
+    )
+    negative_amount_counts = Counter(_negative_amounts(lines[zone_start:zone_end]))
+
+    def _positive_amount(line: str) -> float | None:
+        stripped = line.strip()
+        if (
+            not stripped
+            or stripped.startswith('-')
+            or _DISCOUNT_LABEL_RE.search(stripped)
+            or re.fullmatch(r'\d+(?:\.\d+)?\s*[%％]', stripped)
+            or _SKIP_PRICE_LINE.search(stripped)
+            or _OCR_QTY_NOTATION_RE.search(stripped)
+        ):
+            return None
+        match = re.search(
+            r'(?<![-\d])(?:[¥￥]\s*)?(\d[\d,]*)\s*'
+            r'(?:[%％*＊※除軽非Xx↓A-Za-zＡ-Ｚ]*)\s*$',
+            stripped,
+        )
+        if not match:
+            return None
+        return float(match.group(1).replace(',', ''))
+
+    def _discount_bundle(owner: int, gross: float, discount: float) -> tuple[int, int] | None:
+        matches: list[tuple[int, int]] = []
+        for price_idx in range(owner, zone_end):
+            price = _positive_amount(lines[price_idx])
+            if price is None or abs(price - gross) > 2:
+                continue
+            amounts: list[float] = []
+            last_discount_idx = price_idx
+            for nearby_idx in range(price_idx + 1, min(zone_end, price_idx + 10)):
+                nearby_amounts = _negative_amounts([lines[nearby_idx]])
+                if nearby_amounts:
+                    amounts.extend(nearby_amounts)
+                    last_discount_idx = nearby_idx
+                    continue
+                if _positive_amount(lines[nearby_idx]) is not None:
+                    break
+            if amounts and abs(sum(amounts) - discount) <= 2:
+                matches.append((price_idx, last_discount_idx))
+        return matches[0] if len(matches) == 1 else None
+
+    def _rates(block: list[str]) -> list[float]:
+        if not any(_DISCOUNT_LABEL_RE.search(line) for line in block):
+            return []
+        return [
+            float(match.group(1))
+            for line in block
+            for match in re.finditer(r'(\d+(?:\.\d+)?)\s*[%％]', line)
+        ]
+
+    def _supported_rate_schedule(
+        rates: list[float], gross: float, discount: float, *, repair_ocr_prefix=False
+    ) -> tuple[float, ...]:
+        if repair_ocr_prefix:
+            rates = [
+                float(str(int(rate))[1:])
+                if rate > 100
+                and rate.is_integer()
+                and 1 <= int(str(int(rate))[1:] or 0) <= 100
+                else rate
+                for rate in rates
+            ]
+        candidates: list[tuple[float, int, tuple[float, ...]]] = []
+        for size in range(1, min(3, len(rates)) + 1):
+            for schedule in combinations(rates, size):
+                remaining = 1.0
+                for rate in schedule:
+                    remaining *= 1.0 - (rate / 100.0)
+                gap = abs(discount - gross * (1.0 - remaining))
+                if gap <= max(2.0, gross * 0.03):
+                    candidates.append((gap, size, tuple(schedule)))
+        return min(candidates, default=(0.0, 0, ()))[2]
+
+    rate_stacks: dict[tuple[float, ...], list[dict]] = {}
+    supported_rate_ids: set[int] = set()
+    supported_bundle_ids: set[int] = set()
+    ordered_owners = sorted(owner_lines.items(), key=lambda pair: pair[1])
+    for owner_pos, (item_idx, owner) in enumerate(ordered_owners):
+        item = items[item_idx]
+        if not isinstance(item, dict) or not (item.get("discount") or 0):
+            continue
+        next_owner = (
+            ordered_owners[owner_pos + 1][1]
+            if owner_pos + 1 < len(ordered_owners)
+            else len(lines)
+        )
+        discount = float(item.get("discount") or 0)
+        qty = float(item.get("qty") or 1)
+        unit = item.get("unit_price")
+        total = item.get("total")
+        gross = qty * float(unit) if unit is not None else float(total or 0) + discount
+        bundle = _discount_bundle(owner, gross, discount)
+        if bundle:
+            supported_bundle_ids.add(id(item))
+        price_idx, discount_idx = bundle or (owner, owner)
+        pre_end = min(price_idx + 1, next_owner)
+        rate_candidates = _rates(lines[owner:pre_end])
+        post_end = min(zone_end, discount_idx + 3)
+        if next_owner > discount_idx:
+            post_end = min(post_end, next_owner)
+        rate_candidates.extend(_rates(lines[price_idx + 1:post_end]))
+        schedule = _supported_rate_schedule(
+            rate_candidates,
+            gross,
+            discount,
+            repair_ocr_prefix=bundle is not None,
+        )
+        if not schedule:
+            local_bundle = bundle is not None and any(
+                re.search(r'まとめ\s*(?:値引き?|割引き?)', nearby)
+                for nearby in lines[owner:discount_idx + 1]
+            )
+            unique_amount = sum(
+                count
+                for amount, count in negative_amount_counts.items()
+                if abs(amount - discount) <= 2
+            ) == 1
+            if gross <= 0 or not unique_amount or not local_bundle:
+                item["discount_rate"] = ""
+                continue
+            effective = round(discount / gross * 100, 1)
+            current = re.search(
+                r'(\d+(?:\.\d+)?)\s*%',
+                str(item.get("discount_rate") or ""),
+            )
+            rate = (
+                float(current.group(1))
+                if current and abs(float(current.group(1)) - effective) <= 0.15
+                else effective
+            )
+            rate_text = f"{rate:.1f}".rstrip("0").rstrip(".")
+            item["discount_rate"] = f"{rate_text}%"
+            supported_rate_ids.add(id(item))
+        elif len(schedule) == 1:
+            rate = f"{schedule[0]:.1f}".rstrip("0").rstrip(".")
+            item["discount_rate"] = f"{rate}%"
+            supported_rate_ids.add(id(item))
+        else:
+            rate_stacks.setdefault(schedule, []).append(item)
+
+    for members in rate_stacks.values():
+        gross = sum(
+            float(item.get("qty") or 1) * float(item.get("unit_price") or 0)
+            for item in members
+        )
+        discount = sum(float(item.get("discount") or 0) for item in members)
+        if gross <= 0 or discount <= 0:
+            continue
+        effective = f"{round(discount / gross * 100, 1):.1f}".rstrip("0").rstrip(".")
+        for item in members:
+            item["discount_rate"] = f"{effective}%"
+            supported_rate_ids.add(id(item))
+
+    # Dense projections can separate percentage markers from their item rows.
+    # Preserve them only when the printed marker multiset has a complete,
+    # arithmetic one-to-one assignment across every discounted row.
+    printed_rate_tokens = [
+        float(match.group(1))
+        for line in lines[zone_start:zone_end]
+        if (
+            _DISCOUNT_LABEL_RE.search(line)
+            or re.fullmatch(r'\s*-?\s*\d+(?:\.\d+)?\s*[%％]\s*', line)
+        )
+        for match in re.finditer(r'(\d+(?:\.\d+)?)\s*[%％]', line)
+        if float(match.group(1)) > 0
+    ]
+    discounted: list[tuple[dict, float, float]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            discount = float(item.get("discount") or 0)
+            qty = float(item.get("qty") or 1)
+            unit = item.get("unit_price")
+            total = item.get("total")
+            gross = qty * float(unit) if unit is not None else float(total or 0) + discount
+        except (TypeError, ValueError):
+            continue
+        if discount > 0 and gross > 0:
+            discounted.append((item, gross, discount))
+
+    allocated: dict[int, float] = {}
+    if len(printed_rate_tokens) >= len(discounted) and discounted:
+        def _marker_rates(token: float) -> tuple[float, ...]:
+            if token <= 100:
+                return (token,)
+            if token.is_integer():
+                suffix = int(str(int(token))[1:] or 0)
+                if 1 <= suffix <= 100:
+                    return (float(suffix),)
+            return ()
+
+        def _allocate(item_idx: int, marker_start: int) -> bool:
+            if item_idx == len(discounted):
+                return True
+            item, gross, discount = discounted[item_idx]
+            remaining = len(discounted) - item_idx - 1
+            for marker_idx in range(
+                marker_start,
+                len(printed_rate_tokens) - remaining,
+            ):
+                for rate in _marker_rates(printed_rate_tokens[marker_idx]):
+                    if abs(discount - gross * rate / 100.0) > max(
+                        2.0, discount * 0.03
+                    ):
+                        continue
+                    allocated[id(item)] = rate
+                    if _allocate(item_idx + 1, marker_idx + 1):
+                        return True
+                    allocated.pop(id(item), None)
+            return False
+
+        if not _allocate(0, 0):
+            allocated.clear()
+
+    for item, _gross, _discount in discounted:
+        rate = allocated.get(id(item))
+        if rate is not None:
+            rate_text = f"{rate:.1f}".rstrip("0").rstrip(".")
+            item["discount_rate"] = f"{rate_text}%"
+            supported_rate_ids.add(id(item))
+        elif id(item) not in supported_rate_ids:
+            item["discount_rate"] = ""
+
+    if rates_only:
+        return
+
     def _supported(item: dict) -> bool:
+        if id(item) in supported_bundle_ids:
+            return True
         desc_norm = _norm(item.get("description") or "")
         unit = item.get("unit_price")
         total = item.get("total")
@@ -1207,7 +1524,7 @@ def _clear_discounts_without_nearby_ocr_marker(items, unified_text):
                 if any(_line_has_amount(nxt, amount) for amount in search_amounts):
                     saw_item_amount = True
                     continue
-                if re.search(r'割引|値引', nxt):
+                if _DISCOUNT_LABEL_RE.search(nxt):
                     return saw_item_amount
                 if _has_matching_rate_marker(nxt):
                     saw_rate_marker = True
@@ -1247,76 +1564,116 @@ def _detect_ocr_discounts(items, unified_text):
         text = re.sub(r'[^\wぁ-んァ-ン一-龥]', '', text, flags=re.UNICODE)
         return text.lower()
 
-    for item in items:
+    owner_lines: dict[int, int] = {}
+    cursor = 0
+    for item_idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            return
+        norm_desc = _norm_discount_desc(item.get("description") or "")
+        if len(norm_desc) < 2:
+            continue
+        candidates: list[tuple[float, int]] = []
+        for line_idx in range(cursor, len(ocr_lines)):
+            line = ocr_lines[line_idx].strip()
+            if (
+                not line
+                or _OCR_ZONE_END_RE.match(line)
+                or '割引' in line
+                or '値引' in line
+                or _DECORATIVE_RE.fullmatch(line)
+                or _BANNER_PHRASE_RE.search(line)
+            ):
+                continue
+            norm_line = _norm_discount_desc(line)
+            if len(norm_line) < 2:
+                continue
+            if norm_desc in norm_line or norm_line in norm_desc:
+                score = 1.0
+            else:
+                score = SequenceMatcher(None, norm_desc, norm_line).ratio()
+            if score >= 0.72:
+                candidates.append((score, line_idx))
+        if not candidates:
+            continue
+        best_score = max(score for score, _line_idx in candidates)
+        best_lines = [
+            line_idx
+            for score, line_idx in candidates
+            if abs(score - best_score) <= 0.01
+        ]
+        remaining_same = sum(
+            _norm_discount_desc(later.get("description") or "") == norm_desc
+            for later in items[item_idx:]
+            if isinstance(later, dict)
+        )
+        if len(best_lines) > 1 and len(best_lines) != remaining_same:
+            return
+        line_idx = min(best_lines)
+        owner_lines[item_idx] = line_idx
+        cursor = line_idx + 1
+
+    for item_idx, item in enumerate(items):
         if not isinstance(item, dict) or (item.get("discount") or 0) > 0:
             continue
-        desc = item.get("description", "")
-        desc_prefix = desc[:4] if len(desc) >= 4 else desc
-        if not desc_prefix:
+        li = owner_lines.get(item_idx)
+        if li is None:
             continue
-        norm_desc = _norm_discount_desc(desc)
-        candidate_lines: list[int] = []
-        fallback_lines: list[int] = []
-        for li, ocr_line in enumerate(ocr_lines):
-            norm_line = _norm_discount_desc(ocr_line)
-            if norm_desc and len(norm_desc) >= 4 and norm_line:
-                if norm_desc in norm_line or norm_line in norm_desc:
-                    candidate_lines.append(li)
-                    continue
-                if SequenceMatcher(None, norm_desc, norm_line).ratio() >= 0.72:
-                    candidate_lines.append(li)
-                    continue
-            if desc_prefix in ocr_line:
-                fallback_lines.append(li)
-        line_indices = candidate_lines or fallback_lines
-        for li in line_indices:
-            for offset in range(1, 8):
-                if li + offset >= len(ocr_lines):
-                    break
-                next_line = ocr_lines[li + offset].strip()
-                # Continuation lines (qty/multiplier info) are NOT a new item.
-                is_qty_continuation = (
-                    next_line.startswith('(')
-                    or re.search(r'\d+\s*[個点]', next_line) is not None
-                    or '単' in next_line
+        for offset in range(1, 8):
+            if li + offset >= len(ocr_lines):
+                break
+            next_line = ocr_lines[li + offset].strip()
+            is_discount_line = '割引' in next_line or '値引' in next_line
+            if (
+                _DECORATIVE_RE.fullmatch(next_line)
+                or (_BANNER_PHRASE_RE.search(next_line) and not is_discount_line)
+                or _OCR_ZONE_END_RE.match(next_line)
+                or re.search(
+                    r'支払|決済|現金|カード|電子マネー|Pay|VISA|Master',
+                    next_line,
+                    re.IGNORECASE,
                 )
-                # Reached the next item: a CJK description line with no
-                # price/discount/qty-info markers.
-                if (re.search(r'[　-鿿]', next_line)
-                        and '割引' not in next_line
-                        and '値引' not in next_line
-                        and '%' not in next_line
-                        and '¥' not in next_line
-                        and '￥' not in next_line
-                        and not next_line.startswith('-')
-                        and not is_qty_continuation):
-                    break
-                if '¥' in next_line and re.search(r'[\u3000-\u9fff]', next_line):
-                    break
-                if '割引' in next_line or '値引' in next_line:
-                    rate_str = ""
-                    discount_amount = 0
-                    for k in range(li + offset, min(li + offset + 4, len(ocr_lines))):
-                        kline = ocr_lines[k].strip()
-                        # Rate may appear inline ("割引: 20%") or alone ("10%").
-                        rate_match = re.search(r'(\d+)\s*%', kline)
-                        if rate_match:
-                            rate_str = rate_match.group(1) + '%'
-                        # Amount line: accept "-38", "-¥24", "-￥24" with optional yen sign.
-                        amt_match = re.match(r'^-\s*[¥￥]?\s*(\d[\d,.]*)\s*$', kline)
-                        if amt_match:
-                            amt_str = amt_match.group(1).replace(',', '')
-                            if '.' in amt_str and float(amt_str) < 10:
-                                amt_str = amt_str.replace('.', '')
-                            discount_amount = float(amt_str)
-                    if discount_amount > 0:
-                        item["discount"] = discount_amount
-                        item["discount_rate"] = rate_str
-                        up = item.get("unit_price") or item.get("total", 0)
-                        item["total"] = item.get("qty", 1) * up - discount_amount
-                        break
-                    break
-            if (item.get("discount") or 0) > 0:
+            ):
+                break
+            # Continuation lines (qty/multiplier info) are NOT a new item.
+            is_qty_continuation = (
+                next_line.startswith('(')
+                or re.search(r'\d+\s*[個点]', next_line) is not None
+                or '単' in next_line
+            )
+            # Reached the next item: a CJK description line with no
+            # price/discount/qty-info markers.
+            if (re.search(r'[　-鿿]', next_line)
+                    and '割引' not in next_line
+                    and '値引' not in next_line
+                    and '%' not in next_line
+                    and '¥' not in next_line
+                    and '￥' not in next_line
+                    and not next_line.startswith('-')
+                    and not is_qty_continuation):
+                break
+            if '¥' in next_line and re.search(r'[\u3000-\u9fff]', next_line):
+                break
+            if is_discount_line:
+                rate_str = ""
+                discount_amount = 0
+                for k in range(li + offset, min(li + offset + 4, len(ocr_lines))):
+                    kline = ocr_lines[k].strip()
+                    # Rate may appear inline ("割引: 20%") or alone ("10%").
+                    rate_match = re.search(r'(\d+)\s*%', kline)
+                    if rate_match:
+                        rate_str = rate_match.group(1) + '%'
+                    # Amount line: accept "-38", "-¥24", "-￥24" with optional yen sign.
+                    amt_match = re.match(r'^-\s*[¥￥]?\s*(\d[\d,.]*)\s*$', kline)
+                    if amt_match:
+                        amt_str = amt_match.group(1).replace(',', '')
+                        if '.' in amt_str and float(amt_str) < 10:
+                            amt_str = amt_str.replace('.', '')
+                        discount_amount = float(amt_str)
+                if discount_amount > 0:
+                    item["discount"] = discount_amount
+                    item["discount_rate"] = rate_str
+                    up = item.get("unit_price") or item.get("total", 0)
+                    item["total"] = item.get("qty", 1) * up - discount_amount
                 break
 
     _repair_rate_discounts_from_ocr_amounts(items, unified_text)
