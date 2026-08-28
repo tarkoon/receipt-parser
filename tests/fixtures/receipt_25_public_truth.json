@@ -3,7 +3,7 @@
 	"merchant": "スーパービバホーム",
 	"date": "2026-03-13",
 	"time": "13:30",
-	"location": "宗像市赤間",
+	"location": "赤間店",
 	"currency": "JPY",
 	"total": 2191,
 	"payment_method": "cash",
@@ -51,5 +51,5 @@
 		"meter_current": null
 	},
 	"payer": null,
-	"payment_reference": null
+	"payment_reference": "202603132855001116090000"
 }

@@ -1,9 +1,10 @@
 {
-  "_llm_prompt": "You are analyzing an image of a Japanese financial document. Classify it and extract data into the JSON structure below. RULES: (1) Set document_type to 'receipt' for store purchases, 'utility_bill' for gas/water/electric bills, or 'payment_slip' for bank transfer or convenience store payment slips. (2) Use null for any field you cannot confidently determine. (3) Amounts are numbers without currency symbols. (4) Dates are YYYY-MM-DD. Japanese era: 令和7年=2025, 令和8年=2026. (5) For date: use payment date if visible, else due date for bills, else transaction date for receipts. (5b) For time: 24-hour HH:MM transaction time printed alongside the date (e.g., '17:05', '13時30分'); null if absent or only present as business hours. (6) payment_method: null unless explicitly stated. Use 'bank_payment' only if the document says 口座引落 or 振替. Use 'cash' only if お預り or 現計 is shown. (7) points_used: loyalty points applied (d-point, WAON point, etc.) as a number. amount_paid = total - points_used. (8) For receipts: extract all line items with prices. tax_category per item: '8%' for items marked ※/軽, '10%' for standard, '0%' if unknown. (9) For utility bills: extract meter readings, usage amount, service type, billing period. (10) For payment slips: merchant is the company receiving the money. payer is who pays. (11) Only fill type-specific sections relevant to the document_type. Leave others null/empty.",
+  "_llm_prompt": "You are analyzing an image of a Japanese financial document. Classify it and extract data into the JSON structure below. RULES: (1) Set document_type to 'receipt' for store purchases, 'utility_bill' for gas/water/electric bills, or 'payment_slip' for bank transfer or convenience store payment slips. (2) Use null for any field you cannot confidently determine. (3) Amounts are numbers without currency symbols. (4) Dates are YYYY-MM-DD. Japanese era: 令和7年=2025, 令和8年=2026. (5) For date: use payment date if visible, else due date for bills, else transaction date for receipts. (5b) For time: 24-hour HH:MM transaction time printed alongside the date (e.g., '17:05', '13時30分'); null if absent or only present as business hours. (6) payment_method: null unless explicitly stated. Use 'bank_payment' only if the document says 口座引落 or 振替. Use 'cash' only if お預り or 現計 is shown. (7) points_used: loyalty points actually applied (d-point, WAON point, etc.). Use null when no redemption is printed, preserve an explicitly printed zero as 0, and use a positive number only when supported by the document. amount_paid = total - points_used when points_used is known. (8) For receipts: extract all line items with prices. tax_category per item: '8%' for items marked ※/軽, '10%' for standard, '0%' if unknown. (9) For utility bills: extract meter readings, usage amount, service type, billing period. (10) For payment slips: merchant is the company receiving the money. payer is who pays. (11) Only fill type-specific sections relevant to the document_type. Leave others null/empty. (12) payment_reference is value-only. Prefer one explicitly labeled receipt or slip number; only if absent, use one uniquely labeled transaction, data, handling, inquiry, acceptance, or reference number.",
   "document_type": null,
   "merchant": null,
   "date": null,
   "time": null,
+  "_comment_location": "Preserve a full street address when explicitly printed. Otherwise use the most specific supported city, ward, locality, branch, or shopping-complex location; do not invent missing street details.",
   "location": null,
   "currency": "JPY",
   "total": null,
@@ -13,7 +14,7 @@
   "amount_paid": null,
   "_comment_line_items_per_weight": "When an item is priced per unit weight (e.g. 281 yen per 100g, 467g purchased, total 1313 yen), do NOT encode the per-weight rate. Use qty=1, unit_price=total, total=total. The schema's qty*unit_price=total invariant assumes a 1:1 unit ratio, and the per-weight rate is not used downstream.",
   "_comment_payment_method": "Allowed values: 'cash', 'credit', 'debit', 'bank_payment', 'WAON', or null. Do NOT use 'credit_card' (use 'credit'). Use 'cash' only if お預り or 現計 is on the receipt — 上記正に領収いたしました alone is NOT enough.",
-  "_comment_time": "Only extract a printed transaction time (e.g. '2026年3月30日 (月) 16:21'). Do NOT extract from barcode/serial-suffix lines like '14:10-2109-01>' — they look like times but are not.",
+  "_comment_time": "Extract a clearly printed transaction or payment time. A receipt-footer time may be retained even when adjacent to register or serial identifiers; reject business hours, phone numbers, and issue or printer timestamps not tied to the transaction.",
   "line_items": [
     {
       "description": "Item name",
@@ -25,7 +26,7 @@
       "discount_rate": null
     }
   ],
-  "_comment_subtotal": "Pre-tax base amount, ALWAYS computed as subtotal = total - sum(taxes), regardless of 内税 / 外税 / 非課税. For 0-tax receipts (no taxes or all taxes = 0) subtotal = total. For 内税 receipts where line item prices are post-tax, sum(line_items) will equal total, NOT subtotal — that is expected. Use null only when total is also unknown.",
+  "_comment_subtotal": "Pre-tax base amount, computed as subtotal = total - sum(taxes), regardless of 内税 / 外税 / 非課税. For 0-tax receipts (no taxes or all taxes = 0) subtotal = total. Exception: when only a tax rate or gross rate target is printed and neither a tax amount nor explicit pre-tax base is printed, do not infer either amount; use subtotal=null and taxes=[]. For 内税 receipts where line item prices are post-tax, sum(line_items) will equal total, NOT subtotal — that is expected.",
   "subtotal": null,
   "taxes": [
     {
@@ -50,5 +51,6 @@
     "meter_current": null
   },
   "payer": null,
+  "_comment_payment_reference": "Value only, without its label, preserving leading zeroes. Prefer one explicitly printed receipt or slip number. If none is printed, use one uniquely labeled transaction, data, handling, inquiry, acceptance, or reference number. Use null for absent, unlabeled, or ambiguous values.",
   "payment_reference": null
 }

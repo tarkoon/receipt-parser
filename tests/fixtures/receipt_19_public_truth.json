@@ -3,7 +3,7 @@
 	"merchant": "コジマ×ビックカメラ",
 	"date": "2025-12-23",
 	"time": "13:49",
-	"location": "北九州市八幡区",
+	"location": "ビックカメラ八幡店",
 	"currency": "JPY",
 	"total": 32580,
 	"payment_method": "cash",
@@ -60,5 +60,5 @@
 	"billing_period": null,
 	"usage": null,
 	"payer": null,
-	"payment_reference": null
+	"payment_reference": "9454"
 }

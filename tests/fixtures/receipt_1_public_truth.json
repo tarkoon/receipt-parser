@@ -30,7 +30,7 @@
 	"taxes": [
 		{
 			"rate": "10%",
-			"label": "内税",
+      "label": "外税",
 			"amount": 65
 		}
 	],
@@ -38,5 +38,5 @@
 	"billing_period": null,
 	"usage": null,
 	"payer": null,
-	"payment_reference": null
+	"payment_reference": "7803"
 }

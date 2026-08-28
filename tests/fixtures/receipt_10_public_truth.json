@@ -3,7 +3,7 @@
 	"merchant": "ダイソー",
 	"date": "2026-03-25",
 	"time": "13:33",
-	"location": "宗像市赤間",
+	"location": "ビバモール赤間店",
 	"currency": "JPY",
 	"total": 550,
 	"payment_method": "cash",
@@ -45,5 +45,5 @@
 	"billing_period": null,
 	"usage": null,
 	"payer": null,
-	"payment_reference": null
+	"payment_reference": "18"
 }

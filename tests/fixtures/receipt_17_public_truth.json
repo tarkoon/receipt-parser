@@ -3,7 +3,7 @@
 	"merchant": "ユニクロ",
 	"date": "2025-12-22",
 	"time": "14:10",
-	"location": "福岡市博多区",
+	"location": "KITTE博多店",
 	"currency": "JPY",
 	"total": 3990,
 	"payment_method": "cash",
@@ -33,5 +33,5 @@
 	"billing_period": null,
 	"usage": null,
 	"payer": null,
-	"payment_reference": null
+	"payment_reference": "1585-2025-12-22-34-0074"
 }

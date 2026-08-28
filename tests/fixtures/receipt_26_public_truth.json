@@ -79,12 +79,12 @@
 	"taxes": [
 		{
 			"rate": "8%",
-			"label": "内税",
+      "label": "外税",
 			"amount": 180
 		},
 		{
 			"rate": "10%",
-			"label": "内税",
+      "label": "外税",
 			"amount": 144
 		}
 	],
@@ -101,5 +101,5 @@
 		"meter_current": null
 	},
 	"payer": null,
-	"payment_reference": null
+	"payment_reference": "9979"
 }

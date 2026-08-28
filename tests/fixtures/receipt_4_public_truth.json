@@ -3,7 +3,7 @@
   "merchant": "業務スーパー",
   "date": "2026-03-22",
   "time": "19:28",
-  "location": "新宗像市",
+  "location": "新宗像店",
   "currency": "JPY",
   "total": 2279,
   "payment_method": "cash",
@@ -94,5 +94,5 @@
   "billing_period": null,
   "usage": null,
   "payer": null,
-  "payment_reference": null
+  "payment_reference": "9549"
 }
