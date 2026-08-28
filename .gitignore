@@ -12,6 +12,7 @@ tmp/
 tmp*.py
 scripts/*
 !scripts/add_flagged_receipts.py
+!scripts/validate_truth.py
 docs/
 CLAUDE.md
 tests/fixtures/*
