@@ -3,10 +3,72 @@
 import logging
 import re
 
-from .patterns import ADMIN_SUFFIX_RE, LOCATION_CLUE_RE
+from .patterns import ADMIN_SUFFIX_RE, LOCATION_CLUE_RE, _COMPANY_SUFFIX_RE
 
 
 logger = logging.getLogger(__name__)
+
+_ASCII_BRAND_HEADER_SCAN_LIMIT = 16
+_LOCATION_TOKEN_TRAILING_PUNCTUATION = " \t\u3000。、，,．.!！:：;；"
+_ASCII_BRAND_LOCATION_NOISE_RE = re.compile(
+    r'領収(?:書|証)?|レシート|請求書|納品書|'
+    r'税|課税|'
+    r'支払|決済|現金|会計|クレジット|電子マネー|売上(?:票)?|お客様控|'
+    r'商品(?:名)?|加盟店(?:名)?|店舗(?:名)?|登録番号|営業時間|合計|小計|購入点数|'
+    r'(?:ご購入店|購入店)|お買上店|お買い上げ店|ご来[店]|店[名]|'
+    r'[カ][ス][タ][マ][ー](?:[サ][ポ][ー][ト])?(?:[セ][ン][タ][ー])?|'
+    r'[サ][ポ][ー][ト](?:[セ][ン][タ][ー])?|[コ][ー][ル][セ][ン][タ][ー]|'
+    r'[お][問][い]?[合][わ]?[せ](?:[窓][口])?'
+)
+_HEADER_LOCATION_SUFFIX_RE = re.compile(
+    r'(?:(?:[シ][ョ][ッ][プ]|支店|[本]店|営業所|[出][張][所]|料金所|店|IC)'
+    r'|(?P<generic>モール|センター|[館]))$',
+    re.IGNORECASE,
+)
+_HEADER_LOCATION_NOISE_RE = re.compile(
+    r'^\s*HQ(?=\s|[本]|$)|[本][社]|[本]店[所][在][地]|[印][紙]税|税[務](?:[署])?|'
+    r'[承][認][済]?|[付][に][つ][き]|[申][告][納]|'
+    r'[カ][ス][タ][マ][ー](?:[サ][ポ][ー][ト])?(?:[セ][ン][タ][ー])?|'
+    r'[サ][ポ][ー][ト](?:[セ][ン][タ][ー])?|[コ][ー][ル][セ][ン][タ][ー]|'
+    r'[お][問][い]?[合][わ]?[せ](?:[窓][口])?|'
+    r'^\s*[本][店](?=\s|TEL|[電][話]|☎|$)|'
+    r'^\s*(?:(?:[担][当][者]?|[責][任][者]?|[係][員]?|[ス][タ][ッ][フ])'
+    r'\s*(?:No\.?|Ｎｏ\.?)?|[ス](?:No\.?|Ｎｏ\.?))'
+    r'\s*[:：]?[A-Za-z0-9-]*[ぁ-んァ-ン一-龥ー]{2,}\s*$'
+)
+
+
+def _strip_location_token_punctuation(value: str) -> str:
+    """Strip suffix-only punctuation from an otherwise exact location token."""
+    return str(value or "").rstrip(_LOCATION_TOKEN_TRAILING_PUNCTUATION)
+
+
+def _location_is_replaceable_header_noise(value: str, ocr_text: str) -> bool:
+    """Return true only when OCR identifies a metadata/HQ/stamp source."""
+    location = re.sub(r'\s+', '', value or "")
+    if not location:
+        return False
+    if _ASCII_BRAND_LOCATION_NOISE_RE.fullmatch(location):
+        return True
+    matching_lines = [
+        line for line in (ocr_text or "").splitlines()
+        if location in re.sub(r'\s+', '', line)
+    ]
+    return bool(matching_lines) and all(
+        _HEADER_LOCATION_NOISE_RE.search(line) for line in matching_lines
+    )
+
+
+def _is_ascii_brand_location_suffix(value: str) -> bool:
+    """Accept only compact Japanese location text, not receipt header noise."""
+    suffix = _strip_location_token_punctuation(re.sub(r'\s+', '', value or ""))
+    return bool(
+        2 <= len(suffix) <= 10
+        and re.fullmatch(r'[ぁ-んァ-ン一-龥ー]+', suffix)
+        and not ADMIN_SUFFIX_RE.fullmatch(suffix)
+        and not _COMPANY_SUFFIX_RE.search(suffix)
+        and not _ASCII_BRAND_LOCATION_NOISE_RE.search(suffix)
+    )
 
 
 def _location_needs_resolution(location: str | None, ocr_text: str = "") -> bool:
@@ -30,6 +92,18 @@ def _location_needs_resolution(location: str | None, ocr_text: str = "") -> bool
             return has_facility
         return False
     if location:
+        loc_norm = re.sub(r'\s+', '', location)
+        if (
+            _is_ascii_brand_location_suffix(loc_norm)
+            and any(
+                re.fullmatch(
+                    rf"[A-Z][A-Z0-9&.'-]{{2,}}{re.escape(loc_norm)}",
+                    re.sub(r'\s+', '', line).upper(),
+                )
+                for line in ocr_text.splitlines()[:_ASCII_BRAND_HEADER_SCAN_LIMIT]
+            )
+        ):
+            return False
         return True
     if ocr_text and LOCATION_CLUE_RE.search(ocr_text):
         return True
@@ -37,86 +111,69 @@ def _location_needs_resolution(location: str | None, ocr_text: str = "") -> bool
 
 
 def _location_has_ocr_evidence(location: str, ocr_text: str) -> bool:
-    """Check if at least part of the location string has evidence in the OCR text.
+    """Require every claimed administrative component to have OCR evidence.
 
     Normalizes whitespace before comparison since Japanese OCR frequently
-    inserts spaces between characters (e.g., "宗像市 赤間" vs "宗像市赤間").
+    inserts spaces between characters.
     """
     if not location or not ocr_text:
         return False
     # Normalize whitespace in both strings for comparison
-    loc_norm = re.sub(r'\s+', '', location)
+    loc_norm = _strip_location_token_punctuation(re.sub(r'\s+', '', location))
     ocr_norm = re.sub(r'\s+', '', ocr_text)
+    if _location_is_replaceable_header_noise(loc_norm, ocr_text):
+        return False
     if loc_norm in ocr_norm:
         return True
-    # Check individual admin-level segments. Also split on facility suffixes
-    # (IC/インターチェンジ) so a toll-gate name like "若宮IC" is matched against
-    # the bare "若宮" that appears in OCR after 料金所.
-    parts = re.split(r'[市区町村郡県都道府]|IC$|インターチェンジ$', location)
-    for part in parts:
-        part = part.strip()
-        if len(part) >= 2 and part in ocr_norm:
-            return True
-    return False
+    components = []
+    tail = loc_norm
+    while match := re.match(
+        r'([ぁ-んァ-ン一-龥ー]{1,10}?)[都道府県市区町村郡]',
+        tail,
+    ):
+        components.append(match.group(0))
+        tail = tail[match.end():]
+    return bool(components) and all(
+        component in ocr_norm for component in components
+    ) and (not tail or tail in ocr_norm)
 
 
 _PURCHASE_STORE_METADATA_RE = re.compile(
-    r'^\s*(?:ご購入店|購入店|お買上店|お買い上げ店)\s*[:：]?\s*(?P<store>.+店)\s*$'
+    r'^\s*(?:ご購入店|購入店|お買上店|お買い上げ店)'
+    r'(?=[\s:：])\s*[:：]?\s*'
+    r'(?P<store>.+店)[\s。、，,．.!！:：;；]*$'
 )
 
 
 def _trim_purchase_store_metadata_location(extracted: dict, ocr_text: str) -> None:
-    """Avoid expanding location from a labeled host-store metadata line."""
+    """Normalize labeled purchase-store evidence without adopting its host brand."""
     location = re.sub(r'\s+', '', extracted.get("location") or "")
     if not location:
         return
     if location in re.sub(r'\s+', '', ocr_text):
         return
 
+    metadata_stores = [
+        _strip_location_token_punctuation(
+            re.sub(r'\s+', '', metadata.group("store"))
+        )
+        for raw_line in ocr_text.splitlines()
+        if (metadata := _PURCHASE_STORE_METADATA_RE.match(raw_line.strip()))
+    ]
     base_match = re.match(r'(?P<base>.*?[市区町村])(?P<tail>.+)$', location)
-    if not base_match:
-        return
-    base = base_match.group("base")
-    tail = base_match.group("tail")
-    if len(tail) < 2:
-        return
+    if base_match and len(base_match.group("tail")) >= 2:
+        for store_line in metadata_stores:
+            if base_match.group("tail") in store_line:
+                location = base_match.group("base")
+                extracted["location"] = location
+                break
 
-    for raw_line in ocr_text.splitlines():
-        metadata = _PURCHASE_STORE_METADATA_RE.match(raw_line.strip())
-        if not metadata:
-            continue
-        store_line = re.sub(r'\s+', '', metadata.group("store"))
-        if tail in store_line:
-            extracted["location"] = base
-            return
-
-
-def _trim_store_in_store_header_location(extracted: dict, ocr_text: str) -> None:
-    """Avoid treating a host store in a mixed brand/store header as the location."""
-    location = re.sub(r'\s+', '', str(extracted.get("location") or ""))
-    if not location or not ocr_text:
-        return
-    merchant = re.sub(r'\s+', '', str(extracted.get("merchant") or "")).upper()
-    for raw_line in ocr_text.splitlines()[:8]:
-        line = re.split(r'(?:TEL|電話|☎)', raw_line.strip(), maxsplit=1, flags=re.IGNORECASE)[0].strip()
-        if not line:
-            continue
-        match = re.match(r"^(?P<brand>[A-Z][A-Z0-9&.'-]{2,})\s+(?P<host>.+店)$", line)
-        if not match:
-            continue
-        brand = match.group("brand").upper()
-        host = re.sub(r'\s+', '', match.group("host"))
-        if merchant and merchant != brand:
-            continue
-        if not re.search(r'[ぁ-んァ-ン一-龥]', host):
-            continue
-        city = _city_from_phone_area_hint(ocr_text) or _city_from_geographic_marker(host)
-        if not city:
-            continue
-        whole_header = re.sub(r'\s+', '', line)
-        if location in {host, whole_header} or (brand in location and host in location):
-            extracted["location"] = city
-            return
+    if bare_city := re.fullmatch(
+        r'(?P<core>[ぁ-んァ-ン一-龥ー]{1,10})市', location
+    ):
+        printed_store = f'{bare_city.group("core")}店'
+        if any(store.endswith(printed_store) for store in metadata_stores):
+            extracted["location"] = printed_store
 
 
 def _recover_header_branch_store_location(extracted: dict, ocr_text: str) -> None:
@@ -124,65 +181,170 @@ def _recover_header_branch_store_location(extracted: dict, ocr_text: str) -> Non
     if not ocr_text:
         return
     current_location = re.sub(r'\s+', '', str(extracted.get("location") or ""))
-    phone_area_city = _city_from_phone_area_hint(ocr_text)
-    can_override_phone_area_city = bool(
-        current_location and phone_area_city and current_location == phone_area_city
-    )
+    was_replaceable_noise = _location_is_replaceable_header_noise(current_location, ocr_text)
+    if was_replaceable_noise:
+        current_location = ""
     can_override_admin_fragment = _is_broad_japanese_admin_location(current_location)
-    if current_location and not can_override_phone_area_city and not can_override_admin_fragment:
-        return
-    for raw_line in ocr_text.splitlines()[:16]:
+    header_lines = ocr_text.splitlines()[:16]
+    deferred_generic_candidate = None
+
+    merchant = re.sub(r'\s+', '', str(extracted.get("merchant") or ""))
+
+    for raw_line in header_lines:
         line = raw_line.strip()
         if not line:
             continue
-        line_for_branch = re.split(r'(?:TEL|電話|☎)', line, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        line_before_contact = re.split(
+            r'(?:TEL|電話|☎)', line, maxsplit=1, flags=re.IGNORECASE
+        )[0].strip()
+        contact_backed = line_before_contact != line
+        line_for_branch = _strip_location_token_punctuation(line_before_contact)
         if re.search(r'www\.|https?://|登録番号|領収|レシート|合計|小計|支払', line, re.IGNORECASE):
             continue
-        if re.search(r'\d{4}[年/-]\d{1,2}[月/-]\d{1,2}', line):
+        if _HEADER_LOCATION_NOISE_RE.search(line):
+            continue
+        if re.search(r'(?:19|20)\d{2}[年/-]\d{1,2}[月/-]\d{1,2}', line):
             break
         if _PURCHASE_STORE_METADATA_RE.match(line_for_branch):
             continue
         if not re.search(r'[ぁ-んァ-ン一-龥]', line_for_branch):
             continue
-        parts = [part.strip() for part in re.split(r'\s+', line_for_branch) if part.strip()]
-        candidates = [part for part in parts if re.search(r'[ぁ-んァ-ン一-龥]', part) and part.endswith("店")]
-        if not candidates and line_for_branch.endswith("店"):
+        parts = [
+            _strip_location_token_punctuation(part)
+            for part in re.split(r'\s+', line_for_branch)
+            if part.strip()
+        ]
+        candidates = [
+            part for part in parts
+            if re.search(r'[ぁ-んァ-ン一-龥]', part)
+            and _HEADER_LOCATION_SUFFIX_RE.search(part)
+        ]
+        if not candidates and _HEADER_LOCATION_SUFFIX_RE.search(line_for_branch):
             candidates = [line_for_branch]
         if not candidates:
             continue
         candidate = candidates[-1]
-        stem = candidate[:-1] if candidate.endswith("店") else candidate
-        if can_override_phone_area_city and len(stem) > 6:
+        candidate_compact = _strip_location_token_punctuation(
+            re.sub(r'\s+', '', candidate)
+        )
+        if (
+            candidate_compact == merchant
+            or _ASCII_BRAND_LOCATION_NOISE_RE.search(candidate_compact)
+        ):
             continue
-        if can_override_admin_fragment and not _branch_extends_admin_fragment(current_location, candidate):
+        if merchant and candidate_compact.startswith(merchant):
+            candidate_compact = candidate_compact[len(merchant):]
+        stem = _HEADER_LOCATION_SUFFIX_RE.sub('', candidate_compact)
+        if current_location and not can_override_admin_fragment:
             continue
-        if 2 <= len(stem) and len(candidate) <= 20:
-            extracted["location"] = candidate
+        if can_override_admin_fragment and not _branch_extends_admin_fragment(current_location, candidate_compact):
+            continue
+        if (
+            len(stem) >= (1 if contact_backed else 2)
+            and len(candidate_compact) <= 30
+        ):
+            if (
+                not contact_backed
+                and (
+                    suffix_match := _HEADER_LOCATION_SUFFIX_RE.search(
+                        candidate_compact
+                    )
+                )
+                and suffix_match.lastgroup == "generic"
+            ):
+                deferred_generic_candidate = (
+                    deferred_generic_candidate or candidate_compact
+                )
+                continue
+            extracted["location"] = candidate_compact
             return
+
+    if deferred_generic_candidate:
+        extracted["location"] = deferred_generic_candidate
+        return
+
+    if current_location:
+        return
+
+    merchant_tokens = re.findall(
+        r'[A-Za-z0-9&.\'-]{2,}|[ぁ-んー]{2,}|[ァ-ンー]{2,}|[一-龥]{2,}',
+        str(extracted.get("merchant") or ""),
+    )
+    for phone_idx, raw_line in enumerate(header_lines):
+        if not re.search(r'TEL|電話|☎|[（(]\s*0\d{1,4}\s*[）)]|^0\d{1,4}[-\s]', raw_line, re.IGNORECASE):
+            continue
+        context = re.sub(
+            r'\s+', '',
+            "".join(header_lines[max(0, phone_idx - 3):phone_idx + 1]),
+        )
+        if merchant_tokens and not any(
+            re.sub(r'\s+', '', token) in context for token in merchant_tokens
+        ):
+            continue
+        for neighbor in range(phone_idx - 1, max(-1, phone_idx - 4), -1):
+            candidate = _strip_location_token_punctuation(
+                re.sub(r'\s+', '', header_lines[neighbor].strip())
+            )
+            if not candidate:
+                continue
+            if candidate == merchant:
+                continue
+            if candidate in merchant:
+                remaining_merchant = merchant.replace(candidate, "", 1)
+                if not (
+                    re.fullmatch(r'[一-龥]{2,}', candidate)
+                    and re.search(r'[A-Za-zぁ-んァ-ンー]', remaining_merchant)
+                ):
+                    continue
+            if merchant and candidate.startswith(merchant):
+                candidate = candidate[len(merchant):]
+            if not _is_ascii_brand_location_suffix(candidate):
+                continue
+            trailing_place = re.search(r'([一-龥]{2,})$', candidate)
+            if trailing_place:
+                extracted["location"] = trailing_place.group(1)
+                return
+
+    if was_replaceable_noise:
+        extracted.pop("location", None)
 
 
 def _recover_ascii_brand_header_location(extracted: dict, ocr_text: str) -> None:
-    """Recover compact location text from an early "ASCII brand + suffix" line."""
+    """Recover a compact suffix when an early ASCII header prefix repeats."""
     if not ocr_text:
         return
+    header_lines = ocr_text.splitlines()[:_ASCII_BRAND_HEADER_SCAN_LIMIT]
     merchant = re.sub(r'\s+', '', str(extracted.get("merchant") or "")).upper()
-    if not re.fullmatch(r"[A-Z][A-Z0-9&.'-]{2,}", merchant):
+    brands = {
+        compact.upper()
+        for raw_line in header_lines
+        if re.fullmatch(
+            r"[A-Z][A-Z0-9&.'-]{2,}",
+            compact := re.sub(r'\s+', '', raw_line.strip()),
+        )
+    }
+    if merchant_prefix := re.match(r"[A-Z][A-Z0-9&.'-]{2,}", merchant):
+        brands.add(merchant_prefix.group(0))
+    if not brands:
         return
     current = re.sub(r'\s+', '', str(extracted.get("location") or ""))
-    if current and not _is_broad_japanese_admin_location(current):
+    if (
+        current
+        and not _is_broad_japanese_admin_location(current)
+        and not _location_is_replaceable_header_noise(current, ocr_text)
+    ):
         return
-    for raw_line in ocr_text.splitlines()[:8]:
-        compact = re.sub(r'\s+', '', raw_line.strip())
-        if not compact.upper().startswith(merchant):
-            continue
-        suffix = compact[len(merchant):]
-        if (
-            2 <= len(suffix) <= 10
-            and re.fullmatch(r'[ぁ-んァ-ン一-龥ー]+', suffix)
-            and not ADMIN_SUFFIX_RE.fullmatch(suffix)
-        ):
-            extracted["location"] = suffix
-            return
+    for raw_line in header_lines:
+        compact = _strip_location_token_punctuation(
+            re.sub(r'\s+', '', raw_line.strip())
+        )
+        for brand in sorted(brands, key=len, reverse=True):
+            if not compact.upper().startswith(brand):
+                continue
+            suffix = compact[len(brand):]
+            if _is_ascii_brand_location_suffix(suffix):
+                extracted["location"] = suffix
+                return
 
 
 def _is_broad_japanese_admin_location(value: str) -> bool:
@@ -196,27 +358,19 @@ def _is_broad_japanese_admin_location(value: str) -> bool:
 
 def _branch_extends_admin_fragment(location: str, branch: str) -> bool:
     location = re.sub(r'\s+', '', str(location or ""))
-    stem = re.sub(r'\s+', '', str(branch or ""))
-    if stem.endswith("店"):
-        stem = stem[:-1]
+    stem = _strip_location_token_punctuation(
+        re.sub(r'\s+', '', str(branch or ""))
+    )
+    stem = _HEADER_LOCATION_SUFFIX_RE.sub('', stem)
     admin_roots = re.findall(r'([一-龥]{1,10}?)(?:都|道|府|県|市|区|町|村)', location)
     if not admin_roots:
         return False
     root = admin_roots[-1]
     return (
-        (stem.startswith(root) or stem.endswith(root))
-        and 3 <= len(stem) <= 6
-        and len(stem) - len(root) >= 2
+        root in stem
+        and len(stem) <= 20
+        and len(stem) - len(root) >= 1
     )
-
-
-_PHONE_AREA_CITY_HINTS = {
-    "0940": ("宗像市", (("福津", "福津市"), ("宗像", "宗像市"))),
-    "093": ("北九州市", ()),
-    "092": ("福岡市", ()),
-    "0942": ("久留米市", ()),
-    "0948": ("飯塚市", ()),
-}
 
 
 def _extract_japanese_phone_hint(ocr_text: str) -> str:
@@ -235,73 +389,6 @@ def _extract_japanese_phone_hint(ocr_text: str) -> str:
     return ""
 
 
-def _city_from_phone_area_hint(ocr_text: str) -> str:
-    phone_hint = _extract_japanese_phone_hint(ocr_text)
-    if not phone_hint:
-        return ""
-    area_code = re.match(r'(0\d{1,4})', phone_hint.replace('-', '').replace(' ', ''))
-    if not area_code:
-        return ""
-    code = area_code.group(1)
-    for prefix, (default_city, markers) in _PHONE_AREA_CITY_HINTS.items():
-        if not code.startswith(prefix):
-            continue
-        for marker, city in markers:
-            if marker in ocr_text:
-                return city
-        return default_city
-    return ""
-
-
-def _city_from_geographic_marker(text: str) -> str:
-    for _prefix, (_default_city, markers) in _PHONE_AREA_CITY_HINTS.items():
-        for marker, city in markers:
-            if marker and marker in text:
-                return city
-    return ""
-
-
-def _recover_phone_area_city_location(extracted: dict, ocr_text: str) -> None:
-    if extracted.get("location") or not ocr_text:
-        return
-    has_ambiguous_store_phone_line = any(
-        re.search(r'[ぁ-んァ-ン一-龥]{1,}店.*(?:TEL|電話|☎)', line, re.IGNORECASE)
-        for line in ocr_text.splitlines()[:12]
-    )
-    if not has_ambiguous_store_phone_line:
-        return
-    city = _city_from_phone_area_hint(ocr_text)
-    if city:
-        extracted["location"] = city
-
-
-def _recover_short_branch_over_phone_area_city(extracted: dict, ocr_text: str) -> None:
-    current_location = re.sub(r'\s+', '', str(extracted.get("location") or ""))
-    phone_area_city = _city_from_phone_area_hint(ocr_text or "")
-    if not current_location or not phone_area_city or not current_location.startswith(phone_area_city):
-        return
-    if current_location == phone_area_city:
-        return
-    current_tail = current_location[len(phone_area_city):]
-    if ADMIN_SUFFIX_RE.search(current_tail):
-        return
-    for raw_line in (ocr_text or "").splitlines()[:16]:
-        line = raw_line.strip()
-        if re.search(r'購入店|お買上店|登録番号|領収|レシート|合計|小計|支払', line):
-            continue
-        line_for_branch = re.split(r'(?:TEL|電話|☎)', line, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-        match = re.fullmatch(r'([ぁ-んァ-ン一-龥]{2,6}店)', line_for_branch)
-        if match:
-            branch = match.group(1)
-            stem = branch[:-1]
-            if (
-                stem in current_location
-                or (current_tail and current_tail in stem)
-            ):
-                extracted["location"] = branch
-                return
-
-
 def _normalize_noisy_city_location(extracted: dict, ocr_text: str) -> None:
     location = re.sub(r'\s+', '', str(extracted.get("location") or ""))
     if not location:
@@ -315,6 +402,21 @@ def _normalize_noisy_city_location(extracted: dict, ocr_text: str) -> None:
     if location in compact_ocr:
         return
     if tail and f"{tail}店" in compact_ocr:
+        visible_branch = next(
+            (
+                f"{tail}店"
+                for line in (ocr_text or "").splitlines()
+                if re.fullmatch(
+                    rf"\s*{re.escape(tail)}店(?:\s+(?:TEL|電話|☎).*)?\s*",
+                    line,
+                    re.IGNORECASE,
+                )
+            ),
+            None,
+        )
+        if visible_branch:
+            extracted["location"] = visible_branch
+            return
         candidate = dict(extracted)
         candidate["location"] = base
         _recover_header_branch_store_location(candidate, ocr_text)
@@ -337,6 +439,7 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
     from .llm import _llm_chat, sanitize_llm_response
 
     merchant = extracted.get("merchant") or ""
+    merchant_norm = re.sub(r'\s+', '', str(merchant))
     raw_location = extracted.get("location") or ""
 
     phone_hint = _extract_japanese_phone_hint(ocr_text)
@@ -349,11 +452,18 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
             continue
         branch_match = re.search(r'([\u3000-\u9fff]{2,})\s*店', line)
         if branch_match:
+            printed_branch = re.sub(r'\s+', '', f"{branch_match.group(1)}店")
+            if printed_branch == merchant_norm:
+                branch_match = None
+                continue
             break
-    if not branch_match:
-        # Location-type indicators: toll gate, station, branch office
-        branch_match = re.search(r'(?:料金所|営業所|支店|出張所)\s*\n?\s*([\u3000-\u9fff]{2,})', ocr_text)
     branch_hint = branch_match.group(1) if branch_match else ""
+    facility_match = re.search(
+        r'(?:料金所|営業所|支店|出張所)'
+        r'(?:[ \t　]+|\r?\n[ \t　]*)([ぁ-んァ-ン一-龥ー]{2,20})',
+        ocr_text,
+    )
+    facility_hint = facility_match.group(1) if facility_match else ""
 
     # Also extract short standalone Japanese text from the first few lines
     # (often branch/location names like "赤間" above the brand name)
@@ -364,30 +474,23 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
     header_lines = []
     for line in ocr_text.split('\n')[:8]:
         s = line.strip()
-        if s and 2 <= len(s) <= 8 and re.match(r'^[\u3000-\u9fff]+$', s) and s not in _FINANCIAL_KEYWORDS:
+        if (
+            s
+            and 2 <= len(s) <= 8
+            and re.match(r'^[\u3000-\u9fff]+$', s)
+            and s not in _FINANCIAL_KEYWORDS
+            and re.sub(r'\s+', '', s) != merchant_norm
+        ):
             header_lines.append(s)
     header_hint = ", ".join(header_lines) if header_lines else ""
-
-    # Phone area code → region hint
-    area_hint = ""
-    area_city = ""
-    area_prefix = ""
-    if phone_hint:
-        area_code = re.match(r'(0\d{1,4})', phone_hint.replace('-', '').replace(' ', ''))
-        if area_code:
-            code = area_code.group(1)
-            for prefix, (city, _markers) in _PHONE_AREA_CITY_HINTS.items():
-                if code.startswith(prefix):
-                    desc = f"{city} area"
-                    area_hint = f"Phone area code {prefix} = {desc}"
-                    area_city = city
-                    area_prefix = prefix
-                    break
 
     addr_lines = []
     for line in ocr_text.split('\n'):
         if re.search(r'[都道府県市区町村郡]|〒\d{3}', line):
             addr_lines.append(line.strip())
+
+    if not any((raw_location, branch_hint, facility_hint, addr_lines, header_lines)):
+        return None, "Location resolution: could not determine city/ward from available clues"
 
     clues = [f"- Merchant/brand: {merchant}"]
     if branch_hint:
@@ -396,56 +499,7 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
         clues.append(f"- Receipt header text: {header_hint} (may contain location or branch name)")
     clues.append(f"- Current location value: {raw_location or 'unknown'}")
     clues.append(f"- Phone number: {phone_hint or 'not found'}")
-    if area_hint:
-        clues.append(f"- {area_hint}")
     clues.append(f"- Address fragments from receipt: {'; '.join(addr_lines) if addr_lines else 'none found'}")
-
-    # Deterministic resolution: if area code gives us a city and we have a
-    # neighborhood name (from branch or header), combine them directly.
-    neighborhood = ""
-    if branch_hint:
-        # Strip common prefixes from branch name to get neighborhood
-        # e.g., "ビバモール赤間" → take last 2-3 chars as neighborhood
-        for suffix_len in (3, 2):
-            candidate = branch_hint[-suffix_len:]
-            if re.match(r'^[\u3000-\u9fff]+$', candidate):
-                neighborhood = candidate
-                break
-        if not neighborhood:
-            neighborhood = branch_hint
-    elif header_lines:
-        # Use the first short header line as neighborhood
-        for h in header_lines:
-            if (
-                2 <= len(h) <= 4
-                and re.match(r'^[\u3000-\u9fff]+$', h)
-                and h != merchant
-            ):
-                neighborhood = h
-                break
-
-    if area_city and neighborhood:
-        area_root = re.sub(r'[都道府県市区町村郡]+$', '', area_city)
-        if neighborhood == area_root:
-            return area_city, None
-        candidate = f"{area_city}{neighborhood}"
-        if ADMIN_SUFFIX_RE.search(candidate):
-            return candidate, None
-
-    if area_prefix in _PHONE_AREA_CITY_HINTS:
-        for marker, city in _PHONE_AREA_CITY_HINTS[area_prefix][1]:
-            if marker in ocr_text:
-                return city, None
-
-    if area_city and raw_location and not ADMIN_SUFFIX_RE.search(raw_location):
-        return area_city, None
-
-    business_line = re.search(r'事業者名\s*[:：]\s*(.+)$', ocr_text, re.MULTILINE)
-    if not raw_location and business_line:
-        business = business_line.group(1).strip()
-        rail = re.match(r'(.{2,12}?)(?:鉄道)?株式会社$', business)
-        if rail and '登山' in rail.group(1):
-            return rail.group(1), None
 
     if (
         not raw_location
@@ -454,40 +508,12 @@ def _resolve_location(extracted: dict, ocr_text: str, model: str) -> tuple[str |
         and re.fullmatch(r'[\wぁ-んァ-ン一-龥ー・]{2,20}', branch_hint)
     ):
         return f"{branch_hint}店", None
-
-    if area_city and not raw_location:
-        return area_city, None
-
-    # Toll-receipt deterministic path: NEXCO/expressway receipts print 料金所
-    # alone on its own line, followed by the toll-gate name on the next non-
-    # empty line (e.g. "若宮", "小倉南"). Without a phone area code (toll-free
-    # 0120) the LLM otherwise falls back to the corporate HQ address — the
-    # geographically wrong place. Use the toll-gate name with an "IC" suffix
-    # as the location instead. Skip the noise line "料金所では一旦停車…".
-    is_toll = bool(re.search(r'料金所|高速道路|NEXCO', ocr_text))
-    if is_toll:
-        toll_lines = ocr_text.split('\n')
-        toll_name = ""
-        for idx, raw in enumerate(toll_lines):
-            line = raw.strip()
-            # Exact "料金所" on a line by itself (not "料金所では一旦…")
-            if line == "料金所":
-                for nxt in toll_lines[idx + 1:idx + 4]:
-                    cand = nxt.strip()
-                    # 2-4 char Japanese name (kanji + kana), no punctuation
-                    if cand and re.match(r'^[　-鿿]{2,8}$', cand) and 'です' not in cand:
-                        toll_name = cand
-                        break
-                if toll_name:
-                    break
-        if toll_name:
-            if not re.search(r'(?:IC|インターチェンジ|料金所)$', toll_name):
-                return f"{toll_name}IC", None
-            return toll_name, None
+    if facility_hint:
+        return facility_hint, None
 
     prompt = f"""Given these clues from a Japanese receipt, determine the city (市) or ward (区) where this store is located.
-Output ONLY a JSON object with a single "location" field. The location should be at the 市区町村 level, e.g. "宗像市赤間", "福岡市博多区", "北九州市八幡区".
-The branch name (e.g. 赤間店 → 赤間 is a neighborhood in 宗像市) is the strongest clue for location.
+Output ONLY a JSON object with a single "location" field. Preserve a full address when it is explicitly printed. Otherwise return only a city, ward, or locality supported by explicit geographic text in the receipt.
+An ambiguous branch name or phone number alone is not sufficient evidence.
 
 Clues:
 {chr(10).join(clues)}
@@ -503,7 +529,11 @@ Respond with a JSON object: {{"location": "..."}} or {{"location": null}} if you
         import json as _json
         data = _json.loads(sanitize_llm_response(result.content))
         resolved = data.get("location")
-        if resolved and ADMIN_SUFFIX_RE.search(resolved):
+        if (
+            resolved
+            and ADMIN_SUFFIX_RE.search(resolved)
+            and _location_has_ocr_evidence(resolved, ocr_text)
+        ):
             return resolved, None
     except Exception as e:
         logger.warning("Location resolution failed: %s", e)
