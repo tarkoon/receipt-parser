@@ -55,16 +55,20 @@ BASELINE_LITERAL_SOURCE_BY_FILE = {
 SCANNED_FILES = tuple(
     sorted({
         PARSER_DIR / "pipeline.py",
+        PARSER_DIR / "patterns.py",
         *PARSER_DIR.glob("pipeline_*.py"),
         *PARSER_DIR.glob("receipt_*.py"),
     })
 )
+JAPANESE_LITERAL_SCANNED_FILES = tuple(
+    path for path in SCANNED_FILES if path.name != "patterns.py"
+)
 
 MERCHANT_OR_STORE_RE = re.compile(
-    r"("
+    r"(?<![a-z0-9])(?:"
     r"maxvalu|max_value|familymart|family_mart|daiso|costco|gyomu|"
     r"starbucks|donki|seria|cosmos|nafco|nishimatsuya|yakitori"
-    r")",
+    r")(?![a-z0-9])",
     re.IGNORECASE,
 )
 FIXTURE_REFERENCE_RE = re.compile(
@@ -81,23 +85,38 @@ KNOWN_ANSWER_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 KNOWN_DATE_RE = re.compile(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b")
+EXACT_BARCODE_LITERAL_RE = re.compile(r"(?<!\d)\d{12,14}(?!\d)")
+EXACT_ADMIN_LOCATION_RE = re.compile(
+    r"^[ぁ-んァ-ヶ一-龥]{2,}(?:都|道|府|県|市|区|町|村)$"
+)
+KNOWN_TOTAL_TABLE_NAME_RE = re.compile(
+    r"(?:known|expected|fixture|answer).*(?:amount|subtotal|total)|"
+    r"(?:amount|subtotal|total).*(?:known|expected|fixture|answer)",
+    re.IGNORECASE,
+)
 
 SEMANTIC_FIELDS = {
     "amount_paid",
     "billing_period",
     "date",
+    "description",
+    "discount",
     "line_items",
     "location",
     "merchant",
     "payment_method",
     "points_earned",
     "points_used",
+    "qty",
     "subtotal",
     "tax_entries",
+    "tax_category",
     "time",
     "total",
+    "unit_price",
     "usage",
 }
+FINANCIAL_FIELDS = {"amount_paid", "subtotal", "total"}
 FINAL_RESULT_MUTATORS = {
     "_drop_duplicate_with_embedded_price",
     "_replace_barcode_qty_price_rows_when_balanced",
@@ -166,39 +185,6 @@ CAMPAIGN_DISCOUNT_PROJECTION_PHASE_HELPER = (
 )
 CAMPAIGN_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT = 1
 FINAL_CAMPAIGN_DISCOUNT_PROJECTION_STAGE_LIMIT = 2
-FINAL_STRUCTURAL_ITEM_PROJECTION_REPAIRS = {
-    "_replace_barcode_unit_qty_amount_stack_when_balanced",
-}
-FINAL_STRUCTURAL_ITEM_PROJECTION_HELPER = (
-    "_run_final_structural_item_projection_phase"
-)
-FINAL_STRUCTURAL_ITEM_PROJECTION_STAGE_LIMIT = 1
-FINAL_JAN_POS_ITEM_PROJECTION_REPAIRS = {
-    "_replace_jan_pos_items_when_balanced",
-}
-FINAL_JAN_POS_ITEM_PROJECTION_HELPER = "_run_final_jan_pos_item_projection_phase"
-FINAL_JAN_POS_ITEM_PROJECTION_STAGE_LIMIT = 1
-FINAL_BARCODE_QTY_PRICE_PROJECTION_REPAIRS = {
-    "_replace_barcode_qty_price_rows_when_balanced",
-}
-FINAL_BARCODE_QTY_PRICE_PROJECTION_HELPER = (
-    "_run_final_barcode_qty_price_projection_phase"
-)
-FINAL_BARCODE_QTY_PRICE_PROJECTION_STAGE_LIMIT = 1
-FINAL_ITEM_PRICE_QTY_PROJECTION_REPAIRS = {
-    "_replace_item_price_qty_rows_when_balanced",
-}
-FINAL_ITEM_PRICE_QTY_PROJECTION_HELPER = (
-    "_run_final_item_price_qty_projection_phase"
-)
-FINAL_ITEM_PRICE_QTY_PROJECTION_STAGE_LIMIT = 1
-FINAL_SPLIT_PRICE_BLOCK_PROJECTION_REPAIRS = {
-    "_replace_split_price_block_when_balanced",
-}
-FINAL_SPLIT_PRICE_BLOCK_PROJECTION_HELPER = (
-    "_run_final_split_price_block_projection_phase"
-)
-FINAL_SPLIT_PRICE_BLOCK_PROJECTION_STAGE_LIMIT = 1
 SPLIT_PRICE_BLOCK_PROJECTION_REPAIRS = {
     "_replace_split_price_block_when_balanced",
 }
@@ -206,37 +192,13 @@ SPLIT_PRICE_BLOCK_PROJECTION_PHASE_HELPER = (
     "_run_split_price_block_projection_phase"
 )
 SPLIT_PRICE_BLOCK_PROJECTION_PHASE_CALL_LIMIT = 1
-FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_REPAIRS = {
-    "_fix_split_item_price_body_total_layout",
-}
-FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_HELPER = (
-    "_run_final_body_total_layout_reconstruction_phase"
-)
-FINAL_BODY_TOTAL_LAYOUT_RECONSTRUCTION_STAGE_LIMIT = 1
-FINAL_STACKED_NAME_PRICE_PROJECTION_REPAIRS = {
-    "_replace_stacked_name_price_rows_when_balanced",
-}
-FINAL_STACKED_NAME_PRICE_PROJECTION_HELPER = (
-    "_run_final_stacked_name_price_projection_phase"
-)
-FINAL_STACKED_NAME_PRICE_PROJECTION_STAGE_LIMIT = 1
-FINAL_DENSE_SEQUENCE_PROJECTION_REPAIRS = {
-    "_replace_dense_sequence_rows_when_balanced",
-}
-FINAL_DENSE_SEQUENCE_PROJECTION_HELPER = (
-    "_run_final_dense_sequence_projection_phase"
-)
-FINAL_DENSE_SEQUENCE_PROJECTION_STAGE_LIMIT = 1
 FINAL_HEADER_LOCATION_REPAIR_HELPERS = {
     "_recover_labeled_purchase_site_location",
-    "_trim_store_in_store_header_location",
     "_recover_header_branch_store_location",
-    "_recover_phone_area_city_location",
-    "_recover_short_branch_over_phone_area_city",
     "_normalize_noisy_city_location",
 }
 FINAL_HEADER_LOCATION_REPAIR_HELPER = "_run_final_header_location_repair_phase"
-FINAL_HEADER_LOCATION_REPAIR_STAGE_LIMIT = 6
+FINAL_HEADER_LOCATION_REPAIR_STAGE_LIMIT = 3
 HEADER_LOCATION_REPAIR_REPAIRS = {
     "_fix_header_store_line_location",
     "_fix_split_address_location_from_ocr",
@@ -247,25 +209,10 @@ HEADER_LOCATION_REPAIR_PHASE_CALL_LIMIT = 1
 BAG_ITEM_OCR_REPAIR_REPAIRS = {
     "_fix_small_non_bag_item_prices_from_ocr",
     "_fix_bag_item_prices_from_ocr",
-    "_fix_split_bag_price_from_nearby_single_digit",
     "_fix_small_bag_description_from_ocr_entry",
 }
 BAG_ITEM_OCR_REPAIR_PHASE_HELPER = "_run_bag_item_ocr_repair_phase"
 BAG_ITEM_OCR_REPAIR_PHASE_CALL_LIMIT = 1
-FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_REPAIRS = {
-    "_restore_single_rate_inclusive_tax_block",
-}
-FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_HELPER = (
-    "_run_final_single_rate_inclusive_tax_restoration_phase"
-)
-FINAL_SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT = 1
-FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_REPAIRS = {
-    "_restore_stacked_inclusive_tax_block",
-}
-FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_HELPER = (
-    "_run_final_stacked_inclusive_tax_restoration_phase"
-)
-FINAL_STACKED_INCLUSIVE_TAX_RESTORATION_STAGE_LIMIT = 1
 FINAL_PRINTED_SUMMARY_TOTAL_REPAIR_HELPERS = {
     "_restore_printed_summary_total_when_tax_balanced",
 }
@@ -280,13 +227,6 @@ PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_HELPER = (
     "_run_printed_summary_total_tax_repair_phase"
 )
 PRINTED_SUMMARY_TOTAL_REPAIR_PHASE_CALL_LIMIT = 1
-FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPERS = {
-    "_prefer_printed_item_sum_total_when_balanced",
-}
-FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_HELPER = (
-    "_run_final_printed_item_sum_total_repair_phase"
-)
-FINAL_PRINTED_ITEM_SUM_TOTAL_REPAIR_STAGE_LIMIT = 1
 PRINTED_ITEM_SUM_TOTAL_REPAIR_REPAIRS = {
     "_prefer_printed_item_sum_total_when_balanced",
 }
@@ -294,20 +234,6 @@ PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_HELPER = (
     "_run_printed_item_sum_total_repair_phase"
 )
 PRINTED_ITEM_SUM_TOTAL_REPAIR_PHASE_CALL_LIMIT = 1
-FINAL_CASH_TENDER_RECONCILIATION_HELPERS = {
-    "_fix_unlabeled_cash_tender_change_block",
-}
-FINAL_CASH_TENDER_RECONCILIATION_HELPER = (
-    "_run_final_cash_tender_reconciliation_phase"
-)
-FINAL_CASH_TENDER_RECONCILIATION_STAGE_LIMIT = 1
-FINAL_PAYMENT_POINTS_RECONCILIATION_HELPERS = {
-    "reconcile_points_payment_from_ocr",
-}
-FINAL_PAYMENT_POINTS_RECONCILIATION_HELPER = (
-    "_run_final_payment_points_reconciliation_phase"
-)
-FINAL_PAYMENT_POINTS_RECONCILIATION_STAGE_LIMIT = 1
 FINAL_TAX_CATEGORY_RECONCILIATION_HELPERS = {
     "reconcile_tax_categories_from_rate_bases",
 }
@@ -322,13 +248,6 @@ FINAL_EXTERNAL_TAX_TOTAL_RESTORATION_HELPER = (
     "_run_final_external_tax_total_restoration_phase"
 )
 FINAL_EXTERNAL_TAX_TOTAL_RESTORATION_STAGE_LIMIT = 2
-FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_REPAIRS = {
-    "_restore_printed_external_tax_amounts",
-}
-FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_HELPER = (
-    "_run_final_printed_external_tax_amount_restoration_phase"
-)
-FINAL_PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_STAGE_LIMIT = 1
 PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_REPAIRS = {
     "_restore_printed_external_tax_amounts",
 }
@@ -336,13 +255,6 @@ PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_PHASE_HELPER = (
     "_run_printed_external_tax_amount_restoration_phase"
 )
 PRINTED_EXTERNAL_TAX_AMOUNT_RESTORATION_PHASE_CALL_LIMIT = 1
-FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_REPAIRS = {
-    "_restore_bare_number_tax_summary",
-}
-FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_HELPER = (
-    "_run_final_bare_number_tax_summary_restoration_phase"
-)
-FINAL_BARE_NUMBER_TAX_SUMMARY_RESTORATION_STAGE_LIMIT = 1
 BARE_NUMBER_TAX_SUMMARY_RESTORATION_REPAIRS = {
     "_restore_bare_number_tax_summary",
 }
@@ -350,13 +262,6 @@ BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_HELPER = (
     "_run_bare_number_tax_summary_restoration_phase"
 )
 BARE_NUMBER_TAX_SUMMARY_RESTORATION_PHASE_CALL_LIMIT = 1
-FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_REPAIRS = {
-    "_drop_unprinted_small_target_only_taxes",
-}
-FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_HELPER = (
-    "_run_final_small_target_only_tax_pruning_phase"
-)
-FINAL_SMALL_TARGET_ONLY_TAX_PRUNING_STAGE_LIMIT = 1
 FINAL_COUPON_DISCOUNT_PROJECTION_REPAIRS = {
     "_fix_item_totals_from_following_discount_lines",
     "_apply_coupon_discount_blocks",
@@ -375,13 +280,6 @@ COUPON_DISCOUNT_PROJECTION_PHASE_HELPER = (
     "_run_coupon_discount_projection_phase"
 )
 COUPON_DISCOUNT_PROJECTION_PHASE_CALL_LIMIT = 2
-FINAL_FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS = {
-    "_repair_tiny_item_prices_from_following_ocr",
-}
-FINAL_FOLLOWING_OCR_PRICE_PROJECTION_HELPER = (
-    "_run_final_following_ocr_price_projection_phase"
-)
-FINAL_FOLLOWING_OCR_PRICE_PROJECTION_STAGE_LIMIT = 1
 FOLLOWING_OCR_PRICE_PROJECTION_REPAIRS = {
     "_repair_tiny_item_prices_from_following_ocr",
 }
@@ -426,13 +324,6 @@ RETIRED_FINAL_DUPLICATE_ROW_CLEANUP_HELPER = (
 RETIRED_FINAL_DUPLICATE_ROW_CLEANUP_STAGE = (
     "drop_duplicate_rows_when_subtotal_balances"
 )
-FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS = {
-    "_clear_discount_when_negative_line_precedes_own_price",
-}
-FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_HELPER = (
-    "_run_final_discount_consistency_reconciliation_phase"
-)
-FINAL_DISCOUNT_CONSISTENCY_RECONCILIATION_STAGE_LIMIT = 1
 DISCOUNT_CONSISTENCY_RECONCILIATION_REPAIRS = {
     "_fix_discounted_item_gross_prices_from_ocr",
     "_fix_item_totals_from_following_discount_lines",
@@ -441,23 +332,15 @@ DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_HELPER = (
     "_run_discount_consistency_reconciliation_phase"
 )
 DISCOUNT_CONSISTENCY_RECONCILIATION_PHASE_CALL_LIMIT = 2
-FINAL_QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
-    "_fix_qty_totals_from_ocr_unit_lines",
-}
-FINAL_QUANTITY_DETAIL_RECONCILIATION_HELPER = (
-    "_run_final_quantity_detail_reconciliation_phase"
-)
-FINAL_QUANTITY_DETAIL_RECONCILIATION_STAGE_LIMIT = 1
 FINAL_OCR_DESCRIPTION_RECONCILIATION_REPAIRS = {
     "_fix_code_table_descriptions_by_order",
-    "_fix_o_ring_descriptions_from_ocr",
     "_repair_discounted_ocr_pair_descriptions",
     "_repair_pre_price_stack_descriptions_from_ocr",
 }
 FINAL_OCR_DESCRIPTION_RECONCILIATION_HELPER = (
     "_run_final_ocr_description_reconciliation_phase"
 )
-FINAL_OCR_DESCRIPTION_RECONCILIATION_STAGE_LIMIT = 3
+FINAL_OCR_DESCRIPTION_RECONCILIATION_STAGE_LIMIT = 2
 DISCOUNTED_OCR_ITEM_REPAIR_REPAIRS = {
     "_repair_discounted_line_item_totals_when_balanced",
     "_repair_discounted_ocr_pair_descriptions",
@@ -474,13 +357,6 @@ FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_HELPER = (
     "_run_final_adjacent_price_shift_reconciliation_phase"
 )
 FINAL_ADJACENT_PRICE_SHIFT_RECONCILIATION_STAGE_LIMIT = 2
-FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS = {
-    "_replace_prefixed_tax_marker_item_rows_when_balanced",
-}
-FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_HELPER = (
-    "_run_final_prefixed_tax_marker_item_rows_phase"
-)
-FINAL_PREFIXED_TAX_MARKER_ITEM_ROWS_STAGE_LIMIT = 1
 PREFIXED_TAX_MARKER_ITEM_ROWS_REPAIRS = {
     "_replace_prefixed_tax_marker_item_rows_when_balanced",
 }
@@ -488,18 +364,8 @@ PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_HELPER = (
     "_run_prefixed_tax_marker_item_rows_phase"
 )
 PREFIXED_TAX_MARKER_ITEM_ROWS_PHASE_CALL_LIMIT = 2
-FINAL_GAP_ITEM_RECOVERY_REPAIRS = {
-    "_recover_missing_items_from_gap",
-}
-FINAL_GAP_ITEM_RECOVERY_HELPER = "_run_final_gap_item_recovery_phase"
-FINAL_GAP_ITEM_RECOVERY_STAGE_LIMIT = 1
 RETIRED_FINAL_REPEATED_GAP_ITEM_RECOVERY_REPAIR = "_recover_repeated_item_from_gap"
 RETIRED_FINAL_REPEATED_GAP_ITEM_RECOVERY_STAGE = "repeated_item_gap"
-FINAL_BASKET_MARKER_ROWS_REPAIRS = {
-    "_replace_basket_marker_rows_when_balanced",
-}
-FINAL_BASKET_MARKER_ROWS_HELPER = "_run_final_basket_marker_rows_phase"
-FINAL_BASKET_MARKER_ROWS_STAGE_LIMIT = 1
 BASKET_MARKER_ROWS_REPAIRS = {
     "_replace_basket_marker_rows_when_balanced",
 }
@@ -514,9 +380,7 @@ QUANTITY_DETAIL_RECONCILIATION_REPAIRS = {
 QUANTITY_DETAIL_RECONCILIATION_PHASE_HELPER = "_run_quantity_detail_reconciliation_phase"
 QUANTITY_DETAIL_RECONCILIATION_PHASE_CALL_LIMIT = 12
 TAX_CATEGORY_ASSIGNMENT_REPAIRS = {
-    "_apply_single_bag_standard_rate_split",
     "_assign_single_standard_rate_from_small_base",
-    "_fix_nonfood_packaging_tax_categories",
     "_fix_tax_categories_from_ocr_markers",
     "_fix_tax_categories_from_price_line_markers",
     "_normalize_taxes",
@@ -534,13 +398,6 @@ BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_HELPER = (
     "_run_bag_item_rate_base_reconciliation_phase"
 )
 BAG_ITEM_RATE_BASE_RECONCILIATION_PHASE_CALL_LIMIT = 2
-FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_REPAIRS = {
-    "_fix_bag_item_prices_from_rate_bases",
-}
-FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_HELPER = (
-    "_run_final_bag_item_rate_base_reconciliation_phase"
-)
-FINAL_BAG_ITEM_RATE_BASE_RECONCILIATION_STAGE_LIMIT = 1
 SINGLE_RATE_INCLUSIVE_TAX_RESTORATION_REPAIRS = {
     "_fix_printed_tax_amounts_from_structural_blocks",
     "_restore_single_rate_inclusive_tax_block",
@@ -588,13 +445,18 @@ PAYMENT_METHOD_REPAIR_REPAIRS = {
 }
 PAYMENT_METHOD_REPAIR_PHASE_HELPER = "_run_payment_method_repair_phase"
 PAYMENT_METHOD_REPAIR_PHASE_CALL_LIMIT = 1
-TOLL_PAYMENT_REFERENCE_REPAIR_REPAIRS = {
-    "_fix_toll_payment_reference",
+PAYMENT_REFERENCE_REPAIR_REPAIRS = {
+    "_fix_payment_reference",
 }
-TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_HELPER = (
-    "_run_toll_payment_reference_repair_phase"
+PAYMENT_REFERENCE_REPAIR_PHASE_HELPER = (
+    "_run_payment_reference_repair_phase"
 )
-TOLL_PAYMENT_REFERENCE_REPAIR_PHASE_CALL_LIMIT = 1
+PAYMENT_REFERENCE_REPAIR_PHASE_CALL_LIMIT = 1
+RECEIPT_PAYER_REPAIR_REPAIRS = {
+    "_fix_receipt_payer",
+}
+RECEIPT_PAYER_REPAIR_PHASE_HELPER = "_run_receipt_payer_repair_phase"
+RECEIPT_PAYER_REPAIR_PHASE_CALL_LIMIT = 1
 PAYMENT_POINTS_RECONCILIATION_REPAIRS = {
     "extract_points_used",
     "reconcile_points_payment_from_ocr",
@@ -602,6 +464,7 @@ PAYMENT_POINTS_RECONCILIATION_REPAIRS = {
 PAYMENT_POINTS_RECONCILIATION_PHASE_HELPER = "_run_payment_points_reconciliation_phase"
 PAYMENT_POINTS_RECONCILIATION_PHASE_CALL_LIMIT = 2
 SERVICE_RECEIPT_RECOVERY_REPAIRS = {
+    "_clear_unprinted_rate_only_tax_summary",
     "_fix_bare_service_receipt_without_itemization",
     "_fix_single_service_inclusive_tax",
     "_replace_service_table_items_when_balanced",
@@ -616,11 +479,9 @@ BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_HELPER = (
 )
 BODY_TOTAL_LAYOUT_RECONSTRUCTION_PHASE_CALL_LIMIT = 3
 OCR_DESCRIPTION_RECONCILIATION_REPAIRS = {
-    "_fix_bag_description_from_ocr_code_context",
     "_fix_code_table_descriptions_by_order",
     "_fix_colon_split_product_names_from_ocr",
     "_fix_duplicate_descriptions_from_ocr",
-    "_fix_o_ring_descriptions_from_ocr",
     "_fix_qty_code_row_descriptions_from_ocr",
 }
 OCR_DESCRIPTION_RECONCILIATION_PHASE_HELPER = "_run_ocr_description_reconciliation_phase"
@@ -732,10 +593,7 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "barcode_qty_price_rows",
     "item_price_qty_rows",
     "labeled_purchase_site_location",
-    "store_in_store_header_location",
     "header_branch_store_location",
-    "phone_area_city_location",
-    "short_branch_over_phone_area_city",
     "noisy_city_location",
     "single_rate_inclusive_tax_block",
     "coupon_discount_projection",
@@ -746,7 +604,6 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "stacked_inclusive_tax_block",
     "printed_summary_total_tax_balanced",
     "printed_item_sum_total",
-    "ocr_description_reconciliation",
     "adjacent_price_shift_reconciliation",
     "dense_sequence_rows",
     "campaign_discount_stream",
@@ -769,18 +626,44 @@ FINAL_OUTPUT_REPAIR_STAGES = (
     "missing_items_from_gap",
     "ocr_description_reconciliation_after_layout",
     "basket_marker_rows",
+    "layout_row_price_permutation",
     "tax_categories_from_rate_bases",
     "external_tax_total_from_printed_subtotal_final",
 )
-STRUCTURAL_JAPANESE_LITERAL_RE = re.compile(
-    r"(小計|合計|内税|外税|非課税|消費税|税|対象|軽減|税込|税抜|"
-    r"現金|預|釣|支払|売上|ポイント|領収|レシート|登録番号|電話|TEL|ありがとう|"
-    r"店|支店|営業所|料金所|住所|市|区|町|村|県|都|道|府|"
-    r"年|月|日|時|分|個|点|円|品番|JAN|バーコード|除|外|内|"
-    r"\\u[0-9a-fA-F]{4}|ぁ-ん|ァ-ン|ァ-ヶ|一-龥|¥|￥)"
-)
+STRUCTURAL_JAPANESE_TERMS = frozenset("""
+    ありがとう ありがとうございました ありがとうございます ありが ご来 ご来店 ご利用
+    内 外 除 軽 非 内税 外税 非課税 課税 税 税分 税込 税抜 税抜き 税率 税額
+    消費税 消費税等 消費税率 消費税率は 内消費税 ガソリン税 税合計
+    対象 対象額 税抜対象額 非課税対象額 軽減 軽減税率 軽税
+    小計 合計 総 総計 現計 売上 お買上高 購入点数 割引 割引き 値引 値引き まとめ
+    本体合計 現金 現金支払 フリー 支払 支払い 支払額 会計 お会計 決済 クレジット デビット 銀行振込 電子マネー
+    カード カード残高 残高
+    預 預り 預かり お預 お預り お預り金 お預かり 釣銭 お釣 お釣り
+    口座引落 口座振替 振替させて 収納済 領入済
+    ポイント 領 領収 領収書 領収証 レシート 伝票 請求書 納品書 登録 登録番号 番号 電話 バーコード
+    取引 取扱番号 データ クレ通番 照会番号 受付番号 参照番号
+    商品 商品名 加盟店 加盟店名 お客様控 営業時間 書 証 名
+    店 店舗 支店 営業所 料金所 給油所 サービスステーション 購入店 ご購入店 お買上店 お買い上げ店
+    ホームセンター スーパー
+    ショッピング モール センター 住所 丁目 番地 市 区 町 村 県 都 道 府 郡
+    市役所 区役所 町役場 村役場 役場 県庁 都庁 府庁 課 係 室 部 局
+    会社 組合 有限会社 株式会社 ㈱ ㈲ 合同会社
+    水道 ガス 電力 発行 請求 供給 元 者 事業者 様 御中
+    通行 利用 サービス 施設 駐車 入場 手数 料金
+    年 月 日 時 分 令和 平成 昭和 個 点 円 数量 単価 金額 品番 部門 担当 レジ 票
+""".split())
 FORMAL_RECEIPT_PURPOSE_LITERALS = {"但", "代", r"^\s*し[、,。\s]+"}
 JAPANESE_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+JAPANESE_RUN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]+")
+JAPANESE_CHAR_CLASS_RE = re.compile(r"\[[^\]]*[\u3040-\u30ff\u3400-\u9fff][^\]]*\]")
+REGEX_META_RE = re.compile(r"[\\[\]().*+?|{}^$]")
+STRUCTURAL_JAPANESE_REGEX_SIGNAL_RE = re.compile(
+    r"小計|合計|税|対象|現金|預|釣|支払|ポイント|領収|レシート|登録番号|"
+    r"電話|店|住所|年|月|日|時|分|個|点|円|品番|バーコード|"
+    r"カード|クレジット|電子マネー|残高|取引|取扱番号|照会番号|受付番号|"
+    r"参照番号|登録|"
+    r"ありがとう|ぁ-ん|ァ-ン|ァ-ヶ|一-龥"
+)
 
 
 @dataclass(frozen=True)
@@ -841,6 +724,20 @@ def _literal_key(node: ast.AST) -> str | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     return None
+
+
+def _is_docstring_literal(
+    node: ast.Constant,
+    parents: dict[ast.AST, ast.AST],
+) -> bool:
+    expression = parents.get(node)
+    owner = parents.get(expression) if expression is not None else None
+    return bool(
+        isinstance(expression, ast.Expr)
+        and isinstance(owner, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and owner.body
+        and owner.body[0] is expression
+    )
 
 
 def _call_name(node: ast.AST) -> str | None:
@@ -955,14 +852,16 @@ def _postprocess_phase_names() -> set[str]:
 
 def _current_japanese_string_counts() -> Counter[tuple[str, str]]:
     counts: Counter[tuple[str, str]] = Counter()
-    for path in SCANNED_FILES:
+    for path in JAPANESE_LITERAL_SCANNED_FILES:
         tree = _parse_file(path)
+        parents = _parents(tree)
         rel = _relative(_literal_count_key_path(path))
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Constant)
                 and isinstance(node.value, str)
                 and JAPANESE_CHAR_RE.search(node.value)
+                and not _is_docstring_literal(node, parents)
             ):
                 counts[(rel, node.value)] += 1
     return counts
@@ -970,7 +869,9 @@ def _current_japanese_string_counts() -> Counter[tuple[str, str]]:
 
 def _baseline_japanese_string_counts() -> Counter[tuple[str, str]]:
     counts: Counter[tuple[str, str]] = Counter()
-    baseline_paths = sorted({_literal_count_key_path(path) for path in SCANNED_FILES})
+    baseline_paths = sorted({
+        _literal_count_key_path(path) for path in JAPANESE_LITERAL_SCANNED_FILES
+    })
     for path in baseline_paths:
         rel = _relative(path)
         try:
@@ -985,22 +886,341 @@ def _baseline_japanese_string_counts() -> Counter[tuple[str, str]]:
                 f"Could not read {rel} from baseline {BASELINE_COMMIT}"
             ) from exc
         tree = ast.parse(source, filename=rel)
+        parents = _parents(tree)
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Constant)
                 and isinstance(node.value, str)
                 and JAPANESE_CHAR_RE.search(node.value)
+                and not _is_docstring_literal(node, parents)
             ):
                 counts[(rel, node.value)] += 1
     return counts
 
 
-def _looks_structural_japanese_literal(value: str) -> bool:
-    return bool(
-        STRUCTURAL_JAPANESE_LITERAL_RE.search(value)
-        or value in FORMAL_RECEIPT_PURPOSE_LITERALS
-        or "代(?:として" in value
+def _looks_structural_japanese_gate_literal(value: str) -> bool:
+    if value in FORMAL_RECEIPT_PURPOSE_LITERALS or "代(?:として" in value:
+        return True
+    without_character_classes = JAPANESE_CHAR_CLASS_RE.sub("", value)
+    without_character_classes = re.sub(r"\\s(?:[*+?])?", "", without_character_classes)
+    without_character_classes = re.sub(
+        r"(?<=[ぁ-んァ-ン一-龥])\?", "", without_character_classes
     )
+    runs = JAPANESE_RUN_RE.findall(without_character_classes)
+    return not runs or all(run in STRUCTURAL_JAPANESE_TERMS for run in runs)
+
+
+def _looks_structural_japanese_literal(value: str) -> bool:
+    if _looks_structural_japanese_gate_literal(value):
+        return True
+    return bool(
+        (REGEX_META_RE.search(value) or re.search(r"ぁ-ん|ァ-ン|一-龥", value))
+        and (
+            JAPANESE_CHAR_CLASS_RE.search(value)
+            or STRUCTURAL_JAPANESE_REGEX_SIGNAL_RE.search(value)
+        )
+    )
+
+
+def _suspicious_japanese_literals(node: ast.AST) -> list[str]:
+    return sorted({
+        child.value
+        for child in ast.walk(node)
+        if isinstance(child, ast.Constant)
+        and isinstance(child.value, str)
+        and JAPANESE_CHAR_RE.search(child.value)
+        and not _looks_structural_japanese_gate_literal(child.value)
+    })
+
+
+def _assignment_target_names(node: ast.AST) -> list[str]:
+    targets: list[ast.AST] = []
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    elif isinstance(node, ast.AnnAssign):
+        targets = [node.target]
+    return [
+        child.id
+        for target in targets
+        for child in ast.walk(target)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+    ]
+
+
+def _scope_nodes(statements: list[ast.stmt]) -> list[ast.AST]:
+    """Walk one function scope without borrowing nested-function dataflow."""
+    nodes: list[ast.AST] = []
+    pending: list[ast.AST] = list(reversed(statements))
+    while pending:
+        node = pending.pop()
+        nodes.append(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        pending.extend(reversed(list(ast.iter_child_nodes(node))))
+    return nodes
+
+
+def _function_node(
+    node: ast.AST,
+    parents: dict[ast.AST, ast.AST],
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    current = node
+    while current in parents:
+        current = parents[current]
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return current
+    return None
+
+
+def _literal_number(node: ast.AST) -> int | float | None:
+    try:
+        value = ast.literal_eval(node)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def _uses_tainted_symbol(node: ast.AST, tainted: set[str]) -> bool:
+    return any(
+        isinstance(child, ast.Name)
+        and isinstance(child.ctx, ast.Load)
+        and child.id in tainted
+        for child in ast.walk(node)
+    )
+
+
+def _japanese_literal_taint_symbols() -> set[str]:
+    trees = [_parse_file(path) for path in SCANNED_FILES]
+    tainted: set[str] = set()
+
+    for tree in trees:
+        for node in tree.body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            if _suspicious_japanese_literals(node.value):
+                tainted.update(_assignment_target_names(node))
+
+    changed = True
+    while changed:
+        changed = False
+        for tree in trees:
+            for node in tree.body:
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    candidates = _assignment_target_names(node)
+                    source = node.value
+                    if _uses_tainted_symbol(source, tainted):
+                        before = len(tainted)
+                        tainted.update(candidates)
+                        changed |= len(tainted) != before
+                elif isinstance(node, ast.ImportFrom):
+                    aliases = {
+                        alias.asname or alias.name
+                        for alias in node.names
+                        if alias.name in tainted
+                    }
+                    before = len(tainted)
+                    tainted.update(aliases)
+                    changed |= len(tainted) != before
+
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                owned_nodes = _scope_nodes(node.body)
+                returns = [
+                    child.value
+                    for child in owned_nodes
+                    if isinstance(child, ast.Return) and child.value is not None
+                ]
+                source = ast.Tuple(elts=returns, ctx=ast.Load())
+                if not _uses_tainted_symbol(source, tainted):
+                    continue
+                before = len(tainted)
+                tainted.add(node.name)
+                changed |= len(tainted) != before
+    return tainted
+
+
+def _file_japanese_flow_functions(
+    tree: ast.AST,
+    tainted_symbols: set[str],
+    parents: dict[ast.AST, ast.AST],
+) -> tuple[set[str], set[str]]:
+    product_functions: set[str] = set()
+    category_functions: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        flow_symbols = tainted_symbols | product_functions | category_functions
+        for function in (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            owned_nodes = _scope_nodes(function.body)
+            returns = [
+                node.value
+                for node in owned_nodes
+                if isinstance(node, ast.Return) and node.value is not None
+            ]
+            returned_names = {
+                child.id
+                for value in returns
+                for child in ast.walk(value)
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+            }
+            controlled_names: set[str] = set()
+            fixed_category_return = False
+            for gate_node in owned_nodes:
+                if not isinstance(gate_node, (ast.If, ast.For)):
+                    continue
+                gate = gate_node.test if isinstance(gate_node, ast.If) else gate_node.iter
+                if not _uses_tainted_symbol(gate, flow_symbols):
+                    continue
+                controlled: list[ast.AST] = list(gate_node.body)
+                if isinstance(gate_node, ast.If):
+                    controlled.extend(
+                        _terminal_guard_following_nodes(gate_node, parents)
+                    )
+                for root in controlled:
+                    for child in ast.walk(root):
+                        if isinstance(child, (ast.Assign, ast.AnnAssign)):
+                            controlled_names.update(_assignment_target_names(child))
+                        elif (
+                            isinstance(child, ast.Call)
+                            and isinstance(child.func, ast.Attribute)
+                            and child.func.attr in {"add", "append", "extend", "update"}
+                            and isinstance(child.func.value, ast.Name)
+                        ):
+                            controlled_names.add(child.func.value.id)
+                        elif (
+                            isinstance(child, ast.Return)
+                            and child.value is not None
+                            and _fixed_tax_category(child.value)
+                        ):
+                            fixed_category_return = True
+
+            before = len(product_functions)
+            if (
+                any(_uses_tainted_symbol(value, flow_symbols) for value in returns)
+                or returned_names & controlled_names
+            ):
+                product_functions.add(function.name)
+            changed |= len(product_functions) != before
+
+            before = len(category_functions)
+            if fixed_category_return:
+                category_functions.add(function.name)
+            changed |= len(category_functions) != before
+    return product_functions, category_functions
+
+
+def _function_local_taints(
+    tree: ast.AST,
+    tainted_symbols: set[str],
+) -> dict[ast.AST, set[str]]:
+    local_taints: dict[ast.AST, set[str]] = {}
+    for function in (
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ):
+        owned_nodes = _scope_nodes(function.body)
+        tainted: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            scope_taint = tainted_symbols | tainted
+            for node in owned_nodes:
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    if _uses_tainted_symbol(node.value, scope_taint):
+                        before = len(tainted)
+                        tainted.update(_assignment_target_names(node))
+                        changed |= len(tainted) != before
+                elif isinstance(node, ast.For) and _uses_tainted_symbol(
+                    node.iter, scope_taint
+                ):
+                    before = len(tainted)
+                    tainted.update(
+                        child.id
+                        for child in ast.walk(node.target)
+                        if isinstance(child, ast.Name)
+                        and isinstance(child.ctx, ast.Store)
+                    )
+                    changed |= len(tainted) != before
+                elif isinstance(node, ast.If) and _uses_tainted_symbol(
+                    node.test, scope_taint
+                ):
+                    controlled_assignments = (
+                        child
+                        for child in _scope_nodes(node.body)
+                        if isinstance(child, (ast.Assign, ast.AnnAssign))
+                    )
+                    before = len(tainted)
+                    for assignment in controlled_assignments:
+                        tainted.update(_assignment_target_names(assignment))
+                    changed |= len(tainted) != before
+        local_taints[function] = tainted
+    return local_taints
+
+
+def _fixed_tax_category(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str) and node.value in {"8%", "10%"}
+    if isinstance(node, ast.Name):
+        return isinstance(node.ctx, ast.Load) and node.id.isupper()
+    if isinstance(node, ast.Call):
+        return any(_fixed_tax_category(arg) for arg in node.args) or any(
+            _fixed_tax_category(keyword.value) for keyword in node.keywords
+        )
+    if isinstance(node, (ast.IfExp, ast.BoolOp, ast.BinOp, ast.UnaryOp)):
+        return any(_fixed_tax_category(child) for child in ast.iter_child_nodes(node))
+    return False
+
+
+def _subscript_receiver_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+        return node.value.id
+    return None
+
+
+def _terminal_guard_following_nodes(
+    node: ast.If,
+    parents: dict[ast.AST, ast.AST],
+) -> list[ast.AST]:
+    if node.orelse or not node.body or not all(
+        isinstance(statement, (ast.Continue, ast.Return, ast.Raise))
+        for statement in node.body
+    ):
+        return []
+    owner = parents.get(node)
+    body = getattr(owner, "body", None)
+    if not isinstance(body, list) or node not in body:
+        return []
+    next_index = body.index(node) + 1
+    return _scope_nodes(body[next_index:next_index + 1])
+
+
+def _semantic_fields_in_node(node: ast.AST) -> set[str]:
+    fields: set[str] = set()
+    for child in ast.walk(node):
+        fields.update(_assigned_semantic_fields(child))
+        if isinstance(child, ast.Dict):
+            fields.update(
+                key.value
+                for key in child.keys
+                if isinstance(key, ast.Constant)
+                and isinstance(key.value, str)
+                and key.value in SEMANTIC_FIELDS
+            )
+        elif isinstance(child, ast.Call):
+            fields.update(
+                keyword.arg
+                for keyword in child.keywords
+                if keyword.arg in SEMANTIC_FIELDS
+            )
+    return fields
 
 
 def _assigned_semantic_fields(node: ast.AST) -> set[str]:
@@ -1031,11 +1251,16 @@ def _condition_known_value_gates(node: ast.AST, source: str) -> list[str]:
         child.value
         for child in ast.walk(node)
         if isinstance(child, ast.Constant)
+        and not isinstance(child.value, bool)
         and isinstance(child.value, (str, int, float))
     ]
     if not constants:
         return []
 
+    condition_text = ast.get_source_segment(source, node) or ""
+    compares_financial_field = bool(
+        re.search(r"\b(?:amount_paid|subtotal|total)\b", condition_text)
+    )
     suspicious = []
     for value in constants:
         if isinstance(value, str):
@@ -1043,38 +1268,110 @@ def _condition_known_value_gates(node: ast.AST, source: str) -> list[str]:
                 KNOWN_DATE_RE.search(value)
                 or MERCHANT_OR_STORE_RE.search(value)
                 or FIXTURE_REFERENCE_RE.search(value)
+                or EXACT_BARCODE_LITERAL_RE.search(value)
             ):
                 suspicious.append(value)
-        elif isinstance(value, (int, float)) and abs(value) >= 1000:
-            suspicious.append(value)
+        elif isinstance(value, (int, float)):
+            digits = str(abs(int(value))) if float(value).is_integer() else ""
+            if (
+                12 <= len(digits) <= 14
+                or abs(value) >= 1000
+                or (compares_financial_field and value != 0)
+            ):
+                suspicious.append(value)
 
     if not suspicious:
         return []
-    return [(ast.get_source_segment(source, node) or repr(suspicious)).replace("\n", " ")]
+    return [(condition_text or repr(suspicious)).replace("\n", " ")]
 
 
-def _scan_ast(path: Path) -> list[Violation]:
+def _scan_ast(path: Path, tainted_symbols: set[str]) -> list[Violation]:
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
     parents = _parents(tree)
+    product_functions, category_functions = _file_japanese_flow_functions(
+        tree, tainted_symbols, parents
+    )
+    semantic_taint = tainted_symbols | category_functions
+    local_taints = _function_local_taints(
+        tree, tainted_symbols | product_functions
+    )
     rel = _relative(path)
     violations: list[Violation] = []
+
+    def product_scope_taint(node: ast.AST) -> set[str]:
+        return (
+            tainted_symbols
+            | product_functions
+            | local_taints.get(_function_node(node, parents), set())
+        )
+
+    product_receivers: dict[
+        tuple[ast.FunctionDef | ast.AsyncFunctionDef | None, str], int
+    ] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        scope = _function_node(node, parents)
+        targets = list(node.targets) if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if (
+                isinstance(target, ast.Subscript)
+                and _literal_key(target.slice) == "description"
+                and _uses_tainted_symbol(value, product_scope_taint(node))
+            ):
+                receiver = _subscript_receiver_name(target)
+                if receiver:
+                    product_receivers.setdefault((scope, receiver), node.lineno)
+        if isinstance(value, ast.Dict):
+            pairs = {
+                key.value: dict_value
+                for key, dict_value in zip(value.keys, value.values)
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+            if "description" not in pairs or not _uses_tainted_symbol(
+                pairs["description"], product_scope_taint(node)
+            ):
+                continue
+            for target_name in _assignment_target_names(node):
+                product_receivers.setdefault((scope, target_name), node.lineno)
 
     for node in ast.walk(tree):
         function = _enclosing_function(node, parents)
 
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            match = BESPOKE_RECEIPT_LITERAL_RE.search(node.value)
-            if match:
-                violations.append(
-                    Violation(
-                        rel,
-                        node.lineno,
-                        function,
-                        "bespoke_receipt_literal",
-                        match.group(0),
-                    )
+            if not _is_docstring_literal(node, parents):
+                literal_rules = (
+                    ("bespoke_receipt_literal", BESPOKE_RECEIPT_LITERAL_RE),
+                    ("fixture_reference_literal", FIXTURE_REFERENCE_RE),
+                    ("exact_barcode_literal", EXACT_BARCODE_LITERAL_RE),
+                    ("exact_location_literal", EXACT_ADMIN_LOCATION_RE),
                 )
+                for rule, pattern in literal_rules:
+                    if rule == "exact_location_literal" and node.value.endswith(("水道", "道路")):
+                        continue
+                    match = pattern.search(node.value)
+                    if match:
+                        violations.append(
+                            Violation(rel, node.lineno, function, rule, match.group(0))
+                        )
+
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, int)
+            and not isinstance(node.value, bool)
+            and 12 <= len(str(abs(node.value))) <= 14
+        ):
+            violations.append(
+                Violation(
+                    rel,
+                    node.lineno,
+                    function,
+                    "exact_barcode_literal",
+                    str(node.value),
+                )
+            )
 
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if MERCHANT_OR_STORE_RE.search(node.name):
@@ -1088,6 +1385,79 @@ def _scan_ast(path: Path) -> list[Violation]:
             if KNOWN_ANSWER_NAME_RE.search(node.name):
                 violations.append(
                     Violation(rel, node.lineno, function, "known_answer_helper_name", node.name)
+                )
+
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value_node = node.value
+            target_names = _assignment_target_names(node)
+            for target_name in target_names:
+                if (
+                    KNOWN_TOTAL_TABLE_NAME_RE.search(target_name)
+                    and any(
+                        _literal_number(child) not in (None, 0)
+                        for child in ast.walk(value_node)
+                    )
+                ):
+                    violations.append(
+                        Violation(
+                            rel,
+                            node.lineno,
+                            function,
+                            "known_total_answer_table",
+                            target_name,
+                        )
+                    )
+
+            financial_fields = _assigned_semantic_fields(node) & FINANCIAL_FIELDS
+            hardcoded_value = _literal_number(value_node)
+            if financial_fields and hardcoded_value is not None:
+                violations.append(
+                    Violation(
+                        rel,
+                        node.lineno,
+                        function,
+                        "hardcoded_financial_assignment",
+                        f"{','.join(sorted(financial_fields))}={hardcoded_value}",
+                    )
+                )
+
+            tainted_fields = _assigned_semantic_fields(node) - {"description"}
+            if tainted_fields and _uses_tainted_symbol(
+                value_node, semantic_taint
+            ):
+                violations.append(
+                    Violation(
+                        rel,
+                        node.lineno,
+                        function,
+                        "japanese_answer_flow_semantic_assignment",
+                        ",".join(sorted(tainted_fields)),
+                    )
+                )
+
+            fixed_product_fields = set()
+            scope = _function_node(node, parents)
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            ):
+                receiver = _subscript_receiver_name(target)
+                if (
+                    receiver
+                    and _literal_key(target.slice) == "tax_category"
+                    and product_receivers.get((scope, receiver), node.lineno + 1)
+                    <= node.lineno
+                    and _fixed_tax_category(value_node)
+                ):
+                    fixed_product_fields.add("tax_category")
+            if fixed_product_fields:
+                violations.append(
+                    Violation(
+                        rel,
+                        node.lineno,
+                        function,
+                        "japanese_answer_flow_semantic_assignment",
+                        ",".join(sorted(fixed_product_fields)),
+                    )
                 )
 
         if isinstance(node, ast.Assign):
@@ -1112,6 +1482,99 @@ def _scan_ast(path: Path) -> list[Violation]:
             violations.append(
                 Violation(rel, node.lineno, function, "known_value_gate", detail)
             )
+
+        if isinstance(node, (ast.If, ast.For)):
+            gate = node.test if isinstance(node, ast.If) else node.iter
+            following_nodes: list[ast.AST] = []
+            if isinstance(node, ast.If):
+                following_nodes = _terminal_guard_following_nodes(node, parents)
+            literals = _suspicious_japanese_literals(gate)
+            fields = set()
+            for body_node in node.body:
+                for child in ast.walk(body_node):
+                    fields.update(_assigned_semantic_fields(child))
+            if literals and fields:
+                violations.append(
+                    Violation(
+                        rel,
+                        node.lineno,
+                        function,
+                        "japanese_answer_gate_semantic_assignment",
+                        f"{','.join(literals)} -> {','.join(sorted(fields))}",
+                    )
+                )
+
+            tainted_fields = set().union(*(
+                _semantic_fields_in_node(body_node) for body_node in node.body
+            ))
+            # Product recognition may select a structurally validated OCR row;
+            # the direct-literal guard still rejects invented descriptions.
+            tainted_fields.discard("description")
+            gate_is_tainted = _uses_tainted_symbol(gate, semantic_taint)
+            if tainted_fields and gate_is_tainted:
+                violations.append(
+                    Violation(
+                        rel,
+                        node.lineno,
+                        function,
+                        "japanese_answer_flow_semantic_assignment",
+                        ",".join(sorted(tainted_fields)),
+                    )
+                )
+            if gate_is_tainted and any(
+                isinstance(child, ast.Call) and _fixed_tax_category(child)
+                for controlled in [*node.body, *following_nodes]
+                for child in ast.walk(controlled)
+            ):
+                violations.append(
+                    Violation(
+                        rel,
+                        node.lineno,
+                        function,
+                        "japanese_answer_flow_semantic_assignment",
+                        "tax_category",
+                    )
+                )
+
+        if isinstance(node, ast.Dict):
+            pairs = {
+                key.value: value
+                for key, value in zip(node.keys, node.values)
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+            for key, value in zip(node.keys, node.values):
+                if (
+                    isinstance(key, ast.Constant)
+                    and key.value in SEMANTIC_FIELDS
+                    and key.value != "description"
+                    and _uses_tainted_symbol(value, semantic_taint)
+                ):
+                    violations.append(
+                        Violation(
+                            rel,
+                            node.lineno,
+                            function,
+                            "japanese_answer_flow_semantic_assignment",
+                            str(key.value),
+                        )
+                    )
+            if (
+                "description" in pairs
+                and "tax_category" in pairs
+                and _uses_tainted_symbol(
+                    pairs["description"], product_scope_taint(node)
+                )
+                and _fixed_tax_category(pairs["tax_category"])
+            ):
+                violations.append(
+                    Violation(
+                        rel,
+                        node.lineno,
+                        function,
+                        "japanese_answer_flow_semantic_assignment",
+                        "tax_category",
+                    )
+                )
 
         if function == "_build_result" and isinstance(node, ast.Call):
             name = _call_name(node.func)
@@ -1188,8 +1651,9 @@ def _scan_comments(path: Path) -> list[Violation]:
 
 def _collect_violations() -> list[Violation]:
     violations: list[Violation] = []
+    tainted_symbols = _japanese_literal_taint_symbols()
     for path in SCANNED_FILES:
-        violations.extend(_scan_ast(path))
+        violations.extend(_scan_ast(path, tainted_symbols))
         violations.extend(_scan_comments(path))
     return sorted(violations, key=lambda item: item.key)
 
@@ -1239,6 +1703,92 @@ def test_production_pipeline_has_no_new_brittle_known_answer_overrides():
             )
 
     assert not unexpected and not stale_allowlist, message.getvalue()
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        """
+import re
+_TOKEN_RE = re.compile(r"有料レジ袋")
+def _select(text):
+    return bool(_TOKEN_RE.search(text))
+def _row(desc, qty, total, tax_category):
+    return {"description": desc, "qty": qty, "total": total,
+            "tax_category": tax_category}
+def repair(desc):
+    rows = []
+    if not _select(desc):
+        return rows
+    rows.append(_row(desc, 1, 5, "10%"))
+    return rows
+""",
+        """
+import re
+_TOKEN_RE = re.compile(r"有料レジ袋")
+def _select(text):
+    return bool(_TOKEN_RE.search(text))
+def _category(marker, desc):
+    if _select(desc):
+        return "10%"
+    return marker
+def recover(desc):
+    return {"description": desc, "tax_category": _category("8%", desc)}
+""",
+        """
+import re
+_TOKEN_RE = re.compile(r"有料レジ袋")
+DEFAULT_CATEGORY = "10%"
+def _select(text):
+    return bool(_TOKEN_RE.search(text))
+def _entries(lines):
+    rows = []
+    for line in lines:
+        if not _select(line):
+            continue
+        rows.append((line, 5))
+    return rows
+def append(lines):
+    candidates = _entries(lines)
+    desc, price = candidates[0]
+    row = {"description": desc, "qty": 1, "unit_price": price,
+           "total": price, "tax_category": DEFAULT_CATEGORY}
+    return row
+""",
+        """
+import re
+_TOKEN_RE = re.compile(r"有料レジ袋")
+def _select(text):
+    return bool(_TOKEN_RE.search(text))
+def rename(item, lines):
+    replacement = None
+    for line in lines:
+        if _select(line):
+            replacement = line
+            break
+    item["description"] = replacement
+    item["tax_category"] = "10%"
+""",
+    ),
+    ids=("positional-row", "category-helper", "new-row", "rename"),
+)
+def test_renamed_japanese_product_flow_to_tax_category_is_rejected(
+    source,
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "candidate.py"
+    path.write_text(source, encoding="utf-8")
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    monkeypatch.setitem(globals(), "SCANNED_FILES", (path,))
+
+    violations = _scan_ast(path, _japanese_literal_taint_symbols())
+
+    assert any(
+        violation.rule == "japanese_answer_flow_semantic_assignment"
+        and violation.detail == "tax_category"
+        for violation in violations
+    )
 
 
 def test_postprocess_receipt_repair_stack_does_not_grow_without_review():
