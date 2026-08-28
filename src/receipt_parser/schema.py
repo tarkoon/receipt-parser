@@ -39,7 +39,7 @@ FIELD_REGISTRY: list[FieldMeta] = [
     FieldMeta(
         name="merchant",
         debug_color_bgr=(255, 165, 0),
-        prompt_hint="Consumer-facing BRAND name only (see merchant rules above). If a subtitle describes the business type (e.g. '自家製生パスタの店') but a proper name also appears (e.g. 'チャオ'), use the proper name. For handwritten receipts (領収証), the merchant name is near the stamp/seal at the bottom. For payment slips, this is the 受取人. For dual English+Japanese names, use the most prominent form.",
+        prompt_hint="The consumer-facing seller or provider name. For payment slips, use the named recipient. Keep branch, location, parent-company, and operator metadata out of this field. For dual English and Japanese names, use the most prominent form.",
         extraction_aliases=["店名", "store", "shop", "受取人"],
     ),
     FieldMeta(
@@ -51,14 +51,13 @@ FIELD_REGISTRY: list[FieldMeta] = [
     FieldMeta(
         name="time",
         debug_color_bgr=(0, 220, 60),
-        prompt_hint="Transaction time of day, 24-hour H:MM (no leading zero on hour, two-digit minute). Look immediately after the date — receipts usually print it as '2026年3月15日 (水) 17:05', '2026/3/15 17:05', or '13時30分'. Drop seconds (17:05:42 → 17:05). Convert 13時30分 → 13:30. Convert 09:32 → 9:32 (strip leading zero on the hour). Output null if no time appears, or if the only time-looking text is a business-hours range (営業時間 9:00~21:00) or a phone number. Do NOT use the time portion of a printer/issued timestamp on utility bills or payment slips unless it clearly marks the transaction.",
+        prompt_hint="A clearly marked transaction or payment time in 24-hour H:MM format, with no leading zero on the hour. Drop seconds. Output null for business hours, phone numbers, and printer or issue timestamps that do not clearly mark the transaction.",
         extraction_aliases=["時刻", "time"],
-        doc_types=["receipt"],
     ),
     FieldMeta(
         name="location",
         debug_color_bgr=(200, 200, 0),
-        prompt_hint="City/ward level location. Use branch name to infer location (e.g. '赤間店' → 赤間 is in 宗像市, so output '宗像市赤間'; '八幡店' → 八幡 is in 北九州市, so output '北九州市八幡区'). Also use explicit address lines or shopping complex names. Output format: '宗像市赤間', '福岡市博多区', '北九州市八幡区'. Always include at least 市 or 区. Extract city/ward only, not full street address. Phone numbers alone are NOT sufficient — only use as supplementary hint. Output null if no location clues exist.",
+        prompt_hint="Use the most-specific reliable location exactly as printed. Prefer a full address; otherwise retain the full printed branch, facility, or locality instead of reducing it to a broader place. Never infer missing geography from an ambiguous name or phone number. Output null if no reliable location is printed.",
         extraction_aliases=["住所", "address"],
         doc_types=["receipt"],
     ),
@@ -77,7 +76,7 @@ FIELD_REGISTRY: list[FieldMeta] = [
     FieldMeta(
         name="payment_method",
         debug_color_bgr=(128, 0, 128),
-        prompt_hint="Must be one of: cash, credit, debit, bank_payment, WAON, or null. Use 'cash' only if お預り or 現計 is shown. Use 'bank_payment' for 口座引落, 口座振替, or 振込. Use null if no evidence on the document.",
+        prompt_hint="Must be one of: cash, credit, debit, bank_payment, WAON, or null. Populate it only when one actual tender is established. Use null for mixed tender or when no single method is clear.",
         extraction_aliases=["支払", "payment"],
     ),
     FieldMeta(
@@ -89,7 +88,7 @@ FIELD_REGISTRY: list[FieldMeta] = [
     FieldMeta(
         name="points_used",
         debug_color_bgr=(200, 100, 200),
-        prompt_hint="Loyalty points applied as payment (d-point, WAON point, etc.). Output as a number. Look for ポイント利用, ポイント値引. Do NOT confuse with ポイント対象額 (eligible amount) or 獲得ポイント (points earned).",
+        prompt_hint="Loyalty points actually applied as payment. Use null when no redemption is printed, preserve an explicitly printed zero, and use a positive number only with direct redemption evidence such as ポイント利用 or ポイント値引. Do not confuse eligible or earned points with redemption.",
         extraction_aliases=["ポイント利用", "ポイント値引"],
         doc_types=["receipt"],
     ),
@@ -103,20 +102,20 @@ FIELD_REGISTRY: list[FieldMeta] = [
     FieldMeta(
         name="line_items",
         debug_color_bgr=(255, 255, 0),
-        prompt_hint="Match description, qty, unit_price, and total per row. Default qty=1. Numbers followed by tax markers at line end ARE prices: 278※ means ¥278 at 8%, 3除 means ¥3 at 10%. Tax markers: ※/*/X → reduced 8%, 除 → standard 10%. A single OCR line may contain multiple items with prices — split them (e.g. '食品ポリ袋L3除日清チャック付328※' = two items: ¥3 and ¥328). '部門NNN' lines are department-coded items. See discount rules above.",
+        prompt_hint="Match description, qty, unit_price, and total per row. Default qty=1. A tax marker attached to a trailing number does not stop that number from being the price. Split multiple item-and-price pairs merged onto one OCR line. discount_rate is the positive effective percentage removed from the pre-discount extended price, formatted as <number>%; leave it empty when no effective rate is established.",
         doc_types=["receipt"],
     ),
     FieldMeta(
         name="subtotal",
         debug_color_bgr=(0, 255, 255),
-        prompt_hint="ALWAYS the pre-tax base: subtotal = total - sum(taxes). For 内税 (tax-inclusive) receipts where 合計 already includes tax, subtotal is LESS than 合計 — compute subtotal = 合計 - 消費税. For 外税 receipts subtotal equals 小計 (printed pre-tax). Never set subtotal equal to total when there is a non-zero tax amount.",
+        prompt_hint="The pre-tax base: subtotal = total - sum(taxes). For 内税 receipts where 合計 includes a printed tax amount, compute subtotal = 合計 - 消費税. For 外税 receipts subtotal equals the printed pre-tax 小計. When only a tax rate or gross rate target is printed and neither a tax amount nor pre-tax base is printed, leave subtotal null instead of inferring it.",
         extraction_aliases=["小計", "subtotal"],
         doc_types=["receipt"],
     ),
     FieldMeta(
         name="taxes",
         debug_color_bgr=(255, 0, 255),
-        prompt_hint="Output as a list of objects with 'rate' (string like '10%' or '8%'), 'label' (e.g. '内税'), and 'amount' (number). JP tax: 軽減税率/※ = reduced 8%, standard = 10%. Look for patterns like '10%内税対象' or '(10%内)' to determine the rate. 内税 means tax-inclusive, 外税 means tax-exclusive.",
+        prompt_hint="Output as a list of objects with 'rate' (string like '10%' or '8%'), 'label' (e.g. '内税'), and 'amount' (number). Prefer a printed tax amount; arithmetic reconstruction from an explicitly printed taxable base and rate is allowed when it reconciles. JP tax: 軽減税率/※ = reduced 8%, standard = 10%. 内税 means tax-inclusive, 外税 means tax-exclusive. When only a rate or gross rate target is printed, keep the rate on each item's tax_category but output taxes=[]; never invent a numeric tax amount from the rate alone.",
         extraction_aliases=["税", "消費税", "tax", "内税", "外税"],
         doc_types=["receipt"],
     ),
@@ -132,32 +131,30 @@ FIELD_REGISTRY: list[FieldMeta] = [
     FieldMeta(
         name="billing_period",
         debug_color_bgr=(100, 200, 200),
-        prompt_hint="Output as an object with 'start' and 'end' in YYYY-MM-DD format. Look for 使用期間, ご利用期間, or derive from 前回検針日 to 今回検針日.",
+        prompt_hint="Output 'start' and 'end' in YYYY-MM-DD format. Prefer an explicitly printed usage period. When deriving from meter-reading dates, start is the calendar day after the previous reading and end is the current reading date.",
         extraction_aliases=["使用期間", "検針日"],
         doc_types=["utility_bill"],
     ),
     FieldMeta(
         name="usage",
         debug_color_bgr=(200, 200, 100),
-        prompt_hint="Output as an object with 'amount' (number), 'unit' (m3, kWh, or L), 'cost_per' (price per unit, e.g. ¥181/L — number or null), 'meter_previous' (number or null), 'meter_current' (number or null). Look for ご使用量, 指針, 単価.",
+        prompt_hint="Measured consumption or purchased volume. Output 'amount', 'unit', 'cost_per', 'meter_previous', and 'meter_current', using null for unprinted members. Retain explicitly printed fuel quantity, unit, and unit price on receipts; service_type remains null because it is utility-only.",
         extraction_aliases=["ご使用量", "使用量", "指針"],
-        doc_types=["utility_bill"],
+        doc_types=["receipt", "utility_bill"],
     ),
 
-    # Payment slip-specific fields
+    # Named parties and references can appear on any document type
     FieldMeta(
         name="payer",
         debug_color_bgr=(100, 0, 200),
-        prompt_hint="The person or entity making the payment. Look for 依頼人, ご依頼人.",
-        extraction_aliases=["依頼人", "ご依頼人"],
-        doc_types=["payment_slip"],
+        prompt_hint="The person or entity explicitly named as payer or document addressee. Do not infer it from unrelated names, account numbers, or membership identifiers.",
+        extraction_aliases=["依頼人", "ご依頼人", "宛名"],
     ),
     FieldMeta(
         name="payment_reference",
         debug_color_bgr=(0, 100, 200),
-        prompt_hint="Tracking or reference number on the payment slip.",
-        extraction_aliases=["手番", "収納番号"],
-        doc_types=["payment_slip"],
+        prompt_hint="A value-only printed document reference, preserving leading zeroes. Prefer a uniquely labeled receipt or slip number; if none is printed, use one uniquely labeled transaction, data, handling, inquiry, acceptance, or reference number. Do not include the label and do not use an unlabeled serial, account, membership, or card number.",
+        extraction_aliases=["レシートNo", "伝票No", "取扱番号", "手番", "収納番号", "参照番号"],
     ),
 ]
 
@@ -215,16 +212,6 @@ def _normalize_time(v) -> str | None:
     return f"{hh}:{mm:02d}"
 
 
-def _coerce_numeric(v) -> float | None:
-    """Coerce a value to float, handling strings with commas."""
-    if v is None:
-        return None
-    try:
-        return float(str(v).replace(',', ''))
-    except (TypeError, ValueError):
-        return None
-
-
 def _coerce_tax_category(v) -> str:
     """Coerce tax_category to a valid literal value."""
     if v in VALID_TAX_RATES:
@@ -265,7 +252,11 @@ class LineItem(BaseModel):
     @field_validator("discount_rate", mode="before")
     @classmethod
     def coerce_discount_rate(cls, v):
-        return "" if v is None else str(v)
+        match = re.fullmatch(r'\s*[+-]?(\d+(?:\.\d+)?)\s*[%％]?\s*', str(v or ""))
+        if not match:
+            return ""
+        rate = float(match.group(1))
+        return f"{rate:g}%" if rate > 0 else ""
 
     @field_validator("discount", mode="before")
     @classmethod
@@ -283,6 +274,12 @@ class LineItem(BaseModel):
         if v < 0:
             raise ValueError("Line item total cannot be negative")
         return v
+
+    @model_validator(mode="after")
+    def clear_ineffective_discount_rate(self) -> "LineItem":
+        if self.discount <= 0:
+            self.discount_rate = ""
+        return self
 
 
 class TaxEntry(BaseModel):
@@ -336,12 +333,12 @@ class Document(BaseModel):
     subtotal: Optional[float] = None
     taxes: list[TaxEntry] = []
 
-    # Utility bill-specific
+    # Utility-only fields, plus usage shared with fuel receipts
     service_type: Optional[str] = None
     billing_period: Optional[BillingPeriod] = None
     usage: Optional[UsageData] = None
 
-    # Payment slip-specific
+    # Optional named party/reference fields shared across document types
     payer: Optional[str] = None
     payment_reference: Optional[str] = None
 
@@ -360,8 +357,17 @@ class Document(BaseModel):
         except (TypeError, ValueError):
             return None
 
+    @field_validator("account_number", mode="before")
+    @classmethod
+    def coerce_optional_account_number(cls, v):
+        if v is None or v == "null" or v == "None" or isinstance(v, bool):
+            return None
+        if isinstance(v, (str, int, float)):
+            return str(v).strip() or None
+        return None
+
     @field_validator("merchant", "date", "time", "location", "currency", "payment_method",
-                     "account_number", "payer", "payment_reference",
+                     "payer", "payment_reference",
                      "service_type", "raw_text_summary", mode="before")
     @classmethod
     def coerce_null_strings(cls, v):
@@ -436,6 +442,15 @@ class Document(BaseModel):
                         data["date"] = f"{2018 + era_year:04d}-{m.group(2)}-{m.group(3)}"
 
         return data
+
+    @model_validator(mode="after")
+    def clear_out_of_scope_fields(self) -> "Document":
+        if self.document_type != "utility_bill":
+            self.service_type = None
+            self.billing_period = None
+        if self.document_type == "payment_slip":
+            self.usage = None
+        return self
 
     @model_validator(mode="after")
     def check_arithmetic(self) -> "Document":
@@ -552,14 +567,15 @@ RULES:
    Do NOT add tax unless actual tax numbers are handwritten. Empty pre-printed form labels (税抜金額, 消費税額, etc.) with no numbers filled in mean no tax — output taxes as an empty list.
    Do NOT create line_items for handwritten receipts unless individual items are listed.
 8. 令和7年=2025, 令和8年=2026. If OCR shows just '7年' or '8年' with no era name, assume 令和.
-9. The merchant name is the consumer-facing BRAND name ONLY — do NOT include the branch name, store location, or shopping complex. Strip everything after the core brand: 'ダイソー' not 'ダイソー ビバモール赤間店', 'カルディ' not 'カルディコーヒーファーム', 'マックスバリュ' not 'マックスバリュくりえいと宗像店'. Do NOT use the parent company (AEON/イオン), corporate entity (株式会社..., 有限会社...), franchisee/operator name, or abbreviation. Short text next to a number code (e.g. 'コウソ 003080') is a cashier/operator identifier, NOT the merchant. If a website domain appears (e.g. 'clickcycle.com'), the brand name is often derived from it (e.g. 'click'). For gas stations, use the fuel brand not the station operator.
-10. If the receipt shows a specific payment method like WAON, クレジット, Suica, PayPay, etc., use that. Only default to "cash" if no electronic payment is named and you see お預り (cash tendered) or 現計 (cash total).
-11. OCR may put item names and their prices on SEPARATE lines. Associate each item with the ¥ amount on the NEXT line. Example: "サニーレタス" followed by "¥129" means サニーレタス costs 129.
+9. The merchant is the consumer-facing seller or provider. Keep branch, location, shopping-complex, parent-company, corporate, franchisee, and operator metadata out of this field. For fuel purchases, use the displayed fuel brand rather than an operator name.
+10. Use only the canonical payment values. Preserve WAON as "WAON"; map named card or electronic payments to "credit" unless the document explicitly says debit. Use "cash" only when cash tender evidence is printed. If multiple tenders contributed and no single method represents the transaction, use null.
+11. OCR may put item descriptions and prices on separate lines. Associate each item with its structurally adjacent amount.
 12. When OCR shows distinct adjacent item prices, emit each item's total verbatim from OCR. Do NOT duplicate a price across multiple items unless OCR shows that same price multiple times. If item names are in one block and prices are in a following block, preserve the price sequence one-for-one.
-13. The subtotal is ALWAYS the pre-tax base: subtotal = total - sum(taxes). This holds for both 外税 (tax-exclusive) and 内税 (tax-inclusive) receipts. For 内税 receipts where printed item prices already include tax, subtotal is LESS than the printed 合計; do NOT set subtotal equal to total. The tax lines (外税8%税額, 消費税 etc.) show the TAX amount, NOT the subtotal.
+13. The subtotal is the pre-tax base: subtotal = total - sum(taxes). This holds for both 外税 (tax-exclusive) and 内税 (tax-inclusive) receipts. For 内税 receipts where printed item prices already include tax, subtotal is LESS than the printed 合計. Exception: if only a tax rate or gross rate target is printed and no numeric tax amount or explicit pre-tax base exists, do not derive either amount; output subtotal=null and taxes=[]. Keep the printed rate only as each item's tax_category. The tax lines (外税8%税額, 消費税 etc.) show the TAX amount, NOT the subtotal.
 14. 課税対象額 means "taxable amount" (the BASE that tax is calculated on) — this is NOT a tax. Only 税額 (tax amount) entries should be in the taxes list. Example: "税率8%課税対象額 ¥2274" is the taxable base; "税率8%税額 ¥168" is the actual tax of 168.
 15. Labels (合計, 小計, 税額) may appear on a DIFFERENT line from their ¥ values, especially in rotated receipts where all labels are in one block and all values in another. Use arithmetic to match: tax = total − subtotal. If you see many ¥ amounts together (e.g. "¥2,279  ¥2,111  ¥168)"), match them with labels elsewhere in the text.
-16. DISCOUNTS: If a discount line follows an item (e.g., "割引 20%" with "-¥94" after "銀さけ切身 ¥467"), do NOT create a separate line item for the discount. Merge it into the parent item: set total = price AFTER discount (467 - 94 = 373), set discount = 94, set discount_rate = "20%". Every line item total must be positive.
+16. DISCOUNTS: Do not create a separate line item for a discount. Merge it into the affected item: total is the post-discount amount and discount is the positive amount removed. discount_rate is the positive effective percentage removed from the pre-discount extended price, canonically formatted as <number>%; leave it empty when no effective rate is established. Every line item total must be positive.
+17. payment_reference is value-only and preserves leading zeroes. Prefer one explicitly labeled receipt or slip number; only when none is printed, use one uniquely labeled transaction, data, handling, inquiry, acceptance, or reference number. Otherwise use null.
 """
 
 UTILITY_BILL_RULES = """You are a utility bill data extraction engine. Extract structured data from the OCR text below.
@@ -573,9 +589,9 @@ RULES:
 6. The total is the ご請求額 or 引落予定額 (amount to be charged).
 7. For date: use the payment/debit date (引落予定日) if shown, else the meter reading date (検針日).
 8. service_type must be one of: gas, water, electric, sewage, internet, phone. If the bill covers both 水道 (water supply) and 下水道 (sewage), use 'water' — combined water/sewage bills are water bills.
-9. Extract billing_period as start/end dates in YYYY-MM-DD format from 前回検針日 → 今回検針日 or 使用期間.
+9. Extract billing_period as start/end dates in YYYY-MM-DD format. Prefer an explicit usage period. When deriving from meter readings, start is the calendar day after the previous reading and end is the current reading date.
 10. Extract usage: amount (ご使用量), unit (m3/kWh/L), cost_per (単価, price per unit — null if not shown or if tiered pricing), meter_previous (前回指針), meter_current (今回指針).
-11. payment_method should be "bank_payment" if 口座引落/口座振替/振替 is mentioned, else null.
+11. payment_method is "bank_payment" only when bank payment is the single established tender; use null for mixed tender or when no single method is clear.
 12. Do NOT create line_items — leave as empty list.
 13. account_number is the お客様番号 if present.
 """
@@ -587,12 +603,12 @@ RULES:
 2. Amounts: Remove currency symbols (¥, $, ￥). Output as numbers, not strings.
 3. 令和7年=2025, 令和8年=2026. If OCR shows just '7年' or '8年' with no era name, assume 令和.
 4. Set document_type to "payment_slip".
-5. The merchant is the company receiving the money (受取人). Look for the 受取人 field specifically. Do NOT use the credit card company, payment processor, or intermediary (e.g., do NOT use アプラス if the 受取人 is a different company). Do NOT include 株式会社 or similar suffixes.
+5. The merchant is the company receiving the money (受取人). Look for the 受取人 field specifically. Do not substitute a card company, payment processor, or intermediary, and omit corporate suffixes.
 6. For date: use the payment date (stamp date, 収納日) if visible, else the due date (支払期限, 納付期限).
 7. The total is the 金額 (amount).
-8. payer is the person/entity making the payment (依頼人).
-9. payment_reference is any tracking/reference number on the slip.
-10. payment_method should be null unless explicitly clear (e.g., if stamp shows コンビニ, it was paid there but we use null).
+8. payer is the person or entity explicitly named as payer or addressee.
+9. payment_reference is value-only and preserves leading zeroes. Prefer one explicitly labeled receipt or slip number; only when none is printed, use one uniquely labeled transaction, data, handling, inquiry, acceptance, or reference number. Otherwise use null.
+10. payment_method is populated only when one actual tender is clearly established; use null for mixed tender or indirect payment-location evidence.
 11. Do NOT create line_items — leave as empty list.
 """
 
@@ -621,14 +637,14 @@ Respond with a single JSON object containing all extracted fields. Return only J
     return system_prompt, user_prompt
 
 
-_VERIFICATION_SYSTEM_PROMPT = """You are a receipt/invoice data extraction engine performing a VERIFICATION PASS.
+_VERIFICATION_SYSTEM_PROMPT = """You are a document data extraction engine performing a VERIFICATION PASS.
 
-Below is the original OCR text from a receipt, your previous extraction attempt, and
+Below is the original OCR text from a document, your previous extraction attempt, and
 a list of validation warnings (arithmetic errors, consistency issues).
 
 CRITICAL RULES FOR VERIFICATION:
 1. ONLY fix the specific fields mentioned in the warnings. Do NOT change other fields.
-2. Receipt totals, subtotals, and tax amounts are AUTHORITATIVE — use values printed on the receipt.
+2. Printed totals, subtotals, and tax amounts are AUTHORITATIVE — use values printed on the document.
 3. If qty × unit_price does not match total, prefer unit_price from the OCR text and set qty=1 unless an explicit multiplier (×N, N点) exists.
 4. If sum of line items does not match subtotal, look for items with qty > 1 that should be qty=1.
 5. Keep all other fields exactly as they were."""
