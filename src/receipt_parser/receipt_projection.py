@@ -1507,13 +1507,102 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
     return candidates
 
 
+def _project_balanced_descriptions_to_layout_rows(items, candidates):
+    """Replace 2+ unsupported names only from one exact ordered layout window."""
+    if not items or any(
+        not isinstance(item, dict)
+        or (item.get("qty") or 1) != 1
+        or (item.get("discount") or 0) != 0
+        or item.get("discount_rate")
+        for item in items
+    ):
+        return
+    try:
+        totals = [float(item.get("total") or 0) for item in items]
+        if any(
+            abs(float(item.get("unit_price") or 0) - total) > 2
+            for item, total in zip(items, totals, strict=False)
+        ):
+            return
+        windows = [
+            candidates[start:start + len(items)]
+            for start in range(len(candidates) - len(items) + 1)
+            if all(
+                abs(total - float(candidate["value"])) <= 2
+                for total, candidate in zip(
+                    totals,
+                    candidates[start:start + len(items)],
+                    strict=False,
+                )
+            )
+        ]
+    except (KeyError, TypeError, ValueError):
+        return
+    if len(windows) != 1:
+        return
+
+    descriptions = [
+        re.sub(
+            r'^[◎○●☆★*※＊]\s*',
+            '',
+            _clean_ocr_price_line_desc(candidate["description"]),
+        ).strip()
+        for candidate in windows[0]
+    ]
+    projected = [_norm_layout_desc(desc) for desc in descriptions]
+    current = [_norm_layout_desc(item.get("description") or "") for item in items]
+    if (
+        len(set(projected)) != len(projected)
+        or any(
+            len(norm) < 3
+            or desc in _GENERIC_DESC_MARKERS
+            or _SKIP_PRICE_LINE.search(desc)
+            or _OCR_ZONE_END_RE.match(desc)
+            for desc, norm in zip(descriptions, projected, strict=False)
+        )
+    ):
+        return
+
+    def matches(left, right):
+        return bool(
+            left
+            and right
+            and (
+                left == right
+                or left in right
+                or right in left
+                or SequenceMatcher(None, left, right).ratio() >= 0.86
+            )
+        )
+
+    matched_indices = [
+        {
+            candidate_idx
+            for candidate_idx, candidate in enumerate(projected)
+            if matches(desc, candidate)
+        }
+        for desc in current
+    ]
+    unsupported = [
+        idx for idx, owned in enumerate(matched_indices) if owned != {idx}
+    ]
+    ownership_shift = any(
+        owned and owned != {idx} for idx, owned in enumerate(matched_indices)
+    )
+    if len(unsupported) >= 2 and ownership_shift:
+        for idx in unsupported:
+            items[idx]["description"] = descriptions[idx]
+
+
 def _project_totals_to_layout_rows(extracted, ocr_layout_blocks):
     """Use preserved OCR row geometry to resolve price-token swaps.
 
     A balanced extraction may be repaired only as a pure permutation: at least
     two unique, strongly matched qty=1 rows must change while their exact value
-    multiset stays unchanged.  Otherwise this remains the existing conservative
-    off-balance repair whose geometric prices must match a financial target.
+    multiset stays unchanged. Balanced descriptions may be projected only when
+    every qty=1 row has the same amount in the same layout order and the current
+    descriptions lack unique row support. Otherwise this remains the existing
+    conservative off-balance repair whose geometric prices must match a target.
     """
     items = extracted.get("line_items") or []
     if not items or not ocr_layout_blocks:
@@ -1643,6 +1732,8 @@ def _project_totals_to_layout_rows(extracted, ocr_layout_blocks):
         return
 
     if items_sum_already_matches:
+        _project_balanced_descriptions_to_layout_rows(items, candidates)
+
         item_descs = {
             idx: _norm_layout_desc(items[idx].get("description") or "")
             for idx in qty_1_indices

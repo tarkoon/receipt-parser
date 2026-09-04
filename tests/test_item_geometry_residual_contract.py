@@ -124,6 +124,230 @@ def test_balanced_layout_projection_rejects_ambiguous_duplicate_descriptions():
     assert extracted["line_items"] == before
 
 
+def test_balanced_layout_projection_reconciles_unique_row_descriptions_only():
+    from receipt_parser.receipt_projection import _project_totals_to_layout_rows
+
+    extracted = {
+        "subtotal": 3670,
+        "total": 3670,
+        "taxes": [{"rate": "10%", "amount": 334}],
+        "line_items": [
+            _item("何回投げても大丈夫 fino 二個セット", 800),
+            _item("ボリューム エクスプレ ロング", 1380),
+            _item("ボリューム エクスプレ ロング", 1490),
+        ],
+    }
+    preserved = [
+        {key: value for key, value in item.items() if key != "description"}
+        for item in extracted["line_items"]
+    ]
+
+    _project_totals_to_layout_rows(
+        extracted,
+        _layout_rows(
+            (10, "☆何回投げても大丈夫", 800),
+            (35, "fino 二個セット", 1380),
+            (60, "ボリューム エクスプレ", 1490),
+            (85, "合計", 3670),
+        ),
+    )
+
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "何回投げても大丈夫",
+        "fino 二個セット",
+        "ボリューム エクスプレ ロング",
+    ]
+    assert [
+        {key: value for key, value in item.items() if key != "description"}
+        for item in extracted["line_items"]
+    ] == preserved
+
+
+def test_balanced_layout_projection_ignores_detached_right_column_noise():
+    from receipt_parser.receipt_projection import _project_totals_to_layout_rows
+
+    extracted = {
+        "subtotal": 473,
+        "total": 473,
+        "taxes": [],
+        "line_items": [
+            _item("BIARANIPIG", 193),
+            _item("クラフトボスイタリアー", 140),
+            _item("アップルティーソーダ", 140),
+        ],
+    }
+    layout = [{
+        "text": "BIARANIPIG",
+        "x": 1046,
+        "y": 0,
+        "bbox": [[1046, 0], [1160, 0], [1160, 15], [1046, 15]],
+    }]
+    layout.extend(_layout_rows(
+        (10, "レジ番号", 3),
+        (25, "クラフトボスイタリアー", 193),
+        (50, "◎アップルティーソーダ", 140),
+        (75, "トロピカーナアップル", 140),
+        (100, "合計", 473),
+    ))
+    preserved = [
+        {key: value for key, value in item.items() if key != "description"}
+        for item in extracted["line_items"]
+    ]
+
+    _project_totals_to_layout_rows(extracted, layout)
+
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "クラフトボスイタリアー",
+        "アップルティーソーダ",
+        "トロピカーナアップル",
+    ]
+    assert [
+        {key: value for key, value in item.items() if key != "description"}
+        for item in extracted["line_items"]
+    ] == preserved
+
+
+def test_balanced_layout_description_projection_rejects_ambiguous_rows():
+    from receipt_parser.receipt_projection import _project_totals_to_layout_rows
+
+    extracted = {
+        "subtotal": 300,
+        "total": 300,
+        "taxes": [],
+        "line_items": [_item("誤った商品甲", 200), _item("誤った商品乙", 100)],
+    }
+    before = [dict(item) for item in extracted["line_items"]]
+
+    _project_totals_to_layout_rows(
+        extracted,
+        _layout_rows(
+            (10, "候補商品甲", 200),
+            (35, "候補商品乙", 100),
+            (60, "別候補商品甲", 200),
+            (85, "別候補商品乙", 100),
+        ),
+    )
+
+    assert extracted["line_items"] == before
+
+
+def test_balanced_layout_description_projection_requires_two_unsupported_rows():
+    from receipt_parser.receipt_projection import _project_totals_to_layout_rows
+
+    extracted = {
+        "subtotal": 300,
+        "total": 300,
+        "taxes": [],
+        "line_items": [_item("商品甲ロング", 200), _item("誤った商品乙", 100)],
+    }
+    before = [dict(item) for item in extracted["line_items"]]
+
+    _project_totals_to_layout_rows(
+        extracted,
+        _layout_rows(
+            (10, "商品甲", 200),
+            (35, "正しい商品乙", 100),
+            (60, "合計", 300),
+        ),
+    )
+
+    assert extracted["line_items"] == before
+
+
+def test_balanced_layout_description_projection_rejects_all_unmatched_names():
+    from receipt_parser.receipt_projection import _project_totals_to_layout_rows
+
+    for descriptions in (
+        ("赤い果物", "青い飲料", "白い菓子"),
+        ("赤い果物", "赤い果物", "赤い果物"),
+    ):
+        extracted = {
+            "subtotal": 350,
+            "total": 350,
+            "taxes": [],
+            "line_items": [
+                _item(description, total)
+                for description, total in zip(
+                    descriptions, (200, 100, 50), strict=False
+                )
+            ],
+        }
+        before = [dict(item) for item in extracted["line_items"]]
+
+        _project_totals_to_layout_rows(
+            extracted,
+            _layout_rows(
+                (10, "乾電池パック", 200),
+                (35, "洗濯用せっけん", 100),
+                (60, "台所スポンジ", 50),
+                (85, "合計", 350),
+            ),
+        )
+
+        assert extracted["line_items"] == before
+
+
+def test_balanced_layout_description_projection_rejects_nonlocal_title_rows():
+    from receipt_parser.receipt_projection import _project_totals_to_layout_rows
+
+    for mode in ("page", "distance"):
+        extracted = {
+            "subtotal": 360,
+            "total": 360,
+            "taxes": [],
+            "line_items": [_item("誤った商品甲", 120), _item("誤った商品乙", 240)],
+        }
+        before = [dict(item) for item in extracted["line_items"]]
+        layout = _split_layout_rows(
+            (10, "PRODUCT ALPHA", "1111111", 120),
+            (60, "PRODUCT BETA", "2222222", 240),
+        )
+        if mode == "page":
+            for block in layout:
+                block["page"] = 0 if block["y"] in {10, 60} else 1
+        else:
+            for block in layout:
+                if block["y"] not in {35, 85}:
+                    continue
+                delta = 1000 - block["y"]
+                block["y"] += delta
+                for point in block["bbox"]:
+                    point[1] += delta
+
+        _project_totals_to_layout_rows(extracted, layout)
+
+        assert extracted["line_items"] == before
+
+
+def test_balanced_layout_description_projection_requires_plain_qty_one_rows():
+    from receipt_parser.receipt_projection import _project_totals_to_layout_rows
+
+    for override in (
+        {"qty": 2, "unit_price": 100},
+        {"unit_price": 210, "discount": 10},
+        {"discount_rate": "5%"},
+    ):
+        extracted = {
+            "subtotal": 300,
+            "total": 300,
+            "taxes": [],
+            "line_items": [_item("誤った商品甲", 200), _item("誤った商品乙", 100)],
+        }
+        extracted["line_items"][0].update(override)
+        before = [dict(item) for item in extracted["line_items"]]
+
+        _project_totals_to_layout_rows(
+            extracted,
+            _layout_rows(
+                (10, "正しい商品甲", 200),
+                (35, "正しい商品乙", 100),
+                (60, "合計", 300),
+            ),
+        )
+
+        assert extracted["line_items"] == before
+
+
 def test_balanced_layout_projection_owns_ascii_description_from_adjacent_detail_row():
     from receipt_parser.receipt_projection import _project_totals_to_layout_rows
 
