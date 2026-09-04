@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -117,6 +118,21 @@ def discover_fixtures(names: list[str] | None = None) -> list[tuple[str, Path, d
         truth = json.loads(truth_file.read_text(encoding="utf-8"))
         fixtures.append((base, ocr_file, truth))
         discovered.add(base)
+
+    # Explicit OCR variants (variant text + its base receipt truth, no image needed)
+    if names is not None and VARIANTS_DIR.exists():
+        for variant_file in sorted(VARIANTS_DIR.glob("*.txt")):
+            stem = variant_file.stem
+            base = re.sub(r"_v\d+$", "", stem)
+            if base == stem or stem not in names:
+                continue
+            truth_file = FIXTURES_DIR / f"{base}_truth.json"
+            if not truth_file.exists():
+                truth_file = FIXTURES_DIR / f"{base}_public_truth.json"
+            if not truth_file.exists():
+                continue
+            truth = json.loads(truth_file.read_text(encoding="utf-8"))
+            fixtures.append((stem, variant_file, truth))
 
     return fixtures
 
@@ -328,6 +344,8 @@ def _run_fixture(
     model: str,
     passes: int,
     cv_client,
+    skip_cache: bool = True,
+    save_variants: bool = True,
 ) -> tuple[str, dict]:
     """Run all iterations for a single fixture. Returns (name, fixture_data)."""
     is_ocr_text = fixture_source.suffix == ".txt"
@@ -346,11 +364,21 @@ def _run_fixture(
                     apply_user_rules=False,
                 )
             else:
+                digital_pdf = (
+                    not skip_cache
+                    and fixture_source.suffix.lower() == ".pdf"
+                    and bool(try_extract_text_layer(str(fixture_source)))
+                )
                 result = process_document(
                     fixture_source, model=model, passes=passes,
-                    apply_user_rules=False, skip_ocr_cache=True,
+                    apply_user_rules=False, skip_ocr_cache=skip_cache,
                     ocr_engine=cv_client,
                 )
+                if not skip_cache and not digital_pdf and result.get("_ocr_source") != "cache":
+                    raise RuntimeError(
+                        "Cached benchmark received non-cache OCR source: "
+                        f"{result.get('_ocr_source', 'missing')}"
+                    )
         except Exception as e:
             error = str(e)
         wall_time = time.perf_counter() - wall_start
@@ -406,11 +434,11 @@ def _run_fixture(
 
     # Finalize fixture
     fixture_data = {"runs": fixture_runs}
-    _finalize_fixture(fixture_name, fixture_data)
+    _finalize_fixture(fixture_name, fixture_data, save_variants=save_variants)
     return fixture_name, fixture_data
 
 
-def _finalize_fixture(fixture_name: str, fdata: dict):
+def _finalize_fixture(fixture_name: str, fdata: dict, *, save_variants: bool = True):
     """Compute attribution, field robustness, determinism, and save variants."""
     runs = fdata["runs"]
     if not runs:
@@ -436,12 +464,13 @@ def _finalize_fixture(fixture_name: str, fdata: dict):
 
     # Auto-save OCR variants for failing runs
     variants_saved = 0
-    for run in runs:
-        has_failure = any(not f["pass"] for f in run["fields"].values())
-        if has_failure and run.get("ocr_text"):
-            path = _save_variant(fixture_name, run["ocr_text"])
-            if path:
-                variants_saved += 1
+    if save_variants:
+        for run in runs:
+            has_failure = any(not f["pass"] for f in run["fields"].values())
+            if has_failure and run.get("ocr_text"):
+                path = _save_variant(fixture_name, run["ocr_text"])
+                if path:
+                    variants_saved += 1
 
     # Per-field robustness
     field_robustness = {}
@@ -880,11 +909,14 @@ def run_benchmark(
     force: bool = False,
     workers: int = 1,
     ci: bool = False,
+    cached_ocr: bool = False,
+    save_variants: bool = True,
 ) -> dict:
     """Main benchmark entry point."""
     # CI mode overrides
     if ci:
         runs = 1
+    use_cached_ocr = ci or cached_ocr
 
     try:
         fixtures = _select_fixtures(fixture_names)
@@ -904,8 +936,10 @@ def run_benchmark(
           f"Workers: {workers} | Passes: {passes}")
     if ci:
         print(f"CI mode: cached OCR, 1 run, exit non-zero on failure")
+    elif cached_ocr:
+        print(f"Cached OCR mode: {runs} run(s), no Vision API calls")
 
-    if ci:
+    if use_cached_ocr:
         missing_cache = _missing_cached_ocr(fixtures)
         if missing_cache:
             print(f"ERROR: cached OCR is missing for {len(missing_cache)} image page(s).")
@@ -918,7 +952,7 @@ def run_benchmark(
     has_image_fixtures = any(f[1].suffix != ".txt" for f in fixtures)
     cv_client = None
     if has_image_fixtures:
-        if ci:
+        if use_cached_ocr:
             cv_client = _CacheOnlyOCREngine()
         else:
             try:
@@ -927,8 +961,8 @@ def run_benchmark(
                 print(f"ERROR: Cloud Vision init failed: {e}")
                 sys.exit(1)
 
-        # Budget check (skip in CI mode — uses cached OCR)
-        if not ci:
+        # Budget check (cached modes make no Vision calls)
+        if not use_cached_ocr:
             image_count = sum(1 for f in fixtures if f[1].suffix != ".txt")
             estimated = _estimate_api_calls(image_count, runs)
             if not _check_budget(estimated, budget_limit, force):
@@ -946,10 +980,14 @@ def run_benchmark(
         "passes": passes,
         "workers": workers,
         "ci_mode": ci,
+        "cached_ocr": use_cached_ocr,
+        "save_variants": save_variants,
         "fixture_scope": "selected" if fixture_names is not None else "all_discovered",
         "fixture_filter": list(fixture_names) if fixture_names is not None else None,
         "fixture_count": n_fixtures,
-        "fixture_corpus_sha256": _fixture_corpus_sha256(fixtures, cached_ocr=ci),
+        "fixture_corpus_sha256": _fixture_corpus_sha256(
+            fixtures, cached_ocr=use_cached_ocr,
+        ),
         "fixture_source_counts": {
             "image": sum(1 for _, source, _ in fixtures if source.suffix != ".txt"),
             "ocr_text": sum(1 for _, source, _ in fixtures if source.suffix == ".txt"),
@@ -960,13 +998,17 @@ def run_benchmark(
     }
 
     per_fixture: dict = {}
+    skip_cache = not use_cached_ocr
 
     if workers > 1 and not ci:
         # Parallel execution across fixtures
         print(f"\nRunning {n_fixtures} fixtures with {workers} workers...")
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(_run_fixture, name, source, truth, runs, model, passes, cv_client): name
+                pool.submit(
+                    _run_fixture, name, source, truth, runs, model, passes, cv_client,
+                    skip_cache, save_variants,
+                ): name
                 for name, source, truth in fixtures
             }
             for future in as_completed(futures):
@@ -976,9 +1018,9 @@ def run_benchmark(
         # Sequential
         for fix_idx, (name, source, truth) in enumerate(fixtures):
             print(f"\n[{fix_idx + 1}/{n_fixtures}] {name}")
-            skip_cache = not ci  # CI mode uses cached OCR
             _, fdata = _run_fixture_sequential(
                 name, source, truth, runs, model, passes, cv_client, skip_cache,
+                save_variants,
             )
             per_fixture[name] = fdata
 
@@ -999,6 +1041,7 @@ def run_benchmark(
 
 def _run_fixture_sequential(
     fixture_name, fixture_source, fixture_truth, runs, model, passes, cv_client, skip_cache,
+    save_variants=True,
 ):
     """Sequential fixture runner with progress printing."""
     is_ocr_text = fixture_source.suffix == ".txt"
@@ -1080,7 +1123,7 @@ def _run_fixture_sequential(
               f"wall: {wall_time:.1f}s{fail_str}")
 
     fixture_data = {"runs": fixture_runs}
-    _finalize_fixture(fixture_name, fixture_data)
+    _finalize_fixture(fixture_name, fixture_data, save_variants=save_variants)
     return fixture_name, fixture_data
 
 
@@ -1112,6 +1155,10 @@ def main():
                         help="Concurrent fixture processing (default: 1, max: 8)")
     parser.add_argument("--ci", action="store_true",
                         help="CI mode: cached OCR, 1 run, exit non-zero on failure")
+    parser.add_argument("--cached-ocr", action="store_true",
+                        help="Use cached OCR without enabling CI pass/fail behavior")
+    parser.add_argument("--no-save-variants", action="store_false", dest="save_variants",
+                        help="Do not save failing OCR text as regression variants")
     args = parser.parse_args()
 
     compare_path = Path(args.compare) if args.compare else None
@@ -1129,6 +1176,8 @@ def main():
         force=args.force,
         workers=min(args.workers, 8),
         ci=args.ci,
+        cached_ocr=args.cached_ocr,
+        save_variants=args.save_variants,
     )
 
     if compare_path is not None:

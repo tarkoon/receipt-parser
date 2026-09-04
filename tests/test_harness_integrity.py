@@ -120,6 +120,120 @@ def test_explicit_filters_reject_empty_and_mixed_unknown(
         accuracy_module._requested_fixture_names()
 
 
+def test_benchmark_selects_exact_variant_with_base_truth(
+    benchmark_module, monkeypatch, tmp_path,
+):
+    fixtures = tmp_path / "fixtures"
+    variants = tmp_path / "variants"
+    fixtures.mkdir()
+    variants.mkdir()
+    truth = {"document_type": "receipt", "total": 123}
+    (fixtures / "receipt_7_truth.json").write_text(
+        json.dumps(truth), encoding="utf-8",
+    )
+    selected_variant = variants / "receipt_7_v2.txt"
+    selected_variant.write_text("selected OCR", encoding="utf-8")
+    (variants / "receipt_7_v1.txt").write_text("other OCR", encoding="utf-8")
+    monkeypatch.setattr(benchmark_module, "FIXTURES_DIR", fixtures)
+    monkeypatch.setattr(benchmark_module, "OCR_FIXTURES_DIR", tmp_path / "named")
+    monkeypatch.setattr(benchmark_module, "VARIANTS_DIR", variants)
+
+    assert benchmark_module.discover_fixtures() == []
+    selected = benchmark_module._select_fixtures(["receipt_7_v2"])
+
+    assert selected == [("receipt_7_v2", selected_variant, truth)]
+
+
+def test_benchmark_can_disable_variant_autosave(benchmark_module, monkeypatch):
+    run = {
+        "passed": False,
+        "pass_count": 0,
+        "total_fields": 1,
+        "fields": {"total": {"pass": False}},
+        "ocr": {"confidence": None, "retried": False},
+        "ocr_text": "failing OCR",
+    }
+    monkeypatch.setattr(
+        benchmark_module, "_save_variant",
+        lambda *_args, **_kwargs: pytest.fail("variant autosave was not disabled"),
+    )
+
+    fixture = {"runs": [run]}
+    benchmark_module._finalize_fixture("receipt_7", fixture, save_variants=False)
+
+    assert fixture["variants_saved"] == 0
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_cached_ocr_mode_keeps_run_count_and_never_initializes_vision(
+    benchmark_module, monkeypatch, tmp_path, workers,
+):
+    image = tmp_path / "receipt.png"
+    image.write_bytes(b"fixture bytes")
+    fixture = ("receipt_7", image, {"total": 123})
+    calls = []
+
+    monkeypatch.setattr(benchmark_module, "_select_fixtures", lambda _names: [fixture])
+    monkeypatch.setattr(benchmark_module, "_missing_cached_ocr", lambda _fixtures: [])
+    monkeypatch.setattr(benchmark_module, "check_model_available", lambda _model: None)
+    monkeypatch.setattr(
+        benchmark_module, "init_cloud_vision",
+        lambda: pytest.fail("cached OCR initialized Cloud Vision"),
+    )
+    monkeypatch.setattr(benchmark_module, "_get_git_state", lambda: {})
+    monkeypatch.setattr(
+        benchmark_module, "_fixture_corpus_sha256",
+        lambda _fixtures, *, cached_ocr: "cached" if cached_ocr else "fresh",
+    )
+
+    def capture_runner(*args):
+        calls.append(args)
+        return args[0], {"runs": []}
+
+    monkeypatch.setattr(benchmark_module, "_run_fixture", capture_runner)
+    monkeypatch.setattr(benchmark_module, "_run_fixture_sequential", capture_runner)
+    monkeypatch.setattr(
+        benchmark_module, "_assemble_results",
+        lambda metadata, _fixtures: {"metadata": metadata, "summary": {"fragile": []}},
+    )
+    monkeypatch.setattr(benchmark_module, "_save_results", lambda *_args: None)
+    monkeypatch.setattr(benchmark_module, "_print_summary", lambda *_args: None)
+
+    result = benchmark_module.run_benchmark(
+        runs=7, workers=workers, cached_ocr=True, output_path=tmp_path / "result.json",
+    )
+
+    assert len(calls) == 1
+    assert calls[0][3] == 7
+    assert isinstance(calls[0][6], benchmark_module._CacheOnlyOCREngine)
+    assert calls[0][7] is False
+    assert result["metadata"]["runs_per_fixture"] == 7
+    assert result["metadata"]["cached_ocr"] is True
+    assert result["metadata"]["ci_mode"] is False
+
+
+def test_cached_ocr_mode_fails_closed_when_cache_is_missing(
+    benchmark_module, monkeypatch, tmp_path,
+):
+    image = tmp_path / "receipt.png"
+    image.write_bytes(b"fixture bytes")
+    missing = tmp_path / "missing-cache.txt"
+    monkeypatch.setattr(
+        benchmark_module, "_select_fixtures",
+        lambda _names: [("receipt_7", image, {"total": 123})],
+    )
+    monkeypatch.setattr(benchmark_module, "_missing_cached_ocr", lambda _fixtures: [missing])
+    monkeypatch.setattr(
+        benchmark_module, "init_cloud_vision",
+        lambda: pytest.fail("missing cached OCR fell back to Cloud Vision"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        benchmark_module.run_benchmark(cached_ocr=True, output_path=tmp_path / "result.json")
+
+    assert exc.value.code == 1
+
+
 def test_accuracy_discovers_cached_images_without_vision_configuration(
     accuracy_module, monkeypatch, tmp_path,
 ):
