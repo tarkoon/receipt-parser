@@ -263,13 +263,20 @@ def _recover_header_branch_store_location(extracted: dict, ocr_text: str) -> Non
         extracted["location"] = deferred_generic_candidate
         return
 
-    if current_location:
+    normalize_embedded_host = bool(
+        current_location
+        and _is_ascii_brand_location_suffix(current_location)
+        and not ADMIN_SUFFIX_RE.search(current_location)
+        and not _HEADER_LOCATION_SUFFIX_RE.search(current_location)
+    )
+    if current_location and not normalize_embedded_host:
         return
 
     merchant_tokens = re.findall(
         r'[A-Za-z0-9&.\'-]{2,}|[ぁ-んー]{2,}|[ァ-ンー]{2,}|[一-龥]{2,}',
         str(extracted.get("merchant") or ""),
     )
+    embedded_host_places = set()
     for phone_idx, raw_line in enumerate(header_lines):
         if not re.search(r'TEL|電話|☎|[（(]\s*0\d{1,4}\s*[）)]|^0\d{1,4}[-\s]', raw_line, re.IGNORECASE):
             continue
@@ -287,6 +294,8 @@ def _recover_header_branch_store_location(extracted: dict, ocr_text: str) -> Non
             )
             if not candidate:
                 continue
+            if current_location and candidate != current_location:
+                continue
             if candidate == merchant:
                 continue
             if candidate in merchant:
@@ -302,8 +311,18 @@ def _recover_header_branch_store_location(extracted: dict, ocr_text: str) -> Non
                 continue
             trailing_place = re.search(r'([一-龥]{2,})$', candidate)
             if trailing_place:
+                if current_location:
+                    if (
+                        trailing_place.start() > 0
+                        and len(re.findall(r'[一-龥]{2,}', candidate)) == 1
+                    ):
+                        embedded_host_places.add(trailing_place.group(1))
+                    continue
                 extracted["location"] = trailing_place.group(1)
                 return
+
+    if len(embedded_host_places) == 1:
+        extracted["location"] = embedded_host_places.pop()
 
     if was_replaceable_noise:
         extracted.pop("location", None)

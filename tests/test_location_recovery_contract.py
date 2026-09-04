@@ -61,3 +61,30 @@ def test_generic_head_office_label_is_not_a_one_character_branch():
     _recover_header_branch_store_location(extracted, ocr_text)
 
     assert extracted.get("location") is None
+
+
+def test_phone_backed_host_line_yields_its_unique_trailing_locality():
+    extracted = {"merchant": "架空商店", "location": "モール北丘"}
+    ocr_text = "架空商店\nモール北丘\n領収証\nTEL 012-345-6789\n合計"
+
+    _recover_header_branch_store_location(extracted, ocr_text)
+
+    assert extracted["location"] == "北丘"
+
+
+def test_phone_backed_host_line_preserves_an_explicit_store_location():
+    extracted = {"merchant": "架空商店", "location": "モール北丘店"}
+    ocr_text = "架空商店\nモール北丘店\n領収証\nTEL 012-345-6789\n合計"
+
+    _recover_header_branch_store_location(extracted, ocr_text)
+
+    assert extracted["location"] == "モール北丘店"
+
+
+def test_phone_backed_host_line_fails_closed_on_multiple_locality_runs():
+    extracted = {"merchant": "架空商店", "location": "モール北丘プラザ南丘"}
+    ocr_text = "架空商店\nモール北丘プラザ南丘\n領収証\nTEL 012-345-6789\n合計"
+
+    _recover_header_branch_store_location(extracted, ocr_text)
+
+    assert extracted["location"] == "モール北丘プラザ南丘"
