@@ -495,3 +495,128 @@ def test_repeated_item_projection_rejects_standalone_party_count_as_description(
         )
 
         assert [item["description"] for item in items] == ["テイクアウト"] * 2
+
+
+def _recover_gap_group(lines, items, unmatched_prices, target):
+    from receipt_parser.receipt_recovery import (
+        _recover_multiple_missing_items_from_gap,
+    )
+
+    extracted = {"line_items": [dict(item) for item in items], "taxes": []}
+    recovered = _recover_multiple_missing_items_from_gap(
+        extracted,
+        "\n".join(lines),
+        lines,
+        extracted["line_items"],
+        unmatched_prices,
+        sum(item["total"] for item in items),
+        [target],
+    )
+    return recovered, extracted["line_items"]
+
+
+def test_gap_recovery_includes_unique_marked_inline_bag_in_three_row_group():
+    lines = [
+        "2099/1/1 00:00",
+        "既存商品 100*",
+        "行政指定ごみ袋 652非",
+        "追加商品",
+        "2",
+        "食品ポリ袋 3除",
+        "小計",
+        "993",
+    ]
+
+    recovered, items = _recover_gap_group(
+        lines,
+        [_item("既存商品", 100)],
+        [(2, 652), (5, 3)],
+        993,
+    )
+
+    assert recovered
+    assert [(item["description"], item["total"]) for item in items] == [
+        ("既存商品", 100),
+        ("行政指定ごみ袋", 652.0),
+        ("追加商品", 238.0),
+        ("食品ポリ袋", 3.0),
+    ]
+
+
+def test_gap_recovery_rejects_ambiguous_inline_bags_instead_of_falling_back():
+    original = [_item("既存商品", 100)]
+    lines = [
+        "2099/1/1 00:00",
+        "既存商品 100*",
+        "行政指定ごみ袋 652非",
+        "追加商品",
+        "2",
+        "食品ポリ袋 3除",
+        "レジ袋 5除",
+        "小計",
+        "998",
+    ]
+
+    recovered, items = _recover_gap_group(
+        lines,
+        original,
+        [(2, 652), (5, 3), (6, 5)],
+        998,
+    )
+
+    assert not recovered
+    assert items == original
+
+
+def test_gap_recovery_rejects_inline_bag_with_only_adjacent_tax_marker():
+    original = [_item("既存商品", 100)]
+    lines = [
+        "2099/1/1 00:00",
+        "既存商品 100*",
+        "行政指定ごみ袋 652非",
+        "追加商品",
+        "2",
+        "食品ポリ袋 3",
+        "除",
+        "小計",
+        "993",
+    ]
+
+    recovered, items = _recover_gap_group(
+        lines,
+        original,
+        [(2, 652), (5, 3)],
+        993,
+    )
+
+    assert not recovered
+    assert items == original
+
+
+def test_gap_recovery_does_not_duplicate_represented_inline_bag():
+    original = [_item("既存商品", 100), _item("食品ポリ袋", 3)]
+    lines = [
+        "2099/1/1 00:00",
+        "既存商品 100*",
+        "行政指定ごみ袋 652非",
+        "追加商品",
+        "2",
+        "食品ポリ袋 3除",
+        "小計",
+        "993",
+    ]
+
+    recovered, items = _recover_gap_group(
+        lines,
+        original,
+        [(2, 652), (5, 3)],
+        993,
+    )
+
+    assert recovered
+    assert [(item["description"], item["total"]) for item in items] == [
+        ("既存商品", 100),
+        ("行政指定ごみ袋", 652.0),
+        ("追加商品", 238.0),
+        ("食品ポリ袋", 3),
+    ]

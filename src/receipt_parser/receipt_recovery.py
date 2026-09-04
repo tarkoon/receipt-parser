@@ -109,6 +109,23 @@ def _recover_multiple_missing_items_from_gap(
         idx: amount for idx, amount in unmatched_prices
         if start_idx <= idx < end_idx
     }
+    raw_inline_bags: list[dict] = []
+    for idx, amount in unmatched_by_idx.items():
+        desc = _clean_desc(lines[idx])
+        desc_norm = _norm_desc(desc)
+        if (
+            0 < float(amount) <= 50
+            and _is_bag_description(desc)
+            and not any(desc_norm and desc_norm in existing for existing in existing_descs)
+        ):
+            marker_m = re.search(r'([%％*＊※除軽非]+)\s*$', lines[idx].strip())
+            raw_inline_bags.append({
+                "desc": desc,
+                "desc_idx": idx,
+                "price_idx": idx,
+                "amount": float(amount),
+                "marker": marker_m.group(1) if marker_m else "",
+            })
 
     clear_candidates: list[dict] = []
     fragment_candidates: list[dict] = []
@@ -174,48 +191,100 @@ def _recover_multiple_missing_items_from_gap(
             "discount_rate": "",
         }
 
-    def _candidate_pairs_for_gap(gap: float) -> list[tuple[dict, dict]]:
-        pairs: list[tuple[dict, dict]] = []
-        for left_idx, left in enumerate(clear_candidates):
-            for right in clear_candidates[left_idx + 1:]:
-                if left["desc_idx"] == right["desc_idx"]:
+    if raw_inline_bags and (
+        len(raw_inline_bags) != 1
+        or _tax_category_from_marker(str(raw_inline_bags[0].get("marker") or "")) is None
+    ):
+        return False
+    required_bag = None
+    if raw_inline_bags:
+        matches = [
+            candidate for candidate in clear_candidates
+            if candidate["desc_idx"] == raw_inline_bags[0]["desc_idx"]
+            and candidate["price_idx"] == raw_inline_bags[0]["price_idx"]
+        ]
+        if len(matches) != 1:
+            return False
+        required_bag = matches[0]
+
+    def _fill_fragment(group: tuple[dict, ...], fragment: dict, gap: float) -> dict | None:
+        if any(
+            fragment["desc_idx"] == candidate["desc_idx"]
+            or fragment["price_idx"] == candidate["price_idx"]
+            for candidate in group
+        ):
+            return None
+        remaining = gap - sum(float(candidate["amount"]) for candidate in group)
+        if remaining <= 0 or remaining > gap:
+            return None
+        remaining_text = str(int(round(remaining)))
+        if not remaining_text.startswith(str(fragment["fragment"])):
+            return None
+        if len(str(fragment["fragment"])) >= len(remaining_text):
+            return None
+        filled = dict(fragment)
+        filled["amount"] = float(remaining)
+        return filled
+
+    def _candidate_groups_for_gap(gap: float) -> list[tuple[dict, ...]]:
+        groups: list[tuple[dict, ...]] = []
+        if required_bag is None:
+            for left_idx, left in enumerate(clear_candidates):
+                for right in clear_candidates[left_idx + 1:]:
+                    if (
+                        left["desc_idx"] == right["desc_idx"]
+                        or left["price_idx"] == right["price_idx"]
+                    ):
+                        continue
+                    if abs(float(left["amount"]) + float(right["amount"]) - gap) <= 2:
+                        groups.append((left, right))
+                for fragment in fragment_candidates:
+                    filled = _fill_fragment((left,), fragment, gap)
+                    if filled is not None:
+                        groups.append((left, filled))
+            return groups
+
+        other_clear = [candidate for candidate in clear_candidates if candidate is not required_bag]
+        for clear in other_clear:
+            if (
+                clear["desc_idx"] != required_bag["desc_idx"]
+                and clear["price_idx"] != required_bag["price_idx"]
+                and abs(float(required_bag["amount"]) + float(clear["amount"]) - gap) <= 2
+            ):
+                groups.append((required_bag, clear))
+        for fragment in fragment_candidates:
+            filled = _fill_fragment((required_bag,), fragment, gap)
+            if filled is not None:
+                groups.append((required_bag, filled))
+            for clear in other_clear:
+                if (
+                    clear["desc_idx"] == required_bag["desc_idx"]
+                    or clear["price_idx"] == required_bag["price_idx"]
+                ):
                     continue
-                if abs(float(left["amount"]) + float(right["amount"]) - gap) <= 2:
-                    pairs.append((left, right))
-            remaining = gap - float(left["amount"])
-            if remaining <= 0 or remaining > gap:
-                continue
-            remaining_text = str(int(round(remaining)))
-            for fragment in fragment_candidates:
-                if fragment["desc_idx"] == left["desc_idx"]:
-                    continue
-                if not remaining_text.startswith(str(fragment["fragment"])):
-                    continue
-                if len(str(fragment["fragment"])) >= len(remaining_text):
-                    continue
-                filled = dict(fragment)
-                filled["amount"] = float(remaining)
-                pairs.append((left, filled))
-        return pairs
+                filled = _fill_fragment((required_bag, clear), fragment, gap)
+                if filled is not None:
+                    groups.append((required_bag, clear, filled))
+        return groups
 
     successful: list[tuple[float, list[dict]]] = []
     for target in try_targets:
         gap = float(target) - float(items_sum)
         if gap <= 0 or gap > float(target):
             continue
-        pairs = _candidate_pairs_for_gap(gap)
-        unique_pairs: list[tuple[dict, dict]] = []
+        groups = _candidate_groups_for_gap(gap)
+        unique_groups: list[tuple[dict, ...]] = []
         seen_keys = set()
-        for left, right in pairs:
-            ordered = sorted((left, right), key=lambda c: (c["desc_idx"], c["price_idx"]))
+        for group in groups:
+            ordered = sorted(group, key=lambda c: (c["desc_idx"], c["price_idx"]))
             key = tuple((c["desc"], int(round(float(c["amount"])))) for c in ordered)
             if key not in seen_keys:
                 seen_keys.add(key)
-                unique_pairs.append((ordered[0], ordered[1]))
-        if len(unique_pairs) != 1:
+                unique_groups.append(tuple(ordered))
+        if len(unique_groups) != 1:
             continue
 
-        ordered = list(unique_pairs[0])
+        ordered = list(unique_groups[0])
         proposed = [dict(item) for item in items if isinstance(item, dict)]
         proposed.extend(_make_item(candidate, float(candidate["amount"])) for candidate in ordered)
         if abs(sum(float(item.get("total") or 0) for item in proposed) - float(target)) > 2:
