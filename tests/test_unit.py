@@ -643,6 +643,97 @@ def test_prompt_includes_hints_and_aliases():
     assert "Look for labels:" in prompt
 
 
+def test_clean_receipt_pass_budget_retains_independent_seed43_candidate(monkeypatch):
+    base = {
+        "document_type": "receipt",
+        "merchant": "BASE",
+        "currency": "JPY",
+        "total": 100,
+        "subtotal": 100,
+        "taxes": [],
+        "line_items": [
+            {"description": "A", "qty": 1, "unit_price": 100, "total": 100},
+        ],
+    }
+    alternate = {
+        **base,
+        "merchant": "ALTERNATE",
+    }
+    seed_offsets = []
+
+    monkeypatch.setattr(
+        llm_module,
+        "extract_with_llm",
+        lambda *args, **kwargs: (base, llm_module.LLMResult(content="{}")),
+    )
+
+    def fake_alt(*args, **kwargs):
+        seed_offsets.append(kwargs["seed_offset"])
+        return alternate, llm_module.LLMResult(content="{}"), None
+
+    monkeypatch.setattr(llm_module, "_alternate_seed_extract_with_result", fake_alt)
+
+    extracted, history = llm_module.extract_with_verification(
+        "OCR", passes=2, validate_fn=lambda receipt: []
+    )
+
+    candidates = [
+        entry for entry in history
+        if entry.get("retry_kind") == "candidate_diversity"
+    ]
+    assert extracted == base
+    assert seed_offsets == [1]
+    assert len(candidates) == 1
+    assert candidates[0]["seed"] == 43
+    assert candidates[0]["extraction"] == alternate
+
+
+def test_duplicate_cross_seed43_candidate_is_reused_with_warnings(monkeypatch):
+    base = {
+        "document_type": "receipt",
+        "merchant": "BASE",
+        "currency": "JPY",
+        "total": 100,
+        "subtotal": 100,
+        "taxes": [],
+        "line_items": [
+            {"description": "A", "qty": 1, "unit_price": 50, "total": 50},
+            {"description": "A", "qty": 1, "unit_price": 50, "total": 50},
+        ],
+    }
+    alternate = {
+        **base,
+        "merchant": "ALTERNATE",
+    }
+    seed_offsets = []
+
+    monkeypatch.setattr(
+        llm_module,
+        "extract_with_llm",
+        lambda *args, **kwargs: (base, llm_module.LLMResult(content="{}")),
+    )
+
+    def fake_alt(*args, **kwargs):
+        seed_offsets.append(kwargs["seed_offset"])
+        return alternate, llm_module.LLMResult(content="{}"), None
+
+    monkeypatch.setattr(llm_module, "_alternate_seed_extract_with_result", fake_alt)
+
+    _extracted, history = llm_module.extract_with_verification(
+        "OCR", passes=1,
+        validate_fn=lambda receipt: ["Unresolved receipt warning"],
+    )
+
+    candidates = [
+        entry for entry in history
+        if entry.get("retry_kind") == "candidate_diversity"
+    ]
+    assert seed_offsets == [1]
+    assert len(candidates) == 1
+    assert candidates[0]["extraction"] == alternate
+    assert candidates[0]["llm_timing"]["backend"] == "unknown"
+
+
 def test_sanity_retry_records_rejected_candidates(monkeypatch):
     base = {
         "document_type": "receipt",

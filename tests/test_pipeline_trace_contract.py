@@ -326,6 +326,118 @@ def test_candidate_selection_prefers_explicit_printed_item_count_when_balanced(
     assert history[0]["postprocess_selected"] is True
 
 
+def test_candidate_selection_considers_cross_alt_and_deduplicates(monkeypatch):
+    from receipt_parser import pipeline
+
+    base = _extraction(line_items=[{
+        "description": "item",
+        "qty": 1,
+        "unit_price": 90,
+        "total": 90,
+    }])
+    alternate = _extraction(line_items=[{
+        "description": "item",
+        "qty": 1,
+        "unit_price": 100,
+        "total": 100,
+    }])
+    history = [{
+        "pass": "1-cross",
+        "extraction": dict(base),
+        "alt_extraction": alternate,
+        "warnings": [],
+    }]
+    postprocess_calls = []
+
+    def postprocess(extracted, *_args, **_kwargs):
+        postprocess_calls.append(extracted["line_items"][0]["total"])
+        return extracted
+
+    monkeypatch.setattr(pipeline, "postprocess_receipt", postprocess)
+    monkeypatch.setattr(
+        pipeline,
+        "_apply_final_receipt_output_repairs",
+        lambda *_args, **_kwargs: None,
+    )
+
+    selected = pipeline._select_receipt_postprocessed_candidate(
+        base,
+        history,
+        "STORE\n合計 ¥100",
+        0.9,
+        {},
+        "test-model",
+        None,
+    )
+
+    assert selected["line_items"][0]["total"] == 100
+    assert postprocess_calls == [90, 100]
+    assert history[0]["postprocess_selected"] is True
+    assert history[0]["postprocess_selected_source"] == "alt_extraction"
+    assert history[0]["postprocess_items_sum_gap"] == 0
+    assert history[0]["postprocess_candidates"]["extraction"]["items_sum_gap"] == 10
+    assert history[0]["postprocess_candidates"]["alt_extraction"]["items_sum_gap"] == 0
+
+
+def test_candidate_selection_scores_late_repaired_copy_but_returns_pre_final(
+    monkeypatch,
+):
+    from receipt_parser import pipeline
+
+    base = _extraction(
+        merchant="BASE",
+        line_items=[{
+            "description": "item",
+            "qty": 1,
+            "unit_price": 99,
+            "total": 99,
+        }],
+    )
+    late_repair_candidate = _extraction(
+        merchant="LATE REPAIR",
+        line_items=[{
+            "description": "item",
+            "qty": 1,
+            "unit_price": 90,
+            "total": 90,
+        }],
+    )
+    history = _history(late_repair_candidate)
+
+    monkeypatch.setattr(
+        pipeline,
+        "postprocess_receipt",
+        lambda extracted, *_args, **_kwargs: extracted,
+    )
+
+    def apply_late_repairs(result, *_args, **_kwargs):
+        if result["merchant"] == "LATE REPAIR":
+            result["line_items"][0]["unit_price"] = 100
+            result["line_items"][0]["total"] = 100
+
+    monkeypatch.setattr(
+        pipeline,
+        "_apply_final_receipt_output_repairs",
+        apply_late_repairs,
+    )
+
+    selected = pipeline._select_receipt_postprocessed_candidate(
+        base,
+        history,
+        "STORE\n合計 ¥100",
+        0.9,
+        {},
+        "test-model",
+        None,
+    )
+
+    assert selected["merchant"] == "LATE REPAIR"
+    assert selected["line_items"][0]["total"] == 90
+    assert late_repair_candidate["line_items"][0]["total"] == 90
+    assert history[0]["postprocess_items_sum_gap"] == 0
+    assert history[0]["postprocess_selected"] is True
+
+
 def test_candidate_selection_validates_malformed_merchant_before_postprocess(
     monkeypatch,
 ):

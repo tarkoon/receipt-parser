@@ -938,18 +938,50 @@ def _select_receipt_postprocessed_candidate(
     """Post-process all captured receipt candidates and keep the cleanest one.
 
     Raw LLM retry scoring can miss candidates that deterministic post-processing
-    repairs cleanly. This selector scores the post-processed reality while still
+    repairs cleanly. This selector scores a copy after final output repairs while
     preserving each history entry's raw extraction for diagnostics.
     """
-    candidate_refs: list[tuple[int | None, dict]] = [(None, extracted)]
+    candidate_refs: list[tuple[list[tuple[int, str]], dict]] = [([], extracted)]
     for idx, entry in enumerate(pass_history):
-        candidate = entry.get("extraction")
-        if not candidate or not isinstance(candidate, dict) or "error" in candidate:
-            continue
-        candidate_refs.append((idx, candidate))
+        entry["postprocess_selected"] = False
+        entry.pop("postprocess_selected_source", None)
+        entry["postprocess_candidates"] = {}
+        for key in ("extraction", "alt_extraction"):
+            candidate = entry.get(key)
+            if not candidate or not isinstance(candidate, dict) or "error" in candidate:
+                continue
+            # ponytail: pass budgets are tiny; replace with stable hashes only if that ceiling grows.
+            duplicate = next(
+                (ref for ref in candidate_refs if ref[1] == candidate),
+                None,
+            )
+            if duplicate is not None:
+                if not any(source_idx == idx for source_idx, _key in duplicate[0]):
+                    duplicate[0].append((idx, key))
+                continue
+            candidate_refs.append(([(idx, key)], candidate))
 
-    best: tuple[tuple, int, dict, list[str], int | None, list[dict] | None] | None = None
-    for order, (history_idx, candidate) in enumerate(candidate_refs):
+    def record_metrics(
+        sources: list[tuple[int, str]],
+        gap: float | None,
+        warnings: list[str],
+    ) -> None:
+        for history_idx, source_key in sources:
+            entry = pass_history[history_idx]
+            metrics = {
+                "items_sum_gap": gap,
+                "warning_count": len(warnings),
+                "warnings": warnings,
+                "selected": False,
+            }
+            entry["postprocess_candidates"][source_key] = metrics
+            if source_key == "extraction":
+                entry["postprocess_items_sum_gap"] = gap
+                entry["postprocess_warning_count"] = len(warnings)
+                entry["postprocess_warnings"] = warnings
+
+    best: tuple[tuple, int, dict, list[str], list[tuple[int, str]], list[dict] | None] | None = None
+    for order, (sources, candidate) in enumerate(candidate_refs):
         postprocessed = deepcopy(candidate)
         llm_conf = postprocessed.get("_confidence")
         candidate_trace: list[dict] | None = [] if mutation_trace is not None else None
@@ -963,12 +995,7 @@ def _select_receipt_postprocessed_candidate(
         )
         if schema_error:
             warnings = [schema_error]
-            if history_idx is not None:
-                entry = pass_history[history_idx]
-                entry["postprocess_items_sum_gap"] = None
-                entry["postprocess_warning_count"] = 1
-                entry["postprocess_warnings"] = warnings
-                entry["postprocess_selected"] = False
+            record_metrics(sources, None, warnings)
             continue
         assert canonical is not None
         postprocessed = canonical
@@ -999,12 +1026,7 @@ def _select_receipt_postprocessed_candidate(
         )
         if schema_error:
             warnings = [schema_error]
-            if history_idx is not None:
-                entry = pass_history[history_idx]
-                entry["postprocess_items_sum_gap"] = None
-                entry["postprocess_warning_count"] = 1
-                entry["postprocess_warnings"] = warnings
-                entry["postprocess_selected"] = False
+            record_metrics(sources, None, warnings)
             continue
         assert canonical is not None and receipt is not None
         postprocessed = canonical
@@ -1014,29 +1036,45 @@ def _select_receipt_postprocessed_candidate(
             before,
             postprocessed,
         )
+        scoring_view = deepcopy(postprocessed)
+        _apply_final_receipt_output_repairs(
+            scoring_view,
+            unified_text,
+            ocr_layout_blocks=ocr_layout_blocks,
+        )
+        canonical, receipt, schema_error = _canonicalize_extracted_receipt(
+            scoring_view
+        )
+        if schema_error:
+            warnings = [schema_error]
+            record_metrics(sources, None, warnings)
+            continue
+        assert canonical is not None and receipt is not None
+        scoring_view = canonical
         warnings = validate_receipt(receipt)
         for warning in receipt._soft_warnings:
             if warning not in warnings:
                 warnings.append(warning)
-        score = _receipt_candidate_score(postprocessed, warnings, unified_text)
+        score = _receipt_candidate_score(scoring_view, warnings, unified_text)
+        record_metrics(sources, _receipt_items_target_gap(scoring_view), warnings)
 
-        if history_idx is not None:
-            entry = pass_history[history_idx]
-            entry["postprocess_items_sum_gap"] = _receipt_items_target_gap(postprocessed)
-            entry["postprocess_warning_count"] = len(warnings)
-            entry["postprocess_warnings"] = warnings
-            entry["postprocess_selected"] = False
-
-        ranked = (score, order, postprocessed, warnings, history_idx, candidate_trace)
+        ranked = (score, order, postprocessed, warnings, sources, candidate_trace)
         if best is None or ranked[:2] < best[:2]:
             best = ranked
 
     if best is None:
         return extracted
 
-    _score, _order, best_extracted, _warnings, best_history_idx, best_trace = best
-    if best_history_idx is not None:
-        pass_history[best_history_idx]["postprocess_selected"] = True
+    _score, _order, best_extracted, _warnings, best_sources, best_trace = best
+    for history_idx, source_key in best_sources:
+        entry = pass_history[history_idx]
+        metrics = entry["postprocess_candidates"][source_key]
+        metrics["selected"] = True
+        entry["postprocess_items_sum_gap"] = metrics["items_sum_gap"]
+        entry["postprocess_warning_count"] = metrics["warning_count"]
+        entry["postprocess_warnings"] = metrics["warnings"]
+        entry["postprocess_selected"] = True
+        entry["postprocess_selected_source"] = source_key
     if mutation_trace is not None and best_trace:
         mutation_trace.extend(best_trace)
     return best_extracted

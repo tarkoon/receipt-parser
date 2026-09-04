@@ -563,26 +563,6 @@ def _has_duplicate_descs(extracted: dict) -> bool:
     return False
 
 
-def _alternate_seed_extract(
-    ocr_text: str, model: str, doc_type: str, seed_offset: int = 1,
-) -> dict | None:
-    """Re-run extraction with a non-default seed using the SAME extraction
-    prompt — not verification.
-
-    Verification prompts bias toward the previous pass's mistake; for cross-
-    check we want an independent extraction. Returns parsed dict or None on
-    failure.
-
-    seed_offset: 1 → seed=43, 2 → seed=44, etc.
-    """
-    parsed, _, error_reason = _alternate_seed_extract_with_result(
-        ocr_text, model, doc_type, seed_offset=seed_offset
-    )
-    if error_reason:
-        return None
-    return parsed
-
-
 def _alternate_seed_extract_with_result(
     ocr_text: str, model: str, doc_type: str, seed_offset: int = 1,
 ) -> tuple[dict | None, LLMResult | None, str | None]:
@@ -970,9 +950,31 @@ def extract_with_verification(
     # 1, look for an alternate-pass item with the same total but a distinct
     # description. Substitute. This fixes the common LLM failure mode where
     # the model copies a nearby item's name onto a distinct adjacent row.
+    seed43_attempted = False
+    seed43_extracted = None
+    seed43_result = None
+    seed43_error = None
+    seed43_retained = False
     if "error" not in extracted and _has_duplicate_descs(extracted):
-        alt_extracted = _alternate_seed_extract(ocr_text, model, doc_type)
-        if alt_extracted is not None and "error" not in alt_extracted:
+        seed43_attempted = True
+        if _notify is not None and passes >= 2:
+            _notify(
+                on_stage, "extract", f"LLM pass 2 of {passes}",
+                _pass_progress(2),
+                payload={"pass": 2, "pass_budget": passes,
+                         "candidate_only": True, "cross_check": True},
+            )
+        seed43_extracted, seed43_result, seed43_error = (
+            _alternate_seed_extract_with_result(
+                ocr_text, model, doc_type, seed_offset=1
+            )
+        )
+        alt_extracted = seed43_extracted
+        if (
+            seed43_error is None
+            and alt_extracted is not None
+            and "error" not in alt_extracted
+        ):
             substituted = _substitute_dup_descs_from_alt(extracted, alt_extracted)
             if substituted > 0:
                 # Re-validate after substitution
@@ -987,8 +989,9 @@ def extract_with_verification(
                     "pass": "1-cross", "extraction": deepcopy(extracted),
                     "warnings": alt_warnings, "alt_extraction": deepcopy(alt_extracted),
                     "substitutions": substituted,
-                    "llm_timing": None,
+                    "llm_timing": _llm_result_to_timing(seed43_result),
                 })
+                seed43_retained = True
                 warnings = alt_warnings
 
     # Track the best extraction across all passes. Two filters apply:
@@ -1003,6 +1006,7 @@ def extract_with_verification(
     best_extracted = extracted
     best_warnings = warnings
     best_llm_warnings = _llm_correctable(warnings)
+    clean_early_exit = not best_llm_warnings
 
     for pass_num in range(2, passes + 1):
         if not best_llm_warnings:
@@ -1056,6 +1060,68 @@ def extract_with_verification(
             best_extracted = pass_extracted
             best_warnings = pass_warnings
             best_llm_warnings = pass_llm_warnings
+
+    # Retain a duplicate cross-check result even when it made no substitution.
+    # A clean receipt otherwise spends only pass 1, so use its remaining pass
+    # budget for the same independent seed-43 candidate.
+    needs_clean_candidate = (
+        doc_type == "receipt"
+        and passes >= 2
+        and clean_early_exit
+        and "error" not in extracted
+        and not seed43_attempted
+    )
+    if needs_clean_candidate or (seed43_attempted and not seed43_retained):
+        if not seed43_attempted:
+            if _notify is not None:
+                _notify(
+                    on_stage, "extract", f"LLM pass 2 of {passes}",
+                    _pass_progress(2),
+                    payload={"pass": 2, "pass_budget": passes,
+                             "candidate_only": True},
+                )
+            seed43_extracted, seed43_result, seed43_error = (
+                _alternate_seed_extract_with_result(
+                    ocr_text, model, doc_type, seed_offset=1
+                )
+            )
+        if (
+            seed43_error is None
+            and seed43_extracted is not None
+            and "error" not in seed43_extracted
+        ):
+            seed43_warnings: list[str] = []
+            if validate_fn:
+                try:
+                    seed43_warnings = validate_fn(Receipt(**seed43_extracted))
+                except Exception:
+                    seed43_warnings = ["Schema validation failed on seed-43 candidate"]
+            history.append({
+                "pass": "candidate-seed43",
+                "retry_kind": "candidate_diversity",
+                "candidate_only": True,
+                "seed": _LLM_SEED + 1,
+                "extraction": deepcopy(seed43_extracted),
+                "warnings": seed43_warnings,
+                "llm_timing": _llm_result_to_timing(seed43_result),
+            })
+        else:
+            rejection_reason = seed43_error or "invalid_extraction"
+            history.append({
+                "pass": "candidate-seed43",
+                "retry_kind": "candidate_diversity",
+                "candidate_only": True,
+                "seed": _LLM_SEED + 1,
+                "accepted": False,
+                "rejection_reason": rejection_reason,
+                "extraction": (
+                    deepcopy(seed43_extracted)
+                    if seed43_extracted is not None
+                    else {"error": rejection_reason}
+                ),
+                "warnings": [f"Seed-43 candidate failed: {rejection_reason}"],
+                "llm_timing": _llm_result_to_timing(seed43_result),
+            })
 
     # Final substitution: if the chosen pass still has duplicate-desc items,
     # walk the other passes for distinct alternates at the same total. This
