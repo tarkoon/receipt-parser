@@ -857,6 +857,8 @@ def _replace_basket_marker_rows_when_balanced(extracted, unified_text):
             return True
         if re.fullmatch(r'(?:1\s*[@eE⚫●.]?|10)', text):
             return True
+        if re.fullmatch(r'1\s*[@eEoOº°⚫●.]?\s+\d[\d,.]*(?:\s*[ET])?', text):
+            return True
         if _parse_marked_amount(text) is not None:
             return True
         if _parse_basket_amount(text) is not None:

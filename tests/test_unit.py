@@ -14364,6 +14364,36 @@ def test_basket_marker_pack_continuation_preserves_row_alignment():
     assert [item["tax_category"] for item in extracted["line_items"]] == ["8%", "10%", "8%"]
 
 
+def test_basket_marker_ignores_normalized_quantity_price_control_row():
+    from receipt_parser.receipt_item_cleanup import _replace_basket_marker_rows_when_balanced
+
+    extracted = {
+        "subtotal": 600,
+        "total": 600,
+        "line_items": [{"description": "未解析", "total": 600}],
+    }
+    ocr_text = "\n".join([
+        ">>> BEGIN BOTTOM OF BASKET <<<",
+        "商品甲",
+        "100 E",
+        "商品乙",
+        "1o 200",
+        "200 T",
+        "商品丙",
+        "300 E",
+        "**** 合計",
+        "600",
+        "御買上げ点数 :3",
+    ])
+
+    _replace_basket_marker_rows_when_balanced(extracted, ocr_text)
+
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "商品甲", "商品乙", "商品丙",
+    ]
+    assert [item["total"] for item in extracted["line_items"]] == [100.0, 200.0, 300.0]
+
+
 @pytest.mark.parametrize("boundary", ["ありがとうございました", "----------"])
 def test_discount_detection_stops_at_banner_or_decorative_boundary(boundary):
     from receipt_parser.receipt_item_cleanup import _detect_ocr_discounts
