@@ -26,6 +26,7 @@ from pathlib import Path
 import cv2
 import pytest
 from receipt_parser.llm import DEFAULT_MODEL
+from receipt_parser.normalize import normalize_fullwidth, strip_barcode_lines
 from receipt_parser.ocr import (
     _OCR_CACHE_DIR,
     _ocr_cache_key,
@@ -34,6 +35,13 @@ from receipt_parser.ocr import (
     ocr_layout_sidecar_path,
 )
 from receipt_parser.preprocess import load_image, try_extract_text_layer
+from receipt_parser.pipeline import detect_document_type
+from receipt_parser.receipt_supplemental_ocr import (
+    SUPPLEMENTAL_OCR_CACHE_DIR,
+    SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
+    load_supplemental_ocr_evidence,
+    supplemental_ocr_cache_path,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 OCR_FIXTURES = Path(__file__).parent / "ocr_fixtures"
@@ -244,6 +252,76 @@ def _cached_ocr_artifacts(source: Path) -> list[tuple[str, Path]]:
     return artifacts
 
 
+def _supplemental_ocr_artifact(
+    case_id: str,
+    source: dict,
+) -> tuple[Path, dict] | None:
+    """Resolve evidence only for one-page scanned receipt inputs/replays."""
+    image_source = source["path"]
+    if source["type"] == "ocr_text":
+        image_source = _find_image(_extract_base_name(case_id))
+        if image_source is None:
+            return None
+    if (
+        image_source.suffix.lower() == ".pdf"
+        and try_extract_text_layer(str(image_source))
+    ):
+        return None
+    images = load_image(image_source)
+    if len(images) != 1:
+        return None
+    image = images[0]
+    if source["type"] == "ocr_text":
+        classification_text = source["path"].read_text(encoding="utf-8")
+    else:
+        classification_text = _selected_cached_ocr_text(image)
+        if classification_text is None:
+            return None
+    classification_text = strip_barcode_lines(
+        normalize_fullwidth(classification_text),
+    )
+    if detect_document_type(classification_text) != "receipt":
+        return None
+    identity = {
+        "image_key": _ocr_cache_key(image),
+        "image_shape": list(image.shape[:2]),
+        "strategy_fingerprint": SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
+    }
+    return (
+        supplemental_ocr_cache_path(SUPPLEMENTAL_OCR_CACHE_DIR, **identity),
+        identity,
+    )
+
+
+def _selected_cached_ocr_text(image) -> str | None:
+    """Mirror the cached one-page rotation choice used by process_document."""
+    text_path = OCR_CACHE_DIR / f"{_ocr_cache_key(image)}.txt"
+    if not text_path.is_file():
+        return None
+    best_text = text_path.read_text(encoding="utf-8")
+    best_count = len([line for line in best_text.splitlines() if line.strip()])
+    if best_count >= 3:
+        return "\n".join(line.strip() for line in best_text.splitlines() if line.strip())
+    for rotation in (
+        cv2.ROTATE_90_CLOCKWISE,
+        cv2.ROTATE_180,
+        cv2.ROTATE_90_COUNTERCLOCKWISE,
+    ):
+        rotated_path = OCR_CACHE_DIR / f"{_ocr_cache_key(cv2.rotate(image, rotation))}.txt"
+        if not rotated_path.is_file():
+            return None
+        rotated_text = rotated_path.read_text(encoding="utf-8")
+        rotated_count = len([
+            line for line in rotated_text.splitlines() if line.strip()
+        ])
+        if rotated_count > best_count:
+            best_text = rotated_text
+            best_count = rotated_count
+        if best_count:
+            break
+    return "\n".join(line.strip() for line in best_text.splitlines() if line.strip())
+
+
 def _update_path_fingerprint(digest, label: str, path: Path) -> None:
     digest.update(label.encode())
     digest.update(b"\0")
@@ -269,6 +347,12 @@ def _corpus_sha256(cases) -> str:
                 digest,
                 "ocr_layout_sidecar",
                 ocr_layout_sidecar_path(source["path"]),
+            )
+        supplemental = _supplemental_ocr_artifact(case_id, source)
+        if supplemental is not None:
+            path, _identity = supplemental
+            _update_path_fingerprint(
+                digest, f"supplemental_ocr:{path.name}", path,
             )
     return digest.hexdigest()
 
@@ -308,6 +392,25 @@ def _preflight_cached_image_layouts(cases) -> None:
                 expected_ocr_text=text_path.read_text(encoding="utf-8"),
                 strict_envelope=True,
             )
+
+
+def _preflight_supplemental_ocr(cases) -> dict[Path, dict]:
+    """Validate required image-bound evidence before accuracy scoring."""
+    replay_evidence = {}
+    for case_id, source, truth in cases:
+        artifact = _supplemental_ocr_artifact(case_id, source)
+        if artifact is None:
+            continue
+        path, identity = artifact
+        evidence = load_supplemental_ocr_evidence(
+            SUPPLEMENTAL_OCR_CACHE_DIR, **identity,
+        )
+        if evidence is None:
+            state = "Invalid" if path.is_file() else "Missing"
+            raise ValueError(f"{state} supplemental OCR sidecar: {path}")
+        if source["type"] == "ocr_text":
+            replay_evidence[source["path"]] = evidence
+    return replay_evidence
 
 
 def _git_output(*args: str) -> bytes | None:
@@ -407,6 +510,7 @@ _ACCURACY_SCOPE = {
 }
 _RESULTS_CACHE: dict[str, dict] = {}
 _OCR_TEXT_LAYOUTS: dict[Path, dict | None] = {}
+_SUPPLEMENTAL_OCR_EVIDENCE: dict[Path, dict] = {}
 
 # Collect check results for summary plugin
 _check_results: list[dict] = []
@@ -423,7 +527,7 @@ def _process_one(case_id: str, source: dict) -> tuple[str, dict, float]:
         )
         result = process_document(
             source["path"], passes=ACCURACY_PASSES, apply_user_rules=False,
-            ocr_engine=_CACHE_ONLY_OCR,
+            ocr_engine=_CACHE_ONLY_OCR, ocr_cache_only=True,
         )
         if not digital_pdf and result.get("_ocr_source") != "cache":
             raise RuntimeError(
@@ -446,6 +550,9 @@ def _process_one(case_id: str, source: dict) -> tuple[str, dict, float]:
             ocr_confidence=(
                 replay_evidence["ocr_confidence"] if replay_evidence else None
             ),
+            supplemental_ocr_evidence=_SUPPLEMENTAL_OCR_EVIDENCE.get(
+                source["path"],
+            ),
         )
     elapsed = time.perf_counter() - t0
     return case_id, result, elapsed
@@ -461,7 +568,7 @@ def _get_result(case_id: str, source: dict) -> dict:
 @pytest.fixture(scope="session", autouse=True)
 def preprocess_fixtures(request):
     """Pre-process all fixtures concurrently before tests run."""
-    global _OCR_TEXT_LAYOUTS
+    global _OCR_TEXT_LAYOUTS, _SUPPLEMENTAL_OCR_EVIDENCE
     workers = request.config.getoption("--workers", default=4)
     scope = {**_ACCURACY_SCOPE, "workers": workers}
     request.config._metadata = {
@@ -473,6 +580,7 @@ def preprocess_fixtures(request):
 
     try:
         _OCR_TEXT_LAYOUTS = _preflight_text_layouts(_CASES)
+        _SUPPLEMENTAL_OCR_EVIDENCE = _preflight_supplemental_ocr(_CASES)
         _preflight_cached_image_layouts(_CASES)
     except ValueError as exc:
         pytest.fail(str(exc), pytrace=False)

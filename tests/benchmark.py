@@ -46,8 +46,19 @@ from receipt_parser.ocr import (
     ocr_layout_sidecar_path,
     write_ocr_layout_sidecar,
 )
-from receipt_parser.pipeline import process_document, process_ocr_text
+from receipt_parser.normalize import normalize_fullwidth, strip_barcode_lines
+from receipt_parser.pipeline import (
+    detect_document_type,
+    process_document,
+    process_ocr_text,
+)
 from receipt_parser.preprocess import load_image, try_extract_text_layer
+from receipt_parser.receipt_supplemental_ocr import (
+    SUPPLEMENTAL_OCR_CACHE_DIR,
+    SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
+    load_supplemental_ocr_evidence,
+    supplemental_ocr_cache_path,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -62,6 +73,7 @@ DEFAULT_BUDGET_LIMIT = 200
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OCR_CACHE_DIR = _OCR_CACHE_DIR
 _LAYOUT_NOT_PREFLIGHTED = object()
+_SUPPLEMENTAL_NOT_PREFLIGHTED = object()
 
 
 class _CacheOnlyOCREngine:
@@ -196,6 +208,87 @@ def _cached_ocr_artifacts(source: Path) -> list[tuple[str, Path]]:
     return artifacts
 
 
+def _fixture_image(base: str) -> Path | None:
+    for ext in (".jpg", ".jpeg", ".png", ".pdf", ".tiff", ".bmp"):
+        candidate = FIXTURES_DIR / f"{base}{ext}"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _supplemental_ocr_artifact(
+    fixture_name: str,
+    source: Path,
+    *,
+    require_receipt: bool = True,
+) -> tuple[Path, dict] | None:
+    """Resolve evidence only for one-page scanned receipt inputs/replays."""
+    image_source = source
+    if source.suffix == ".txt":
+        image_source = _fixture_image(re.sub(r"_v\d+$", "", fixture_name))
+        if image_source is None:
+            return None
+    if (
+        image_source.suffix.lower() == ".pdf"
+        and try_extract_text_layer(str(image_source))
+    ):
+        return None
+    images = load_image(image_source)
+    if len(images) != 1:
+        return None
+    image = images[0]
+    if require_receipt:
+        if source.suffix == ".txt":
+            classification_text = source.read_text(encoding="utf-8")
+        else:
+            classification_text = _selected_cached_ocr_text(image)
+            if classification_text is None:
+                return None
+        classification_text = strip_barcode_lines(
+            normalize_fullwidth(classification_text),
+        )
+        if detect_document_type(classification_text) != "receipt":
+            return None
+    identity = {
+        "image_key": _ocr_cache_key(image),
+        "image_shape": list(image.shape[:2]),
+        "strategy_fingerprint": SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
+    }
+    return (
+        supplemental_ocr_cache_path(SUPPLEMENTAL_OCR_CACHE_DIR, **identity),
+        identity,
+    )
+
+
+def _selected_cached_ocr_text(image) -> str | None:
+    """Mirror the cached one-page rotation choice used by process_document."""
+    text_path = OCR_CACHE_DIR / f"{_ocr_cache_key(image)}.txt"
+    if not text_path.is_file():
+        return None
+    best_text = text_path.read_text(encoding="utf-8")
+    best_count = len([line for line in best_text.splitlines() if line.strip()])
+    if best_count >= 3:
+        return "\n".join(line.strip() for line in best_text.splitlines() if line.strip())
+    for rotation in (
+        cv2.ROTATE_90_CLOCKWISE,
+        cv2.ROTATE_180,
+        cv2.ROTATE_90_COUNTERCLOCKWISE,
+    ):
+        rotated_path = OCR_CACHE_DIR / f"{_ocr_cache_key(cv2.rotate(image, rotation))}.txt"
+        if not rotated_path.is_file():
+            return None
+        rotated_text = rotated_path.read_text(encoding="utf-8")
+        rotated_count = len([
+            line for line in rotated_text.splitlines() if line.strip()
+        ])
+        if rotated_count > best_count:
+            best_text = rotated_text
+            best_count = rotated_count
+        if best_count:
+            break
+    return "\n".join(line.strip() for line in best_text.splitlines() if line.strip())
+
+
 def _update_path_fingerprint(digest, label: str, path: Path) -> None:
     digest.update(label.encode())
     digest.update(b"\0")
@@ -223,6 +316,13 @@ def _fixture_corpus_sha256(
                 "ocr_layout_sidecar",
                 ocr_layout_sidecar_path(source),
             )
+        if cached_ocr or source.suffix == ".txt":
+            supplemental = _supplemental_ocr_artifact(name, source)
+            if supplemental is not None:
+                path, _identity = supplemental
+                _update_path_fingerprint(
+                    digest, f"supplemental_ocr:{path.name}", path,
+                )
     return digest.hexdigest()
 
 
@@ -265,6 +365,31 @@ def _preflight_cached_image_layouts(
                 expected_ocr_text=text_path.read_text(encoding="utf-8"),
                 strict_envelope=True,
             )
+
+
+def _preflight_supplemental_ocr(
+    fixtures: list[tuple[str, Path, dict]],
+    *,
+    cached_images: bool,
+) -> dict[Path, dict]:
+    """Validate required image-bound evidence before model or Vision setup."""
+    replay_evidence = {}
+    for name, source, truth in fixtures:
+        if source.suffix != ".txt" and not cached_images:
+            continue
+        artifact = _supplemental_ocr_artifact(name, source)
+        if artifact is None:
+            continue
+        path, identity = artifact
+        evidence = load_supplemental_ocr_evidence(
+            SUPPLEMENTAL_OCR_CACHE_DIR, **identity,
+        )
+        if evidence is None:
+            state = "Invalid" if path.is_file() else "Missing"
+            raise ValueError(f"{state} supplemental OCR sidecar: {path}")
+        if source.suffix == ".txt":
+            replay_evidence[source] = evidence
+    return replay_evidence
 
 
 # ---------------------------------------------------------------------------
@@ -407,11 +532,20 @@ def _save_variant(
 # Budget management
 # ---------------------------------------------------------------------------
 
-def _estimate_api_calls(n_fixtures: int, n_runs: int) -> int:
+def _estimate_api_calls(
+    n_fixtures: int,
+    n_runs: int,
+    supplemental_fixture_count: int = 0,
+) -> int:
     calls_per_fixture_per_run = 1
     retry_estimate = max(1, int(n_fixtures * 0.10))
     rotation_extras = max(1, int(n_fixtures * 0.15))
-    return (n_fixtures * calls_per_fixture_per_run + retry_estimate + rotation_extras) * n_runs
+    return (
+        n_fixtures * calls_per_fixture_per_run
+        + retry_estimate
+        + rotation_extras
+        + supplemental_fixture_count * 2
+    ) * n_runs
 
 
 def _check_budget(estimated_calls: int, budget_limit: int, force: bool) -> bool:
@@ -454,6 +588,7 @@ def _run_fixture(
     skip_cache: bool = True,
     save_variants: bool = True,
     preflight_layout_blocks=_LAYOUT_NOT_PREFLIGHTED,
+    preflight_supplemental_evidence=_SUPPLEMENTAL_NOT_PREFLIGHTED,
 ) -> tuple[str, dict]:
     """Run all iterations for a single fixture. Returns (name, fixture_data)."""
     is_ocr_text = fixture_source.suffix == ".txt"
@@ -472,6 +607,16 @@ def _run_fixture(
     replay_ocr_confidence = (
         replay_evidence["ocr_confidence"] if replay_evidence else None
     )
+    supplemental_evidence = None
+    if is_ocr_text:
+        supplemental_evidence = (
+            _preflight_supplemental_ocr(
+                [(fixture_name, fixture_source, fixture_truth)],
+                cached_images=False,
+            ).get(fixture_source)
+            if preflight_supplemental_evidence is _SUPPLEMENTAL_NOT_PREFLIGHTED
+            else preflight_supplemental_evidence
+        )
 
     for run_idx in range(1, runs + 1):
         wall_start = time.perf_counter()
@@ -485,6 +630,7 @@ def _run_fixture(
                     apply_user_rules=False,
                     ocr_layout_blocks=replay_layout_blocks,
                     ocr_confidence=replay_ocr_confidence,
+                    supplemental_ocr_evidence=supplemental_evidence,
                 )
             else:
                 digital_pdf = (
@@ -496,6 +642,7 @@ def _run_fixture(
                     fixture_source, model=model, passes=passes,
                     apply_user_rules=False, skip_ocr_cache=skip_cache,
                     ocr_engine=cv_client, capture_ocr_layout=True,
+                    ocr_cache_only=not skip_cache,
                 )
                 if not skip_cache and not digital_pdf and result.get("_ocr_source") != "cache":
                     raise RuntimeError(
@@ -1122,6 +1269,9 @@ def run_benchmark(
         sys.exit(1)
     try:
         preflight_layouts = _preflight_text_layouts(fixtures)
+        preflight_supplemental = _preflight_supplemental_ocr(
+            fixtures, cached_images=use_cached_ocr,
+        )
         if use_cached_ocr:
             _preflight_cached_image_layouts(fixtures)
     except ValueError as exc:
@@ -1165,7 +1315,16 @@ def run_benchmark(
         # Budget check (cached modes make no Vision calls)
         if not use_cached_ocr:
             image_count = sum(1 for f in fixtures if f[1].suffix != ".txt")
-            estimated = _estimate_api_calls(image_count, runs)
+            supplemental_image_count = sum(
+                _supplemental_ocr_artifact(
+                    name, source, require_receipt=False,
+                ) is not None
+                for name, source, truth in fixtures
+                if source.suffix != ".txt"
+            )
+            estimated = _estimate_api_calls(
+                image_count, runs, supplemental_image_count,
+            )
             if not _check_budget(estimated, budget_limit, force):
                 sys.exit(1)
     else:
@@ -1209,6 +1368,7 @@ def run_benchmark(
                 pool.submit(
                     _run_fixture, name, source, truth, runs, model, passes, cv_client,
                     skip_cache, save_variants, preflight_layouts.get(source),
+                    preflight_supplemental.get(source),
                 ): name
                 for name, source, truth in fixtures
             }
@@ -1222,6 +1382,7 @@ def run_benchmark(
             _, fdata = _run_fixture_sequential(
                 name, source, truth, runs, model, passes, cv_client, skip_cache,
                 save_variants, preflight_layouts.get(source),
+                preflight_supplemental.get(source),
             )
             per_fixture[name] = fdata
 
@@ -1243,6 +1404,7 @@ def run_benchmark(
 def _run_fixture_sequential(
     fixture_name, fixture_source, fixture_truth, runs, model, passes, cv_client, skip_cache,
     save_variants=True, preflight_layout_blocks=_LAYOUT_NOT_PREFLIGHTED,
+    preflight_supplemental_evidence=_SUPPLEMENTAL_NOT_PREFLIGHTED,
 ):
     """Sequential fixture runner with progress printing."""
     is_ocr_text = fixture_source.suffix == ".txt"
@@ -1261,6 +1423,16 @@ def _run_fixture_sequential(
     replay_ocr_confidence = (
         replay_evidence["ocr_confidence"] if replay_evidence else None
     )
+    supplemental_evidence = None
+    if is_ocr_text:
+        supplemental_evidence = (
+            _preflight_supplemental_ocr(
+                [(fixture_name, fixture_source, fixture_truth)],
+                cached_images=False,
+            ).get(fixture_source)
+            if preflight_supplemental_evidence is _SUPPLEMENTAL_NOT_PREFLIGHTED
+            else preflight_supplemental_evidence
+        )
 
     for run_idx in range(1, runs + 1):
         wall_start = time.perf_counter()
@@ -1274,6 +1446,7 @@ def _run_fixture_sequential(
                     apply_user_rules=False,
                     ocr_layout_blocks=replay_layout_blocks,
                     ocr_confidence=replay_ocr_confidence,
+                    supplemental_ocr_evidence=supplemental_evidence,
                 )
             else:
                 digital_pdf = (
@@ -1284,6 +1457,7 @@ def _run_fixture_sequential(
                     fixture_source, model=model, passes=passes,
                     apply_user_rules=False, skip_ocr_cache=skip_cache,
                     ocr_engine=cv_client, capture_ocr_layout=True,
+                    ocr_cache_only=not skip_cache,
                 )
                 if not skip_cache and not digital_pdf and result.get("_ocr_source") != "cache":
                     raise RuntimeError(
