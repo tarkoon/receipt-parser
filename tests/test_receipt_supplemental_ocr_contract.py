@@ -1,15 +1,21 @@
 import json
+import threading
+import weakref
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import pytest
 
 import receipt_parser.receipt_supplemental_ocr as supplemental
 from receipt_parser.receipt_supplemental_ocr import (
     apply_supplemental_ocr_evidence,
+    acquire_supplemental_ocr_evidence,
     build_supplemental_ocr_evidence,
     load_supplemental_ocr_evidence,
     save_supplemental_ocr_evidence,
     supplemental_ocr_cache_path,
+    SupplementalOCRCacheMiss,
 )
 
 
@@ -37,6 +43,48 @@ def _layout_for(text):
     ]
 
 
+def _word(text, *, x=0, y=0, size=9, confidence=0.9):
+    return {
+        "text": text,
+        "confidence": confidence,
+        "x": x,
+        "y": y,
+        "bbox": [[x, y], [x + size, y], [x + size, y + size], [x, y + size]],
+        "page": 0,
+    }
+
+
+def _mock_vision(monkeypatch, texts=("TOP", "BOTTOM")):
+    calls = []
+    responses = [
+        {"text": text, "words": [_word(text)]}
+        for text in texts
+    ]
+
+    def call(image, client):
+        calls.append((image.copy(), client))
+        return responses[len(calls) - 1]
+
+    initialized = []
+    monkeypatch.setattr(supplemental, "_call_cloud_vision", call)
+    monkeypatch.setattr(
+        supplemental,
+        "_extract_fulltext_from_response",
+        lambda response: response["text"],
+    )
+    monkeypatch.setattr(
+        supplemental,
+        "_extract_words_from_response",
+        lambda response: response["words"],
+    )
+    monkeypatch.setattr(
+        supplemental,
+        "init_cloud_vision",
+        lambda: initialized.append(True) or "mock-client",
+    )
+    return calls, initialized
+
+
 def _evidence(merged_text, tile_one, tile_two="footer"):
     return build_supplemental_ocr_evidence(
         image_key=IMAGE_KEY,
@@ -58,6 +106,259 @@ def _without_tax_categories(value):
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def test_uniform_two_tile_strategy_matches_the_sealed_v1_2_fingerprint():
+    assert supplemental.SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT == (
+        "4a87f52dca59c609136e787775c631a630e04d3a1a43ca5066b3b793e9b7cca5"
+    )
+    assert supplemental.SUPPLEMENTAL_OCR_STRATEGY["tile_y_fractions"] == (
+        (0.0, 0.58),
+        (0.42, 1.0),
+    )
+
+
+def test_uniform_receipt_bbox_and_overlapping_tiles_match_the_sealed_geometry():
+    image = np.zeros((200, 100, 3), dtype=np.uint8)
+    image[20:180, 10:90] = 255
+
+    bbox = supplemental._supplemental_receipt_bbox(image)
+
+    assert bbox == (9, 18, 91, 182)
+    assert supplemental._supplemental_tile_bboxes(bbox) == [
+        (9, 18, 91, 113),
+        (9, 87, 91, 182),
+    ]
+
+
+def test_uniform_scale_is_shared_and_selected_payload_guards_fail_closed(monkeypatch):
+    image = np.zeros((10, 10, 3), dtype=np.uint8)
+    bboxes = [(0, 0, 10, 6), (0, 4, 10, 10)]
+    scales = []
+    three_x_refs = []
+    fallback_index = 0
+
+    def preprocess(_image, _bbox, *, scale):
+        nonlocal fallback_index
+        scales.append(scale)
+        processed = np.zeros((scale, 2), dtype=np.uint8)
+        if scale == 3:
+            three_x_refs.append(weakref.ref(processed))
+        else:
+            assert three_x_refs[fallback_index]() is None
+            fallback_index += 1
+        return processed
+
+    monkeypatch.setattr(supplemental, "_preprocess_supplemental_bbox", preprocess)
+    monkeypatch.setattr(
+        supplemental,
+        "_supplemental_png_size",
+        lambda processed: (
+            supplemental.SUPPLEMENTAL_OCR_PAYLOAD_CAP_BYTES
+            if processed.shape[0] == 3
+            else 1
+        ),
+    )
+
+    scale, prepared = supplemental._prepare_supplemental_tiles(image, bboxes)
+
+    assert scale == 2
+    assert scales == [3, 3, 2, 2]
+    assert [tile.shape for tile in prepared] == [(2, 2), (2, 2)]
+
+    monkeypatch.setattr(
+        supplemental,
+        "_supplemental_png_size",
+        lambda _processed: supplemental.SUPPLEMENTAL_OCR_PAYLOAD_CAP_BYTES,
+    )
+    with pytest.raises(RuntimeError, match="payload limit"):
+        supplemental._prepare_supplemental_tiles(image, bboxes)
+
+    monkeypatch.setattr(supplemental, "_supplemental_png_size", lambda _processed: 1)
+    monkeypatch.setattr(supplemental, "SUPPLEMENTAL_OCR_API_PIXEL_LIMIT", 3)
+    with pytest.raises(RuntimeError, match="API pixel limit"):
+        supplemental._prepare_supplemental_tiles(image, bboxes)
+
+
+def test_uniform_word_mapping_and_iterative_iou_dedupe_use_sealed_preference_rule():
+    word = _word("x", x=0, y=0, size=30, confidence=0.9)
+    mapped = supplemental._map_supplemental_word(
+        word,
+        (10, 20, 100, 100),
+        scale=3,
+    )
+    assert mapped["bbox"] == [[10, 20], [20, 20], [20, 30], [10, 30]]
+
+    richer = {**mapped, "text": "x*", "confidence": 0.7}
+    assert supplemental._merge_supplemental_words([mapped, richer]) == [richer]
+    too_uncertain = {**mapped, "text": "x*", "confidence": 0.6}
+    assert supplemental._merge_supplemental_words([mapped, too_uncertain]) == [mapped]
+
+    chain = [
+        {**mapped, "confidence": 0.8, "x": 0, "y": 0, "bbox": [[0, 0], [10, 0], [10, 100], [0, 100]]},
+        {**mapped, "confidence": 0.8, "x": 6, "y": 1, "bbox": [[6, 1], [16, 1], [16, 101], [6, 101]]},
+        {**mapped, "confidence": 0.9, "x": 3, "y": 2, "bbox": [[3, 2], [13, 2], [13, 102], [3, 102]]},
+    ]
+    merged = supplemental._merge_supplemental_words(chain)
+    assert all(
+        supplemental._supplemental_word_iou(left, right) < 0.5
+        for index, left in enumerate(merged)
+        for right in merged[index + 1:]
+    )
+
+
+def test_normal_mode_misses_then_hits_cache_with_exactly_two_vision_calls(
+    tmp_path,
+    monkeypatch,
+):
+    image = np.full((100, 60, 3), 255, dtype=np.uint8)
+    calls, initialized = _mock_vision(monkeypatch)
+
+    acquired = acquire_supplemental_ocr_evidence(image, cache_dir=tmp_path)
+    cached = acquire_supplemental_ocr_evidence(image, cache_dir=tmp_path)
+
+    assert len(calls) == 2
+    assert initialized == [True]
+    assert cached == acquired
+    assert acquired["merged_text"] == "TOP\nBOTTOM"
+    assert len(acquired["tiles"]) == 2
+
+
+def test_concurrent_normal_misses_share_one_two_call_acquisition_and_cached_result(
+    tmp_path,
+    monkeypatch,
+):
+    image = np.full((100, 60, 3), 255, dtype=np.uint8)
+    calls, initialized = _mock_vision(monkeypatch)
+    real_load = supplemental.load_supplemental_ocr_evidence
+    initial_loads = threading.Barrier(2)
+    thread_state = threading.local()
+
+    def synchronized_initial_load(*args, **kwargs):
+        result = real_load(*args, **kwargs)
+        if not getattr(thread_state, "did_initial_load", False):
+            thread_state.did_initial_load = True
+            initial_loads.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        supplemental,
+        "load_supplemental_ocr_evidence",
+        synchronized_initial_load,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                acquire_supplemental_ocr_evidence,
+                image,
+                cache_dir=tmp_path,
+            )
+            for _ in range(2)
+        ]
+        results = [future.result(timeout=10) for future in futures]
+
+    cached = real_load(
+        tmp_path,
+        image_key=supplemental._ocr_cache_key(image),
+        image_shape=list(image.shape[:2]),
+        strategy_fingerprint=supplemental.SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
+    )
+    assert len(calls) == 2
+    assert initialized == [True]
+    assert results[0] == results[1] == cached
+    assert supplemental._NORMAL_CACHE_LOCKS == {}
+
+
+def test_normal_mode_cleans_per_identity_lock_after_acquisition_error(
+    tmp_path,
+    monkeypatch,
+):
+    image = np.full((100, 60, 3), 255, dtype=np.uint8)
+
+    def fail_vision(*_args, **_kwargs):
+        raise RuntimeError("Vision failed")
+
+    monkeypatch.setattr(supplemental, "_call_cloud_vision", fail_vision)
+
+    with pytest.raises(RuntimeError, match="Vision failed"):
+        acquire_supplemental_ocr_evidence(
+            image,
+            client=object(),
+            cache_dir=tmp_path,
+        )
+
+    assert supplemental._NORMAL_CACHE_LOCKS == {}
+
+
+def test_cache_only_missing_and_corrupt_entries_make_zero_vision_calls(
+    tmp_path,
+    monkeypatch,
+):
+    image = np.full((100, 60, 3), 255, dtype=np.uint8)
+    calls = []
+    monkeypatch.setattr(
+        supplemental,
+        "_call_cloud_vision",
+        lambda *_args, **_kwargs: calls.append(True),
+    )
+    monkeypatch.setattr(
+        supplemental,
+        "init_cloud_vision",
+        lambda: pytest.fail("cache-only mode initialized Vision"),
+    )
+
+    with pytest.raises(SupplementalOCRCacheMiss, match="no valid supplemental OCR cache"):
+        acquire_supplemental_ocr_evidence(
+            image,
+            mode="cache_only",
+            cache_dir=tmp_path,
+        )
+
+    path = supplemental_ocr_cache_path(
+        tmp_path,
+        image_key=supplemental._ocr_cache_key(image),
+        image_shape=list(image.shape[:2]),
+        strategy_fingerprint=supplemental.SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{corrupt", encoding="utf-8")
+    with pytest.raises(SupplementalOCRCacheMiss, match="no valid supplemental OCR cache"):
+        acquire_supplemental_ocr_evidence(
+            image,
+            mode="cache_only",
+            cache_dir=tmp_path,
+        )
+    assert calls == []
+
+
+def test_fresh_mode_ignores_valid_cache_and_leaves_it_byte_unchanged(
+    tmp_path,
+    monkeypatch,
+):
+    image = np.full((100, 60, 3), 255, dtype=np.uint8)
+    cached_layout = [_word("CACHED")]
+    cached_evidence = build_supplemental_ocr_evidence(
+        image_key=supplemental._ocr_cache_key(image),
+        image_shape=list(image.shape[:2]),
+        strategy_fingerprint=supplemental.SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
+        merged_text="CACHED",
+        source_layout=cached_layout,
+        tile_texts=["cached top", "cached bottom"],
+    )
+    path = save_supplemental_ocr_evidence(tmp_path, cached_evidence)
+    cached_bytes = path.read_bytes()
+    calls, initialized = _mock_vision(monkeypatch, texts=("FRESH TOP", "FRESH BOTTOM"))
+
+    fresh = acquire_supplemental_ocr_evidence(
+        image,
+        mode="fresh",
+        cache_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert initialized == [True]
+    assert fresh["merged_text"] == "FRESH TOP\nFRESH BOTTOM"
+    assert path.read_bytes() == cached_bytes
 
 
 def test_unique_ocr_backed_location_extension_changes_only_location():

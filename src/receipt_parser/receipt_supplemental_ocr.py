@@ -10,16 +10,30 @@ and 10% bases.  Every rejected proposal leaves the receipt unchanged.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import tempfile
+import threading
+from contextlib import contextmanager
 from copy import deepcopy
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from .ocr import blocks_to_structured_text
+import cv2
+import numpy as np
+
+from .ocr import (
+    _OCR_CACHE_DIR,
+    _call_cloud_vision,
+    _extract_fulltext_from_response,
+    _extract_words_from_response,
+    _ocr_cache_key,
+    blocks_to_structured_text,
+    init_cloud_vision,
+)
 from .receipt_location import (
     _location_has_ocr_evidence,
     _recover_header_branch_store_location,
@@ -27,6 +41,37 @@ from .receipt_location import (
 
 
 SUPPLEMENTAL_OCR_SCHEMA_VERSION = 1
+SUPPLEMENTAL_OCR_TILE_FRACTIONS = ((0.0, 0.58), (0.42, 1.0))
+SUPPLEMENTAL_OCR_PIXEL_CAP = 60_000_000
+SUPPLEMENTAL_OCR_API_PIXEL_LIMIT = 75_000_000
+SUPPLEMENTAL_OCR_PAYLOAD_CAP_BYTES = 18_000_000
+SUPPLEMENTAL_OCR_STRATEGY = {
+    "id": "uniform_receipt_bbox_two_vertical_tiles",
+    "version": "1.2.0",
+    "receipt_bbox": "largest bright low-saturation HSV component; S<30, V>70, 1% image padding",
+    "tile_y_fractions": SUPPLEMENTAL_OCR_TILE_FRACTIONS,
+    "preprocess": "grayscale, CLAHE clipLimit=2.0 tileGridSize=8x8, cubic upscale",
+    "scale_rule": "preprocess both 3x candidates; use 3x only if both are <=60000000 pixels and <18000000 PNG bytes, otherwise regenerate both at 2x",
+    "encoded_payload_guard": "fail closed if either selected 2x PNG is >=18000000 bytes",
+    "api_pixel_guard": "fail closed if either selected tile exceeds 75000000 pixels",
+    "coordinate_remap": "round(tile_coordinate / effective_scale) + source_tile_origin",
+    "merge": "source-coordinate word IoU>=0.5; prefer richer containing token within 0.25 confidence, otherwise higher confidence",
+    "integrity_version": "1",
+}
+SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT = hashlib.sha256(
+    json.dumps(
+        SUPPLEMENTAL_OCR_STRATEGY,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
+_SEALED_STRATEGY_FINGERPRINT = (
+    "4a87f52dca59c609136e787775c631a630e04d3a1a43ca5066b3b793e9b7cca5"
+)
+if SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT != _SEALED_STRATEGY_FINGERPRINT:
+    raise RuntimeError("supplemental OCR strategy drifted from the sealed v1.2 contract")
+SUPPLEMENTAL_OCR_CACHE_DIR = _OCR_CACHE_DIR / "supplemental"
 _HEX_ID_RE = re.compile(r"[0-9a-f]{32,64}")
 _EVIDENCE_KEYS = {
     "schema_version",
@@ -38,6 +83,229 @@ _EVIDENCE_KEYS = {
     "tiles",
 }
 _LAYOUT_BLOCK_KEYS = {"bbox", "confidence", "page", "text", "x", "y"}
+
+
+class SupplementalOCRCacheMiss(RuntimeError):
+    """Raised when cache-only supplemental OCR has no valid sidecar."""
+
+
+_NORMAL_CACHE_LOCKS_GUARD = threading.Lock()
+_NORMAL_CACHE_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
+
+
+@contextmanager
+def _normal_cache_identity_lock(path: Path):
+    key = os.path.normcase(str(path.resolve()))
+    with _NORMAL_CACHE_LOCKS_GUARD:
+        current = _NORMAL_CACHE_LOCKS.get(key)
+        lock, users = current if current is not None else (threading.Lock(), 0)
+        _NORMAL_CACHE_LOCKS[key] = (lock, users + 1)
+    acquired = False
+    try:
+        lock.acquire()
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            lock.release()
+        with _NORMAL_CACHE_LOCKS_GUARD:
+            current = _NORMAL_CACHE_LOCKS.get(key)
+            if current is not None and current[0] is lock:
+                if current[1] == 1:
+                    _NORMAL_CACHE_LOCKS.pop(key, None)
+                else:
+                    _NORMAL_CACHE_LOCKS[key] = (lock, current[1] - 1)
+
+
+def _supplemental_receipt_bbox(image: np.ndarray) -> tuple[int, int, int, int]:
+    """Find the largest bright, low-saturation paper-like component."""
+    height, width = image.shape[:2]
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mask = ((hsv[:, :, 1] < 30) & (hsv[:, :, 2] > 70)).astype(np.uint8) * 255
+    radius = max(5, round(min(height, width) * 0.025))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (radius, radius))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0, 0, width, height
+
+    candidates = []
+    for contour in contours:
+        x, y, candidate_width, candidate_height = cv2.boundingRect(contour)
+        if candidate_width * candidate_height >= width * height * 0.05:
+            rectangularity = cv2.contourArea(contour) / max(
+                1, candidate_width * candidate_height
+            )
+            candidates.append((
+                candidate_width * candidate_height * (0.5 + rectangularity),
+                x,
+                y,
+                candidate_width,
+                candidate_height,
+            ))
+    if not candidates:
+        return 0, 0, width, height
+
+    _, x, y, candidate_width, candidate_height = max(candidates)
+    pad_x = round(width * 0.01)
+    pad_y = round(height * 0.01)
+    return (
+        max(0, x - pad_x),
+        max(0, y - pad_y),
+        min(width, x + candidate_width + pad_x),
+        min(height, y + candidate_height + pad_y),
+    )
+
+
+def _supplemental_tile_bboxes(
+    bbox: tuple[int, int, int, int],
+) -> list[tuple[int, int, int, int]]:
+    x0, y0, x1, y1 = bbox
+    height = y1 - y0
+    return [
+        (x0, y0 + round(height * start), x1, y0 + round(height * end))
+        for start, end in SUPPLEMENTAL_OCR_TILE_FRACTIONS
+    ]
+
+
+def _preprocess_supplemental_bbox(
+    image: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    *,
+    scale: int,
+) -> np.ndarray:
+    x0, y0, x1, y1 = bbox
+    gray = cv2.cvtColor(image[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    return cv2.resize(
+        gray,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+
+def _supplemental_png_size(image: np.ndarray) -> int:
+    success, encoded = cv2.imencode(".png", image)
+    if not success:
+        raise RuntimeError("supplemental OCR tile PNG encoding failed")
+    return len(encoded)
+
+
+def _choose_supplemental_scale(candidates: list[dict]) -> int:
+    return 3 if all(
+        candidate["candidate_3x_pixels"] <= SUPPLEMENTAL_OCR_PIXEL_CAP
+        and candidate["candidate_3x_png_bytes"] < SUPPLEMENTAL_OCR_PAYLOAD_CAP_BYTES
+        for candidate in candidates
+    ) else 2
+
+
+def _prepare_supplemental_tiles(
+    image: np.ndarray,
+    bboxes: list[tuple[int, int, int, int]],
+) -> tuple[int, list[np.ndarray]]:
+    candidates = []
+    for bbox in bboxes:
+        processed = _preprocess_supplemental_bbox(image, bbox, scale=3)
+        candidates.append({
+            "candidate_3x_pixels": int(processed.size),
+            "candidate_3x_png_bytes": _supplemental_png_size(processed),
+            "processed_3x": processed,
+        })
+
+    scale = _choose_supplemental_scale(candidates)
+    prepared = []
+    for bbox, candidate in zip(bboxes, candidates, strict=True):
+        if scale == 3:
+            processed = candidate.pop("processed_3x")
+        else:
+            candidate.pop("processed_3x")
+            processed = _preprocess_supplemental_bbox(image, bbox, scale=2)
+        if processed.size > SUPPLEMENTAL_OCR_API_PIXEL_LIMIT:
+            raise RuntimeError(
+                f"supplemental OCR tile exceeds API pixel limit: {processed.size}"
+            )
+        payload_bytes = _supplemental_png_size(processed)
+        if payload_bytes >= SUPPLEMENTAL_OCR_PAYLOAD_CAP_BYTES:
+            raise RuntimeError(
+                f"supplemental OCR tile exceeds payload limit: {payload_bytes} bytes"
+            )
+        prepared.append(processed)
+    return scale, prepared
+
+
+def _map_supplemental_word(
+    word: dict,
+    tile: tuple[int, int, int, int],
+    *,
+    scale: int,
+) -> dict:
+    x0, y0, _, _ = tile
+    bbox = [
+        [round(x / scale) + x0, round(y / scale) + y0]
+        for x, y in word["bbox"]
+    ]
+    return {
+        **word,
+        "x": min(point[0] for point in bbox),
+        "y": min(point[1] for point in bbox),
+        "bbox": bbox,
+    }
+
+
+def _supplemental_word_iou(left: dict, right: dict) -> float:
+    ax0 = min(point[0] for point in left["bbox"])
+    ay0 = min(point[1] for point in left["bbox"])
+    ax1 = max(point[0] for point in left["bbox"])
+    ay1 = max(point[1] for point in left["bbox"])
+    bx0 = min(point[0] for point in right["bbox"])
+    by0 = min(point[1] for point in right["bbox"])
+    bx1 = max(point[0] for point in right["bbox"])
+    by1 = max(point[1] for point in right["bbox"])
+    intersection = max(0, min(ax1, bx1) - max(ax0, bx0)) * max(
+        0, min(ay1, by1) - max(ay0, by0)
+    )
+    union = max(
+        1,
+        (ax1 - ax0) * (ay1 - ay0)
+        + (bx1 - bx0) * (by1 - by0)
+        - intersection,
+    )
+    return intersection / union
+
+
+def _merge_supplemental_words_once(words: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    for word in sorted(words, key=lambda item: (item["y"], item["x"])):
+        duplicate = next(
+            (
+                index
+                for index, prior in enumerate(merged)
+                if _supplemental_word_iou(word, prior) >= 0.5
+            ),
+            None,
+        )
+        if duplicate is None:
+            merged.append(word)
+            continue
+        prior = merged[duplicate]
+        if prior["text"] in word["text"] and len(word["text"]) > len(prior["text"]):
+            if word["confidence"] >= prior["confidence"] - 0.25:
+                merged[duplicate] = word
+        elif word["text"] not in prior["text"] and word["confidence"] > prior["confidence"]:
+            merged[duplicate] = word
+    return sorted(merged, key=lambda item: (item["y"], item["x"]))
+
+
+def _merge_supplemental_words(words: list[dict]) -> list[dict]:
+    """Merge until no replacement-created overlap remains."""
+    current = list(words)
+    while True:
+        merged = _merge_supplemental_words_once(current)
+        if len(merged) == len(current):
+            return merged
+        current = merged
 
 
 def _compact(value: str) -> str:
@@ -263,6 +531,83 @@ def load_supplemental_ocr_evidence(
     ):
         return None
     return evidence
+
+
+def _acquire_two_tile_evidence(
+    image: np.ndarray,
+    *,
+    client,
+    identity: dict,
+) -> dict:
+    source_bbox = _supplemental_receipt_bbox(image)
+    tile_bboxes = _supplemental_tile_bboxes(source_bbox)
+    scale, prepared_tiles = _prepare_supplemental_tiles(image, tile_bboxes)
+    tile_texts = []
+    mapped_words = []
+    for tile_bbox, processed in zip(tile_bboxes, prepared_tiles, strict=True):
+        response = _call_cloud_vision(processed, client)
+        tile_texts.append(_extract_fulltext_from_response(response) or "")
+        mapped_words.extend(
+            _map_supplemental_word(word, tile_bbox, scale=scale)
+            for word in _extract_words_from_response(response)
+        )
+    source_layout = _merge_supplemental_words(mapped_words)
+    evidence = build_supplemental_ocr_evidence(
+        **identity,
+        merged_text=blocks_to_structured_text(source_layout),
+        source_layout=source_layout,
+        tile_texts=tile_texts,
+    )
+    return evidence
+
+
+def acquire_supplemental_ocr_evidence(
+    image: np.ndarray,
+    *,
+    mode: str = "normal",
+    client=None,
+    cache_dir: str | Path = SUPPLEMENTAL_OCR_CACHE_DIR,
+) -> dict:
+    """Load or acquire one sealed two-tile supplemental OCR evidence record.
+
+    ``normal`` reads then fills the cache, ``cache_only`` never contacts Vision,
+    and ``fresh`` bypasses both cache reads and writes.
+    """
+    if mode not in {"normal", "cache_only", "fresh"}:
+        raise ValueError("supplemental OCR mode must be normal, cache_only, or fresh")
+    height, width = image.shape[:2]
+    identity = {
+        "image_key": _ocr_cache_key(image),
+        "image_shape": [height, width],
+        "strategy_fingerprint": SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
+    }
+    if mode != "fresh":
+        cached = load_supplemental_ocr_evidence(cache_dir, **identity)
+        if cached is not None:
+            return cached
+        if mode == "cache_only":
+            raise SupplementalOCRCacheMiss(
+                "no valid supplemental OCR cache entry for this image and strategy"
+            )
+    if mode == "fresh":
+        return _acquire_two_tile_evidence(
+            image,
+            client=client if client is not None else init_cloud_vision(),
+            identity=identity,
+        )
+
+    cache_path = supplemental_ocr_cache_path(cache_dir, **identity)
+    with _normal_cache_identity_lock(cache_path):
+        cached = load_supplemental_ocr_evidence(cache_dir, **identity)
+        if cached is not None:
+            return cached
+        evidence = _acquire_two_tile_evidence(
+            image,
+            client=client if client is not None else init_cloud_vision(),
+            identity=identity,
+        )
+        save_supplemental_ocr_evidence(cache_dir, evidence)
+        return evidence
 
 
 def _location_candidate(receipt: dict, text: str) -> str | None:
