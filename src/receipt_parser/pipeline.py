@@ -1046,10 +1046,7 @@ def _select_receipt_postprocessed_candidate(
                 continue
             candidate_refs.append(([(idx, key)], candidate))
 
-    shared_layout_item_count = _balanced_layout_item_count(
-        extracted,
-        ocr_layout_blocks,
-    )
+    shared_layout_item_count = None
 
     def record_metrics(
         sources: list[tuple[int, str]],
@@ -1126,6 +1123,11 @@ def _select_receipt_postprocessed_candidate(
             before,
             postprocessed,
         )
+        if order == 0:
+            shared_layout_item_count = _balanced_layout_item_count(
+                postprocessed,
+                ocr_layout_blocks,
+            )
         scoring_view = deepcopy(postprocessed)
         _apply_final_receipt_output_repairs(
             scoring_view,

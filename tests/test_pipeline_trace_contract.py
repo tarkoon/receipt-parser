@@ -381,7 +381,66 @@ def test_candidate_selection_uses_exact_balanced_layout_count_as_tiebreaker(
 
     assert len(selected["line_items"]) == 4
     assert history[0]["postprocess_selected"] is False
-    assert layout_count_calls == [(four_rows, [{"text": "layout"}])]
+    assert len(layout_count_calls) == 1
+    assert layout_count_calls[0][0]["total"] == 100
+    assert layout_count_calls[0][1] == [{"text": "layout"}]
+
+
+def test_candidate_layout_count_uses_postprocessed_primary_financials(monkeypatch):
+    from receipt_parser import pipeline
+
+    def rows(count, unit_price):
+        return [
+            {
+                "description": f"row {index}",
+                "qty": 1,
+                "unit_price": unit_price,
+                "total": unit_price,
+            }
+            for index in range(count)
+        ]
+
+    four_rows = _extraction(total=120, amount_paid=120, line_items=rows(4, 25))
+    five_rows = _extraction(total=220, amount_paid=220, line_items=rows(5, 40))
+    history = _history(five_rows)
+
+    def postprocess(extracted, *_args, **_kwargs):
+        target = 100 if len(extracted["line_items"]) == 4 else 200
+        extracted["total"] = target
+        extracted["amount_paid"] = target
+        return extracted
+
+    monkeypatch.setattr(pipeline, "postprocess_receipt", postprocess)
+    monkeypatch.setattr(
+        pipeline,
+        "_apply_final_receipt_output_repairs",
+        lambda *_args, **_kwargs: None,
+    )
+    layout_count_bases = []
+
+    def balanced_layout_item_count(extracted, _layout):
+        layout_count_bases.append(extracted["total"])
+        return 4 if extracted["total"] == 100 else 5
+
+    monkeypatch.setattr(
+        pipeline,
+        "_balanced_layout_item_count",
+        balanced_layout_item_count,
+    )
+
+    selected = pipeline._select_receipt_postprocessed_candidate(
+        four_rows,
+        history,
+        "STORE\n合計 ¥100",
+        0.9,
+        {},
+        "test-model",
+        [{"text": "layout"}],
+    )
+
+    assert len(selected["line_items"]) == 4
+    assert history[0]["postprocess_selected"] is False
+    assert layout_count_bases == [100.0]
 
 
 def test_candidate_selection_prefers_printed_count_over_layout_count(monkeypatch):
