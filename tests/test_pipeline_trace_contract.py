@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 
 def _extraction(**overrides):
     payload = {
@@ -324,6 +326,133 @@ def test_candidate_selection_prefers_explicit_printed_item_count_when_balanced(
 
     assert len(selected["line_items"]) == 9
     assert history[0]["postprocess_selected"] is True
+
+
+def test_candidate_selection_uses_exact_balanced_layout_count_as_tiebreaker(
+    monkeypatch,
+):
+    from receipt_parser import pipeline
+
+    def rows(totals):
+        return [
+            {
+                "description": f"row {index}",
+                "qty": 1,
+                "unit_price": total,
+                "total": total,
+            }
+            for index, total in enumerate(totals)
+        ]
+
+    four_rows = _extraction(total=100, amount_paid=100, line_items=rows([25] * 4))
+    five_rows = _extraction(total=100, amount_paid=100, line_items=rows([20] * 5))
+    history = _history(five_rows)
+    monkeypatch.setattr(
+        pipeline,
+        "postprocess_receipt",
+        lambda extracted, *_args, **_kwargs: extracted,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_apply_final_receipt_output_repairs",
+        lambda *_args, **_kwargs: None,
+    )
+    layout_count_calls = []
+
+    def balanced_layout_item_count(extracted, layout):
+        layout_count_calls.append((extracted, layout))
+        return 4 if layout else None
+
+    monkeypatch.setattr(
+        pipeline,
+        "_balanced_layout_item_count",
+        balanced_layout_item_count,
+    )
+
+    selected = pipeline._select_receipt_postprocessed_candidate(
+        four_rows,
+        history,
+        "STORE\n合計 ¥100",
+        0.9,
+        {},
+        "test-model",
+        [{"text": "layout"}],
+    )
+
+    assert len(selected["line_items"]) == 4
+    assert history[0]["postprocess_selected"] is False
+    assert layout_count_calls == [(four_rows, [{"text": "layout"}])]
+
+
+def test_candidate_selection_prefers_printed_count_over_layout_count(monkeypatch):
+    from receipt_parser import pipeline
+
+    def rows(count, unit_price):
+        return [
+            {
+                "description": f"row {index}",
+                "qty": 1,
+                "unit_price": unit_price,
+                "total": unit_price,
+            }
+            for index in range(count)
+        ]
+
+    four_rows = _extraction(total=100, amount_paid=100, line_items=rows(4, 25))
+    five_rows = _extraction(total=100, amount_paid=100, line_items=rows(5, 20))
+    history = _history(five_rows)
+    monkeypatch.setattr(
+        pipeline,
+        "postprocess_receipt",
+        lambda extracted, *_args, **_kwargs: extracted,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_apply_final_receipt_output_repairs",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_balanced_layout_item_count",
+        lambda _extracted, _layout: 4,
+    )
+
+    selected = pipeline._select_receipt_postprocessed_candidate(
+        four_rows,
+        history,
+        "STORE\nお買上商品数:5\n合計 ¥100",
+        0.9,
+        {},
+        "test-model",
+        [{"text": "layout"}],
+    )
+
+    assert len(selected["line_items"]) == 5
+    assert history[0]["postprocess_selected"] is True
+
+
+def test_candidate_score_ranks_layout_exact_then_absent_then_mismatch():
+    from receipt_parser import pipeline
+
+    extracted = _extraction(
+        total=100,
+        amount_paid=100,
+        line_items=[
+            {
+                "description": f"row {index}",
+                "qty": 1,
+                "unit_price": 25,
+                "total": 25,
+            }
+            for index in range(4)
+        ],
+    )
+
+    exact = pipeline._receipt_candidate_score(extracted, [], layout_item_count=4)
+    absent = pipeline._receipt_candidate_score(extracted, [], layout_item_count=None)
+    mismatch = pipeline._receipt_candidate_score(extracted, [], layout_item_count=5)
+
+    assert exact < absent < mismatch
 
 
 def test_candidate_selection_considers_cross_alt_and_deduplicates(monkeypatch):
@@ -703,7 +832,8 @@ def test_scanned_layout_blocks_reach_final_output_reconciliation(monkeypatch):
     ocr_result = OCRResult(
         blocks=[{}, {}, {}],
         layout_blocks=[layout_block],
-        chosen_text="TEST\n合計 ¥100",
+        layout_trusted=True,
+        chosen_text="TEST 合計 ¥100",
         confidence=0.9,
         source="mock",
     )
@@ -740,4 +870,115 @@ def test_scanned_layout_blocks_reach_final_output_reconciliation(monkeypatch):
     result = pipeline.process_document(Path("scan.png"))
 
     assert "_error" not in result
+    assert "_ocr_layout_blocks" not in result
     assert captured["ocr_layout_blocks"] == [{**layout_block, "page": 0}]
+
+    captured_result = pipeline.process_document(
+        Path("scan.png"), capture_ocr_layout=True,
+    )
+    assert captured_result["_ocr_layout_blocks"] == [{**layout_block, "page": 0}]
+    assert captured_result["_ocr_layout_trusted"] is True
+    assert captured_result["_ocr_page_count"] == 1
+    assert captured_result["_ocr_text"] == "TEST 合計 ¥100"
+    assert captured_result["_ocr_replay_text"] == "TEST\n合計 ¥100"
+    assert captured_result["_ocr_replay_confidence"] == 0.9
+
+    ocr_result.layout_trusted = False
+    legacy_result = pipeline.process_document(
+        Path("scan.png"), capture_ocr_layout=True,
+    )
+    assert legacy_result["_ocr_layout_blocks"] == []
+    assert legacy_result["_ocr_layout_trusted"] is False
+
+    ocr_result.layout_trusted = True
+    monkeypatch.setattr(pipeline, "load_image", lambda _path: [object(), object()])
+    multi_page_result = pipeline.process_document(
+        Path("scan.png"), capture_ocr_layout=True,
+    )
+    assert multi_page_result["_ocr_page_count"] == 2
+    assert multi_page_result["_ocr_layout_blocks"] == [{**layout_block, "page": 0}]
+
+
+def test_injected_layout_blocks_reach_pipeline_and_final_output_reconciliation(
+    monkeypatch,
+):
+    from receipt_parser import pipeline
+
+    source = _extraction()
+    layout = [{
+        "text": "商品甲",
+        "x": 100,
+        "y": 100,
+        "bbox": [[100, 100], [200, 100], [200, 120], [100, 120]],
+        "page": 0,
+    }]
+    captured = {}
+    monkeypatch.setattr(pipeline, "check_model_available", lambda _model: None)
+    monkeypatch.setattr(
+        pipeline,
+        "extract_with_verification",
+        lambda *_args, **_kwargs: (source, _history(source)),
+    )
+
+    def select(extracted, *_args, **kwargs):
+        captured["pipeline"] = kwargs.get("ocr_layout_blocks")
+        return dict(extracted)
+
+    def prepare(receipt, _ocr_text=None, **kwargs):
+        captured["final_output"] = kwargs.get("ocr_layout_blocks")
+        return receipt.model_dump()
+
+    monkeypatch.setattr(pipeline, "_select_receipt_postprocessed_candidate", select)
+    monkeypatch.setattr(pipeline, "_prepare_receipt_output_payload", prepare)
+    monkeypatch.setattr(pipeline, "_location_needs_resolution", lambda *_args: False)
+
+    result = pipeline.process_ocr_text(
+        "TEST\n合計 ¥100",
+        ocr_layout_blocks=layout,
+    )
+
+    assert "_error" not in result
+    assert captured == {"pipeline": layout, "final_output": layout}
+
+
+def test_injected_replay_preserves_scored_text_semantics_and_confidence(monkeypatch):
+    from receipt_parser import pipeline
+
+    source = _extraction()
+    receipt = pipeline.Receipt.model_validate(source)
+    injected_text = "ＴＥＳＴ    商品\n4901234567894\n合計 ￥１００"
+    normalized_text = pipeline.normalize_fullwidth(injected_text)
+    scored_text = pipeline.strip_barcode_lines(normalized_text)
+    captured = {}
+    monkeypatch.setattr(pipeline, "check_model_available", lambda _model: None)
+
+    def run_pipeline(**kwargs):
+        captured["run"] = kwargs
+        return source, _history(source), [], receipt
+
+    def prepare(prepared_receipt, ocr_text=None, **_kwargs):
+        captured["final_repair_text"] = ocr_text
+        return prepared_receipt.model_dump()
+
+    monkeypatch.setattr(pipeline, "_run_extraction_pipeline", run_pipeline)
+    monkeypatch.setattr(pipeline, "_prepare_receipt_output_payload", prepare)
+
+    result = pipeline.process_ocr_text(
+        injected_text,
+        apply_user_rules=False,
+        ocr_confidence=0.73,
+    )
+
+    assert captured["run"]["unified_text"] == scored_text
+    assert captured["run"]["raw_text"] == normalized_text
+    assert captured["run"]["payment_reference_text"] == normalized_text
+    assert captured["run"]["ocr_conf"] == 0.73
+    assert captured["final_repair_text"] == normalized_text
+    assert result["_ocr_confidence"] == 0.73
+
+    legacy = pipeline.process_ocr_text(injected_text, apply_user_rules=False)
+    assert legacy["_ocr_confidence"] == 0.9
+
+    for invalid in (True, "0.9", float("nan"), 1.01):
+        with pytest.raises(ValueError, match="OCR confidence"):
+            pipeline.process_ocr_text(injected_text, ocr_confidence=invalid)

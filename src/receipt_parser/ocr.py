@@ -4,10 +4,13 @@ Returns blocks in the format:
   [{"text": str, "confidence": float, "x": float, "y": float, "bbox": list}, ...]
 """
 
+import hashlib
 import json
 import logging
+import math
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,6 +30,7 @@ class OCRResult:
     retry_reason: str | None = None
     source: str = "unknown"      # "cache", "fresh", "digital_pdf"
     chosen_text: str = ""
+    layout_trusted: bool = False
 
 
 # Delegates to the unified usage tracker in usage.py.
@@ -233,6 +237,199 @@ def _extract_fulltext_from_response(response) -> str | None:
 # Cache in .data/ at project root (sibling of src/)
 _OCR_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / ".data" / "ocr_cache"
 
+_LAYOUT_SIDECAR_SCHEMA_VERSION = 1
+_LAYOUT_PROVENANCE_KINDS = {"exact_text_cache_reuse", "same_call_capture"}
+
+
+def ocr_layout_sidecar_path(ocr_text_path: Path) -> Path:
+    """Return the adjacent geometry sidecar path for an OCR text fixture."""
+    return Path(ocr_text_path).with_suffix(".layout.json")
+
+
+def _text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def layout_blocks_sha256(layout_blocks: list[dict]) -> str:
+    """Hash OCR geometry using a stable JSON representation."""
+    payload = json.dumps(
+        layout_blocks,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Replace one cache artifact atomically from the same directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(text)
+        temp_path.replace(path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+
+
+def validate_ocr_confidence(ocr_confidence: float) -> float:
+    """Return a finite OCR confidence in the public 0..1 range."""
+    if isinstance(ocr_confidence, bool) or not isinstance(ocr_confidence, (int, float)):
+        raise ValueError("OCR confidence must be a number between 0 and 1")
+    confidence = float(ocr_confidence)
+    if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+        raise ValueError("OCR confidence must be a number between 0 and 1")
+    return confidence
+
+
+def load_ocr_replay_evidence(
+    ocr_text_path: Path,
+    *,
+    expected_ocr_text: str | None = None,
+) -> dict | None:
+    """Load exact replay evidence only when its envelope matches the OCR text."""
+    text_path = Path(ocr_text_path)
+    sidecar_path = ocr_layout_sidecar_path(text_path)
+    if not sidecar_path.is_file():
+        return None
+
+    try:
+        envelope = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        layout_blocks = envelope["layout_blocks"]
+        provenance = envelope["provenance"]
+        ocr_confidence = validate_ocr_confidence(envelope["ocr_confidence"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid OCR layout sidecar: {sidecar_path}") from exc
+
+    if type(envelope.get("schema_version")) is not int or (
+        envelope["schema_version"] != _LAYOUT_SIDECAR_SCHEMA_VERSION
+    ):
+        raise ValueError(f"Unsupported OCR layout sidecar schema: {sidecar_path}")
+    if not isinstance(layout_blocks, list) or not all(
+        isinstance(block, dict) for block in layout_blocks
+    ):
+        raise ValueError(f"Invalid OCR layout blocks: {sidecar_path}")
+    bound_text = (
+        text_path.read_text(encoding="utf-8")
+        if expected_ocr_text is None
+        else expected_ocr_text
+    )
+    if envelope.get("ocr_text_sha256") != _text_sha256(bound_text):
+        raise ValueError(f"OCR layout sidecar text hash mismatch: {sidecar_path}")
+    try:
+        actual_layout_sha256 = layout_blocks_sha256(layout_blocks)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid OCR layout blocks: {sidecar_path}") from exc
+    if envelope.get("layout_blocks_sha256") != actual_layout_sha256:
+        raise ValueError(f"OCR layout sidecar layout hash mismatch: {sidecar_path}")
+    if not isinstance(provenance, dict):
+        raise ValueError(f"Invalid OCR layout sidecar provenance: {sidecar_path}")
+    if provenance.get("kind") not in _LAYOUT_PROVENANCE_KINDS:
+        raise ValueError(f"Invalid OCR layout provenance kind: {sidecar_path}")
+    if not isinstance(provenance.get("source"), str) or not provenance["source"].strip():
+        raise ValueError(f"Invalid OCR layout provenance source: {sidecar_path}")
+    return {
+        "layout_blocks": layout_blocks,
+        "ocr_confidence": ocr_confidence,
+        "provenance": provenance,
+    }
+
+
+def load_ocr_layout_sidecar(
+    ocr_text_path: Path,
+    *,
+    expected_ocr_text: str | None = None,
+) -> list[dict] | None:
+    """Load geometry only when its envelope exactly matches the OCR text."""
+    evidence = load_ocr_replay_evidence(
+        ocr_text_path,
+        expected_ocr_text=expected_ocr_text,
+    )
+    return evidence["layout_blocks"] if evidence else None
+
+
+def load_cached_ocr_layout(
+    ocr_text_path: Path,
+    *,
+    expected_ocr_text: str | None = None,
+    strict_envelope: bool = False,
+) -> tuple[list[dict], bool]:
+    """Read legacy cache geometry, trusting only a valid bound envelope."""
+    text_path = Path(ocr_text_path)
+    layout_path = ocr_layout_sidecar_path(text_path)
+    if not layout_path.is_file():
+        return [], False
+    try:
+        cached_layout = json.loads(layout_path.read_text(encoding="utf-8"))
+        if isinstance(cached_layout, list):
+            if not all(isinstance(block, dict) for block in cached_layout):
+                raise ValueError(f"Invalid legacy OCR layout blocks: {layout_path}")
+            return cached_layout, False
+        return load_ocr_layout_sidecar(
+            text_path,
+            expected_ocr_text=expected_ocr_text,
+        ) or [], True
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        if strict_envelope:
+            raise ValueError(f"Invalid cached OCR layout: {layout_path}") from exc
+        return [], False
+
+
+def write_ocr_layout_sidecar(
+    ocr_text_path: Path,
+    layout_blocks: list[dict],
+    *,
+    provenance_kind: str,
+    provenance_source: str,
+    expected_ocr_text: str | None = None,
+    ocr_confidence: float = 0.9,
+) -> Path:
+    """Bind OCR geometry to the exact adjacent text and record its origin."""
+    text_path = Path(ocr_text_path)
+    if provenance_kind not in _LAYOUT_PROVENANCE_KINDS:
+        raise ValueError(f"Invalid OCR layout provenance kind: {provenance_kind}")
+    if not isinstance(provenance_source, str) or not provenance_source.strip():
+        raise ValueError("OCR layout provenance source must be non-empty")
+    if not isinstance(layout_blocks, list) or not all(
+        isinstance(block, dict) for block in layout_blocks
+    ):
+        raise ValueError("OCR layout blocks must be a list of objects")
+    confidence = validate_ocr_confidence(ocr_confidence)
+
+    bound_text = (
+        text_path.read_text(encoding="utf-8")
+        if expected_ocr_text is None
+        else expected_ocr_text
+    )
+    envelope = {
+        "schema_version": _LAYOUT_SIDECAR_SCHEMA_VERSION,
+        "ocr_text_sha256": _text_sha256(bound_text),
+        "layout_blocks_sha256": layout_blocks_sha256(layout_blocks),
+        "ocr_confidence": confidence,
+        "provenance": {
+            "kind": provenance_kind,
+            "source": provenance_source,
+        },
+        "layout_blocks": layout_blocks,
+    }
+    sidecar_path = ocr_layout_sidecar_path(text_path)
+    _atomic_write_text(
+        sidecar_path,
+        json.dumps(envelope, ensure_ascii=False, indent=2),
+    )
+    return sidecar_path
+
 
 def _ocr_cache_key(image: np.ndarray) -> str:
     """Stable hash for an image to use as cache key."""
@@ -301,16 +498,15 @@ def run_cloud_vision(image: np.ndarray, client=None, *, skip_cache: bool = False
         layout_path = _OCR_CACHE_DIR / f"{key}.layout.json"
         if cache_path.exists():
             fulltext = cache_path.read_text(encoding="utf-8")
-            layout_blocks = []
-            if layout_path.exists():
-                try:
-                    layout_blocks = json.loads(layout_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    layout_blocks = []
+            layout_blocks, layout_trusted = load_cached_ocr_layout(
+                cache_path,
+                expected_ocr_text=fulltext,
+            )
             blocks = _fulltext_to_blocks(fulltext)
             return OCRResult(
                 blocks=blocks,
                 layout_blocks=layout_blocks,
+                layout_trusted=layout_trusted,
                 confidence=compute_ocr_confidence(blocks),
                 source="cache",
                 chosen_text=fulltext,
@@ -346,25 +542,38 @@ def run_cloud_vision(image: np.ndarray, client=None, *, skip_cache: bool = False
             if picked == fulltext2:
                 layout_blocks = _extract_words_from_response(response2)
 
+    blocks = _fulltext_to_blocks(fulltext)
+    confidence = compute_ocr_confidence(blocks)
+
     # Save to cache (unless skipping)
     if not skip_cache:
-        _OCR_CACHE_DIR.mkdir(exist_ok=True)
+        _OCR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         key = _ocr_cache_key(image)
         cache_path = _OCR_CACHE_DIR / f"{key}.txt"
-        cache_path.write_text(fulltext, encoding="utf-8")
+        layout_path = _OCR_CACHE_DIR / f"{key}.layout.json"
+        _atomic_write_text(cache_path, fulltext)
         if layout_blocks:
-            layout_path = _OCR_CACHE_DIR / f"{key}.layout.json"
-            layout_path.write_text(json.dumps(layout_blocks, ensure_ascii=False), encoding="utf-8")
+            write_ocr_layout_sidecar(
+                cache_path,
+                layout_blocks,
+                provenance_kind="same_call_capture",
+                provenance_source=key,
+                expected_ocr_text=fulltext,
+                ocr_confidence=confidence,
+            )
+        elif layout_path.exists():
+            layout_path.unlink()
+            logger.info("Removed stale OCR layout cache without matching geometry: %s", layout_path)
 
-    blocks = _fulltext_to_blocks(fulltext)
     return OCRResult(
         blocks=blocks,
         layout_blocks=layout_blocks,
-        confidence=compute_ocr_confidence(blocks),
+        confidence=confidence,
         retried=retried,
         retry_reason=retry_reason,
         source="fresh",
         chosen_text=fulltext,
+        layout_trusted=bool(layout_blocks),
     )
 
 

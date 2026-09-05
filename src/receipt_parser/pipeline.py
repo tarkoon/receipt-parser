@@ -20,7 +20,14 @@ logger = logging.getLogger(__name__)
 
 from .schema import Receipt
 from .preprocess import load_image, try_extract_text_layer
-from .ocr import init_cloud_vision, run_cloud_vision, blocks_to_structured_text, compute_ocr_confidence, OCRResult
+from .ocr import (
+    OCRResult,
+    blocks_to_structured_text,
+    compute_ocr_confidence,
+    init_cloud_vision,
+    run_cloud_vision,
+    validate_ocr_confidence,
+)
 from .llm import check_model_available, extract_with_verification, DEFAULT_MODEL
 from .validation import validate_receipt
 from .normalize import (normalize_fullwidth, clean_handwritten_ocr, strip_barcode_lines,
@@ -48,6 +55,7 @@ from .receipt_output import (
     _apply_final_receipt_output_repairs,  # noqa: F401 - legacy private import surface
     _prepare_receipt_output_payload,
 )
+from .receipt_projection import _balanced_layout_item_count
 from .receipt_phase_trace import (
     POSTPROCESS_MUTATION_FIELDS,
     _record_receipt_mutation,
@@ -533,6 +541,7 @@ def process_document(
     ocr_engine=None,
     apply_user_rules: bool = True,
     skip_ocr_cache: bool = False,
+    capture_ocr_layout: bool = False,
     **kwargs,
 ) -> dict:
     """Main pipeline. Uses Cloud Vision OCR + LLM extraction (OpenRouter or Ollama)."""
@@ -606,6 +615,14 @@ def process_document(
                     "_pipeline_version": _PIPELINE_VERSION,
                     "_line_items_reliable": False,
                 })
+                if capture_ocr_layout:
+                    extracted.update({
+                        "_ocr_layout_blocks": [],
+                        "_ocr_layout_trusted": False,
+                        "_ocr_page_count": len(images),
+                        "_ocr_replay_text": digital_text,
+                        "_ocr_replay_confidence": 1.0,
+                    })
                 return extracted
 
             if debug:
@@ -642,6 +659,14 @@ def process_document(
                 result,
                 result["_warnings"],
             )
+            if capture_ocr_layout:
+                result.update({
+                    "_ocr_layout_blocks": [],
+                    "_ocr_layout_trusted": False,
+                    "_ocr_page_count": len(images),
+                    "_ocr_replay_text": digital_text,
+                    "_ocr_replay_confidence": 1.0,
+                })
             _notify(on_stage, "done", "Complete", 1.0)
             return result
 
@@ -653,6 +678,7 @@ def process_document(
     _notify(on_stage, "ocr", "Running OCR", 0.05)
     all_ocr_results: list[OCRResult] = []
     text_parts = []
+    page_structured_texts = []
 
     n_pages = max(1, len(images))
     _OCR_BAND_START, _OCR_BAND_END = 0.05, 0.30
@@ -713,6 +739,7 @@ def process_document(
             draw_ocr_bboxes(page_img, blocks, debug_dir / f"03_page{i+1}_ocr_bboxes.png")
 
         page_text = blocks_to_structured_text(blocks)
+        page_structured_texts.append(page_text)
         if i > 0:
             text_parts.append(f"--- PAGE {i+1} ---")
         text_parts.append(page_text)
@@ -720,12 +747,22 @@ def process_document(
     unified_text = "\n".join(text_parts)
     unified_text = normalize_fullwidth(unified_text)
     raw_text = unified_text  # Preserve pre-barcode-stripped text
+    primary_replay_text = (
+        normalize_fullwidth(page_structured_texts[0])
+        if page_structured_texts
+        else ""
+    )
     unified_text = strip_barcode_lines(unified_text)
 
     # Compute aggregate OCR confidence
     _notify(on_stage, "normalize", "Processing OCR text", 0.30)
     all_blocks_flat = [b for r in all_ocr_results for b in r.blocks]
     ocr_conf = compute_ocr_confidence(all_blocks_flat)
+    primary_replay_confidence = (
+        compute_ocr_confidence(all_ocr_results[0].blocks)
+        if all_ocr_results
+        else 0.0
+    )
 
     # Detect document type
     doc_type = detect_document_type(unified_text)
@@ -736,11 +773,20 @@ def process_document(
     )
 
     if not unified_text.strip():
-        return {
+        result = {
             "_error": "OCR produced no text.",
             "_warnings": [], "_pass_count": 0, "_model": model,
             "_pipeline_version": _PIPELINE_VERSION, "_line_items_reliable": False,
         }
+        if capture_ocr_layout:
+            result.update({
+                "_ocr_layout_blocks": [],
+                "_ocr_layout_trusted": False,
+                "_ocr_page_count": len(images),
+                "_ocr_replay_text": primary_replay_text,
+                "_ocr_replay_confidence": primary_replay_confidence,
+            })
+        return result
 
     trace.log_step("ocr_grouped", data=unified_text)
 
@@ -752,6 +798,16 @@ def process_document(
             block_with_page = dict(block)
             block_with_page["page"] = page_idx
             all_layout_blocks.append(block_with_page)
+    # _ocr_text is the primary page's chosen text, so benchmark capture must
+    # carry only geometry from that exact same page.
+    captured_layout_trusted = bool(
+        all_ocr_results and all_ocr_results[0].layout_trusted
+    )
+    captured_layout_blocks = (
+        [block for block in all_layout_blocks if block["page"] == 0]
+        if captured_layout_trusted
+        else []
+    )
     receipt_mutation_trace: list[dict] | None = [] if debug else None
     extracted, pass_history, final_warnings, receipt = _run_extraction_pipeline(
         unified_text=unified_text, raw_text=raw_text,
@@ -766,6 +822,14 @@ def process_document(
     if "_error" in extracted:
         extracted.update({"_warnings": final_warnings, "_pass_count": 0, "_model": model,
                           "_pipeline_version": _PIPELINE_VERSION, "_line_items_reliable": False})
+        if capture_ocr_layout:
+            extracted.update({
+                "_ocr_layout_blocks": captured_layout_blocks,
+                "_ocr_layout_trusted": captured_layout_trusted,
+                "_ocr_page_count": len(images),
+                "_ocr_replay_text": primary_replay_text,
+                "_ocr_replay_confidence": primary_replay_confidence,
+            })
         return extracted
 
     if debug:
@@ -783,10 +847,10 @@ def process_document(
     # Aggregate OCR metadata from first page result
     assert receipt is not None
     primary_ocr = all_ocr_results[0] if all_ocr_results else None
-    repair_ocr_text = primary_ocr.chosen_text if primary_ocr else None
+    provider_ocr_text = primary_ocr.chosen_text if primary_ocr else None
     receipt_payload = _prepare_receipt_output_payload(
         receipt,
-        repair_ocr_text,
+        raw_text,
         mutation_trace=receipt_mutation_trace,
         ocr_layout_blocks=all_layout_blocks,
     )
@@ -796,7 +860,7 @@ def process_document(
         ocr_source=primary_ocr.source if primary_ocr else None,
         ocr_retried=primary_ocr.retried if primary_ocr else None,
         ocr_retry_reason=primary_ocr.retry_reason if primary_ocr else None,
-        ocr_text=repair_ocr_text,
+        ocr_text=provider_ocr_text,
         mutation_trace=receipt_mutation_trace,
     )
     result = _finalize_receipt_result(
@@ -806,6 +870,14 @@ def process_document(
     )
     _notify(on_stage, "validate", _build_validate_detail(result), 0.95)
     result["_llm_confidence"] = _compute_posthoc_confidence(result, result["_warnings"])
+    if capture_ocr_layout:
+        result.update({
+            "_ocr_layout_blocks": captured_layout_blocks,
+            "_ocr_layout_trusted": captured_layout_trusted,
+            "_ocr_page_count": len(images),
+            "_ocr_replay_text": primary_replay_text,
+            "_ocr_replay_confidence": primary_replay_confidence,
+        })
     _notify(on_stage, "done", "Complete", 1.0)
     return result
 
@@ -883,7 +955,12 @@ def _receipt_printed_tax_gap(extracted: dict, unified_text: str) -> float:
     return gap
 
 
-def _receipt_candidate_score(extracted: dict, warnings: list[str], unified_text: str = "") -> tuple:
+def _receipt_candidate_score(
+    extracted: dict,
+    warnings: list[str],
+    unified_text: str = "",
+    layout_item_count: int | None = None,
+) -> tuple:
     gap = _receipt_items_target_gap(extracted)
     gap_value = 1_000_000.0 if gap is None else float(gap)
     tax_gap = _receipt_printed_tax_gap(extracted, unified_text)
@@ -911,15 +988,23 @@ def _receipt_candidate_score(extracted: dict, warnings: list[str], unified_text:
             abs(item_count - printed_count),
             abs(qty_count - printed_count),
         )
+    if layout_item_count is None:
+        layout_count_state = 1
+        layout_count_gap = 0
+    else:
+        layout_count_gap = abs(item_count - layout_item_count)
+        layout_count_state = 0 if layout_count_gap == 0 else 2
     return (
         gap_value > 2,
         gap_value,
         tax_gap > 2,
         tax_gap,
-        item_warning_count,
-        len(warnings),
         count_gap > 0,
         count_gap,
+        layout_count_state,
+        layout_count_gap,
+        item_warning_count,
+        len(warnings),
         -item_count,
     )
 
@@ -960,6 +1045,11 @@ def _select_receipt_postprocessed_candidate(
                     duplicate[0].append((idx, key))
                 continue
             candidate_refs.append(([(idx, key)], candidate))
+
+    shared_layout_item_count = _balanced_layout_item_count(
+        extracted,
+        ocr_layout_blocks,
+    )
 
     def record_metrics(
         sources: list[tuple[int, str]],
@@ -1055,7 +1145,12 @@ def _select_receipt_postprocessed_candidate(
         for warning in receipt._soft_warnings:
             if warning not in warnings:
                 warnings.append(warning)
-        score = _receipt_candidate_score(scoring_view, warnings, unified_text)
+        score = _receipt_candidate_score(
+            scoring_view,
+            warnings,
+            unified_text,
+            shared_layout_item_count,
+        )
         record_metrics(sources, _receipt_items_target_gap(scoring_view), warnings)
 
         ranked = (score, order, postprocessed, warnings, sources, candidate_trace)
@@ -1157,7 +1252,7 @@ def _run_extraction_pipeline(
             ocr_conf,
             ocr_totals,
             model,
-            ocr_layout_blocks,
+            ocr_layout_blocks=ocr_layout_blocks,
             mutation_trace=mutation_trace,
             payment_reference_text=payment_reference_text,
         )
@@ -1323,6 +1418,8 @@ def process_ocr_text(
     apply_user_rules: bool = True,
     on_stage: StageCallback = None,
     debug: bool = False,
+    ocr_layout_blocks: list[dict] | None = None,
+    ocr_confidence: float | None = None,
 ) -> dict:
     """Run the pipeline from OCR text onwards (skip image loading + OCR).
 
@@ -1331,14 +1428,17 @@ def process_ocr_text(
     - Debugging with specific OCR output
     - Benchmarking LLM extraction independently of OCR variance
     """
+    ocr_conf = (
+        0.9
+        if ocr_confidence is None
+        else validate_ocr_confidence(ocr_confidence)
+    )
     check_model_available(model)
 
     # Normalize text
     payment_reference_text = normalize_fullwidth(ocr_text)
     unified_text = strip_barcode_lines(payment_reference_text)
     doc_type = detect_document_type(unified_text)
-    ocr_conf = 0.9  # default confidence for injected text
-
     if not unified_text.strip():
         return {
             "_error": "OCR text is empty.",
@@ -1361,9 +1461,10 @@ def process_ocr_text(
     _notify(on_stage, "extract", "LLM extraction", 0.40)
     receipt_mutation_trace: list[dict] | None = [] if debug else None
     extracted, pass_history, final_warnings, receipt = _run_extraction_pipeline(
-        unified_text=unified_text, raw_text=ocr_text,
+        unified_text=unified_text, raw_text=payment_reference_text,
         ocr_conf=ocr_conf, doc_type=doc_type,
         model=model, passes=passes,
+        ocr_layout_blocks=ocr_layout_blocks,
         on_stage=on_stage,
         mutation_trace=receipt_mutation_trace,
         payment_reference_text=payment_reference_text,
@@ -1377,8 +1478,9 @@ def process_ocr_text(
     assert receipt is not None
     receipt_payload = _prepare_receipt_output_payload(
         receipt,
-        ocr_text,
+        payment_reference_text,
         mutation_trace=receipt_mutation_trace,
+        ocr_layout_blocks=ocr_layout_blocks,
     )
     result = _build_result(
         receipt_payload, final_warnings, pass_history, model,

@@ -26,7 +26,13 @@ from pathlib import Path
 import cv2
 import pytest
 from receipt_parser.llm import DEFAULT_MODEL
-from receipt_parser.ocr import _OCR_CACHE_DIR, _ocr_cache_key
+from receipt_parser.ocr import (
+    _OCR_CACHE_DIR,
+    _ocr_cache_key,
+    load_cached_ocr_layout,
+    load_ocr_replay_evidence,
+    ocr_layout_sidecar_path,
+)
 from receipt_parser.preprocess import load_image, try_extract_text_layer
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -258,6 +264,12 @@ def _corpus_sha256(cases) -> str:
         if source["type"] == "image":
             for label, path in _cached_ocr_artifacts(source["path"]):
                 _update_path_fingerprint(digest, label, path)
+        else:
+            _update_path_fingerprint(
+                digest,
+                "ocr_layout_sidecar",
+                ocr_layout_sidecar_path(source["path"]),
+            )
     return digest.hexdigest()
 
 
@@ -269,6 +281,33 @@ def _missing_cached_ocr(cases) -> list[Path]:
         for label, path in _cached_ocr_artifacts(source["path"])
         if label.endswith("ocr_text") and not path.is_file()
     ]
+
+
+def _preflight_text_layouts(cases) -> dict[Path, dict | None]:
+    """Validate every selected text sidecar before any result is scored."""
+    return {
+        source["path"]: load_ocr_replay_evidence(source["path"])
+        for _case_id, source, _truth in cases
+        if source["type"] == "ocr_text"
+    }
+
+
+def _preflight_cached_image_layouts(cases) -> None:
+    """Reject corrupt bound cache geometry before accuracy scoring starts."""
+    for _case_id, source, _truth in cases:
+        if source["type"] != "image":
+            continue
+        for label, layout_path in _cached_ocr_artifacts(source["path"]):
+            if not label.endswith("ocr_layout") or not layout_path.is_file():
+                continue
+            text_path = layout_path.with_name(
+                layout_path.name.removesuffix(".layout.json") + ".txt"
+            )
+            load_cached_ocr_layout(
+                text_path,
+                expected_ocr_text=text_path.read_text(encoding="utf-8"),
+                strict_envelope=True,
+            )
 
 
 def _git_output(*args: str) -> bytes | None:
@@ -367,6 +406,7 @@ _ACCURACY_SCOPE = {
     "apply_user_rules": False,
 }
 _RESULTS_CACHE: dict[str, dict] = {}
+_OCR_TEXT_LAYOUTS: dict[Path, dict | None] = {}
 
 # Collect check results for summary plugin
 _check_results: list[dict] = []
@@ -393,8 +433,19 @@ def _process_one(case_id: str, source: dict) -> tuple[str, dict, float]:
     else:
         from receipt_parser.pipeline import process_ocr_text
         ocr_text = source["path"].read_text(encoding="utf-8")
+        replay_evidence = (
+            _OCR_TEXT_LAYOUTS[source["path"]]
+            if source["path"] in _OCR_TEXT_LAYOUTS
+            else load_ocr_replay_evidence(source["path"])
+        )
         result = process_ocr_text(
             ocr_text, passes=ACCURACY_PASSES, apply_user_rules=False,
+            ocr_layout_blocks=(
+                replay_evidence["layout_blocks"] if replay_evidence else None
+            ),
+            ocr_confidence=(
+                replay_evidence["ocr_confidence"] if replay_evidence else None
+            ),
         )
     elapsed = time.perf_counter() - t0
     return case_id, result, elapsed
@@ -410,6 +461,7 @@ def _get_result(case_id: str, source: dict) -> dict:
 @pytest.fixture(scope="session", autouse=True)
 def preprocess_fixtures(request):
     """Pre-process all fixtures concurrently before tests run."""
+    global _OCR_TEXT_LAYOUTS
     workers = request.config.getoption("--workers", default=4)
     scope = {**_ACCURACY_SCOPE, "workers": workers}
     request.config._metadata = {
@@ -418,6 +470,12 @@ def preprocess_fixtures(request):
     }
     if not _CASES:
         return
+
+    try:
+        _OCR_TEXT_LAYOUTS = _preflight_text_layouts(_CASES)
+        _preflight_cached_image_layouts(_CASES)
+    except ValueError as exc:
+        pytest.fail(str(exc), pytrace=False)
 
     missing_cache = _missing_cached_ocr(_CASES)
     if missing_cache:

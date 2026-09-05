@@ -40,6 +40,11 @@ from receipt_parser.ocr import (
     _ocr_cache_key,
     get_api_usage,
     init_cloud_vision,
+    layout_blocks_sha256,
+    load_cached_ocr_layout,
+    load_ocr_replay_evidence,
+    ocr_layout_sidecar_path,
+    write_ocr_layout_sidecar,
 )
 from receipt_parser.pipeline import process_document, process_ocr_text
 from receipt_parser.preprocess import load_image, try_extract_text_layer
@@ -56,6 +61,7 @@ DEFAULT_OUTPUT = RESULTS_DIR / "latest.json"
 DEFAULT_BUDGET_LIMIT = 200
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OCR_CACHE_DIR = _OCR_CACHE_DIR
+_LAYOUT_NOT_PREFLIGHTED = object()
 
 
 class _CacheOnlyOCREngine:
@@ -211,6 +217,12 @@ def _fixture_corpus_sha256(
         if cached_ocr and source.suffix != ".txt":
             for label, path in _cached_ocr_artifacts(source):
                 _update_path_fingerprint(digest, label, path)
+        elif source.suffix == ".txt":
+            _update_path_fingerprint(
+                digest,
+                "ocr_layout_sidecar",
+                ocr_layout_sidecar_path(source),
+            )
     return digest.hexdigest()
 
 
@@ -222,6 +234,37 @@ def _missing_cached_ocr(fixtures: list[tuple[str, Path, dict]]) -> list[Path]:
         for label, path in _cached_ocr_artifacts(source)
         if label.endswith("ocr_text") and not path.is_file()
     ]
+
+
+def _preflight_text_layouts(
+    fixtures: list[tuple[str, Path, dict]],
+) -> dict[Path, dict | None]:
+    """Validate every selected text sidecar before any fixture is scored."""
+    return {
+        source: load_ocr_replay_evidence(source)
+        for _name, source, _truth in fixtures
+        if source.suffix == ".txt"
+    }
+
+
+def _preflight_cached_image_layouts(
+    fixtures: list[tuple[str, Path, dict]],
+) -> None:
+    """Reject corrupt bound cache geometry before cached scoring starts."""
+    for _name, source, _truth in fixtures:
+        if source.suffix == ".txt":
+            continue
+        for label, layout_path in _cached_ocr_artifacts(source):
+            if not label.endswith("ocr_layout") or not layout_path.is_file():
+                continue
+            text_path = layout_path.with_name(
+                layout_path.name.removesuffix(".layout.json") + ".txt"
+            )
+            load_cached_ocr_layout(
+                text_path,
+                expected_ocr_text=text_path.read_text(encoding="utf-8"),
+                strict_envelope=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -279,20 +322,84 @@ def _attribute_failure(failed_field: str, failed_run: dict, ref_run: dict) -> st
 # OCR variant auto-save
 # ---------------------------------------------------------------------------
 
-def _save_variant(fixture_name: str, ocr_text: str) -> Path | None:
-    """Save a unique failing OCR variant. Returns path if saved, None if deduplicated."""
+def _save_variant(
+    fixture_name: str,
+    ocr_text: str,
+    ocr_layout_blocks: list[dict] | None = None,
+    *,
+    provenance_kind: str = "same_call_capture",
+    provenance_source: str | None = None,
+    ocr_confidence: float = 0.9,
+) -> Path | None:
+    """Save a failing OCR variant and exact-text geometry when available."""
     VARIANTS_DIR.mkdir(parents=True, exist_ok=True)
 
     existing = sorted(VARIANTS_DIR.glob(f"{fixture_name}_v*.txt"))
+    captured_layout_sha256 = (
+        layout_blocks_sha256(ocr_layout_blocks) if ocr_layout_blocks else None
+    )
 
     for existing_file in existing:
         existing_text = existing_file.read_text(encoding="utf-8")
-        if _text_similarity(ocr_text, existing_text) > 0.98:
+        if ocr_text == existing_text:
+            sidecar = ocr_layout_sidecar_path(existing_file)
+            if sidecar.is_file():
+                existing_evidence = load_ocr_replay_evidence(existing_file)
+                if captured_layout_sha256 is None or (
+                    layout_blocks_sha256(existing_evidence["layout_blocks"])
+                    == captured_layout_sha256
+                    and existing_evidence["ocr_confidence"] == ocr_confidence
+                ):
+                    return None
+                continue
+            if ocr_layout_blocks:
+                try:
+                    write_ocr_layout_sidecar(
+                        existing_file,
+                        ocr_layout_blocks,
+                        provenance_kind=provenance_kind,
+                        provenance_source=provenance_source or fixture_name,
+                        expected_ocr_text=ocr_text,
+                        ocr_confidence=ocr_confidence,
+                    )
+                except Exception:
+                    ocr_layout_sidecar_path(existing_file).unlink(missing_ok=True)
+                    raise
+                return existing_file
+            return None
+        if not ocr_layout_blocks and _text_similarity(ocr_text, existing_text) > 0.98:
             return None
 
-    version = len(existing) + 1
-    path = VARIANTS_DIR / f"{fixture_name}_v{version}.txt"
-    path.write_text(ocr_text, encoding="utf-8")
+    versions = [
+        int(match.group(1))
+        for path in existing
+        if (match := re.fullmatch(
+            rf"{re.escape(fixture_name)}_v(\d+)", path.stem,
+        ))
+    ]
+    version = max(versions, default=0) + 1
+    while True:
+        path = VARIANTS_DIR / f"{fixture_name}_v{version}.txt"
+        try:
+            with path.open("x", encoding="utf-8") as handle:
+                handle.write(ocr_text)
+            break
+        except FileExistsError:
+            version += 1
+    if ocr_layout_blocks:
+        try:
+            write_ocr_layout_sidecar(
+                path,
+                ocr_layout_blocks,
+                provenance_kind=provenance_kind,
+                provenance_source=provenance_source or fixture_name,
+                expected_ocr_text=ocr_text,
+                ocr_confidence=ocr_confidence,
+            )
+        except Exception:
+            ocr_layout_sidecar_path(path).unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
+            raise
     return path
 
 
@@ -346,11 +453,25 @@ def _run_fixture(
     cv_client,
     skip_cache: bool = True,
     save_variants: bool = True,
+    preflight_layout_blocks=_LAYOUT_NOT_PREFLIGHTED,
 ) -> tuple[str, dict]:
     """Run all iterations for a single fixture. Returns (name, fixture_data)."""
     is_ocr_text = fixture_source.suffix == ".txt"
     checks = get_checks_for(fixture_truth)
     fixture_runs = []
+    replay_evidence = None
+    if is_ocr_text:
+        replay_evidence = (
+            load_ocr_replay_evidence(fixture_source)
+            if preflight_layout_blocks is _LAYOUT_NOT_PREFLIGHTED
+            else preflight_layout_blocks
+        )
+    replay_layout_blocks = (
+        replay_evidence["layout_blocks"] if replay_evidence else None
+    )
+    replay_ocr_confidence = (
+        replay_evidence["ocr_confidence"] if replay_evidence else None
+    )
 
     for run_idx in range(1, runs + 1):
         wall_start = time.perf_counter()
@@ -362,6 +483,8 @@ def _run_fixture(
                 result = process_ocr_text(
                     ocr_text, model=model, passes=passes,
                     apply_user_rules=False,
+                    ocr_layout_blocks=replay_layout_blocks,
+                    ocr_confidence=replay_ocr_confidence,
                 )
             else:
                 digital_pdf = (
@@ -372,7 +495,7 @@ def _run_fixture(
                 result = process_document(
                     fixture_source, model=model, passes=passes,
                     apply_user_rules=False, skip_ocr_cache=skip_cache,
-                    ocr_engine=cv_client,
+                    ocr_engine=cv_client, capture_ocr_layout=True,
                 )
                 if not skip_cache and not digital_pdf and result.get("_ocr_source") != "cache":
                     raise RuntimeError(
@@ -407,12 +530,24 @@ def _run_fixture(
             "error": error,
             "fields": field_results,
             "ocr": {
-                "confidence": result.get("_ocr_confidence"),
+                "confidence": result.get(
+                    "_ocr_replay_confidence", result.get("_ocr_confidence"),
+                ),
                 "retried": result.get("_ocr_retried", False),
                 "retry_reason": result.get("_ocr_retry_reason"),
                 "source": result.get("_ocr_source", "unknown"),
+                "origin": fixture_source.name,
+                "layout_trusted": result.get(
+                    "_ocr_layout_trusted",
+                    is_ocr_text and replay_evidence is not None,
+                ),
+                "page_count": result.get("_ocr_page_count", 1),
             },
-            "ocr_text": result.get("_ocr_text", ""),
+            "ocr_text": result.get("_ocr_replay_text", result.get("_ocr_text", "")),
+            "ocr_provider_text": result.get("_ocr_text", ""),
+            "ocr_layout_blocks": deepcopy(
+                result.get("_ocr_layout_blocks", replay_layout_blocks or [])
+            ),
             "llm_raw": deepcopy(llm_raw),
             "llm_pass_history": deepcopy(pass_history),
             "final_extraction": _public_extraction(result),
@@ -434,7 +569,11 @@ def _run_fixture(
 
     # Finalize fixture
     fixture_data = {"runs": fixture_runs}
-    _finalize_fixture(fixture_name, fixture_data, save_variants=save_variants)
+    _finalize_fixture(
+        fixture_name,
+        fixture_data,
+        save_variants=save_variants and not is_ocr_text,
+    )
     return fixture_name, fixture_data
 
 
@@ -467,8 +606,32 @@ def _finalize_fixture(fixture_name: str, fdata: dict, *, save_variants: bool = T
     if save_variants:
         for run in runs:
             has_failure = any(not f["pass"] for f in run["fields"].values())
-            if has_failure and run.get("ocr_text"):
-                path = _save_variant(fixture_name, run["ocr_text"])
+            if (
+                has_failure
+                and run.get("ocr_text")
+                and run.get("ocr", {}).get("page_count", 1) == 1
+            ):
+                layout_blocks = (
+                    run.get("ocr_layout_blocks")
+                    if run.get("ocr", {}).get("layout_trusted")
+                    else None
+                )
+                path = _save_variant(
+                    fixture_name,
+                    run["ocr_text"],
+                    layout_blocks,
+                    provenance_kind=(
+                        "exact_text_cache_reuse"
+                        if run.get("ocr", {}).get("source") in {"cache", "injected"}
+                        else "same_call_capture"
+                    ),
+                    provenance_source=run.get("ocr", {}).get("origin") or fixture_name,
+                    ocr_confidence=(
+                        run.get("ocr", {}).get("confidence")
+                        if run.get("ocr", {}).get("confidence") is not None
+                        else 0.9
+                    ),
+                )
                 if path:
                     variants_saved += 1
 
@@ -722,7 +885,38 @@ def _assemble_results(metadata: dict, per_fixture: dict) -> dict:
                 ocr_path = ocr_dir / f"{fname}_run{run['run']}.txt"
                 ocr_path.write_text(clean_run["ocr_text"], encoding="utf-8")
                 clean_run["ocr"]["text_file"] = _artifact_report_path(ocr_path)
+                if (
+                    clean_run.get("ocr_provider_text")
+                    and clean_run["ocr_provider_text"] != clean_run["ocr_text"]
+                ):
+                    provider_path = ocr_dir / f"{fname}_run{run['run']}.provider.txt"
+                    provider_path.write_text(
+                        clean_run["ocr_provider_text"], encoding="utf-8",
+                    )
+                    clean_run["ocr"]["provider_text_file"] = _artifact_report_path(
+                        provider_path,
+                    )
+                if clean_run["ocr"].get("layout_trusted"):
+                    layout_path = write_ocr_layout_sidecar(
+                        ocr_path,
+                        clean_run.get("ocr_layout_blocks", []),
+                        provenance_kind=(
+                            "exact_text_cache_reuse"
+                            if clean_run["ocr"].get("source") in {"cache", "injected"}
+                            else "same_call_capture"
+                        ),
+                        provenance_source=clean_run["ocr"].get("origin") or fname,
+                        expected_ocr_text=clean_run["ocr_text"],
+                        ocr_confidence=(
+                            clean_run["ocr"].get("confidence")
+                            if clean_run["ocr"].get("confidence") is not None
+                            else 0.9
+                        ),
+                    )
+                    clean_run["ocr"]["layout_file"] = _artifact_report_path(layout_path)
             clean_run.pop("ocr_text", None)
+            clean_run.pop("ocr_provider_text", None)
+            clean_run.pop("ocr_layout_blocks", None)
             # Save LLM raw as companion file
             if clean_run.get("llm_raw"):
                 llm_dir = artifact_dir / "llm"
@@ -926,6 +1120,13 @@ def run_benchmark(
     if not fixtures:
         print("No fixtures found. Exiting.")
         sys.exit(1)
+    try:
+        preflight_layouts = _preflight_text_layouts(fixtures)
+        if use_cached_ocr:
+            _preflight_cached_image_layouts(fixtures)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        raise SystemExit(1) from exc
 
     n_fixtures = len(fixtures)
     fixture_name_list = [f[0] for f in fixtures]
@@ -1007,7 +1208,7 @@ def run_benchmark(
             futures = {
                 pool.submit(
                     _run_fixture, name, source, truth, runs, model, passes, cv_client,
-                    skip_cache, save_variants,
+                    skip_cache, save_variants, preflight_layouts.get(source),
                 ): name
                 for name, source, truth in fixtures
             }
@@ -1020,7 +1221,7 @@ def run_benchmark(
             print(f"\n[{fix_idx + 1}/{n_fixtures}] {name}")
             _, fdata = _run_fixture_sequential(
                 name, source, truth, runs, model, passes, cv_client, skip_cache,
-                save_variants,
+                save_variants, preflight_layouts.get(source),
             )
             per_fixture[name] = fdata
 
@@ -1041,12 +1242,25 @@ def run_benchmark(
 
 def _run_fixture_sequential(
     fixture_name, fixture_source, fixture_truth, runs, model, passes, cv_client, skip_cache,
-    save_variants=True,
+    save_variants=True, preflight_layout_blocks=_LAYOUT_NOT_PREFLIGHTED,
 ):
     """Sequential fixture runner with progress printing."""
     is_ocr_text = fixture_source.suffix == ".txt"
     checks = get_checks_for(fixture_truth)
     fixture_runs = []
+    replay_evidence = None
+    if is_ocr_text:
+        replay_evidence = (
+            load_ocr_replay_evidence(fixture_source)
+            if preflight_layout_blocks is _LAYOUT_NOT_PREFLIGHTED
+            else preflight_layout_blocks
+        )
+    replay_layout_blocks = (
+        replay_evidence["layout_blocks"] if replay_evidence else None
+    )
+    replay_ocr_confidence = (
+        replay_evidence["ocr_confidence"] if replay_evidence else None
+    )
 
     for run_idx in range(1, runs + 1):
         wall_start = time.perf_counter()
@@ -1058,6 +1272,8 @@ def _run_fixture_sequential(
                 result = process_ocr_text(
                     ocr_text, model=model, passes=passes,
                     apply_user_rules=False,
+                    ocr_layout_blocks=replay_layout_blocks,
+                    ocr_confidence=replay_ocr_confidence,
                 )
             else:
                 digital_pdf = (
@@ -1067,7 +1283,7 @@ def _run_fixture_sequential(
                 result = process_document(
                     fixture_source, model=model, passes=passes,
                     apply_user_rules=False, skip_ocr_cache=skip_cache,
-                    ocr_engine=cv_client,
+                    ocr_engine=cv_client, capture_ocr_layout=True,
                 )
                 if not skip_cache and not digital_pdf and result.get("_ocr_source") != "cache":
                     raise RuntimeError(
@@ -1099,12 +1315,24 @@ def _run_fixture_sequential(
             "error": error,
             "fields": field_results,
             "ocr": {
-                "confidence": result.get("_ocr_confidence"),
+                "confidence": result.get(
+                    "_ocr_replay_confidence", result.get("_ocr_confidence"),
+                ),
                 "retried": result.get("_ocr_retried", False),
                 "retry_reason": result.get("_ocr_retry_reason"),
                 "source": result.get("_ocr_source", "unknown"),
+                "origin": fixture_source.name,
+                "layout_trusted": result.get(
+                    "_ocr_layout_trusted",
+                    is_ocr_text and replay_evidence is not None,
+                ),
+                "page_count": result.get("_ocr_page_count", 1),
             },
-            "ocr_text": result.get("_ocr_text", ""),
+            "ocr_text": result.get("_ocr_replay_text", result.get("_ocr_text", "")),
+            "ocr_provider_text": result.get("_ocr_text", ""),
+            "ocr_layout_blocks": deepcopy(
+                result.get("_ocr_layout_blocks", replay_layout_blocks or [])
+            ),
             "llm_raw": deepcopy(llm_raw),
             "llm_pass_history": deepcopy(pass_history),
             "final_extraction": _public_extraction(result),
@@ -1123,7 +1351,11 @@ def _run_fixture_sequential(
               f"wall: {wall_time:.1f}s{fail_str}")
 
     fixture_data = {"runs": fixture_runs}
-    _finalize_fixture(fixture_name, fixture_data, save_variants=save_variants)
+    _finalize_fixture(
+        fixture_name,
+        fixture_data,
+        save_variants=save_variants and not is_ocr_text,
+    )
     return fixture_name, fixture_data
 
 
