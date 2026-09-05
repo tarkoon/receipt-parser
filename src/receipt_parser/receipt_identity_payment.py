@@ -1331,7 +1331,10 @@ def _fix_total_from_stacked_cash_tender_block(extracted, unified_text):
     lines = unified_text.split('\n')
 
     def _loose_amount(line: str) -> float | None:
-        m = re.fullmatch(r'[¥￥]?\s*(\d{1,3}(?:,\d{3})*|\d{1,5})\s*', line.strip())
+        m = re.fullmatch(
+            r'[¥￥]?\s*(\d{1,3}(?:,\d{3})*|\d{1,5})\s*(?:円|[¥￥\\])?\s*',
+            line.strip(),
+        )
         if not m:
             return None
         try:
@@ -1345,13 +1348,71 @@ def _fix_total_from_stacked_cash_tender_block(extracted, unified_text):
             continue
         if re.search(r'税|対象|点数', line):
             continue
-        window = '\n'.join(lines[idx:min(len(lines), idx + 10)])
-        if not (re.search(r'現金|現計', window) or _CASH_TENDER_LABEL_RE.search(window)):
+        short_end = min(len(lines), idx + 10)
+        window = '\n'.join(lines[idx:short_end])
+        has_tender = bool(
+            re.search(r'現金|現計', window) or _CASH_TENDER_LABEL_RE.search(window)
+        )
+        has_change = bool(_CASH_CHANGE_LABEL_RE.search(window))
+        if not (has_tender and has_change):
+            end = min(len(lines), idx + 18)
+            wide_window = '\n'.join(lines[idx:end])
+            if (
+                _has_noncash_tender_amount(wide_window)
+                or not _CASH_CHANGE_LABEL_RE.search(wide_window)
+            ):
+                continue
+            try:
+                previous_total = float(extracted.get("total"))
+            except (TypeError, ValueError):
+                continue
+            for cash_idx in range(idx + 1, end):
+                cash_match = _CASH_SETTLEMENT_LABEL_RE.fullmatch(
+                    lines[cash_idx].strip()
+                )
+                if not cash_match:
+                    continue
+                tendered = _loose_amount(cash_match.group("amount") or "")
+                if tendered is None:
+                    for following in lines[cash_idx + 1:cash_idx + 3]:
+                        if following.strip():
+                            tendered = _loose_amount(following)
+                            break
+                if tendered is None or tendered <= 0 or abs(previous_total - tendered) > 2:
+                    continue
+                for change_idx in range(cash_idx + 1, end):
+                    if not _CASH_CHANGE_LABEL_RE.fullmatch(lines[change_idx].strip()):
+                        continue
+                    change = _amount_at_end(lines[change_idx])
+                    if change is None:
+                        for following in lines[change_idx + 1:min(end, change_idx + 3)]:
+                            if not following.strip():
+                                continue
+                            change = _loose_amount(following)
+                            if change is not None:
+                                break
+                            if not _CASH_SETTLEMENT_LABEL_RE.fullmatch(following.strip()):
+                                break
+                    if change is None or change < 0 or tendered <= change:
+                        continue
+                    inferred_total = tendered - change
+                    printed_totals = [
+                        printed
+                        for j in range(idx + 1, cash_idx)
+                        if (printed := _loose_amount(lines[j])) is not None
+                    ]
+                    if (
+                        not printed_totals
+                        or abs(printed_totals[-1] - inferred_total) > 2
+                    ):
+                        continue
+                    extracted["total"] = inferred_total
+                    points_used = float(extracted.get("points_used") or 0)
+                    extracted["amount_paid"] = max(0.0, inferred_total - points_used)
+                    return
             continue
-        if not _CASH_CHANGE_LABEL_RE.search(window):
-            continue
-        has_noncash_tender_amount = _has_noncash_tender_amount(window)
 
+        has_noncash_tender_amount = _has_noncash_tender_amount(window)
         amounts: list[float] = []
         for following in lines[idx + 1:min(len(lines), idx + 18)]:
             stripped = following.strip()

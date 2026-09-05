@@ -83,6 +83,124 @@ def test_balanced_cash_settlement_outranks_broad_payment_tokens(total, ocr_text)
     assert extracted["payment_method"] == "cash"
 
 
+def test_stacked_cash_settlement_accepts_trailing_currency_marks():
+    extracted = {
+        "total": 3606,
+        "subtotal": 3260,
+        "amount_paid": 3606,
+        "points_used": 0,
+        "payment_method": "credit",
+    }
+    ocr_text = "\n".join([
+        "ラベル ID: 867459823",
+        "合計",
+        "購入点数",
+        "視覚的に問題なし",
+        "1299.00",
+        "1039",
+        "1299",
+        "****",
+        "3586",
+        "現金",
+        "3606 ¥",
+        "お釣り",
+        "現金",
+        "20 \\",
+    ])
+
+    _run_cash_tender_reconciliation_phase(
+        extracted,
+        ocr_text,
+        ("stacked_cash_tender", "unlabeled_cash_tender_change"),
+    )
+
+    assert extracted["total"] == 3586
+    assert extracted["subtotal"] == 3260
+    assert extracted["amount_paid"] == 3586
+
+
+def test_distant_settlement_labels_do_not_adopt_tax_stack_arithmetic():
+    extracted = {
+        "total": 2748,
+        "amount_paid": 2748,
+        "points_used": 0,
+    }
+    ocr_text = "\n".join([
+        "合計",
+        "¥4",
+        "¥2748",
+        "(8%対象)",
+        "¥2744",
+        "内税",
+        "¥203",
+        "取引情報",
+        "お預り",
+        "¥5048",
+        "お",
+        "釣",
+        "¥2300",
+    ])
+
+    _run_cash_tender_reconciliation_phase(
+        extracted,
+        ocr_text,
+        ("stacked_cash_tender",),
+    )
+
+    assert extracted == {
+        "total": 2748,
+        "amount_paid": 2748,
+        "points_used": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("current_total", "printed_totals", "after_change"),
+    [
+        (3606, [3500], ["現金", "20 \\"]),
+        (3586, [3586], ["現金", "20 \\"]),
+        (3606, [3586], ["注文番号", "20 \\"]),
+        (3606, [3586, 3500], ["現金", "20 \\"]),
+    ],
+)
+def test_distant_cash_settlement_requires_three_independent_bindings(
+    current_total,
+    printed_totals,
+    after_change,
+):
+    extracted = {
+        "total": current_total,
+        "amount_paid": 1111,
+        "points_used": 0,
+    }
+    ocr_text = "\n".join([
+        "合計",
+        "購入点数",
+        "視覚的に問題なし",
+        "1299.00",
+        "1039",
+        "1299",
+        "****",
+        *map(str, printed_totals),
+        "現金",
+        "3606 ¥",
+        "お釣り",
+        *after_change,
+    ])
+
+    _run_cash_tender_reconciliation_phase(
+        extracted,
+        ocr_text,
+        ("stacked_cash_tender",),
+    )
+
+    assert extracted == {
+        "total": current_total,
+        "amount_paid": 1111,
+        "points_used": 0,
+    }
+
+
 @pytest.mark.parametrize(
     "ocr_text",
     [
