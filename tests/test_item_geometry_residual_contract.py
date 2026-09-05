@@ -381,6 +381,48 @@ def test_balanced_layout_projection_owns_ascii_description_from_adjacent_detail_
     assert [item["unit_price"] for item in extracted["line_items"]] == [120, 240]
 
 
+def test_barcode_projection_recovers_missing_discounted_unit_in_exact_bundle_swap():
+    from receipt_parser.receipt_projection import _project_totals_to_layout_rows
+
+    extracted = {
+        "subtotal": 300,
+        "total": 300,
+        "taxes": [],
+        "line_items": [_item("ALPHA ITEM", 200), _item("BETA ITEM", 100)],
+    }
+    extracted["line_items"][1].update(unit_price=None, discount=30)
+    layout = _catalog_layout_rows(
+        (10, (("ALPHA ITEM", 100),)),
+        (35, (("4900000000001", 100),)),
+        (60, (("¥130", 500),)),
+        (85, (("-¥30", 500),)),
+        (110, (("BETA ITEM", 100),)),
+        (135, (("4900000000002", 100),)),
+        (160, (("¥200", 500),)),
+        (185, (("合計", 100), ("300", 500))),
+    )
+
+    _project_totals_to_layout_rows(extracted, layout)
+
+    assert [
+        (item["unit_price"], item["total"], item["discount"])
+        for item in extracted["line_items"]
+    ] == [(130.0, 100.0, 30.0), (200.0, 200.0, 0.0)]
+
+    near_miss = {
+        "subtotal": 300,
+        "total": 300,
+        "taxes": [],
+        "line_items": [_item("ALPHA ITEM", 200), _item("BETA ITEM", 100)],
+    }
+    near_miss["line_items"][1].update(unit_price=None, discount=29)
+    before = [dict(item) for item in near_miss["line_items"]]
+
+    _project_totals_to_layout_rows(near_miss, layout)
+
+    assert near_miss["line_items"] == before
+
+
 def test_mixed_catalog_layout_owns_structural_sales_and_excludes_reference_metadata():
     from receipt_parser.receipt_projection import (
         _layout_row_price_candidates,

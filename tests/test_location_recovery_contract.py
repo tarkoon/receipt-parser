@@ -72,6 +72,30 @@ def test_phone_backed_host_line_yields_its_unique_trailing_locality():
     assert extracted["location"] == "北丘"
 
 
+def test_phone_backed_split_host_yields_its_unique_trailing_locality():
+    extracted = {"merchant": "架空商店", "location": "モール北丘"}
+    ocr_text = "モール\n北丘\n架空商店 (012) 345-6789\n合計"
+
+    _recover_header_branch_store_location(extracted, ocr_text)
+
+    assert extracted["location"] == "北丘"
+
+
+def test_phone_backed_split_host_fails_closed_without_one_kanji_locality():
+    split_hosts = [
+        ("モール北丘", "プラザ南丘"),
+        ("モール", "丘"),
+    ]
+    for first, second in split_hosts:
+        location = first + second
+        extracted = {"merchant": "架空商店", "location": location}
+        ocr_text = f"{first}\n{second}\n架空商店 (012) 345-6789\n合計"
+
+        _recover_header_branch_store_location(extracted, ocr_text)
+
+        assert extracted["location"] == location
+
+
 def test_phone_backed_host_line_preserves_an_explicit_store_location():
     extracted = {"merchant": "架空商店", "location": "モール北丘店"}
     ocr_text = "架空商店\nモール北丘店\n領収証\nTEL 012-345-6789\n合計"

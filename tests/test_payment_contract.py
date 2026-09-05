@@ -530,6 +530,68 @@ def test_fuel_merchant_uses_nearest_brand_line_not_header_slogan():
     assert extracted["merchant"] == "ACME"
 
 
+def test_contact_row_after_host_store_uses_leading_logo_idempotently():
+    extracted = {"merchant": "青空珈琲"}
+    ocr_text = "\n".join([
+        "NORTHSTAR",
+        "COFFFF",
+        "青空珈琲",
+        "北丘モール中央店",
+        "TEL: 000-0000-0000",
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+    assert extracted["merchant"] == "NORTHSTAR"
+
+    _fix_company_name_merchant(extracted, ocr_text)
+    assert extracted["merchant"] == "NORTHSTAR"
+
+
+def test_alphabetic_romanization_still_identifies_following_brand_line():
+    extracted = {"merchant": "星空亭"}
+    ocr_text = "\n".join([
+        "星空亭",
+        "星空料理店",
+        "Hoshizora Dining",
+        "中央店",
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "星空料理店"
+
+
+@pytest.mark.parametrize(
+    "leading_lines",
+    [
+        pytest.param([], id="no-leading-logo"),
+        pytest.param(["RECEIPT"], id="structural-noise"),
+        pytest.param(["NORTHSTAR"], id="no-supporting-logo-line"),
+        pytest.param(["ORDER123", "COFFFF"], id="identifier-like-leading-token"),
+        pytest.param(
+            ["NORTHSTAR", "ご案内", "COFFFF"],
+            id="interrupted-logo-stack",
+        ),
+    ],
+)
+def test_contact_row_without_valid_leading_logo_preserves_japanese_merchant(
+    leading_lines,
+):
+    extracted = {"merchant": "青空珈琲"}
+    lines = [
+        *leading_lines,
+        "青空珈琲",
+        "北丘モール中央店",
+        "TEL: 000-0000-0000",
+    ]
+
+    _fix_company_name_merchant(extracted, "\n".join(lines))
+    assert extracted["merchant"] == "青空珈琲"
+
+    _fix_company_name_merchant(extracted, "\n".join(lines))
+    assert extracted["merchant"] == "青空珈琲"
+
+
 @pytest.mark.parametrize(
     ("ocr_text", "extracted", "expected"),
     [
@@ -587,6 +649,233 @@ def test_receipt_owner_header_requires_unique_candidate_and_section_ownership(
     _fix_company_name_merchant(extracted, ocr_text)
 
     assert extracted["merchant"] == before
+
+
+def test_standalone_post_title_logo_is_not_receipt_owner_proof():
+    extracted = {"merchant": "サンプル流通本部", "line_items": []}
+    ocr_text = "\n".join([
+        "NORTHSTAR",
+        "ORBIT",
+        "領収証",
+        "サンプル流通本部",
+        "青空県星見市1番地",
+        "登録番号 T1234567890123",
+        "NORTHSTAR",
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "サンプル流通本部"
+
+
+def test_repeated_loyalty_heading_does_not_hide_the_unique_receipt_owner():
+    extracted = {"merchant": "サンプル流通本部", "line_items": []}
+    ocr_text = "\n".join([
+        "NORTHSTAR",
+        "MEMBERSHIP",
+        "領収証",
+        "サンプル流通本部",
+        "青空県星見市1番地",
+        "登録番号 T1234567890123",
+        "MEMBERSHIP",
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "NORTHSTAR"
+
+
+def test_receipt_owner_can_repeat_inside_a_shopping_thanks_footer():
+    extracted = {"merchant": "サンプル流通本部", "line_items": []}
+    ocr_text = "\n".join([
+        "NORTHSTAR",
+        "EWHOLESALE",
+        "領収証",
+        "サンプル流通本部",
+        "青空県星見市1番地",
+        "登録番号 T1234567890123",
+        "THANK YOU FOR SHOPPING AT NORTHSTAR.",
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "NORTHSTAR"
+
+
+@pytest.mark.parametrize(
+    "post_title_lines",
+    [
+        [
+            "サンプル流通本部",
+            "青空県星見市1番地",
+            "登録番号 T1234567890123",
+            "NORTHSTAR FILTER 100円",
+        ],
+        [
+            "サンプル流通本部",
+            "青空県星見市1番地",
+            "登録番号 T1234567890123",
+            "THANK NORTHSTAR AND ORBIT FOR SHOPPING WITH US",
+        ],
+        [
+            "サンプル流通本部",
+            "青空県星見市1番地",
+            "登録番号 T1234567890123",
+            "THANKS NORTHSTAR MEMBERS - SHOP AGAIN",
+        ],
+        [
+            "サンプル流通本部",
+            "青空県星見市1番地",
+            "登録番号 T1234567890123",
+            "SHOP AT NORTHSTAR",
+        ],
+    ],
+)
+def test_embedded_receipt_owner_repeat_requires_unambiguous_footer_prose(
+    post_title_lines,
+):
+    extracted = {"merchant": "サンプル流通本部", "line_items": []}
+    ocr_text = "\n".join([
+        "NORTHSTAR",
+        "ORBIT",
+        "領収証",
+        *post_title_lines,
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "サンプル流通本部"
+
+
+def test_embedded_receipt_owner_repeat_matches_a_whole_logo_token():
+    extracted = {"merchant": "サンプル流通本部", "line_items": []}
+    ocr_text = "\n".join([
+        "NORTH",
+        "NORTHSTAR",
+        "領収証",
+        "サンプル流通本部",
+        "青空県星見市1番地",
+        "登録番号 T1234567890123",
+        "THANK YOU FOR SHOPPING AT NORTHSTAR",
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "NORTHSTAR"
+
+
+@pytest.mark.parametrize(
+    "post_title_lines",
+    [
+        pytest.param(
+            [
+                "サンプル流通本部",
+                "青空県星見市1番地",
+                "登録番号 T1234567890123",
+            ],
+            id="no-repeated-owner",
+        ),
+        pytest.param(
+            [
+                "サンプル流通本部",
+                "青空県星見市1番地",
+                "NORTHSTAR",
+            ],
+            id="no-registration",
+        ),
+    ],
+)
+def test_ambiguous_receipt_owner_requires_repeat_and_registration(post_title_lines):
+    extracted = {"merchant": "サンプル流通本部", "line_items": []}
+    ocr_text = "\n".join([
+        "NORTHSTAR",
+        "ORBIT",
+        "領収証",
+        *post_title_lines,
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "サンプル流通本部"
+
+
+def test_parking_machine_prefers_one_normalized_facility_over_legal_operator():
+    extracted = {"merchant": "サンプル管理"}
+    ocr_text = "\n".join([
+        "領収書",
+        "(有) サンプル管理",
+        "車室 No.12",
+        "入庫時刻 08月05日 14時39分",
+        "精算時刻 08月05日 15時31分",
+        "100円",
+        "駐車料金 消費税率 10%",
+        "PARKING FEE",
+        "駐車場所在地: 青空県星見市1番地",
+        "| NORTH PARK |",
+        "north   park",
+        "SPARKLING WATER",
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "NORTH PARK"
+
+
+def test_parking_machine_accepts_one_unlabelled_post_fee_facility():
+    extracted = {"merchant": "サンプル管理"}
+    ocr_text = "\n".join([
+        "領収書",
+        "(有) サンプル管理",
+        "車室 No.12",
+        "入庫時刻 08月05日 14時39分",
+        "料金 消費税率 10%",
+        "虹色スペース",
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "虹色スペース"
+
+
+@pytest.mark.parametrize(
+    ("operator_line", "facility_lines"),
+    [
+        pytest.param(
+            "(株) サンプル管理",
+            ["NORTH PARK", "SOUTH PARK"],
+            id="ambiguous-facilities",
+        ),
+        pytest.param(
+            "運営者 サンプル管理",
+            ["NORTH PARK"],
+            id="no-legal-marker",
+        ),
+        pytest.param(
+            "(有) サンプル管理",
+            ["PARKING RECEIPT"],
+            id="document-title-is-not-a-facility",
+        ),
+        pytest.param(
+            "(有) サンプル管理",
+            ["LOCATION: NORTH PARK"],
+            id="location-label-is-not-a-facility",
+        ),
+    ],
+)
+def test_parking_machine_facility_repair_fails_closed(operator_line, facility_lines):
+    extracted = {"merchant": "サンプル管理"}
+    ocr_text = "\n".join([
+        "領収書",
+        operator_line,
+        "車室 No.12",
+        "入庫時刻 08月05日 14時39分",
+        "駐車料金 消費税率 10%",
+        *facility_lines,
+    ])
+
+    _fix_company_name_merchant(extracted, ocr_text)
+
+    assert extracted["merchant"] == "サンプル管理"
 
 
 def test_late_unlabeled_cash_repair_cannot_override_noncash_evidence():

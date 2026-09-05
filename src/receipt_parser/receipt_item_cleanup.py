@@ -162,15 +162,6 @@ def _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text):
         extracted_unit_count = sum(float(item.get("qty") or 1) for item in items)
     except (TypeError, ValueError):
         extracted_unit_count = None
-    if current_gap <= 2 and (
-        printed_count is None
-        or (
-            extracted_unit_count is not None
-            and abs(extracted_unit_count - printed_count) < 0.01
-        )
-    ):
-        return
-
     lines = [line.strip() for line in unified_text.split('\n')]
 
     def _norm(text: str) -> str:
@@ -197,11 +188,12 @@ def _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text):
 
     line_norms = [_norm(line) for line in lines]
 
-    def _find_desc_line(desc: str) -> int | None:
+    def _find_desc_line(desc: str, *, require_unique: bool = False) -> int | None:
         desc_norm = _norm(desc)
         if len(desc_norm) < 3:
             return None
         best: tuple[float, int] | None = None
+        match_count = 0
         for idx, line_norm in enumerate(line_norms):
             if len(line_norm) < 3:
                 continue
@@ -211,7 +203,19 @@ def _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text):
                 score = SequenceMatcher(None, desc_norm, line_norm).ratio()
             if score >= 0.86 and (best is None or score > best[0]):
                 best = (score, idx)
+            if score >= 0.86:
+                match_count += 1
+        if require_unique and match_count != 1:
+            return None
         return best[1] if best else None
+
+    basket_balanced = current_gap <= 2 and (
+        printed_count is None
+        or (
+            extracted_unit_count is not None
+            and abs(extracted_unit_count - printed_count) < 0.01
+        )
+    )
 
     def _next_item_line(start_idx: int, item_idx: int) -> int | None:
         nearest = None
@@ -262,6 +266,56 @@ def _fix_adjacent_ocr_price_shift_when_balanced(extracted, unified_text):
             or second_total <= 0
         ):
             continue
+        if basket_balanced:
+            first_desc = _norm(first.get("description") or "")
+            second_desc = _norm(second.get("description") or "")
+            first_line = _find_desc_line(first.get("description") or "", require_unique=True)
+            second_line = _find_desc_line(second.get("description") or "", require_unique=True)
+            if (
+                first_desc == second_desc
+                or first_line is None
+                or second_line != first_line + 1
+                or second_line + 2 >= len(lines)
+            ):
+                continue
+            previous_line = lines[first_line - 1] if first_line else ""
+            following_idx = second_line + 3
+            following_line = lines[following_idx] if following_idx < len(lines) else ""
+            if (
+                _amount_from_line(lines[first_line]) is not None
+                or _amount_from_line(lines[second_line]) is not None
+                or _norm(lines[second_line + 1])
+                or _norm(lines[second_line + 2])
+                or (
+                    previous_line
+                    and _amount_from_line(previous_line) is None
+                    and _valid_ocr_item_desc(_clean_ocr_price_line_desc(previous_line))
+                )
+                or (
+                    _amount_from_line(following_line) is not None
+                    and not _norm(following_line)
+                )
+            ):
+                continue
+            first_amount = _amount_from_line(lines[second_line + 1])
+            second_amount = _amount_from_line(lines[second_line + 2])
+            if first_amount is None or second_amount is None:
+                continue
+            item_amounts = tuple(round(value, 2) for value in (first_total, second_total))
+            ocr_amounts = tuple(round(value, 2) for value in (first_amount, second_amount))
+            if (
+                ocr_amounts[0] == ocr_amounts[1]
+                or Counter(item_amounts) != Counter(ocr_amounts)
+                or item_amounts == ocr_amounts
+            ):
+                continue
+            first["qty"] = 1.0
+            first["unit_price"] = first_amount
+            first["total"] = first_amount
+            second["qty"] = 1.0
+            second["unit_price"] = second_amount
+            second["total"] = second_amount
+            return
         first_supported = _supported_amount_for_item(idx)
         second_supported = _supported_amount_for_item(idx + 1)
         if first_supported is None or second_supported is None:

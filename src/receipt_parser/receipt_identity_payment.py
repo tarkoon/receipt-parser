@@ -46,6 +46,14 @@ _PAYMENT_TOKEN_RE = re.compile(
     rf'PayPay|{_TRANSPORT_LABEL}|(?<![A-Za-z])IC(?![A-Za-z])',
     re.IGNORECASE,
 )
+_RECEIPT_OWNER_NOISE_RE = re.compile(
+    r'CREDIT|RECEIPT|CUSTOMER|SALE|PAYMENT|TOTAL|SUBTOTAL|VOID(?:ED)?|'
+    r'ID|NO|POS|TEL|FAX|SS|WELCOME|APP|MEMBER(?:SHIP)?|LOYALTY|'
+    r'(?:(?:CUSTOMER|MERCHANT|STORE|OFFICE|CARDHOLDER|RECEIPT)[&.\'-]?)?'
+    r'(?:COPY|DUPLICATE|ORIGINAL|REPRINT)'
+    r'(?:[&.\'-]?(?:COPY|\d+))*',
+    re.IGNORECASE,
+)
 _PAYMENT_AMOUNT_PATTERN = r'(?:[¥￥][ \t]*)?[0-9][0-9,]*(?:\.[0-9]+)?[ \t]*円?'
 _CASH_TENDER_LABEL_RE = re.compile(
     r'^[ \t]*(?:現金[ \t]*)?(?:お?[ \t]*預(?:[ \t]*(?:か[ \t]*)?り(?:[ \t]*金(?:[ \t]*額)?)?)?)'
@@ -590,6 +598,18 @@ def _clean_merchant_candidate(text: str, *, keep_company_suffix: bool = False) -
     return text
 
 
+def _clean_receipt_owner_candidate(value: str) -> str | None:
+    candidate = re.sub(r'[®™©]', '', value).strip()
+    if (
+        not re.fullmatch(r'[A-Za-z][A-Za-z0-9&.\'-]{2,30}', candidate)
+        or _RECEIPT_OWNER_NOISE_RE.fullmatch(candidate)
+        or _PAYMENT_TOKEN_RE.fullmatch(candidate)
+        or _merchant_looks_invalid(candidate)
+    ):
+        return None
+    return candidate
+
+
 def _official_authority_header_candidate(lines: list[str]) -> str | None:
     for raw_line in lines[:8]:
         line = raw_line.strip()
@@ -606,26 +626,6 @@ def _official_authority_header_candidate(lines: list[str]) -> str | None:
 
 def _receipt_owner_header_candidate(lines: list[str], title_idx: int) -> str | None:
     """Return one logo-like owner from the header ending at a receipt title."""
-    noise = re.compile(
-        r'CREDIT|RECEIPT|CUSTOMER|SALE|PAYMENT|TOTAL|SUBTOTAL|VOID(?:ED)?|'
-        r'ID|NO|POS|TEL|FAX|SS|WELCOME|APP|'
-        r'(?:(?:CUSTOMER|MERCHANT|STORE|OFFICE|CARDHOLDER|RECEIPT)[&.\'-]?)?'
-        r'(?:COPY|DUPLICATE|ORIGINAL|REPRINT)'
-        r'(?:[&.\'-]?(?:COPY|\d+))*',
-        re.IGNORECASE,
-    )
-
-    def clean(value: str) -> str | None:
-        candidate = re.sub(r'[®™©]', '', value).strip()
-        if (
-            not re.fullmatch(r'[A-Za-z][A-Za-z0-9&.\'-]{2,30}', candidate)
-            or noise.fullmatch(candidate)
-            or _PAYMENT_TOKEN_RE.fullmatch(candidate)
-            or _merchant_looks_invalid(candidate)
-        ):
-            return None
-        return candidate
-
     title = lines[title_idx].strip()
     inline = re.match(
         r'^\s*(?P<owner>[A-Za-z][A-Za-z0-9&.\'-]{2,30})\s*'
@@ -634,11 +634,11 @@ def _receipt_owner_header_candidate(lines: list[str], title_idx: int) -> str | N
         re.IGNORECASE,
     )
     if inline:
-        owner = clean(inline.group("owner"))
+        owner = _clean_receipt_owner_candidate(inline.group("owner"))
         if not owner:
             return None
         continuation = (
-            clean(lines[title_idx + 1].strip())
+            _clean_receipt_owner_candidate(lines[title_idx + 1].strip())
             if title_idx + 1 < len(lines)
             else None
         )
@@ -660,10 +660,29 @@ def _receipt_owner_header_candidate(lines: list[str], title_idx: int) -> str | N
 
     candidates: dict[str, str] = {}
     for raw_line in lines[:title_idx]:
-        candidate = clean(raw_line.strip())
+        candidate = _clean_receipt_owner_candidate(raw_line.strip())
         if candidate:
             candidates.setdefault(candidate.casefold(), candidate)
-    return next(iter(candidates.values())) if len(candidates) == 1 else None
+    if len(candidates) == 1:
+        return next(iter(candidates.values()))
+    repeated = set()
+    for raw_line in lines[title_idx + 1:]:
+        footer = re.search(
+            r'\bTHANK(?:S|\s+YOU)?\s+FOR\s+SHOP(?:PING)?\s+AT\s+(?P<owner>.*)',
+            re.sub(r'[®™©]', '', raw_line),
+            re.IGNORECASE,
+        )
+        if footer:
+            repeated.update(
+                owner_key
+                for owner_key, owner in candidates.items()
+                if re.match(
+                    rf'{re.escape(owner)}(?=$|[\s,;:!?。.])',
+                    footer.group("owner"),
+                    re.IGNORECASE,
+                )
+            )
+    return candidates[next(iter(repeated))] if len(repeated) == 1 else None
 
 
 def _fix_company_name_merchant(extracted, unified_text):
@@ -671,6 +690,7 @@ def _fix_company_name_merchant(extracted, unified_text):
     merchant = extracted.get("merchant")
     lines = unified_text.split('\n')
     merchant_text = (merchant or "").strip()
+    merchant_key = re.sub(r'\s+', '', merchant_text).casefold()
     authority_header = _official_authority_header_candidate(lines)
     if authority_header and merchant_text != authority_header:
         for idx, raw_line in enumerate(lines[:8]):
@@ -698,8 +718,7 @@ def _fix_company_name_merchant(extracted, unified_text):
             )
         )
     ), None)
-    if title_idx is not None and len(re.sub(r'\s+', '', merchant_text)) >= 3:
-        merchant_key = re.sub(r'\s+', '', merchant_text).casefold()
+    if title_idx is not None and len(merchant_key) >= 3:
         header_has_merchant = any(
             merchant_key in re.sub(r'\s+', '', line).casefold()
             for line in lines[:title_idx + 1]
@@ -715,14 +734,87 @@ def _fix_company_name_merchant(extracted, unified_text):
             re.sub(r'\s+', '', line).casefold().startswith(merchant_key)
             for line in lines[title_idx + 1:]
         )
+        legal_identity_owned = False
+        for idx in range(title_idx + 1, min(len(lines), title_idx + 5)):
+            following = '\n'.join(lines[idx + 1:idx + 4])
+            if (
+                re.sub(r'\s+', '', lines[idx]).casefold().startswith(merchant_key)
+                and re.search(
+                    r'〒|\d+(?:丁目|番地|番\s*号)|'
+                    r'(?:都|道|府|県).{0,20}(?:市|区|町|村|郡)',
+                    following,
+                )
+                and re.search(r'(?:インボイス制度)?登録\s*番号', following)
+            ):
+                legal_identity_owned = True
+                break
         owner = _receipt_owner_header_candidate(lines, title_idx)
         if (
             owner
             and owner.casefold() != merchant_key
             and not header_has_merchant
-            and (item_owned or usage_owned)
+            and (item_owned or usage_owned or legal_identity_owned)
         ):
             extracted["merchant"] = owner
+            return
+
+    merchant_lines = [
+        line
+        for line in lines
+        if len(merchant_key) >= 3
+        and merchant_key in re.sub(r'\s+', '', line).casefold()
+    ]
+    parking_fee = re.compile(r'料金|PARKING\s+FEE', re.IGNORECASE)
+    fee_line_indexes = {
+        idx for idx, line in enumerate(lines) if parking_fee.search(line)
+    }
+    parking_machine = (
+        bool(re.search(r'(?:No\.?|#)\s*\d+', unified_text, re.IGNORECASE))
+        and bool(re.search(
+            r'(?:入庫|出庫|精算)(?:時刻|日時|時間)',
+            unified_text,
+        ))
+        and bool(fee_line_indexes)
+    )
+    if (
+        merchant_lines
+        and all(_COMPANY_SUFFIX_RE.search(line) for line in merchant_lines)
+        and parking_machine
+    ):
+        facility_token = re.compile(
+            r'(?<![A-Za-z])PARK(?:ING)?(?![A-Za-z])', re.IGNORECASE
+        )
+        facility_noise = re.compile(
+            r'^(?:(?:施設|駐車場|パーク)(?:名|名称)|名称)\s*[:：]|'
+            r'^(?:パーク|駐車場|PARK(?:ING)?)(?:名|名称)?[:：]?$|'
+            r'領収|料金|税率|車室|入庫|出庫|精算|登録|番号|インボイス|'
+            r'事業者|運営|管理|会社|法人|所在地|住所|案内|〒|TEL|電話|FAX|'
+            r'https?://|\b(?:FEE|NAME|ADDRESS|OPERATOR|RECEIPT|LOCATION)\b',
+            re.IGNORECASE,
+        )
+        facilities: dict[str, str] = {}
+        for facility_idx, raw_line in enumerate(lines):
+            candidate = re.sub(
+                r'\s+', ' ', raw_line.strip(' \t\u3000|｜┃│')
+            ).strip()
+            compact = re.sub(r'\s+', '', candidate)
+            if (
+                not 3 <= len(compact) <= 40
+                or not (
+                    facility_token.search(candidate)
+                    or facility_idx - 1 in fee_line_indexes
+                )
+                or _COMPANY_SUFFIX_RE.search(candidate)
+                or _merchant_looks_invalid(candidate)
+                or facility_noise.search(candidate)
+            ):
+                continue
+            facilities.setdefault(
+                re.sub(r'[\W_]+', '', candidate, flags=re.UNICODE).casefold(),
+                candidate,
+            )
+        if len(facilities) == 1:
+            extracted["merchant"] = next(iter(facilities.values()))
             return
     for facility_idx, raw_line in enumerate(lines):
         facility = raw_line.strip()
@@ -822,12 +914,30 @@ def _fix_company_name_merchant(extracted, unified_text):
                 next_line
                 and romanized_line
                 and re.search(r'[ぁ-んァ-ン一-龥]', next_line)
-                and re.search(r'[A-Za-z]', romanized_line)
                 and not re.search(r'TEL|FAX|https?://|登録番号|領収', next_line, re.IGNORECASE)
             ):
-                candidate = _clean_merchant_candidate(next_line)
-                if candidate and not _merchant_looks_invalid(candidate):
-                    extracted["merchant"] = candidate
+                if (
+                    re.fullmatch(r"[A-Za-z][A-Za-z .&'-]{2,50}", romanized_line)
+                    and not _RECEIPT_OWNER_NOISE_RE.fullmatch(romanized_line)
+                    and not _PAYMENT_TOKEN_RE.fullmatch(romanized_line)
+                ):
+                    candidate = _clean_merchant_candidate(next_line)
+                    if candidate and not _merchant_looks_invalid(candidate):
+                        extracted["merchant"] = candidate
+                        return
+                if (
+                    re.search(r'店[。．.]?$', next_line)
+                    and re.search(r'TEL|FAX|https?://', romanized_line, re.IGNORECASE)
+                ):
+                    logo_stack: list[str] = []
+                    for item in reversed(lines[:idx]):
+                        candidate = _clean_receipt_owner_candidate(item.strip())
+                        if not candidate:
+                            break
+                        logo_stack.append(candidate)
+                    leading_logo = logo_stack[-1] if len(logo_stack) >= 2 else ""
+                    if re.fullmatch(r"[A-Za-z][A-Za-z&.'-]{2,30}", leading_logo):
+                        extracted["merchant"] = leading_logo
                     return
     for raw_line in lines[:_ASCII_BRAND_HEADER_SCAN_LIMIT]:
         line = raw_line.strip()

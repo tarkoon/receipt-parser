@@ -88,7 +88,7 @@ def strip_barcode_lines(text: str) -> str:
 _BONUS_POINT_LINE_RE = re.compile(
     r'^\(?\s*(?:'
     r'ボーナスポイント[\s\d]*\)?'        # "(ボーナスポイント" or "(ボーナスポイント 10P)"
-    r'|\d+\s*P\)?'                        # "(10P)", "10P)", "40P"
+    r'|\d+\s*P\s*\)?'                    # "(10P)", "10 P )", "40P"
     r')\s*$'
 )
 

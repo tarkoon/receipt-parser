@@ -16,6 +16,7 @@ from .receipt_item_repair import (
 )
 from .receipt_projection import (
     _clean_ocr_price_line_desc,
+    _norm_layout_desc,
 )
 from .receipt_tax_categories import (
     _fix_tax_categories_from_ocr_markers,
@@ -155,6 +156,24 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
             for current, candidate in zip(current_rows, candidate_rows)
         ):
             return False
+        current_descriptions = [
+            _norm_layout_desc(str(item.get("description") or ""))
+            for item in current_rows
+        ]
+        candidate_descriptions = [
+            _norm_layout_desc(str(item.get("description") or ""))
+            for item in candidate_rows
+        ]
+        if (
+            all(current_descriptions)
+            and all(candidate_descriptions)
+            and len(set(current_descriptions)) == len(current_descriptions)
+            and len(set(candidate_descriptions)) == len(candidate_descriptions)
+            and sorted(current_descriptions) == sorted(candidate_descriptions)
+            and current_descriptions != candidate_descriptions
+        ):
+            for current, candidate in zip(current_rows, candidate_rows):
+                current["description"] = candidate["description"]
         for current, candidate in zip(current_rows, candidate_rows):
             current["discount_rate"] = candidate.get("discount_rate") or ""
         return True

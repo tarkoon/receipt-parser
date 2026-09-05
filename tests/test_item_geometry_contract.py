@@ -55,6 +55,41 @@ def test_footer_unit_count_is_not_borrowed_as_row_quantity():
     assert items == [_item("一般商品甲乙", 100)]
 
 
+def test_mangled_qty_uses_one_row_owned_printed_amount_and_preserves_neighbor():
+    from receipt_parser.receipt_item_repair import _fix_qty_from_ocr_patterns
+
+    neighbor = _item("隣接商品甲乙", 128)
+    target = _item("対象商品甲乙", 198)
+    items = [neighbor, target]
+    expected_neighbor = dict(neighbor)
+
+    _fix_qty_from_ocr_patterns(
+        items,
+        "隣接商品甲乙\n128%\n対象商品甲乙\n196* A\n(21 X 198)\n小計\n324",
+    )
+
+    assert items[0] == expected_neighbor
+    assert (items[1]["qty"], items[1]["unit_price"], items[1]["total"]) == (
+        2,
+        98,
+        196,
+    )
+
+
+def test_mangled_qty_fails_closed_when_factor_interpretation_is_ambiguous():
+    from receipt_parser.receipt_item_repair import _fix_qty_from_ocr_patterns
+
+    items = [_item("対象商品甲乙", 60)]
+    expected = [dict(items[0])]
+
+    _fix_qty_from_ocr_patterns(
+        items,
+        "対象商品甲乙\n60* A\n(23 35 X 130 120)\n小計\n60",
+    )
+
+    assert items == expected
+
+
 def test_repeated_description_quantity_belongs_to_its_ocr_occurrence():
     from receipt_parser.receipt_item_repair import _apply_qty_notation_from_ocr
 
@@ -121,6 +156,95 @@ def test_neighborhood_projection_fails_closed_on_equal_candidates():
     )
 
     assert items == expected
+
+
+def test_balanced_adjacent_price_shift_uses_unique_desc_desc_amount_amount_fifo():
+    from receipt_parser.receipt_item_cleanup import _fix_adjacent_ocr_price_shift_when_balanced
+
+    extracted = {
+        "subtotal": 750,
+        "total": 750,
+        "line_items": [
+            _item("直前商品甲乙", 50),
+            _item("先行商品甲乙", 430),
+            _item("後続商品甲乙", 270),
+        ],
+    }
+
+    _fix_adjacent_ocr_price_shift_when_balanced(
+        extracted,
+        "直前商品甲乙 ¥50\n先行商品甲乙\n後続商品甲乙\n¥270\n¥430\n小計\n¥750",
+    )
+
+    assert [
+        (item["qty"], item["unit_price"], item["total"])
+        for item in extracted["line_items"]
+    ] == [
+        (1, 50, 50),
+        (1.0, 270.0, 270.0),
+        (1.0, 430.0, 430.0),
+    ]
+
+
+def test_balanced_adjacent_price_shift_rejects_mismatched_amount_multiset():
+    from receipt_parser.receipt_item_cleanup import _fix_adjacent_ocr_price_shift_when_balanced
+
+    extracted = {
+        "subtotal": 700,
+        "total": 700,
+        "line_items": [_item("先行商品甲乙", 420), _item("後続商品甲乙", 280)],
+    }
+    expected = [dict(item) for item in extracted["line_items"]]
+
+    _fix_adjacent_ocr_price_shift_when_balanced(
+        extracted,
+        "先行商品甲乙\n後続商品甲乙\n¥270\n¥430\n小計\n¥700",
+    )
+
+    assert extracted["line_items"] == expected
+
+
+def test_balanced_adjacent_price_shift_rejects_ambiguous_description_owner():
+    from receipt_parser.receipt_item_cleanup import _fix_adjacent_ocr_price_shift_when_balanced
+
+    extracted = {
+        "subtotal": 700,
+        "total": 700,
+        "line_items": [_item("先行商品甲乙", 430), _item("後続商品甲乙", 270)],
+    }
+    expected = [dict(item) for item in extracted["line_items"]]
+
+    _fix_adjacent_ocr_price_shift_when_balanced(
+        extracted,
+        "先行商品甲乙\n後続商品甲乙\n¥270\n¥430\n先行商品甲乙\n小計\n¥700",
+    )
+
+    assert extracted["line_items"] == expected
+
+
+def test_balanced_adjacent_price_shift_rejects_larger_stack_idempotently():
+    from receipt_parser.receipt_item_cleanup import _fix_adjacent_ocr_price_shift_when_balanced
+
+    extracted = {
+        "subtotal": 600,
+        "total": 600,
+        "line_items": [
+            _item("積上商品甲乙", 300),
+            _item("積上商品丙丁", 200),
+            _item("積上商品戊己", 100),
+        ],
+    }
+    expected = [dict(item) for item in extracted["line_items"]]
+    ocr_text = (
+        "積上商品甲乙\n積上商品丙丁\n積上商品戊己\n"
+        "¥100\n¥200\n¥300\n小計\n¥600"
+    )
+
+    _fix_adjacent_ocr_price_shift_when_balanced(extracted, ocr_text)
+    assert extracted["line_items"] == expected
+
+    _fix_adjacent_ocr_price_shift_when_balanced(extracted, ocr_text)
+    assert extracted["line_items"] == expected
 
 
 def test_digit_repair_accepts_unique_non_terminal_substitution_only_with_full_count():

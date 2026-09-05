@@ -1773,10 +1773,15 @@ def _project_totals_to_layout_rows(extracted, ocr_layout_blocks):
         projected_gap = min(abs(projected_sum - float(target)) for target in targets)
 
         def _bundle(item: dict) -> tuple[float, float, float]:
+            total = float(item.get("total") or 0)
+            discount = float(item.get("discount") or 0)
+            unit_price = item.get("unit_price")
+            if unit_price is None and (item.get("qty") or 1) == 1 and discount > 0:
+                unit_price = total + discount
             return (
-                round(float(item.get("unit_price") or 0), 2),
-                round(float(item.get("total") or 0), 2),
-                round(float(item.get("discount") or 0), 2),
+                round(float(unit_price or 0), 2),
+                round(total, 2),
+                round(discount, 2),
             )
 
         current_bundles = sorted(_bundle(item) for item in items)

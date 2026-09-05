@@ -409,6 +409,12 @@ def test_fullwidth_mixed():
     assert normalize_fullwidth("２０２６年") == "2026年"
 
 
+def test_bonus_point_fragment_allows_ocr_space_before_closing_parenthesis():
+    from receipt_parser.normalize import strip_bonus_point_lines
+
+    assert strip_bonus_point_lines("商品甲\n20 P )\n128*") == "商品甲\n128*"
+
+
 def test_yen_preserved():
     result = normalize_fullwidth("¥100")
     assert "¥" in result
@@ -7800,9 +7806,9 @@ def test_dense_sequence_rows_splits_ambiguous_quantity_ocr_by_printed_amount():
     from receipt_parser.pipeline_receipt import _replace_dense_sequence_rows_when_balanced
 
     extracted = {
-        "subtotal": 1606,
+        "subtotal": 1806,
         "taxes": [{"rate": "8%", "label": "外税", "amount": 128}],
-        "line_items": [{"description": "dummy", "qty": 1, "unit_price": 1606, "total": 1606}],
+        "line_items": [{"description": "dummy", "qty": 1, "unit_price": 1806, "total": 1806}],
     }
     ocr_text = "\n".join([
         "テストマート",
@@ -7820,15 +7826,19 @@ def test_dense_sequence_rows_splits_ambiguous_quantity_ocr_by_printed_amount():
         "540*",
         "278*",
         "438*",
+        "商品キ",
+        "商品ク",
+        "120*",
+        "80*",
         "小計",
-        "¥1,606",
+        "¥1,806",
         "外税8%対象額",
-        "¥1,606",
+        "¥1,806",
         "外税8%",
         "¥128",
         "合計",
-        "¥1,734",
-        "お買上商品数:7",
+        "¥1,950",
+        "お買上商品数:9",
     ])
 
     _replace_dense_sequence_rows_when_balanced(extracted, ocr_text)
@@ -7840,6 +7850,8 @@ def test_dense_sequence_rows_splits_ambiguous_quantity_ocr_by_printed_amount():
         "商品エ",
         "商品オ",
         "商品カ",
+        "商品キ",
+        "商品ク",
     ]
     assert [item["total"] for item in extracted["line_items"]] == [
         100.0,
@@ -7848,9 +7860,111 @@ def test_dense_sequence_rows_splits_ambiguous_quantity_ocr_by_printed_amount():
         540.0,
         278.0,
         438.0,
+        120.0,
+        80.0,
     ]
     assert extracted["line_items"][3]["qty"] == 2.0
     assert extracted["line_items"][3]["unit_price"] == 270.0
+
+
+def test_dense_sequence_rows_defers_an_ambiguous_qty_group_until_its_total():
+    from receipt_parser.pipeline_receipt import _replace_dense_sequence_rows_when_balanced
+
+    extracted = {
+        "subtotal": 1000,
+        "line_items": [
+            {"description": "dummy", "qty": 1, "unit_price": 1000, "total": 1000}
+        ],
+    }
+    ocr_text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 196*",
+        "商品乙",
+        "(21 X 198)",
+        "商品丙",
+        "196*",
+        "200*",
+        "商品丁 300*",
+        "商品戊 108*",
+        "小計",
+        "¥1,000",
+        "外税8%対象額 ¥1,000",
+        "お買上商品数:6",
+        "*印は軽減税率8%対象商品",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, ocr_text)
+
+    assert [row["description"] for row in extracted["line_items"]] == [
+        "商品甲",
+        "商品乙",
+        "商品丙",
+        "商品丁",
+        "商品戊",
+    ]
+    assert [row["total"] for row in extracted["line_items"]] == [
+        196.0,
+        196.0,
+        200.0,
+        300.0,
+        108.0,
+    ]
+    assert extracted["line_items"][0]["qty"] == 1.0
+    assert extracted["line_items"][1]["qty"] == 2.0
+    assert extracted["line_items"][1]["unit_price"] == 98.0
+
+
+def test_dense_sequence_rows_atomically_reconstruct_interleaved_discount_and_mangled_qty():
+    from receipt_parser.pipeline_receipt import _replace_dense_sequence_rows_when_balanced
+
+    original_items = [
+        {"description": "誤った抽出", "qty": 1, "unit_price": 950, "total": 950},
+    ]
+    extracted = {
+        "subtotal": 950,
+        "taxes": [],
+        "line_items": original_items,
+    }
+    ocr_text = "\n".join([
+        "テストマート",
+        "2026/6/1(月)",
+        "商品甲",
+        "100*",
+        "商品乙",
+        "200*",
+        "商品丙",
+        "500*",
+        "割引",
+        "商品丁",
+        "(4個 X 単30)",
+        "40%",
+        "-200",
+        "120*",
+        "商品戊",
+        "80*",
+        "商品己",
+        "144* B",
+        "(31 X 148)",
+        "小計",
+        "¥944",
+        "合計",
+        "¥944",
+        "お買上商品数:11",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, ocr_text)
+    assert extracted["line_items"] is original_items
+
+    extracted["subtotal"] = 944
+    _replace_dense_sequence_rows_when_balanced(extracted, ocr_text)
+
+    items = extracted["line_items"]
+    assert [item["total"] for item in items] == [100, 200, 300, 120, 80, 144]
+    assert items[2]["discount"] == 200
+    assert items[2]["discount_rate"] == "40%"
+    assert (items[3]["qty"], items[3]["unit_price"]) == (4, 30)
+    assert (items[5]["qty"], items[5]["unit_price"]) == (3, 48)
+    assert sum(item["total"] for item in items) == extracted["subtotal"]
 
 
 def test_dense_sequence_rows_merges_split_quantity_detail_lines():
@@ -10844,12 +10958,13 @@ def test_drop_non_product_removes_percent_inner_tax_marker_item():
     assert [item["description"] for item in extracted["line_items"]] == ["ヤサイ"]
 
 
-def test_colon_split_product_name_rejoins_adjacent_ocr_prefix():
+@pytest.mark.parametrize("description", ["りんご", "りんご蒟蒻畑"])
+def test_colon_split_product_name_rejoins_adjacent_ocr_prefix(description):
     from receipt_parser.pipeline_receipt import _fix_colon_split_product_names_from_ocr
 
     extracted = {
         "line_items": [
-            {"description": "りんご", "qty": 1, "unit_price": 228, "total": 228},
+            {"description": description, "qty": 1, "unit_price": 228, "total": 228},
         ]
     }
     ocr_text = "\n".join([
@@ -10862,6 +10977,36 @@ def test_colon_split_product_name_rejoins_adjacent_ocr_prefix():
     _fix_colon_split_product_names_from_ocr(extracted, ocr_text)
 
     assert extracted["line_items"][0]["description"] == "蒟蒻畑: りんご"
+
+
+def test_colon_split_product_name_keeps_unrelated_joined_description():
+    from receipt_parser.pipeline_receipt import _fix_colon_split_product_names_from_ocr
+
+    extracted = {
+        "line_items": [
+            {"description": "ぶどう蒟蒻畑", "qty": 1, "unit_price": 228, "total": 228},
+        ]
+    }
+    ocr_text = "\n".join(["220210", "りんご", "蒟蒻畑:", "¥228"])
+
+    _fix_colon_split_product_names_from_ocr(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["description"] == "ぶどう蒟蒻畑"
+
+
+def test_colon_split_product_name_keeps_discount_label_prefix():
+    from receipt_parser.pipeline_receipt import _fix_colon_split_product_names_from_ocr
+
+    extracted = {
+        "line_items": [
+            {"description": "商品甲値引", "qty": 1, "unit_price": 228, "total": 228},
+        ]
+    }
+    ocr_text = "\n".join(["商品甲", "値引:", "¥228"])
+
+    _fix_colon_split_product_names_from_ocr(extracted, ocr_text)
+
+    assert extracted["line_items"][0]["description"] == "商品甲値引"
 
 
 def test_barcode_qty_price_rows_replace_collapsed_retail_duplicates_when_balanced():

@@ -40,7 +40,9 @@ LOCATION_CLUE_RE = re.compile(
 , re.MULTILINE)
 
 
-_COMPANY_SUFFIX_RE = re.compile(r'有限会社|株式会社|㈱|㈲|合同会社')
+_COMPANY_SUFFIX_RE = re.compile(
+    r'有限会社|株式会社|合同会社|㈱|㈲|[（(]\s*[株有同]\s*[）)]'
+)
 _DECORATIVE_RE = re.compile(r'^[☆★\-=\*\s・♪♫]+$')
 _HEADER_PHONE_MERCHANT_RE = re.compile(
     r'^\s*(?P<merchant>.{2,40}?)\s*'
@@ -125,7 +127,8 @@ _OCR_QTY_NOTATION_RE = re.compile(
     r')'
 )
 _PAID_CONTAINER_DESC_RE = re.compile(
-    r'レジ[ブフ]クロ|レジ袋|有料レジ袋|食品ポリ袋|ポリ袋|ショッピングバッグ|紙袋|バイオ.*袋|フクロHK'
+    r'レジ[ブフ]クロ|レジ袋|有料レジ袋|食品ポリ袋|ポリ袋|(?:ごみ|ゴミ)袋|'
+    r'ショッピングバッグ|紙袋|バイオ.*袋|フクロHK'
 )
 
 

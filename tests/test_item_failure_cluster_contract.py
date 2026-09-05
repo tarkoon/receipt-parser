@@ -17,6 +17,266 @@ def _item(description, total, *, qty=1, unit_price=None, discount=0, rate=""):
     }
 
 
+def _four_row_uncounted_bag_text(*, bag_amount=4, reduced_base=626, standard_base=None):
+    first_amount = 130 - bag_amount
+    standard_base = bag_amount if standard_base is None else standard_base
+    return "\n".join([
+        "2099/1/1 00:00",
+        "商品甲",
+        f"有料レジ袋 {bag_amount}",
+        f"{first_amount}*",
+        "商品乙 200*",
+        "商品丙",
+        "300* A",
+        "小計",
+        "¥630",
+        f"外税8%対象額 ¥{reduced_base}",
+        f"外税10%対象額 ¥{standard_base}",
+        "お買上商品数:3",
+        "*印は軽減税率8%対象商品",
+    ])
+
+
+def _dense_fragment_text(fragment_lines, *, subtotal=1000, rate_base=1000):
+    return "\n".join([
+        "2099/1/1 00:00",
+        "先行商品",
+        "商品甲 100* 50*",
+        *fragment_lines,
+        "商品丙 200*",
+        "商品丁 300*",
+        "商品戊 112*",
+        "小計",
+        f"¥{subtotal}",
+        f"外税8%対象額 ¥{rate_base}",
+        "お買上商品数:6",
+        "*印は軽減税率8%対象商品",
+    ])
+
+
+def test_dense_projection_accepts_balanced_four_rows_when_count_excludes_one_bag():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    for initial_items in ([], [_item("未解析", 630)]):
+        extracted = {"subtotal": 630, "line_items": initial_items}
+
+        _replace_dense_sequence_rows_when_balanced(
+            extracted,
+            _four_row_uncounted_bag_text(),
+        )
+
+        assert [
+            (row["description"], row["total"], row["tax_category"])
+            for row in extracted["line_items"]
+        ] == [
+            ("有料レジ袋", 4.0, "10%"),
+            ("商品甲", 126.0, "8%"),
+            ("商品乙", 200.0, "8%"),
+            ("商品丙", 300.0, "8%"),
+        ]
+
+
+def test_dense_projection_four_row_exception_requires_low_bag_and_balanced_rate_bases():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    for text in (
+        _four_row_uncounted_bag_text(reduced_base=620),
+        _four_row_uncounted_bag_text(bag_amount=14, reduced_base=616),
+        _four_row_uncounted_bag_text(reduced_base=620, standard_base=10),
+    ):
+        original = []
+        extracted = {"subtotal": 630, "line_items": original}
+
+        _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+        assert extracted["line_items"] is original
+
+
+def test_dense_projection_recovers_one_prefixed_amount_fragment_in_split_or_joined_shape():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    for fragment_lines in (["商品乙", "2"], ["商品乙 2"]):
+        extracted = {"subtotal": 1000, "line_items": []}
+
+        _replace_dense_sequence_rows_when_balanced(
+            extracted,
+            _dense_fragment_text(fragment_lines),
+        )
+
+        assert [
+            (row["description"], row["total"])
+            for row in extracted["line_items"]
+        ] == [
+            ("商品甲", 100.0),
+            ("先行商品", 50.0),
+            ("商品乙", 238.0),
+            ("商品丙", 200.0),
+            ("商品丁", 300.0),
+            ("商品戊", 112.0),
+        ]
+
+
+def test_valid_fragment_recovery_can_replace_a_balanced_model_shape():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = [
+        _item("モデル行甲", 100),
+        _item("モデル行乙", 50),
+        _item("モデル行丙", 200),
+        _item("モデル行丁", 300),
+        _item("モデル行戊", 238),
+        _item("モデル行己", 112),
+    ]
+    extracted = {"subtotal": 1000, "line_items": original}
+
+    _replace_dense_sequence_rows_when_balanced(
+        extracted,
+        _dense_fragment_text(["商品乙", "2"]),
+    )
+
+    assert extracted["line_items"] is not original
+    assert [row["total"] for row in extracted["line_items"]] == [
+        100.0,
+        50.0,
+        238.0,
+        200.0,
+        300.0,
+        112.0,
+    ]
+
+
+def test_fragment_recovery_preserves_locked_non_tax_and_mixed_rate_ownership():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = [
+        _item("モデル甲", 600),
+        _item("モデル乙", 100),
+        _item("モデル丙", 238),
+        _item("モデル丁", 3),
+        _item("モデル戊", 559),
+    ]
+    extracted = {"subtotal": 1500, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "前置商品",
+        "自治体ごみ袋 600非 100*",
+        "商品甲",
+        "2",
+        "食品ポリ袋 3除",
+        "標準商品 180",
+        "商品乙 200*",
+        "商品丙 179*",
+        "小計",
+        "¥1500",
+        "外税8%対象額 ¥717",
+        "外税10%対象額 ¥183",
+        "お買上商品数:5",
+        "*印は軽減税率8%対象商品",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is not original
+    assert [
+        (row["description"], row["total"], row["tax_category"])
+        for row in extracted["line_items"]
+    ] == [
+        ("自治体ごみ袋", 600.0, "0%"),
+        ("前置商品", 100.0, "8%"),
+        ("商品甲", 238.0, "8%"),
+        ("食品ポリ袋", 3.0, "10%"),
+        ("標準商品", 180.0, "10%"),
+        ("商品乙", 200.0, "8%"),
+        ("商品丙", 179.0, "8%"),
+    ]
+
+
+def test_fragment_recovery_does_not_treat_an_unmarked_bag_as_count_exempt():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = [
+        _item("モデル甲", 600),
+        _item("モデル乙", 100),
+        _item("モデル丙", 238),
+        _item("モデル丁", 3),
+        _item("モデル戊", 559),
+    ]
+    extracted = {"subtotal": 1500, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "前置商品",
+        "自治体ごみ袋 600非 100*",
+        "商品甲",
+        "2",
+        "食品ポリ袋 3",
+        "標準商品 180",
+        "商品乙 200*",
+        "商品丙 179*",
+        "小計",
+        "¥1500",
+        "外税8%対象額 ¥717",
+        "外税10%対象額 ¥183",
+        "お買上商品数:5",
+        "*印は軽減税率8%対象商品",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is original
+
+
+def test_dense_projection_fragment_recovery_rejects_ambiguous_or_owned_tokens():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    cases = (
+        ["商品乙", "7"],
+        ["商品乙", "2", "商品追加", "3"],
+        ["商品乙", "2 X 111"],
+        ["中間商品 10*", "商品乙", "2"],
+    )
+    for fragment_lines in cases:
+        original = []
+        extracted = {"subtotal": 1000, "line_items": original}
+
+        _replace_dense_sequence_rows_when_balanced(
+            extracted,
+            _dense_fragment_text(fragment_lines),
+        )
+
+        assert extracted["line_items"] is original
+
+
+def test_dense_projection_fragment_recovery_requires_consistent_subtotal_and_rate_base():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    for subtotal, rate_base in ((990, 1000), (1000, 990)):
+        original = []
+        extracted = {"subtotal": subtotal, "line_items": original}
+
+        _replace_dense_sequence_rows_when_balanced(
+            extracted,
+            _dense_fragment_text(["商品乙", "2"], subtotal=subtotal, rate_base=rate_base),
+        )
+
+        assert extracted["line_items"] is original
+
+
 def test_dense_projection_preserves_complete_balanced_rows():
     from receipt_parser.receipt_row_projection import (
         _replace_dense_sequence_rows_when_balanced,
@@ -37,6 +297,182 @@ def test_dense_projection_preserves_complete_balanced_rows():
     _replace_dense_sequence_rows_when_balanced(extracted, text)
 
     assert extracted["line_items"] == expected
+
+
+def test_dense_projection_repairs_only_shifted_names_across_jan_rows():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    items = [
+        _item("商品甲 商品乙", 100),
+        _item("商品丙", 200),
+        _item("商品丙", 300),
+    ]
+    extracted = {"subtotal": 600, "line_items": items}
+    before_details = [
+        {key: value for key, value in item.items() if key != "description"}
+        for item in items
+    ]
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲",
+        "4900000000001JAN",
+        "商品乙",
+        "100",
+        "200",
+        "4900000000002 JAN",
+        "商品丙 300",
+        "小計",
+        "3",
+        "600",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is items
+    assert [item["description"] for item in items] == ["商品甲", "商品乙", "商品丙"]
+    assert [
+        {key: value for key, value in item.items() if key != "description"}
+        for item in items
+    ] == before_details
+
+
+def test_dense_projection_requires_two_distinct_jan_rows_for_balanced_names():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = [
+        _item("商品甲", 100),
+        _item("商品乙", 200),
+        _item("商品丙", 300),
+    ]
+    extracted = {"subtotal": 600, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品乙 100",
+        "4900000000001JAN",
+        "商品甲 200",
+        "4900000000001 JAN",
+        "商品丙 300",
+        "小計",
+        "3",
+        "600",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is original
+    assert [row["description"] for row in original] == ["商品甲", "商品乙", "商品丙"]
+
+
+def test_dense_projection_does_not_replace_balanced_rows_with_a_different_money_multiset():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = [
+        _item("既存甲", 100),
+        _item("既存乙", 200),
+        _item("既存丙", 200),
+        _item("既存丁", 300),
+        _item("既存戊", 200),
+    ]
+    extracted = {"subtotal": 1000, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 100",
+        "商品乙 150",
+        "商品丙 200",
+        "商品丁 250",
+        "商品戊 300",
+        "小計",
+        "¥1000",
+        "外税8%対象額 ¥1000",
+        "お買上点数:5",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is original
+
+
+def test_dense_projection_does_not_replace_balanced_rows_with_different_descriptions():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = [
+        _item("商品甲", 200),
+        _item("商品乙", 100),
+        _item("商品丙", 300),
+        _item("商品丁", 150),
+        _item("商品戊", 250),
+    ]
+    extracted = {"subtotal": 1000, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 100",
+        "商品乙 200",
+        "商品丙 150",
+        "商品丁 250",
+        "別の商品 300",
+        "小計",
+        "¥1000",
+        "外税8%対象額 ¥1000",
+        "お買上点数:5",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is original
+
+
+def test_dense_projection_preserves_balanced_rows_despite_flattened_price_swap():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = [
+        _item("商品甲", 200),
+        _item("商品乙", 100),
+        _item("商品丙", 300),
+        _item("商品丁", 150),
+        _item("商品戊", 250),
+    ]
+    for row, category in zip(original, ("10%", "8%", "10%", "8%", "8%")):
+        row["tax_category"] = category
+    extracted = {"subtotal": 1000, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 100",
+        "商品乙 200",
+        "商品丙 150",
+        "商品丁 250",
+        "商品戊 300",
+        "小計",
+        "¥1000",
+        "お買上点数:5",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is original
+    assert [row["total"] for row in extracted["line_items"]] == [
+        200,
+        100,
+        300,
+        150,
+        250,
+    ]
+    assert [row["tax_category"] for row in extracted["line_items"]] == [
+        "10%",
+        "8%",
+        "10%",
+        "8%",
+        "8%",
+    ]
 
 
 def test_dense_projection_repairs_count_inconsistent_table():
@@ -61,6 +497,340 @@ def test_dense_projection_repairs_count_inconsistent_table():
         "商品乙",
     ]
     assert [row["total"] for row in extracted["line_items"]] == [300.0, 200.0]
+
+
+def test_dense_projection_owns_unlabeled_rate_by_adjacent_discount():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    extracted = {"subtotal": 883, "line_items": []}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 200*",
+        "<2個 X 単100)",
+        "割引",
+        "30%",
+        "-60",
+        "反復商品 200*",
+        "30%",
+        "-60",
+        "反復商品 453%",
+        "割引",
+        "40%",
+        "-182",
+        "商品丁 382*",
+        "割引",
+        "240%",
+        "-153",
+        "食品ポリ袋 3除",
+        "商品戊",
+        "<2個 X 単50)",
+        "100*",
+        "小計",
+        "¥883",
+        "外税8%対象額 ¥880",
+        "外税10%対象額 ¥3",
+        "お買上商品数:7",
+        "*印は軽減税率8%対象商品",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert [
+        (
+            row["description"],
+            row["qty"],
+            row["unit_price"],
+            row["total"],
+            row["discount_rate"],
+            row["tax_category"],
+        )
+        for row in extracted["line_items"]
+    ] == [
+        ("商品甲", 2.0, 100.0, 140.0, "30%", "8%"),
+        ("反復商品", 1.0, 200.0, 140.0, "30%", "8%"),
+        ("反復商品", 1.0, 453.0, 271.0, "40%", "8%"),
+        ("商品丁", 1.0, 382.0, 229.0, "40%", "8%"),
+        ("食品ポリ袋", 1.0, 3.0, 3.0, "", "10%"),
+        ("商品戊", 2.0, 50.0, 100.0, "", "8%"),
+    ]
+
+
+def test_dense_projection_does_not_steal_pending_percent_price_as_rate():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    extracted = {"subtotal": 170, "line_items": []}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 100*",
+        "割引",
+        "商品乙",
+        "30%",
+        "-30",
+        "商品丙 100*",
+        "小計",
+        "2点",
+        "170",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] == []
+
+
+def test_dense_projection_does_not_rewrite_plausible_discount_rate():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = [_item("既存商品", 170)]
+    extracted = {"subtotal": 170, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 100*",
+        "割引",
+        "20%",
+        "-30",
+        "商品乙 100*",
+        "小計",
+        "2点",
+        "170",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is original
+    assert original[0]["discount_rate"] == ""
+
+
+def test_dense_projection_applies_adjacent_discount_to_proven_owner():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    extracted = {"subtotal": 230, "line_items": []}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 200*",
+        "割引",
+        "30%",
+        "商品乙 150*",
+        "40%",
+        "-60",
+        "-60",
+        "小計",
+        "2点",
+        "230",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert [row["total"] for row in extracted["line_items"]] == [140, 90]
+    assert extracted["line_items"][0]["discount"] == 60
+    assert extracted["line_items"][1]["discount"] == 60
+    assert extracted["line_items"][1]["discount_rate"] == "40%"
+
+
+def test_dense_projection_rejects_discount_ambiguous_with_pending_item():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = []
+    extracted = {"subtotal": 170, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 100*",
+        "商品乙",
+        "割引",
+        "30%",
+        "-30",
+        "100*",
+        "小計",
+        "2点",
+        "170",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is original
+
+
+def test_dense_projection_rejects_deferred_rate_with_pending_item():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = []
+    extracted = {"subtotal": 170, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 100*",
+        "商品乙",
+        "割引",
+        "30%",
+        "値引",
+        "-30",
+        "100*",
+        "小計",
+        "2点",
+        "170",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is original
+
+
+def test_dense_projection_carries_latest_deferred_rate_owner():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    extracted = {"subtotal": 230, "line_items": []}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 140*",
+        "商品乙 150*",
+        "割引",
+        "40%",
+        "値引",
+        "-60",
+        "小計",
+        "2点",
+        "230",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert [row["total"] for row in extracted["line_items"]] == [140, 90]
+    assert extracted["line_items"][1]["discount"] == 60
+    assert extracted["line_items"][1]["discount_rate"] == "40%"
+
+
+def test_dense_projection_rejects_equal_discount_owner_scores():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = []
+    extracted = {"subtotal": 290, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 200*",
+        "割引",
+        "商品乙 150*",
+        "割引",
+        "-60",
+        "小計",
+        "2点",
+        "290",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is original
+
+
+def test_dense_projection_invalidates_stale_deferred_rate_owner():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    extracted = {"subtotal": 260, "line_items": []}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 200*",
+        "割引",
+        "30%",
+        "商品乙 100*",
+        "割引",
+        "-40",
+        "小計",
+        "2点",
+        "260",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert [row["total"] for row in extracted["line_items"]] == [200, 60]
+    assert extracted["line_items"][1]["discount"] == 40
+    assert extracted["line_items"][0]["discount_rate"] == ""
+    assert extracted["line_items"][1]["discount_rate"] == ""
+
+
+def test_dense_projection_rejects_mismatched_deferred_rate_owner():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = []
+    extracted = {"subtotal": 300, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 200*",
+        "割引",
+        "30%",
+        "商品乙 100*",
+        "-50",
+        "小計",
+        "2点",
+        "300",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is original
+
+
+def test_dense_projection_keeps_identical_discount_owners_distinct():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = []
+    extracted = {"subtotal": 200, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 100*",
+        "割引",
+        "商品甲 100*",
+        "割引",
+        "-30",
+        "小計",
+        "2点",
+        "200",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is original
+
+
+def test_dense_projection_rejects_unresolved_discount_control():
+    from receipt_parser.receipt_row_projection import (
+        _replace_dense_sequence_rows_when_balanced,
+    )
+
+    original = []
+    extracted = {"subtotal": 200, "line_items": original}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 100*",
+        "割引",
+        "30%",
+        "商品乙 100*",
+        "小計",
+        "2点",
+        "200",
+    ])
+
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+
+    assert extracted["line_items"] is original
 
 
 def test_subtotal_repair_preserves_tax_inclusive_visible_item_prices():
@@ -312,6 +1082,67 @@ def test_campaign_projection_keeps_combined_effective_rate():
 
     _replace_campaign_discount_stream_when_balanced(extracted, text)
 
+    assert [row["discount_rate"] for row in extracted["line_items"]][1:4] == [
+        "33.7%",
+        "33.7%",
+        "33.7%",
+    ]
+
+
+def test_campaign_projection_repairs_pure_description_permutation_when_money_matches():
+    from receipt_parser.receipt_marker_projection import (
+        _replace_campaign_discount_stream_when_balanced,
+    )
+
+    expected_descriptions = [
+        "OCR商品甲",
+        "OCR商品乙",
+        "OCR商品丙",
+        "OCR商品丁",
+        "OCR商品戊",
+    ]
+    extracted = {
+        "subtotal": 1129,
+        "line_items": [
+            _item("OCR商品甲", 95, unit_price=100, discount=5, rate="5%"),
+            _item("OCR商品丙", 412, unit_price=621, discount=209, rate="30%"),
+            _item("OCR商品乙", 266, unit_price=401, discount=135, rate="30%"),
+            _item("OCR商品丁", 261, unit_price=394, discount=133, rate="30%"),
+            _item("OCR商品戊", 95, unit_price=100, discount=5, rate="5%"),
+        ],
+        "taxes": [],
+    }
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "OCR商品甲 100",
+        "会員割引5%",
+        "-5",
+        "OCR商品乙 621",
+        "割引 30%",
+        "会員割引5%",
+        "-187",
+        "-22",
+        "OCR商品丙 401",
+        "割引 30%",
+        "-121",
+        "会員割引5%",
+        "-14",
+        "OCR商品丁 394",
+        "割引 30%",
+        "-119",
+        "会員割引5%",
+        "-14",
+        "OCR商品戊 100",
+        "会員割引5%",
+        "-5",
+        "小計",
+        "1129",
+        "お買上商品数:5",
+    ])
+
+    _replace_campaign_discount_stream_when_balanced(extracted, text)
+
+    assert [row["description"] for row in extracted["line_items"]] == expected_descriptions
     assert [row["discount_rate"] for row in extracted["line_items"]][1:4] == [
         "33.7%",
         "33.7%",

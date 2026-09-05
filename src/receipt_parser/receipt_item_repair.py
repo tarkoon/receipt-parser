@@ -1560,9 +1560,14 @@ def _fix_qty_from_ocr_patterns(items, unified_text):
         items[item_idx]["total"] = qty * unit
         local_qty_owner_indices.add(item_idx)
 
-    # Garbled multiplication lines: try digit substrings validated against item total
-    for item in items:
-        if not isinstance(item, dict) or item.get("qty", 1) != 1:
+    # Garbled multiplication lines: try digit substrings validated against one
+    # row-owned amount (or the extracted total when no amount separates the rows).
+    for item_idx, item in enumerate(items):
+        if (
+            not isinstance(item, dict)
+            or item.get("qty", 1) != 1
+            or item.get("discount") not in (None, 0, 0.0, "", "0", "0.0")
+        ):
             continue
         total = item.get("total", 0)
         if total <= 0:
@@ -1579,6 +1584,25 @@ def _fix_qty_from_ocr_patterns(items, unified_text):
         if len(matching_lines) != 1:
             continue
         li = matching_lines[0]
+        owner_desc = _norm_layout_desc(
+            _clean_ocr_price_line_desc(ocr_lines[li])
+        )
+        owner_indices = [
+            idx
+            for idx, candidate in enumerate(items)
+            if isinstance(candidate, dict)
+            and (candidate_desc := _norm_layout_desc(
+                candidate.get("description") or ""
+            ))
+            and owner_desc
+            and (
+                candidate_desc == owner_desc
+                or candidate_desc in owner_desc
+                or owner_desc in candidate_desc
+            )
+        ]
+        if owner_indices != [item_idx]:
+            continue
         for offset in range(1, 3):
             if li + offset >= len(ocr_lines):
                 break
@@ -1595,45 +1619,44 @@ def _fix_qty_from_ocr_patterns(items, unified_text):
             parts = re.split(r'\s*[×xX]\s*', nearby, maxsplit=1)
             if len(parts) != 2:
                 continue
+            local_amounts = []
+            for local_line in ocr_lines[li + 1:li + offset]:
+                amount_match = re.fullmatch(
+                    r'\s*[¥￥]?\s*(\d[\d,]*)\s*'
+                    r'(?:[A-ZＡ-Ｚ%％*＊※除軽]\s*)*',
+                    local_line,
+                )
+                if amount_match:
+                    local_amounts.append(
+                        float(amount_match.group(1).replace(',', ''))
+                    )
+            if len(local_amounts) > 1:
+                continue
+            target_total = local_amounts[0] if local_amounts else float(total)
             left_digits = re.findall(r'\d+', parts[0])
             right_digits = re.findall(r'\d+', parts[1])
-            found = False
+            candidates: set[tuple[float, float]] = set()
             for ld in left_digits:
                 for rd in right_digits:
-                    q, p = int(ld), int(rd)
-                    if 2 <= q <= 9 and p > 0 and q * p == total:
-                        item["qty"] = float(q)
-                        item["unit_price"] = float(p)
-                        item["total"] = float(q * p)
-                        found = True
-                        break
+                    qty_candidates = {int(ld)}
+                    unit_candidates = {int(rd)}
                     if len(ld) > 1:
-                        q2 = int(ld[0])
-                        if 2 <= q2 <= 9 and q2 * p == total:
-                            item["qty"] = float(q2)
-                            item["unit_price"] = float(p)
-                            item["total"] = float(q2 * p)
-                            found = True
-                            break
+                        qty_candidates.add(int(ld[0]))
                     if len(rd) > 1:
-                        p2 = int(rd[1:])
-                        if p2 > 0 and q * p2 == total:
-                            item["qty"] = float(q)
-                            item["unit_price"] = float(p2)
-                            item["total"] = float(q * p2)
-                            found = True
-                            break
-                        if len(ld) > 1:
-                            q2 = int(ld[0])
-                            if 2 <= q2 <= 9 and p2 > 0 and q2 * p2 == total:
-                                item["qty"] = float(q2)
-                                item["unit_price"] = float(p2)
-                                item["total"] = float(q2 * p2)
-                                found = True
-                                break
-                if found:
-                    break
-            if found:
+                        unit_candidates.add(int(rd[1:]))
+                    candidates.update(
+                        (float(qty), float(unit))
+                        for qty in qty_candidates
+                        for unit in unit_candidates
+                        if 2 <= qty <= 9
+                        and unit > 0
+                        and qty * unit == target_total
+                    )
+            if len(candidates) == 1:
+                qty, unit = candidates.pop()
+                item["qty"] = qty
+                item["unit_price"] = unit
+                item["total"] = qty * unit
                 break
 
     # Collect explicit row-local qty/unit arithmetic with its OCR position.

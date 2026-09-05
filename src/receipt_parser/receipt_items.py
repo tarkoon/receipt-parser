@@ -2084,6 +2084,9 @@ def _fix_colon_split_product_names_from_ocr(extracted, unified_text):
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
+    def _name_key(text: str) -> str:
+        return re.sub(r'[\s:：]+', '', text)
+
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -2092,11 +2095,18 @@ def _fix_colon_split_product_names_from_ocr(extracted, unified_text):
             continue
         total = item.get("total")
         for idx, line in enumerate(lines[:-1]):
-            if _clean(line) != desc:
-                continue
+            suffix = _clean(line)
             nxt = _clean(lines[idx + 1])
             if not re.search(r'[:：]\s*$', nxt):
                 continue
+            if suffix != desc:
+                flattened_match = _name_key(desc) == _name_key(f"{suffix}{nxt}")
+                if not (
+                    flattened_match
+                    and _valid_ocr_item_desc(suffix)
+                    and _valid_ocr_item_desc(nxt)
+                ):
+                    continue
             if re.search(r'小計|合計|税|対象|ポイント|レジ|登録番号', nxt):
                 continue
             price_nearby = False
@@ -2112,5 +2122,5 @@ def _fix_colon_split_product_names_from_ocr(extracted, unified_text):
                     price_nearby = True
                     break
             if price_nearby:
-                item["description"] = f"{nxt} {desc}".replace("：", ":")
+                item["description"] = f"{nxt} {suffix}".replace("：", ":")
                 break

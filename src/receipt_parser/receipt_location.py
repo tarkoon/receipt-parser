@@ -288,6 +288,22 @@ def _recover_header_branch_store_location(extracted: dict, ocr_text: str) -> Non
             re.sub(r'\s+', '', token) in context for token in merchant_tokens
         ):
             continue
+        split_host_parts = [
+            _strip_location_token_punctuation(re.sub(r'\s+', '', line))
+            for line in header_lines[max(0, phone_idx - 3):phone_idx]
+        ]
+        split_host_parts = [
+            part for part in split_host_parts if part and part != merchant
+        ]
+        if (
+            normalize_embedded_host
+            and len(split_host_parts) >= 2
+            and all(_is_ascii_brand_location_suffix(part) for part in split_host_parts)
+            and "".join(split_host_parts) == current_location
+            and re.fullmatch(r'[一-龥]{2,}', split_host_parts[-1])
+            and len(re.findall(r'[一-龥]{2,}', current_location)) == 1
+        ):
+            embedded_host_places.add(split_host_parts[-1])
         for neighbor in range(phone_idx - 1, max(-1, phone_idx - 4), -1):
             candidate = _strip_location_token_punctuation(
                 re.sub(r'\s+', '', header_lines[neighbor].strip())
