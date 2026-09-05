@@ -1,5 +1,6 @@
 """Contracts for pipeline-owned receipt mutations and digital PDFs."""
 
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -1041,3 +1042,278 @@ def test_injected_replay_preserves_scored_text_semantics_and_confidence(monkeypa
     for invalid in (True, "0.9", float("nan"), 1.01):
         with pytest.raises(ValueError, match="OCR confidence"):
             pipeline.process_ocr_text(injected_text, ocr_confidence=invalid)
+
+
+def test_injected_supplemental_ocr_is_field_only_traced_and_never_acquired(
+    monkeypatch,
+):
+    from receipt_parser import pipeline
+
+    source = _extraction(
+        location="旧店",
+        subtotal=100,
+        line_items=[{
+            "description": "商品",
+            "qty": 1,
+            "unit_price": 100,
+            "total": 100,
+            "tax_category": "10%",
+        }],
+    )
+    receipt = pipeline.Receipt.model_validate(source)
+    events = []
+    captured = {}
+    monkeypatch.setattr(pipeline, "check_model_available", lambda _model: None)
+    monkeypatch.setattr(
+        pipeline,
+        "acquire_supplemental_ocr_evidence",
+        lambda *_args, **_kwargs: pytest.fail(
+            "process_ocr_text attempted supplemental Vision acquisition"
+        ),
+    )
+
+    def run_pipeline(**kwargs):
+        captured["trace"] = kwargs["mutation_trace"]
+        return source, _history(source), [], receipt
+
+    monkeypatch.setattr(pipeline, "_run_extraction_pipeline", run_pipeline)
+    monkeypatch.setattr(
+        pipeline,
+        "_prepare_receipt_output_payload",
+        lambda prepared, *_args, **_kwargs: prepared.model_dump(),
+    )
+    real_finalize = pipeline._finalize_receipt_result
+
+    def finalize(*args, **kwargs):
+        result = real_finalize(*args, **kwargs)
+        events.append("finalize")
+        return result
+
+    monkeypatch.setattr(pipeline, "_finalize_receipt_result", finalize)
+
+    def propose(payload, _evidence):
+        events.append("supplemental")
+        candidate = deepcopy(payload)
+        candidate["location"] = "新店"
+        candidate["total"] = 999
+        candidate["line_items"][0]["description"] = "not allowed"
+        candidate["line_items"][0]["tax_category"] = "8%"
+        return candidate, {
+            "accepted_fields": ["location", "tax_categories"],
+        }
+
+    monkeypatch.setattr(pipeline, "apply_supplemental_ocr_evidence", propose)
+
+    def confidence(payload, warnings):
+        events.append("confidence")
+        assert payload["total"] == 100
+        assert warnings == []
+        return {"line_items": 0.9}
+
+    monkeypatch.setattr(pipeline, "_compute_posthoc_confidence", confidence)
+
+    def on_stage(stage, _detail, _progress, payload=None):
+        del payload
+        if stage in {"validate", "done"}:
+            events.append(stage)
+
+    result = pipeline.process_ocr_text(
+        "ALIAS SOURCE\n商品 ¥100\n合計 ¥100",
+        apply_user_rules=False,
+        debug=True,
+        supplemental_ocr_evidence={"sealed": True},
+        on_stage=on_stage,
+    )
+
+    assert events == ["finalize", "supplemental", "validate", "confidence", "done"]
+    assert result["location"] == "新店"
+    assert result["total"] == 100
+    assert result["line_items"][0]["description"] == "商品"
+    assert result["line_items"][0]["tax_category"] == "8%"
+    assert result["_warnings"] == []
+    assert result["_line_items_reliable"] is True
+    assert result["_llm_confidence"] == {"line_items": 0.9}
+    assert result["_receipt_mutation_trace"] is captured["trace"]
+    event = next(
+        event
+        for event in result["_receipt_mutation_trace"]
+        if event["stage"] == "supplemental_ocr_field_recovery"
+    )
+    assert event["owner_phase"] == "supplemental_ocr_field_recovery"
+    assert set(event["changes"]) == {"location", "line_items"}
+    assert set(event["writes"]) == {"location", "line_items"}
+
+
+def test_invalid_supplemental_ocr_evidence_is_an_exact_noop():
+    from receipt_parser import pipeline
+
+    trace = []
+    result = {
+        **_extraction(location="旧店"),
+        "_warnings": ["existing warning"],
+        "_line_items_reliable": False,
+        "_receipt_mutation_trace": trace,
+    }
+    before = deepcopy(result)
+
+    pipeline._apply_final_supplemental_ocr_evidence(
+        result,
+        {"invalid": True},
+        mutation_trace=trace,
+    )
+
+    assert result == before
+    assert result["_receipt_mutation_trace"] is trace
+
+
+def test_supplemental_ocr_evidence_is_receipt_only(monkeypatch):
+    from receipt_parser import pipeline
+
+    result = {
+        **_extraction(document_type="utility_bill", location="旧店"),
+        "_warnings": [],
+        "_line_items_reliable": True,
+    }
+    before = deepcopy(result)
+    monkeypatch.setattr(
+        pipeline,
+        "apply_supplemental_ocr_evidence",
+        lambda *_args: pytest.fail("non-receipt evidence was applied"),
+    )
+
+    pipeline._apply_final_supplemental_ocr_evidence(result, {"sealed": True})
+
+    assert result == before
+
+
+def test_scanned_single_page_receipt_maps_supplemental_ocr_cache_modes(monkeypatch):
+    from receipt_parser import pipeline, usage
+    from receipt_parser.ocr import OCRResult
+
+    source = _extraction()
+    receipt = pipeline.Receipt.model_validate(source)
+    image = object()
+    ocr_result = OCRResult(
+        blocks=[{}, {}, {}],
+        chosen_text="TEST\n商品 ¥100\n合計 ¥100",
+        source="mock",
+    )
+    modes = []
+    client = object()
+    monkeypatch.setattr(pipeline, "check_model_available", lambda _model: None)
+    monkeypatch.setattr(usage, "track_document", lambda _path: None)
+    monkeypatch.setattr(pipeline, "load_image", lambda _path: [image])
+    monkeypatch.setattr(pipeline, "init_cloud_vision", lambda: client)
+    monkeypatch.setattr(
+        pipeline,
+        "run_cloud_vision",
+        lambda *_args, **_kwargs: ocr_result,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "blocks_to_structured_text",
+        lambda _blocks: "TEST\n商品 ¥100\n合計 ¥100",
+    )
+    monkeypatch.setattr(pipeline, "compute_ocr_confidence", lambda _blocks: 0.9)
+    monkeypatch.setattr(
+        pipeline,
+        "_run_extraction_pipeline",
+        lambda **_kwargs: (source, _history(source), [], receipt),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_prepare_receipt_output_payload",
+        lambda prepared, *_args, **_kwargs: prepared.model_dump(),
+    )
+
+    def acquire(acquired_image, *, mode, client: object):
+        assert acquired_image is image
+        modes.append((mode, client))
+        return None
+
+    monkeypatch.setattr(pipeline, "acquire_supplemental_ocr_evidence", acquire)
+
+    pipeline.process_document(Path("scan.png"))
+    pipeline.process_document(Path("scan.png"), skip_ocr_cache=True)
+    pipeline.process_document(Path("scan.png"), ocr_cache_only=True)
+
+    assert modes == [("normal", client), ("fresh", client), ("cache_only", client)]
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("supplemental unavailable")
+
+    monkeypatch.setattr(pipeline, "acquire_supplemental_ocr_evidence", unavailable)
+    assert pipeline.process_document(Path("scan.png"))["total"] == 100
+    with pytest.raises(RuntimeError, match="supplemental unavailable"):
+        pipeline.process_document(Path("scan.png"), skip_ocr_cache=True)
+    with pytest.raises(RuntimeError, match="supplemental unavailable"):
+        pipeline.process_document(Path("scan.png"), ocr_cache_only=True)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        pipeline.process_document(
+            Path("scan.png"),
+            skip_ocr_cache=True,
+            ocr_cache_only=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("path", "text", "page_count"),
+    [
+        (Path("digital.pdf"), "TEST\n商品 ¥100\n合計 ¥100", 1),
+        (Path("scan.png"), "電気料金\nご使用量\n請求額 ¥100", 1),
+        (Path("scan.png"), "TEST\n商品 ¥100\n合計 ¥100", 2),
+    ],
+)
+def test_supplemental_ocr_skips_digital_nonreceipt_and_multipage_documents(
+    monkeypatch,
+    path,
+    text,
+    page_count,
+):
+    from receipt_parser import pipeline, usage
+    from receipt_parser.ocr import OCRResult
+
+    doc_type = pipeline.detect_document_type(text)
+    source = _extraction(document_type=doc_type)
+    receipt = pipeline.Receipt.model_validate(source)
+    ocr_result = OCRResult(
+        blocks=[{}, {}, {}],
+        chosen_text=text,
+        source="mock",
+    )
+    monkeypatch.setattr(pipeline, "check_model_available", lambda _model: None)
+    monkeypatch.setattr(usage, "track_document", lambda _path: None)
+    monkeypatch.setattr(pipeline, "load_image", lambda _path: [object()] * page_count)
+    monkeypatch.setattr(
+        pipeline,
+        "try_extract_text_layer",
+        lambda _path: text if path.suffix == ".pdf" else None,
+    )
+    monkeypatch.setattr(pipeline, "init_cloud_vision", lambda: object())
+    monkeypatch.setattr(
+        pipeline,
+        "run_cloud_vision",
+        lambda *_args, **_kwargs: ocr_result,
+    )
+    monkeypatch.setattr(pipeline, "blocks_to_structured_text", lambda _blocks: text)
+    monkeypatch.setattr(pipeline, "compute_ocr_confidence", lambda _blocks: 0.9)
+    monkeypatch.setattr(
+        pipeline,
+        "_run_extraction_pipeline",
+        lambda **_kwargs: (source, _history(source), [], receipt),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_prepare_receipt_output_payload",
+        lambda prepared, *_args, **_kwargs: prepared.model_dump(),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "acquire_supplemental_ocr_evidence",
+        lambda *_args, **_kwargs: pytest.fail("ineligible document acquired OCR"),
+    )
+
+    result = pipeline.process_document(path)
+
+    assert result["document_type"] == doc_type

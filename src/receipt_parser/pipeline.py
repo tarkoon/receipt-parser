@@ -56,6 +56,10 @@ from .receipt_output import (
     _prepare_receipt_output_payload,
 )
 from .receipt_projection import _balanced_layout_item_count
+from .receipt_supplemental_ocr import (
+    acquire_supplemental_ocr_evidence,
+    apply_supplemental_ocr_evidence,
+)
 from .receipt_phase_trace import (
     POSTPROCESS_MUTATION_FIELDS,
     _record_receipt_mutation,
@@ -212,6 +216,11 @@ _PIPELINE_RECEIPT_MUTATION_PHASES = {
         "reads": POSTPROCESS_MUTATION_FIELDS,
         "writes": POSTPROCESS_MUTATION_FIELDS,
         "invariant": "Final serialization may only normalize schema-owned receipt fields and must return a valid canonical payload.",
+    },
+    "supplemental_ocr_field_recovery": {
+        "reads": ("location", "line_items", "supplemental_ocr_evidence"),
+        "writes": ("location", "line_items"),
+        "invariant": "Supplemental OCR may change only a validated location or existing item tax categories backed by sealed evidence.",
     },
 }
 
@@ -533,6 +542,78 @@ def _finalize_receipt_result(
     return finalized
 
 
+def _apply_final_supplemental_ocr_evidence(
+    result: dict,
+    evidence: dict | None,
+    mutation_trace: list[dict] | None = None,
+) -> None:
+    """Validate a supplemental proposal, then copy only its owned fields."""
+    if evidence is None or result.get("document_type") != "receipt":
+        return
+
+    proposed, proposal_meta = apply_supplemental_ocr_evidence(result, evidence)
+    proposed_payload, _receipt, schema_error = _canonicalize_extracted_receipt(
+        proposed
+    )
+    if schema_error or proposed_payload is None:
+        return
+
+    accepted = set(proposal_meta.get("accepted_fields") or []) & {
+        "location",
+        "tax_categories",
+    }
+    if not accepted:
+        return
+    current_payload, _receipt, schema_error = _canonicalize_extracted_receipt(result)
+    if schema_error or current_payload is None:
+        return
+    if "tax_categories" in accepted and len(
+        proposed_payload.get("line_items") or []
+    ) != len(current_payload.get("line_items") or []):
+        return
+
+    candidate = deepcopy(current_payload)
+    if "location" in accepted:
+        candidate["location"] = proposed_payload.get("location")
+    if "tax_categories" in accepted:
+        for item, proposed_item in zip(
+            candidate.get("line_items") or [],
+            proposed_payload.get("line_items") or [],
+            strict=True,
+        ):
+            item["tax_category"] = proposed_item["tax_category"]
+
+    canonical_candidate, warnings = _validate_and_serialize_final_receipt_payload(
+        candidate,
+        result.get("_warnings"),
+    )
+    if canonical_candidate is None:
+        return
+
+    before = (
+        _snapshot_receipt_mutation_fields(result)
+        if mutation_trace is not None
+        else None
+    )
+    if "location" in accepted:
+        result["location"] = canonical_candidate["location"]
+    if "tax_categories" in accepted:
+        for item, candidate_item in zip(
+            result.get("line_items") or [],
+            canonical_candidate.get("line_items") or [],
+            strict=True,
+        ):
+            item["tax_category"] = candidate_item["tax_category"]
+    _record_pipeline_receipt_mutation(
+        mutation_trace,
+        "supplemental_ocr_field_recovery",
+        before,
+        result,
+    )
+    result["_warnings"] = warnings
+    result["_line_items_reliable"] = _line_items_are_reliable(warnings)
+
+
 def process_document(
     file_path: Path,
     model: str = DEFAULT_MODEL,
@@ -542,10 +623,13 @@ def process_document(
     apply_user_rules: bool = True,
     skip_ocr_cache: bool = False,
     capture_ocr_layout: bool = False,
+    ocr_cache_only: bool = False,
     **kwargs,
 ) -> dict:
     """Main pipeline. Uses Cloud Vision OCR + LLM extraction (OpenRouter or Ollama)."""
     file_path = Path(file_path)
+    if skip_ocr_cache and ocr_cache_only:
+        raise ValueError("skip_ocr_cache and ocr_cache_only are mutually exclusive")
     check_model_available(model)
     on_stage: StageCallback = kwargs.get("on_stage")
 
@@ -788,6 +872,22 @@ def process_document(
             })
         return result
 
+    supplemental_ocr_evidence = None
+    if doc_type == "receipt" and len(images) == 1:
+        supplemental_mode = (
+            "fresh" if skip_ocr_cache else "cache_only" if ocr_cache_only else "normal"
+        )
+        try:
+            supplemental_ocr_evidence = acquire_supplemental_ocr_evidence(
+                images[0],
+                mode=supplemental_mode,
+                client=ocr_engine,
+            )
+        except Exception as exc:
+            if supplemental_mode != "normal":
+                raise
+            logger.warning("Supplemental OCR unavailable; using primary result: %s", exc)
+
     trace.log_step("ocr_grouped", data=unified_text)
 
     # Step 4–5: LLM extraction → post-processing → validation (shared path)
@@ -866,6 +966,11 @@ def process_document(
     result = _finalize_receipt_result(
         result,
         apply_user_rules,
+        mutation_trace=receipt_mutation_trace,
+    )
+    _apply_final_supplemental_ocr_evidence(
+        result,
+        supplemental_ocr_evidence,
         mutation_trace=receipt_mutation_trace,
     )
     _notify(on_stage, "validate", _build_validate_detail(result), 0.95)
@@ -1422,6 +1527,7 @@ def process_ocr_text(
     debug: bool = False,
     ocr_layout_blocks: list[dict] | None = None,
     ocr_confidence: float | None = None,
+    supplemental_ocr_evidence: dict | None = None,
 ) -> dict:
     """Run the pipeline from OCR text onwards (skip image loading + OCR).
 
@@ -1496,7 +1602,16 @@ def process_ocr_text(
         apply_user_rules,
         mutation_trace=receipt_mutation_trace,
     )
+    _apply_final_supplemental_ocr_evidence(
+        result,
+        supplemental_ocr_evidence,
+        mutation_trace=receipt_mutation_trace,
+    )
     _notify(on_stage, "validate", _build_validate_detail(result), 0.95)
+    result["_llm_confidence"] = _compute_posthoc_confidence(
+        result,
+        result["_warnings"],
+    )
     _notify(on_stage, "done", "Complete", 1.0)
     return result
 
