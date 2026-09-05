@@ -51,6 +51,7 @@ BASELINE_LITERAL_SOURCE_BY_FILE = {
     PARSER_DIR / "receipt_items.py": PARSER_DIR / "pipeline_receipt.py",
     PARSER_DIR / "receipt_projection.py": PARSER_DIR / "pipeline_receipt.py",
     PARSER_DIR / "receipt_item_repair.py": PARSER_DIR / "pipeline_receipt.py",
+    PARSER_DIR / "receipt_supplemental_ocr.py": PARSER_DIR / "pipeline_receipt.py",
 }
 SCANNED_FILES = tuple(
     sorted({
