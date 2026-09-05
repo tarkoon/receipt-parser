@@ -53,6 +53,19 @@ def _split_layout_rows(*rows):
     return blocks
 
 
+def _catalog_layout_rows(*rows):
+    blocks = []
+    for y, cells in rows:
+        for text, x in cells:
+            blocks.append({
+                "text": text,
+                "x": x,
+                "y": y,
+                "bbox": [[x, y], [x + 40, y], [x + 40, y + 15], [x, y + 15]],
+            })
+    return blocks
+
+
 def test_balanced_layout_projection_repairs_pure_two_row_swap_with_exact_multiset():
     from receipt_parser.receipt_projection import _project_totals_to_layout_rows
 
@@ -366,6 +379,72 @@ def test_balanced_layout_projection_owns_ascii_description_from_adjacent_detail_
 
     assert [item["total"] for item in extracted["line_items"]] == [120, 240]
     assert [item["unit_price"] for item in extracted["line_items"]] == [120, 240]
+
+
+def test_mixed_catalog_layout_owns_structural_sales_and_excludes_reference_metadata():
+    from receipt_parser.receipt_projection import (
+        _layout_row_price_candidates,
+        _project_totals_to_layout_rows,
+    )
+
+    layout = _catalog_layout_rows(
+        (10, (("センサーホワイト", 20),)),
+        (35, (("1", 150), ("*", 190), ("549", 250), ("549", 390), ("0", 540))),
+        (60, (("通常価格", 20), ("799", 470))),
+        (85, (("商品名", 20), ("20595575", 170), ("16775", 420))),
+        (110, (("MODL?ALPHA", 20), ("499", 510), ("0", 590))),
+        (135, (("MODL?ALPHA 赤いケース用の長い説明テキスト", 20),)),
+        (160, (("商品ID", 20), ("40513890", 170), ("21576", 420))),
+        (185, (("MODEL BETA", 20), ("1499", 500))),
+        (210, (("MODEL BETA 青い工具", 20),)),
+        (235, (("ケーブルブルー", 20),)),
+        (260, (("1", 150), ("*", 190), ("1039", 240), ("1039", 390))),
+        (285, (("合計", 20), ("3586", 460))),
+    )
+
+    assert [
+        (candidate["description"], candidate["value"])
+        for candidate in _layout_row_price_candidates(layout)
+    ] == [
+        ("センサーホワイト", 549),
+        ("MODL?ALPHA 赤いケース用の長い説明テキスト", 499),
+        ("MODEL BETA 青い工具", 1499),
+        ("ケーブルブルー", 1039),
+    ]
+
+    extracted = {
+        "subtotal": 3586,
+        "total": 3586,
+        "taxes": [],
+        "line_items": [
+            _item(description, amount)
+            for description, amount in (
+                ("センサーホワイト", 549),
+                ("MODLÄALPHA", 499),
+                ("MODEL BETA 青い工具", 799),
+                ("ケーブルブルー", 1039),
+            )
+        ],
+    }
+
+    _project_totals_to_layout_rows(extracted, layout)
+
+    assert len(extracted["line_items"]) == 4
+    assert [item["total"] for item in extracted["line_items"]] == [549, 499, 1499, 1039]
+
+
+def test_inline_catalog_layout_requires_local_repeated_description():
+    from receipt_parser.receipt_projection import _layout_row_price_candidates
+
+    layout = _catalog_layout_rows(
+        (10, (("MODEL ALPHA", 20), ("499", 510))),
+        (35, (("DIFFERENT PRODUCT 赤いケース", 20),)),
+        (60, (("MODEL BETA", 20), ("1499", 500))),
+        (200, (("MODEL BETA 青い工具", 20),)),
+        (225, (("合計", 20), ("1998", 460))),
+    )
+
+    assert _layout_row_price_candidates(layout) == []
 
 
 def test_adjacent_layout_projection_rejects_non_permutation_amounts():

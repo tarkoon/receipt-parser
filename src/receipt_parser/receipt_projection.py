@@ -1351,10 +1351,52 @@ def _adjacent_layout_description(rows: list[list[dict]], raw: dict):
     if (
         not re.search(r"[A-Za-zぁ-んァ-ン一-龥]", description)
         or _SKIP_PRICE_LINE.search(description)
+        or _LAYOUT_REFERENCE_ROW_RE.search(description)
         or _OCR_ZONE_END_RE.match(description)
     ):
         return None
     return description, total_idx, total
+
+
+_LAYOUT_REFERENCE_ROW_RE = re.compile(
+    r'^\s*(?:(?:\u901a\u5e38|\u53c2\u8003|\u6a19\u6e96)\s*\u4fa1\u683c|\u5b9a\u4fa1|'
+    r'(?:regular|reference|list)\s*price|'
+    r'\u5546\u54c1\s*(?:\u540d|ID|\u30b3\u30fc\u30c9)|(?:\u30e9\u30d9\u30eb|\u88fd\u54c1)\s*ID)',
+    re.IGNORECASE,
+)
+
+
+def _inline_layout_description(rows: list[list[dict]], raw: dict):
+    """Own a local continuation that repeats and expands an ASCII model name."""
+    row_idx = raw["row_idx"]
+    if row_idx + 1 >= len(rows) or not _layout_rows_are_local(
+        raw["row"], rows[row_idx + 1]
+    ):
+        return None
+    row = raw["row"]
+    price_idx, value = max(
+        raw["price_positions"],
+        key=lambda pair: float(row[pair[0]].get("x") or 0),
+    )
+    prefix = "".join(str(block.get("text") or "") for block in row[:price_idx]).strip()
+    continuation = "".join(
+        str(block.get("text") or "") for block in rows[row_idx + 1]
+    ).strip()
+    prefix_norm = _norm_layout_desc(prefix)
+    continuation_norm = _norm_layout_desc(continuation)
+    added = continuation_norm[len(prefix_norm):]
+    if (
+        len(prefix_norm) < 3
+        or not re.search(r'[A-Za-z]', prefix)
+        or not continuation_norm.startswith(prefix_norm)
+        or not re.search(r'[A-Za-z\u3041-\u3096\u30a1-\u30fa\u4e00-\u9fff]', added)
+        or _LAYOUT_REFERENCE_ROW_RE.search(prefix)
+        or _LAYOUT_REFERENCE_ROW_RE.search(continuation)
+        or _SKIP_PRICE_LINE.search(continuation)
+        or _OCR_ZONE_END_RE.match(continuation)
+    ):
+        return None
+    return continuation, price_idx, value, prefix
 
 
 def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]:
@@ -1376,6 +1418,7 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
             and re.fullmatch(r'\d{10,14}', barcode)
             and re.search(r'[A-Za-zぁ-んァ-ン一-龥]', description)
             and not _SKIP_PRICE_LINE.search(description)
+            and not _LAYOUT_REFERENCE_ROW_RE.search(description)
             and not _OCR_ZONE_END_RE.match(description)
         ):
             barcode_anchors.append((row_idx, row_idx + 1, description))
@@ -1426,6 +1469,8 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
             continue
         if _OCR_ZONE_END_RE.match(row_text):
             break
+        if _LAYOUT_REFERENCE_ROW_RE.search(row_text):
+            continue
         price_positions = [
             (idx, _layout_price_value(str(block.get("text") or ""), allow_small=True))
             for idx, block in enumerate(row)
@@ -1460,16 +1505,26 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
     candidates: list[dict] = []
     for raw in raw_rows:
         row = raw["row"]
-        near_column = [
-            pair for pair in raw["price_positions"]
-            if abs(float(row[pair[0]].get("x") or 0) - price_col_x) <= x_tol
-        ]
-        if not near_column:
-            continue
-        price_idx, value = max(
-            near_column,
-            key=lambda pair: float(row[pair[0]].get("x") or 0),
-        )
+        adjacent = _adjacent_layout_description(rows, raw)
+        structured = adjacent or _inline_layout_description(rows, raw)
+        if structured is not None:
+            desc_text, price_idx, value = structured[:3]
+            owner_description = structured[3] if len(structured) == 4 else desc_text
+        else:
+            near_column = [
+                pair for pair in raw["price_positions"]
+                if abs(float(row[pair[0]].get("x") or 0) - price_col_x) <= x_tol
+            ]
+            if not near_column:
+                continue
+            price_idx, value = max(
+                near_column,
+                key=lambda pair: float(row[pair[0]].get("x") or 0),
+            )
+            desc_text = "".join(
+                str(block.get("text") or "") for block in row[:price_idx]
+            ).strip()
+            owner_description = desc_text
         price_x = float(row[price_idx].get("x") or 0)
         price_text = str(row[price_idx].get("text") or "").strip()
         marker_text = re.sub(
@@ -1478,14 +1533,9 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
             price_text,
         ) + ''.join(str(block.get("text") or "") for block in row[price_idx + 1:])
         marker_text = re.sub(r'\s+', '', marker_text)
-        desc_text = "".join(str(b.get("text") or "") for b in row[:price_idx]).strip()
-        adjacent = _adjacent_layout_description(rows, raw)
-        if adjacent is not None:
-            desc_text, price_idx, value = adjacent
-            price_x = float(row[price_idx].get("x") or 0)
         if not desc_text or _SKIP_PRICE_LINE.search(desc_text):
             continue
-        if adjacent is None and not re.search(r'[ぁ-んァ-ン一-龥]', desc_text):
+        if structured is None and not re.search(r'[ぁ-んァ-ン一-龥]', desc_text):
             continue
         next_row_text = ""
         next_row_idx = raw["row_idx"] + 1
@@ -1496,6 +1546,7 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
             value = qty_detail_total
         candidates.append({
             "description": desc_text,
+            "owner_description": owner_description,
             "value": int(value),
             "y": _layout_block_center_y(row[price_idx]),
             "x": price_x,
@@ -1505,6 +1556,35 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
             ),
         })
     return candidates
+
+
+def _balanced_layout_item_count(extracted, ocr_layout_blocks) -> int | None:
+    """Return a layout-backed basket count only when its prices exactly balance."""
+    candidates = _layout_row_price_candidates(ocr_layout_blocks)
+    descriptions = [
+        _norm_layout_desc(candidate.get("description") or "")
+        for candidate in candidates
+    ]
+    if (
+        len(candidates) < 2
+        or any(len(description) < 3 for description in descriptions)
+        or len(descriptions) != len(set(descriptions))
+    ):
+        return None
+    try:
+        candidate_sum = sum(float(candidate["value"]) for candidate in candidates)
+        targets = [
+            float(value)
+            for value in (
+                _canonical_subtotal_from_taxes(extracted),
+                extracted.get("subtotal"),
+                extracted.get("total"),
+            )
+            if value is not None and float(value) > 0
+        ]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return len(candidates) if any(abs(candidate_sum - target) <= 2 for target in targets) else None
 
 
 def _project_balanced_descriptions_to_layout_rows(items, candidates):
@@ -1829,11 +1909,16 @@ def _project_totals_to_layout_rows(extracted, ocr_layout_blocks):
         for cand_idx, cand in enumerate(chosen):
             if cand_idx in used_candidate_idxs:
                 continue
-            cand_desc = _norm_layout_desc(cand["description"])
-            if item_desc in cand_desc or cand_desc in item_desc:
-                score = 1.0
-            else:
-                score = SequenceMatcher(None, item_desc, cand_desc).ratio()
+            cand_descs = {
+                _norm_layout_desc(cand.get(key) or "")
+                for key in ("description", "owner_description")
+            }
+            score = max(
+                1.0
+                if item_desc in cand_desc or cand_desc in item_desc
+                else SequenceMatcher(None, item_desc, cand_desc).ratio()
+                for cand_desc in cand_descs if cand_desc
+            )
             if score >= 0.72:
                 matches.append((score, cand_idx))
         if not matches:
