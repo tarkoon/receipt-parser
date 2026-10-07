@@ -22,6 +22,13 @@ from receipt_parser.checks import check_time, check_tree_edit_distance
 from scripts import add_flagged_receipts as flagged_exporter
 
 
+@pytest.fixture(autouse=True)
+def _offline_unit_environment(monkeypatch):
+    """Mocked pipeline calls need neither credentials nor an existing workspace."""
+    monkeypatch.setattr("receipt_parser.pipeline.check_model_available", lambda *_: None)
+    Path("local").mkdir(exist_ok=True)
+
+
 # --- Tree Edit Distance tests ---
 
 def test_tree_ed_identical():
@@ -7489,9 +7496,65 @@ def test_dense_sequence_rows_flushes_pending_quantity_row_before_next_inline_ite
         "taxes": [{"rate": "8%", "label": "外税", "amount": 193}],
         "line_items": [{"description": "dummy", "qty": 1, "unit_price": 2419, "total": 2419}],
     }
-    ocr_text = (Path(__file__).parent.parent / ".data/ocr_cache/variants/receipt_95_v1.txt").read_text(
-        encoding="utf-8"
-    )
+    ocr_text = "\n".join([
+        "10:57",
+        "食品ポリ袋L (バイオマス306",
+        "(2個 X 単3)",
+        "商品ア 78",
+        "商品イ",
+        "398",
+        "商品ウ",
+        "(2個 X 単48)",
+        "96",
+        "商品エ",
+        "商品オ",
+        "128",
+        "98",
+        "商品カ",
+        "248",
+        "商品キ",
+        "294",
+        "割引",
+        "30%",
+        "-89",
+        "商品ク",
+        "98",
+        "商品ケ",
+        "98*",
+        "商品コ 593 A",
+        "まとめ値引",
+        "-200",
+        "商品サ 583 A",
+        "まとめ値引",
+        "-196",
+        "商品シ",
+        "88B",
+        "たまねぎ バラ",
+        "(2個 X 単58)",
+        "116 C",
+        "まとめ値引",
+        "-18",
+        "A: 2個 ¥780 の商品です",
+        "C: 2個 ¥98 の商品です",
+        "小計",
+        "¥2,419",
+        "外税 8%対象額",
+        "¥2,413",
+        "外税8%",
+        "¥193",
+        "外税10%対象額",
+        "¥6",
+        "外税10%",
+        "¥0",
+        "合計",
+        "¥2,612",
+        "現金",
+        "お釣り",
+        "¥3,030",
+        "¥418",
+        "お買上商品数:15",
+        "※印は軽減税率8%対象商品",
+    ])
 
     _replace_dense_sequence_rows_when_balanced(extracted, ocr_text)
 
@@ -8300,9 +8363,15 @@ def test_following_qty_detail_repairs_previous_small_amount_when_summary_balance
             {"description": "りんごクリームデニッ", "qty": 1, "unit_price": 138, "total": 138},
         ],
     }
-    ocr_path = Path(__file__).parent.parent / ".data/ocr_cache/variants/receipt_57_v1.txt"
+    ocr_text = "\n".join([
+        "キャベツ (1/2カット)",
+        "10",
+        "2個 X70)",
+        "小計",
+        "¥4,963",
+    ])
 
-    _repair_previous_item_from_following_qty_detail(extracted, ocr_path.read_text(encoding="utf-8"))
+    _repair_previous_item_from_following_qty_detail(extracted, ocr_text)
 
     cabbage = next(item for item in extracted["line_items"] if item["description"].startswith("キャベツ"))
     assert cabbage["qty"] == 2.0
