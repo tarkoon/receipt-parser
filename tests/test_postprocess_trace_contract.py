@@ -11,6 +11,7 @@ from receipt_parser.receipt_phase_trace import (
     _snapshot_receipt_mutation_fields,
 )
 from receipt_parser.receipt_output import _record_receipt_output_repair
+from receipt_parser.receipt_output import _record_final_receipt_output_repair
 
 
 POSTPROCESS_PATH = (
@@ -49,22 +50,15 @@ def test_direct_semantic_mutations_are_immediately_traced_by_field_owner():
         for index, statement in enumerate(function.body)
         if _call_name(statement) == "_extract_fuel_usage"
     )
-    masked_account = next(
+    account = next(
         index
         for index, statement in enumerate(function.body)
-        if isinstance(statement, ast.If)
-        and any(
-            isinstance(node, ast.Subscript)
-            and isinstance(node.slice, ast.Constant)
-            and node.slice.value == "account_number"
-            and isinstance(node.ctx, ast.Store)
-            for node in ast.walk(statement)
-        )
+        if _call_name(statement) == "_run_payment_method_repair_phase"
     )
 
     expected = {
         merchant: ("header_identity_repair", "merchant"),
-        masked_account: ("payment_method_repair", "account_number"),
+        account: ("payment_method_repair", "account_number"),
         usage: ("service_receipt_recovery", "usage"),
     }
     for index, (stage, field) in expected.items():
@@ -96,6 +90,42 @@ def test_output_trace_rejects_mutations_outside_owner_writes():
             [],
             lambda: receipt.update(total=200),
         )
+
+
+@pytest.mark.parametrize(
+    "stage,owner,text,helper_name",
+    [
+        (
+            "single_rate_inclusive_tax_block",
+            "single_rate_inclusive_tax_restoration",
+            "10%対象 110 内消費税 10",
+            "_restore_single_rate_inclusive_tax_block",
+        ),
+        (
+            "stacked_inclusive_tax_block",
+            "stacked_inclusive_tax_restoration",
+            "10%対象\n内消費税\n¥110)\n¥10)",
+            "_restore_stacked_inclusive_tax_block",
+        ),
+    ],
+)
+def test_final_printed_inclusive_tax_restoration_traces_total_minus_tax_subtotal(
+    stage, owner, text, helper_name
+):
+    from receipt_parser import receipt_late_repairs
+
+    receipt = {"total": 110, "subtotal": 110, "taxes": []}
+    trace = []
+    helper = getattr(receipt_late_repairs, helper_name)
+
+    _record_final_receipt_output_repair(
+        stage, receipt, trace, lambda: helper(receipt, text)
+    )
+
+    assert receipt["subtotal"] == 100
+    assert receipt["taxes"] == [{"rate": "10%", "label": "内税", "amount": 10}]
+    assert trace[-1]["owner_phase"] == owner
+    assert set(trace[-1]["changes"]) == {"subtotal", "taxes"}
 
 
 def test_top_level_postprocess_phases_record_before_the_next_phase_runs():

@@ -1,6 +1,7 @@
 """Receipt item total and layout projection helpers."""
 
 import re
+import unicodedata
 from difflib import SequenceMatcher
 
 from .patterns import (
@@ -140,6 +141,8 @@ def _repair_previous_item_from_following_qty_detail(extracted, unified_text):
                     continue
                 detail = _parse_qty_detail_total(lookahead)
                 if not detail:
+                    if re.search(r'[A-Za-zぁ-んァ-ン一-龥]', lookahead):
+                        break
                     continue
                 qty, unit = detail
                 gross = qty * unit
@@ -415,7 +418,7 @@ def _fix_item_totals_from_ocr_neighborhood(
                 li for li, line in enumerate(lines)
                 if desc_prefix in line
             ]
-            if not matching_lines:
+            if len(matching_lines) != 1:
                 continue
             if any(_ocr_window_contains_price(li, float(total)) for li in matching_lines):
                 continue  # original total is OCR-supported; do not chase neighbors
@@ -941,9 +944,9 @@ def _replace_hallucinated_dup_with_ocr_item(items, unified_text, target_subtotal
 
 def _parse_qty_detail_total(line: str) -> tuple[float, float] | None:
     """Return (qty, unit_price) from OCR qty detail like "2個 X70)"."""
-    m = re.search(r'(\d+)\s*[コ個点]\s*[xX×Ⅹ]\s*(?:単|@)?\s*(\d[\d,]*)', line)
+    m = re.search(r'(\d+)\s*[コ個点]\s*[xX×Ⅹ]\s*(?:単|@)?\s*[¥￥]?\s*(\d[\d,]*)', line)
     if not m:
-        m = re.search(r'(?:単|@)\s*(\d[\d,]*)\s*[xX×Ⅹ]\s*(\d+)\s*[コ個点]', line)
+        m = re.search(r'(?:単|@)\s*[¥￥]?\s*(\d[\d,]*)\s*[xX×Ⅹ]\s*(\d+)\s*[コ個点]', line)
         if not m:
             return None
         unit = float(m.group(1).replace(',', ''))
@@ -1253,6 +1256,11 @@ def _group_layout_rows(layout_blocks: list[dict]) -> list[list[dict]]:
     heights = sorted(h for h in (_layout_block_height(b) for b in blocks) if h > 0)
     median_h = heights[len(heights) // 2] if heights else 20.0
     y_tol = max(8.0, median_h * 0.55)
+    x_spans = {}
+    for block in blocks:
+        xs = [point[0] for point in block.get("bbox") or []
+              if isinstance(point, (list, tuple)) and len(point) >= 2]
+        x_spans[id(block)] = (min(xs), max(xs)) if xs else None
 
     rows: list[list[dict]] = []
     row_y: float | None = None
@@ -1260,11 +1268,19 @@ def _group_layout_rows(layout_blocks: list[dict]) -> list[list[dict]]:
     for block in sorted(blocks, key=lambda b: (b.get("page", 0), _layout_block_center_y(b), b.get("x") or 0)):
         cy = _layout_block_center_y(block)
         page = block.get("page", 0)
+        span = x_spans[id(block)]
+        # ponytail: scan short word rows; index intervals if very wide rows become costly.
+        competing_column = span is not None and rows and any(
+            (previous := x_spans[id(word)]) is not None
+            and max(span[0], previous[0]) < min(span[1], previous[1])
+            and abs(cy - _layout_block_center_y(word)) > y_tol
+            for word in rows[-1]
+        )
         if current_page != page:
             rows.append([block])
             row_y = cy
             current_page = page
-        elif row_y is None or abs(cy - row_y) <= y_tol:
+        elif row_y is None or (abs(cy - row_y) <= y_tol and not competing_column):
             if not rows:
                 rows.append([])
             rows[-1].append(block)
@@ -1275,9 +1291,112 @@ def _group_layout_rows(layout_blocks: list[dict]) -> list[list[dict]]:
     return [sorted(row, key=lambda b: b.get("x") or 0) for row in rows]
 
 
+_DIRECT_SUMMARY_OWNER_PATTERNS = {
+    "subtotal": re.compile(r"(?P<label>小計)(?P<count>/?\d{1,2}(?:点|個))?(?P<currency>[¥￥])?(?P<amount>\d[\d,]*)"),
+    "tax": re.compile(r"(?P<rate>\d+(?:\.\d+)?%)?(?P<label>消費税(?:等)?|税額)(?P<currency>[¥￥])?(?P<amount>\d[\d,]*)"),
+    "total": re.compile(r"(?P<label>合計|総計|現計)(?P<currency>[¥￥])?(?P<amount>\d[\d,]*)"),
+    "tax_info": re.compile(r"(?P<label>内税額|内消費税(?:等)?)(?P<currency>[¥￥])?(?P<amount>\d[\d,]*)\)?$"),
+    "rate_component": re.compile(r"(?P<open>\()?(?P<table>[A-Za-z](?=[外内]))?(?P<prefix_label>外税?|内税?)?(?P<rate>8(?:\.0+)?|10(?:\.0+)?)%(?P<label>外税?|内税?)?(?P<base>タイショウ|対象(?:額)?)?(?P<currency>[¥￥])(?P<amount>\d[\d,]*)(?(open)\)|)"),
+}
+
+
+def _collect_direct_summary_owners(layout_blocks: list[dict]) -> dict:
+    """Collect literal label→amount owners and source positions; never resolve duplicates.
+
+    Rows come from the existing geometry grouper. A financial role is accepted
+    only when its complete normalized row is exactly a label, optional printed
+    count/rate/currency, and one amount. `内税額` is separately informational.
+    """
+    blocks = []
+    for index, block in enumerate(layout_blocks or []):
+        if isinstance(block, dict) and (block.get("text") or "").strip():
+            blocks.append({**block, "_source_index": index})
+    owners = {role: [] for role in _DIRECT_SUMMARY_OWNER_PATTERNS}
+
+    def source_indices(start: int, end: int, spans: list[tuple[int, int, dict]]) -> list[int]:
+        return sorted({
+            int(block["_source_index"])
+            for left, right, block in spans
+            if left < end and right > start
+        })
+
+    for row_number, row in enumerate(_group_layout_rows(blocks)):
+        pieces, spans, offset = [], [], 0
+        for block in row:
+            text = "".join(unicodedata.normalize("NFKC", str(block.get("text") or "")).split())
+            if text:
+                pieces.append(text)
+                spans.append((offset, offset + len(text), block))
+                offset += len(text)
+        text = "".join(pieces)
+
+        for role, pattern in _DIRECT_SUMMARY_OWNER_PATTERNS.items():
+            matches = list(pattern.finditer(text)) if role == "tax_info" else [pattern.fullmatch(text)]
+            for match in matches:
+                if not match:
+                    continue
+                if role == "rate_component" and bool(match.group("prefix_label")) == bool(match.group("label")):
+                    continue
+                amount_start, amount_end = match.span("amount")
+                currency_span = match.span("currency") if match.groupdict().get("currency") else None
+                amount_indices = sorted(set(
+                    source_indices(amount_start, amount_end, spans)
+                    + (source_indices(*currency_span, spans) if currency_span else [])
+                ))
+                label_group = "prefix_label" if role == "rate_component" and match.group("prefix_label") else "label"
+                label_indices = source_indices(*match.span(label_group), spans)
+                optional_indices = []
+                for optional in ("count", "rate", "table", "base"):
+                    if match.groupdict().get(optional):
+                        start, end = match.span(optional)
+                        optional_indices.extend(source_indices(
+                            start, end + int(role == "rate_component" and optional == "rate"), spans))
+                involved = set(label_indices + amount_indices + optional_indices)
+                rate_meta = {}
+                literal_rate = match.groupdict().get("rate")
+                if literal_rate:
+                    if role == "rate_component":
+                        literal_rate += "%"
+                    rate_number = float(literal_rate.rstrip("%"))
+                    canonical_rate = f"{int(rate_number)}%" if rate_number in (8, 10) else literal_rate
+                    rate_meta = {"rate": canonical_rate, "rate_literal": literal_rate}
+                if role == "rate_component":
+                    mode_literal = match.group("label") or match.group("prefix_label")
+                    rate_meta.update(mode=mode_literal[0] + "税", mode_literal=mode_literal,
+                                     kind="base" if match.group("base") else "tax",
+                                     table_label=match.group("table"),
+                                     table_label_indices=source_indices(*match.span("table"), spans))
+                if match.groupdict().get("count"):
+                    rate_meta["count"] = int(re.sub(r"\D", "", match.group("count")))
+                owners[role].append({
+                    **rate_meta,
+                    "row": row_number,
+                    "row_text": text,
+                    "value": int(match.group("amount").replace(",", "")),
+                    "label": "".join(str(block.get("text") or "") for block in row
+                                     if int(block["_source_index"]) in label_indices),
+                    "literal_amount": "".join(str(block.get("text") or "") for block in row
+                                               if int(block["_source_index"]) in amount_indices),
+                    "label_indices": label_indices,
+                    "amount_indices": amount_indices,
+                    "row_indices": sorted(involved),
+                    "confidence": min(
+                        (float(block.get("confidence", 1.0)) for block in row
+                         if int(block["_source_index"]) in involved),
+                        default=1.0,
+                    ),
+                })
+
+    return {
+        "owners": owners,
+        "unique": {role: items[0] if len(items) == 1 else None for role, items in owners.items()},
+        "ambiguous_roles": [role for role, items in owners.items() if len(items) > 1],
+    }
+
+
 def _layout_price_value(text: str, *, allow_small: bool = False) -> int | None:
     s = (text or "").strip()
-    m = re.match(r'^[¥￥]?\s*(\d[\d,]*)\s*(?:[*＊※%％除軽xX]+)?\s*$', s)
+    m = re.match(r'^[¥￥]?\s*(\d[\d,]*)\s*(?:[*＊※%％除軽xX↓]+)?\s*$', s)
     if not m:
         return None
     try:
@@ -1316,6 +1435,21 @@ def _norm_layout_desc(text: str) -> str:
     return text.lower()
 
 
+def _unit_first_qty1_values(row):
+    """Consume one complete unit/count/right-total row without resolving money."""
+    positions = [(i, value) for i, block in enumerate(row)
+                 if (value := _layout_price_value(str(block.get("text") or ""), allow_small=True)) is not None]
+    if len(positions) != 3:
+        return None
+    (unit_idx, unit), (_, qty), (total_idx, total) = positions
+    compact = "".join("".join(unicodedata.normalize("NFKC", str(block.get("text") or "")).split())
+                      for block in row)
+    if (qty != 1 or not re.fullmatch(r"@?\d[\d,]*1[点個コ]\d[\d,]*", compact)
+            or float(row[total_idx].get("x") or 0) - float(row[unit_idx].get("x") or 0) < 30):
+        return None
+    return unit_idx, unit, total_idx, total
+
+
 def _adjacent_layout_description(rows: list[list[dict]], raw: dict):
     """Own a preceding title only for a code/qty/unit/total detail row.
 
@@ -1337,7 +1471,10 @@ def _adjacent_layout_description(rows: list[list[dict]], raw: dict):
         return None
     (_qty_idx, qty), (unit_idx, unit), (total_idx, total) = ordered[-3:]
     if qty != 1 or unit != total:
-        return None
+        unit_first = _unit_first_qty1_values(row)
+        if unit_first is None or unit_first[1] != unit_first[3]:
+            return None
+        unit_idx, unit, total_idx, total = unit_first
     unit_x = float(row[unit_idx].get("x") or 0)
     total_x = float(row[total_idx].get("x") or 0)
     if total_x - unit_x < 30:
@@ -1455,6 +1592,7 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
             "value": gross - discount,
             "gross": gross,
             "discount": discount,
+            "currency_owned": True,
             "y": _layout_block_center_y(price_row[-1]),
             "x": float(price_row[-1].get("x") or 0),
             "reduced_marker": False,
@@ -1505,6 +1643,7 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
     candidates: list[dict] = []
     for raw in raw_rows:
         row = raw["row"]
+        currency_owned = False
         adjacent = _adjacent_layout_description(rows, raw)
         structured = adjacent or _inline_layout_description(rows, raw)
         if structured is not None:
@@ -1521,8 +1660,36 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
                 near_column,
                 key=lambda pair: float(row[pair[0]].get("x") or 0),
             )
+            desc_end = price_idx
+            # A separate currency block is price metadata only with unique
+            # column ownership and nearby, vertically overlapping glyph boxes.
+            if (
+                len(near_column) == 1
+                and price_idx > 0
+                and str(row[price_idx - 1].get("text") or "").strip() in ("¥", "￥")
+            ):
+                symbol_box = row[price_idx - 1].get("bbox") or []
+                price_box = row[price_idx].get("bbox") or []
+                heights = sorted(
+                    height for block in row
+                    if (height := _layout_block_height(block)) > 0
+                )
+                if symbol_box and price_box and heights:
+                    symbol_ys = [point[1] for point in symbol_box]
+                    price_ys = [point[1] for point in price_box]
+                    overlap = min(max(symbol_ys), max(price_ys)) - max(min(symbol_ys), min(price_ys))
+                    token_height = min(max(symbol_ys) - min(symbol_ys), max(price_ys) - min(price_ys))
+                    gap = min(point[0] for point in price_box) - max(point[0] for point in symbol_box)
+                    row_height = heights[len(heights) // 2]
+                    if (
+                        token_height > 0
+                        and overlap >= token_height * 0.5
+                        and -0.30 * row_height <= gap <= 0.50 * token_height
+                    ):
+                        desc_end -= 1
+                        currency_owned = True
             desc_text = "".join(
-                str(block.get("text") or "") for block in row[:price_idx]
+                str(block.get("text") or "") for block in row[:desc_end]
             ).strip()
             owner_description = desc_text
         price_x = float(row[price_idx].get("x") or 0)
@@ -1550,6 +1717,7 @@ def _layout_row_price_candidates(layout_blocks: list[dict] | None) -> list[dict]
             "value": int(value),
             "y": _layout_block_center_y(row[price_idx]),
             "x": price_x,
+            "currency_owned": currency_owned or price_text.startswith(("¥", "￥")),
             "reduced_marker": bool(
                 marker_text
                 and re.fullmatch(r'[*＊※%％xX軽]+', marker_text)
@@ -2130,22 +2298,20 @@ def _find_ocr_item_desc(lines, price_line_idx, existing_items):
 
     # Same-line first (rejoin merged item+price)
     cand = _clean(lines[price_line_idx])
-    if (
-        _is_valid(cand)
-        and cand not in existing_descs
-        and not _ocr_desc_fragment_owned_by_existing(lines, price_line_idx, existing_items)
-    ):
-        return cand
+    if _is_valid(cand):
+        return None if (
+            cand in existing_descs
+            or _ocr_desc_fragment_owned_by_existing(lines, price_line_idx, existing_items)
+        ) else cand
     # Search backward up to 15 lines, then forward up to 5
     for j in list(range(price_line_idx - 1, max(price_line_idx - 16, -1), -1)) + \
              list(range(price_line_idx + 1, min(price_line_idx + 6, len(lines)))):
         cand = _clean(lines[j])
-        if (
-            _is_valid(cand)
-            and cand not in existing_descs
-            and not _ocr_desc_fragment_owned_by_existing(lines, j, existing_items)
-        ):
-            return cand
+        if _is_valid(cand):
+            return None if (
+                cand in existing_descs
+                or _ocr_desc_fragment_owned_by_existing(lines, j, existing_items)
+            ) else cand
     return None
 
 

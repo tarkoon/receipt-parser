@@ -19,6 +19,75 @@ def _item(description, total, category):
     }
 
 
+def test_code_prefixed_included_marker_requires_unique_row_price_and_tax_group():
+    from copy import deepcopy
+
+    row = "0123内#商品甲\n¥1100"
+    group = "内10%対象額\n¥1100\n内10%\n¥100"
+    outer = "外8%対象額\n¥2000\n外8%\n¥160"
+    items = [_item("商品甲", 1100, "8%"), _item("商品乙", 2000, "8%")]
+    expected = deepcopy(items)
+    expected[0]["tax_category"] = "10%"
+    locked = set()
+
+    for included_group in (group, "内10%対象額\n内10%\n¥1100\n¥100", group):
+        _fix_tax_categories_from_ocr_markers(
+            items, "\n".join((row, included_group, outer)), locked_indices=locked,
+        )
+        assert items == expected
+        assert locked == {0}
+
+    for bad_row, bad_group, duplicate_amount in [
+        (row.replace("内#", "#"), group, False),
+        (row.replace("0123内#", "商品内#"), group, False),
+        (row + "\n" + row, group, False),
+        (row + "\n0456#商品甲\n¥1100", group, False),
+        (row.replace("1100", "1200"), group, False),
+        (row.replace("商品甲", "商品甲*"), group, False),
+        (row, "内10%対象額\n¥1100", False),
+        (row, group.replace("¥100", "¥105"), False),
+        (row, "内10%対象額\n内10%\n¥1100\n¥100\n¥99", False),
+        (row, group + "\n" + group, False),
+        (row, group, True),
+    ]:
+        unchanged = [_item("商品甲", 1100, "8%"), _item("商品乙", 2000, "8%")]
+        if duplicate_amount:
+            unchanged.append(_item("商品丙", 1100, "8%"))
+        before = deepcopy(unchanged)
+        _fix_tax_categories_from_ocr_markers(
+            unchanged, "\n".join((bad_row, bad_group, outer)),
+        )
+        assert unchanged == before
+
+    for included_group in (
+        group.replace("¥100", "¥110"),
+        group + "\n" + group,
+        group + "\n内10%\n¥100",
+    ):
+        unchanged = [_item("商品甲", 1100, "8%")]
+        before = deepcopy(unchanged)
+        _fix_tax_categories_from_ocr_markers(unchanged, row + "\n" + included_group)
+        assert unchanged == before
+
+    locked_item = _item("商品甲", 1100, "8%")
+    for private_lock in (False, True):
+        if private_lock:
+            locked_item["_tax_category_locked"] = "8%"
+        before = deepcopy(locked_item)
+        _fix_tax_categories_from_ocr_markers(
+            [locked_item], row + "\n" + group,
+            locked_indices={0} if not private_lock else None,
+        )
+        assert locked_item == before
+
+    numeric_title = [_item("商品甲2024", 1100, "8%")]
+    before = deepcopy(numeric_title)
+    _fix_tax_categories_from_ocr_markers(
+        numeric_title, row.replace("商品甲", "商品甲2025") + "\n" + group,
+    )
+    assert numeric_title == before
+
+
 def test_explicit_row_markers_win_while_rate_bases_fill_only_unresolved_rows():
     items = [
         _item("商品甲", 100, "10%"),

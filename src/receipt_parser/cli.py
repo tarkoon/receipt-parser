@@ -625,12 +625,11 @@ def setup():
 
     # Step 4: Verify end-to-end
     typer.echo("\n[4/4] End-to-end test")
-    run_test = typer.prompt("  Run a quick test with a sample receipt? [Y/n]",
-                             default="y", show_default=False).strip().lower()
-    if run_test != "n":
-        fixtures_dir = _PROJECT_ROOT / "tests" / "fixtures"
-        sample = next(fixtures_dir.glob("receipt_1.*"), None) if fixtures_dir.exists() else None
-        if sample:
+    sample_path = typer.prompt("  Receipt image path (Enter to skip)",
+                               default="", show_default=False).strip()
+    if sample_path:
+        sample = Path(sample_path).expanduser()
+        if sample.is_file():
             typer.echo(f"  Processing {sample.name}...")
             try:
                 # Reload env
@@ -643,7 +642,7 @@ def setup():
             except Exception as e:
                 typer.echo(f"  Test failed: {e}")
         else:
-            typer.echo("  No test fixtures found, skipping.")
+            typer.echo("  Receipt image path is not a file, skipping.")
 
     typer.echo("\n" + "=" * 40)
     typer.echo("Setup complete! Run 'receipt-parser parse <image>' to get started.")

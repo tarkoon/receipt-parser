@@ -7,8 +7,8 @@ import re
 from datetime import date, timedelta
 
 from .patterns import ERA_TABLE, UTILITY_BILL_KEYWORDS
-from .pipeline_slip import _PAYER_LABEL_RE, _clean_payer_candidate
-from .receipt_identity_payment import _fix_payment_reference
+from .pipeline_slip import _PAYER_LABEL_RE, _clean_payer_candidate, _fix_account_number
+from .receipt_identity_payment import _fix_payment_method, _fix_payment_reference
 
 
 def _date_fragment(prefix: str) -> str:
@@ -239,6 +239,7 @@ def postprocess_utility_bill(
     payment_reference_text: str | None = None,
 ) -> dict:
     """Apply utility bill-specific post-processing to the LLM extraction."""
+    _fix_account_number(extracted, payment_reference_text or unified_text)
     _fix_payment_reference(extracted, payment_reference_text or unified_text)
 
     if (
@@ -253,17 +254,10 @@ def postprocess_utility_bill(
     if saw_addressee:
         extracted["payer"] = next(iter(payers.values())) if len(payers) == 1 else None
 
-    # Check for convenience store payment evidence (overrides bank_payment)
-    paid_at_store = bool(re.search(
-        r'ローソン|セブン|ファミリーマート|コンビニ|収納代行|領収.*いたしました',
-        unified_text,
-    ))
-    if paid_at_store:
-        extracted["payment_method"] = "cash"
-    elif re.search(r'口座引落|口座振替|振替させて', unified_text):
+    if re.search(r'口座引落|口座振替|振替させて', unified_text):
         extracted["payment_method"] = "bank_payment"
-    elif re.search(r'領入済|収納済', unified_text):
-        extracted["payment_method"] = "cash"
+    else:
+        _fix_payment_method(extracted, unified_text, 1.0, {})
 
     # Service type: bills with both 水道 and 下水道 are water bills
     if extracted.get("service_type") == "sewage" and re.search(r'水道', unified_text):

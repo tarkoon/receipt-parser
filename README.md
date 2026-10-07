@@ -252,6 +252,36 @@ Usage is tracked automatically:
 
 The `receipt-parser usage` command shows real-time cost estimates. Cloud Vision offers 1,000 free calls/month. DeepSeek pricing: $0.028/1M (cache hit), $0.28/1M (cache miss), $0.42/1M (output). OpenRouter cost is recorded from provider-reported usage when available, which is especially useful for monitoring validator-gated model triage.
 
+### Last-resort receipt vision
+
+After OCR and its existing repairs, a receipt may use one Google Gemini 3.8 Flash
+request through OpenRouter. Eligibility requires independently bound original
+pixels and OCR geometry: either one item with matching code and title (and any printed barcode)
+has conflicting prices in two OCR reads and leaves the basket unbalanced, or a
+seller header remains unresolved among competing marks. Ordinary receipts skip
+this stage.
+
+The request contains a native image crop and a transcription prompt. A price
+correction must match its complete printed item packet and reconcile the basket
+with the existing printed total, tax and settlement evidence. A merchant
+correction must resolve every competing header role and match the independently
+read contact row. The same price crop can resolve a contested item title when
+both OCR reads own its code/barcode and the blind transcription matches exactly
+one observed title candidate. Only those owned fields can change; user aliases
+apply afterward. Each receipt permits at most one request, with no automatic
+retries and a 60-second timeout. Missing credentials or rejected evidence
+preserve the OCR result.
+
+Set `OPENROUTER_API_KEY` to enable requests. The model defaults to
+`google/gemini-3.8-flash`; set `RECEIPT_VISION_MODEL=` to disable this stage.
+Captures are cached separately under `.data/receipt_vision/`, bound to the
+original image, OCR text/geometry, crop, model and prompt. Public pipeline calls
+accept `vision_mode="normal"` (read/write cache), `"cache_only"` (no request), or
+`"fresh"` (one request with cache reads/writes bypassed). The test harnesses use
+`RECEIPT_VISION_MODE` for the same choice and record fallback metadata.
+Actual paid calls enter the OpenRouter usage ledger once; cache replay adds no
+usage. Benchmark `--budget-limit` covers Cloud Vision OCR calls.
+
 ## Troubleshooting
 
 ### "No API key configured"

@@ -22,7 +22,6 @@ _BANNER_PHRASE_RE = re.compile(
     r'当店をご利用|またのご利用|またお越し|'
     r'お問い合わせ|営業時間|定休日|'
     r'カードお取扱日|取引内容|伝票番号|承認番号|'
-    r'プロの品質とプロの価格|'
     r'上記金額正に領収|上記正に領収|'
     r'本書保管|印字面|'
     r'の商品です|まとめ値引|'
@@ -43,13 +42,7 @@ def normalize_fullwidth(text: str) -> str:
     Uses NFKC normalization (standard for JP text processing).
     Keeps ¥ symbols so the LLM can distinguish prices from codes.
     """
-    text = unicodedata.normalize('NFKC', text)
-    # Known OCR-segmentation errors on financial labels. Cloud Vision
-    # occasionally splits 計 (言+十) into 富 + 士, so 小計 reads as 小富士.
-    # The replacement is safe because 小富士 is virtually never a product
-    # name in a Japanese receipt context.
-    text = re.sub(r'(?<!\S)小富士(?!\S)', '小計', text)
-    return text
+    return unicodedata.normalize('NFKC', text)
 
 
 def strip_barcode_lines(text: str) -> str:
@@ -118,7 +111,6 @@ _STRIP_SAFE_BANNER_RE = re.compile(
     r'今回獲得|現在のポイント|'
     r'クレジットカード売上票|お客様控え?|'
     r'当店をご利用|またのご利用|またお越し|'
-    r'プロの品質とプロの価格|'
     r'本書保管|印字面|'
     r'の商品です|まとめ値引|'
     r'^[A-Z]\s*[:：]\s*\d+\s*[個コ点]'
@@ -320,7 +312,7 @@ def rejoin_price_lines(text: str) -> str:
 
     # Pattern for inline price suffix: digit(s) + tax marker at end of line
     # e.g. "食品ポリ袋L (バイオマス30 3除" has "3除" = inline price
-    _INLINE_PRICE_SUFFIX = re.compile(r'\d[\d,]*\s*[※X除軽]\s*$')
+    _INLINE_PRICE_SUFFIX = re.compile(r'\d[\d,]*\s*[*※X除軽非]\s*$')
 
     def _has_inline_price(s: str) -> bool:
         """Check if a line already has a price suffix (digit + tax marker)."""

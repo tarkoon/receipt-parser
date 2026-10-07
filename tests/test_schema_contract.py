@@ -3,11 +3,19 @@
 import pytest
 
 from receipt_parser.schema import (
+    Document,
     LineItem,
     Receipt,
     generate_extraction_prompt,
     generate_verification_prompt,
 )
+
+
+@pytest.mark.parametrize("document_type", ["receipt", "utility_bill", "payment_slip"])
+def test_alias_normalization_preserves_iso_gregorian_year_without_printed_era(document_type):
+    for date in ("0007-02-03", "2001-02-03", "2016-02-03", "2018-02-03", "2026-02-03"):
+        document = Document(document_type=document_type, date=date, total=100, currency="JPY")
+        assert document.date == date
 
 
 @pytest.mark.parametrize(
@@ -109,6 +117,28 @@ def test_payment_slip_clears_usage_and_utility_only_fields():
     assert document.payment_reference == "REF-126"
 
 
+@pytest.mark.parametrize("usage", [None, {}, {
+    "amount": None, "unit": None, "cost_per": None,
+    "meter_previous": None, "meter_current": None,
+}])
+def test_empty_usage_has_one_public_representation(usage):
+    document = Receipt(usage=usage)
+
+    assert document.model_dump()["usage"] is None
+
+
+@pytest.mark.parametrize("usage", [
+    {"amount": 0}, {"cost_per": 0}, {"meter_previous": 0},
+    {"meter_current": 0}, {"unit": "L"},
+])
+def test_usage_normalization_preserves_explicit_zero_readings_and_units(usage):
+    document = Receipt(usage=usage)
+
+    assert document.usage is not None
+    for field, value in usage.items():
+        assert document.model_dump()["usage"][field] == value
+
+
 @pytest.mark.parametrize("document_type", ["receipt", "utility_bill", "payment_slip"])
 def test_account_number_remains_optional_across_document_types(document_type):
     document = Receipt(document_type=document_type, account_number="ACCOUNT-1")
@@ -187,6 +217,8 @@ def test_prompts_state_the_approved_semantic_conventions():
     assert "Use null for mixed tender" in receipt_prompt
     assert "Use null when no redemption is printed" in receipt_prompt
     assert "positive effective percentage" in receipt_prompt
+    assert "supported by a printed percentage schedule" in receipt_prompt
+    assert "empty for amount-only discounts, including bundle offers" in receipt_prompt
     assert "payment_reference is value-only" in receipt_prompt
     assert "receipt or slip number" in receipt_prompt
     assert "calendar day after the previous reading" in utility_prompt

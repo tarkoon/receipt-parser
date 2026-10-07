@@ -67,7 +67,7 @@ POSTPROCESS_PHASES = (
         "name": "payment_method_repair",
         "reads": ("payment_method", "account_number", "ocr_text", "ocr_confidence", "llm_confidence"),
         "writes": ("payment_method", "account_number"),
-        "invariant": "Payment method repair requires visible OCR cash or card/e-money markers; masked card suffixes are not retained as account numbers.",
+        "invariant": "Payment method repair requires visible OCR tender markers; account numbers require one unique customer/billing owner, excluding masked, member, pickup and corroborated receipt references.",
     },
     {
         "name": "payment_reference_repair",
@@ -205,12 +205,6 @@ POSTPROCESS_PHASES = (
         "invariant": "Description reconciliation requires visible OCR code/name context and must preserve item counts, prices, and totals.",
     },
     {
-        "name": "digit_misread_item_repair",
-        "reads": ("line_items", "subtotal", "total", "ocr_text"),
-        "writes": ("line_items",),
-        "invariant": "Digit-misread item repair requires a small subtotal/total item-sum gap, exactly one digit-confusion candidate, and OCR percent-marker evidence.",
-    },
-    {
         "name": "split_price_block_projection",
         "reads": ("line_items", "subtotal", "total", "ocr_text"),
         "writes": ("line_items",),
@@ -273,8 +267,8 @@ POSTPROCESS_PHASES = (
     {
         "name": "bare_number_tax_summary_restoration",
         "reads": ("line_items", "taxes", "subtotal", "total", "ocr_text"),
-        "writes": ("taxes", "subtotal"),
-        "invariant": "Bare-number tax summary restoration requires visible rate labels, numeric tax amounts, and printed total arithmetic.",
+        "writes": ("taxes", "subtotal", "line_items"),
+        "invariant": "Bare-number tax summary restoration requires visible rate labels, numeric tax amounts, and printed total arithmetic; a unique label-owned inclusive pair may assign the rate to one purpose item covering the complete printed gross.",
     },
     {
         "name": "external_tax_total_restoration",
@@ -292,7 +286,7 @@ POSTPROCESS_PHASES = (
         "name": "bag_item_rate_base_reconciliation",
         "reads": ("line_items", "subtotal", "total", "taxes", "ocr_text"),
         "writes": ("line_items",),
-        "invariant": "Bag item price/rate-base reconciliation requires a tiny printed 10% rate base and paid-bag totals that can be reconciled to it.",
+        "invariant": "Bag price reconciliation requires literal OCR bag amounts whose combined total matches the tiny printed 10% rate base; the base cannot supply a row price.",
     },
     {
         "name": "tax_category_assignment",
@@ -354,7 +348,7 @@ POSTPROCESS_PHASES = (
         "name": "code_prefixed_description_cleanup",
         "reads": ("line_items", "ocr_text"),
         "writes": ("line_items",),
-        "invariant": "Code-prefixed description cleanup requires visible OCR/POS item-code prefixes and preserves item description field consistency.",
+        "invariant": "Leading POS codes are stripped only when a Japanese item name remains; trailing codes require a unique standalone OCR code/quantity row matching the extracted quantity and nearest title.",
     },
     {
         "name": "duplicate_row_cleanup",

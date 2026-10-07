@@ -3,7 +3,8 @@
 import logging
 import re
 
-from .patterns import ADMIN_SUFFIX_RE, LOCATION_CLUE_RE, _COMPANY_SUFFIX_RE
+from .checks import fuzzy_similarity
+from .patterns import ADMIN_SUFFIX_RE, LOCATION_CLUE_RE, _COMPANY_SUFFIX_RE, _OCR_ZONE_END_RE
 
 
 logger = logging.getLogger(__name__)
@@ -177,7 +178,17 @@ def _trim_purchase_store_metadata_location(extracted: dict, ocr_text: str) -> No
 
 
 def _recover_header_branch_store_location(extracted: dict, ocr_text: str) -> None:
-    """Recover a visible branch/store token from the receipt header."""
+    """Recover a visible branch/store token from the receipt header.
+
+    An existing full header row yields only to a uniquely separated cross-script
+    merchant prefix and the entire independently selected branch suffix. An exact
+    merchant spelling preserves the complete visible store name.
+
+    Trigger: one complete literal address between an exact merchant/store header
+    and its sole phone row, without competing or explicitly scoped addresses.
+    Invariant: preserve supported specific locations and every printed address
+    character; detached numeric rows never extend the address.
+    """
     if not ocr_text:
         return
     current_location = re.sub(r'\s+', '', str(extracted.get("location") or ""))
@@ -185,10 +196,73 @@ def _recover_header_branch_store_location(extracted: dict, ocr_text: str) -> Non
     if was_replaceable_noise:
         current_location = ""
     can_override_admin_fragment = _is_broad_japanese_admin_location(current_location)
-    header_lines = ocr_text.splitlines()[:16]
+    header_lines = ocr_text.splitlines()[:_ASCII_BRAND_HEADER_SCAN_LIMIT]
+    header_lines = header_lines[:next((
+        idx for idx, line in enumerate(header_lines)
+        if _OCR_ZONE_END_RE.match(line.strip())
+        or re.search(r'(?:19|20)\d{2}[年/-]\d{1,2}[月/-]\d{1,2}', line)
+    ), len(header_lines))]
     deferred_generic_candidate = None
 
     merchant = re.sub(r'\s+', '', str(extracted.get("merchant") or ""))
+
+    # ponytail: complete rows only; split-address proof stays in its existing helper.
+    if (
+        not current_location
+        or can_override_admin_fragment
+        or not _location_has_ocr_evidence(current_location, ocr_text)
+    ):
+        compact_header = [
+            _strip_location_token_punctuation(re.sub(r'\s+', '', line))
+            for line in header_lines
+        ]
+        address_chars = r'[\u3040-\u30ff\u3400-\u9fff々〆ー]'
+        addresses = [
+            (idx, row) for idx, row in enumerate(compact_header)
+            if re.fullmatch(
+                rf'{address_chars}{{1,4}}[都道府県]{address_chars}+[市区町村]'
+                rf'{address_chars}+\d+(?:(?:[-－‐―ー]|丁目|番(?:地)?)\d+)+'
+                r'(?:番(?:地)?|号)?',
+                row,
+            )
+            and not _ASCII_BRAND_LOCATION_NOISE_RE.search(row)
+            and not re.search(r'レジ|店コード', row)
+        ]
+        if len(addresses) == 1:
+            address_idx, address = addresses[0]
+            merchant_rows = [
+                idx for idx, row in enumerate(compact_header[:address_idx])
+                if merchant and row == merchant
+            ]
+            branch_rows = [
+                idx for idx, row in enumerate(compact_header[:address_idx])
+                if row != merchant
+                and (suffix := _HEADER_LOCATION_SUFFIX_RE.search(row))
+                and suffix.lastgroup != "generic"
+                and not _ASCII_BRAND_LOCATION_NOISE_RE.search(row)
+                and not _HEADER_LOCATION_NOISE_RE.search(row)
+                and not _PURCHASE_STORE_METADATA_RE.match(header_lines[idx])
+            ]
+            phone_rows = [
+                idx for idx, line in enumerate(header_lines)
+                if _extract_japanese_phone_hint(line)
+            ]
+            scoped_address = re.compile(
+                r'^HQ\b|請求先|配送先|送付先|お届け先|返送先|宛先|'
+                r'住所|所在地|連絡先|FAX',
+                re.IGNORECASE,
+            )
+            if (
+                len(merchant_rows) == len(branch_rows) == len(phone_rows) == 1
+                and merchant_rows[0] < branch_rows[0] < address_idx < phone_rows[0]
+                and not any(
+                    _HEADER_LOCATION_NOISE_RE.search(row) or scoped_address.search(row)
+                    for row in compact_header[:phone_rows[0] + 1]
+                )
+                and (not can_override_admin_fragment or current_location in address)
+            ):
+                extracted["location"] = address
+                return
 
     for raw_line in header_lines:
         line = raw_line.strip()
@@ -203,8 +277,6 @@ def _recover_header_branch_store_location(extracted: dict, ocr_text: str) -> Non
             continue
         if _HEADER_LOCATION_NOISE_RE.search(line):
             continue
-        if re.search(r'(?:19|20)\d{2}[年/-]\d{1,2}[月/-]\d{1,2}', line):
-            break
         if _PURCHASE_STORE_METADATA_RE.match(line_for_branch):
             continue
         if not re.search(r'[ぁ-んァ-ン一-龥]', line_for_branch):
@@ -236,7 +308,21 @@ def _recover_header_branch_store_location(extracted: dict, ocr_text: str) -> Non
             candidate_compact = candidate_compact[len(merchant):]
         stem = _HEADER_LOCATION_SUFFIX_RE.sub('', candidate_compact)
         if current_location and not can_override_admin_fragment:
-            continue
+            source_rows = [row.strip() for row in header_lines
+                           if re.sub(r'\s+', '', row) == current_location]
+            if len(source_rows) != 1 or re.sub(r'\s+', '', raw_line) != current_location:
+                continue
+            owners = {merchant, *re.findall(r"[A-Za-z0-9&.'-]+|[ぁ-んァ-ン一-龥ー]+", merchant)} - {""}
+            cuts = []
+            for split in re.finditer(r'\s+', source_rows[0]):
+                prefix = re.sub(r'\s+', '', source_rows[0][:split.start()]).lower()
+                suffix = re.sub(r'\s+', '', source_rows[0][split.end():])
+                if prefix not in {owner.lower() for owner in owners} and suffix == candidate_compact and sum(
+                    fuzzy_similarity(prefix, owner.lower()) == 1.0 for owner in owners
+                ) == 1:
+                    cuts.append(split.start())
+            if len(cuts) != 1:
+                continue
         if can_override_admin_fragment and not _branch_extends_admin_fragment(current_location, candidate_compact):
             continue
         if (
@@ -425,7 +511,16 @@ def _extract_japanese_phone_hint(ocr_text: str) -> str:
 
 
 def _normalize_noisy_city_location(extracted: dict, ocr_text: str) -> None:
-    location = re.sub(r'\s+', '', str(extracted.get("location") or ""))
+    """Normalize a uniquely printed locality without changing address characters."""
+    raw_location = str(extracted.get("location") or "")
+    location = re.sub(r'\s+', '', raw_location)
+    source_rows = [line for line in (ocr_text or "").splitlines()
+                   if re.sub(r'\s+', '', line) == location]
+    if location and len(source_rows) == 1 and re.search(r'[都道府県市区町村郡]', location):
+        street_number = r'[0-9０-９]+(?:[-－‐―ー][0-9０-９]|丁目|番(?:地)?|号)'
+        extracted["location"] = re.sub(
+            rf'(?<=[\u3040-\u30ff\u3400-\u9fff々〆ー])\s+(?={street_number})', '', raw_location,
+        )
     if not location:
         return
     match = re.match(r'(?P<base>.*?[市区町村])(?P<tail>.+)$', location)

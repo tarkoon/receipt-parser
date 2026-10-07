@@ -18,10 +18,13 @@ import cv2
 
 logger = logging.getLogger(__name__)
 
-from .schema import Receipt
+from .schema import Receipt, VALID_TAX_RATES
 from .preprocess import load_image, try_extract_text_layer
 from .ocr import (
     OCRResult,
+    _OCR_CACHE_DIR,
+    _ocr_cache_key,
+    load_ocr_replay_evidence,
     blocks_to_structured_text,
     compute_ocr_confidence,
     init_cloud_vision,
@@ -40,6 +43,8 @@ from .patterns import (
     LOCATION_CLUE_RE,
 )
 from .receipt_financial import extract_financial_totals, reconcile_points_payment_from_ocr
+from .receipt_totals import _sum_taxable_amounts
+from .receipt_tax_categories import _is_bag_description
 from .receipt_postprocess import postprocess_receipt
 from .pipeline_bill import postprocess_utility_bill
 from .pipeline_slip import postprocess_payment_slip
@@ -55,10 +60,23 @@ from .receipt_output import (
     _apply_final_receipt_output_repairs,  # noqa: F401 - legacy private import surface
     _prepare_receipt_output_payload,
 )
-from .receipt_projection import _balanced_layout_item_count
+from .receipt_projection import _balanced_layout_item_count, _collect_direct_summary_owners
+from .receipt_pixel_markers import build_pixel_marker_context
+from .receipt_vision import VISION_MODES, recover_with_vision
 from .receipt_supplemental_ocr import (
     acquire_supplemental_ocr_evidence,
     apply_supplemental_ocr_evidence,
+    _build_financial_source_identity,
+    reconcile_supplemental_quantity_rows,
+    acquire_quantity_crop_ocr_evidence,
+    build_quantity_crop_context,
+    reconcile_quantity_crop_rows,
+    acquire_native_owner_crop_ocr_evidence,
+    build_native_owner_crop_context,
+    build_native_title_crop_context,
+    build_native_price_column_context,
+    NATIVE_TITLE_CROP_OCR_FINGERPRINT,
+    NATIVE_OWNER_CROP_OCR_CACHE_DIR,
 )
 from .receipt_phase_trace import (
     POSTPROCESS_MUTATION_FIELDS,
@@ -159,6 +177,11 @@ _USER_RULES_PATH = Path(__file__).parent / "user_rules.json"
 
 
 _PIPELINE_RECEIPT_MUTATION_PHASES = {
+    "last_resort_vision_field_recovery": {
+        "reads": ("document_type", "currency", "merchant", "line_items", "subtotal", "total", "taxes", "amount_paid", "primary_ocr_text", "supplemental_ocr_evidence", "pixel_marker_context"),
+        "writes": ("merchant", "line_items"),
+        "invariant": "After all OCR recovery, one independently image/text/layout-bound native crop may supply a literal price for one exact code/title/barcode conflict only when the unchanged qty-one basket closes printed total/tax and settlement. Already contested titles in that basket require exact code/barcode/geometry ownership and a blind literal matching exactly one observed candidate; every other price remains unchanged. A header seller must match the sealed contact-row literal and unique phone/registration while every competing upper mark has a resolved visual role. Vision never changes dates, totals, tax categories, quantities or discounts.",
+    },
     "document_type_location_policy": {
         "reads": ("document_type", "location"),
         "writes": ("location",),
@@ -166,6 +189,7 @@ _PIPELINE_RECEIPT_MUTATION_PHASES = {
     },
     "utility_bill_postprocess": {
         "reads": (
+            "account_number",
             "merchant",
             "date",
             "payment_method",
@@ -177,6 +201,7 @@ _PIPELINE_RECEIPT_MUTATION_PHASES = {
             "raw_text",
         ),
         "writes": (
+            "account_number",
             "merchant",
             "date",
             "payment_method",
@@ -188,9 +213,9 @@ _PIPELINE_RECEIPT_MUTATION_PHASES = {
         "invariant": "Utility identity, tender, date, reference, and service fields must remain backed by printed bill evidence.",
     },
     "payment_slip_postprocess": {
-        "reads": ("date", "payer", "payment_reference", "ocr_text", "raw_text"),
-        "writes": ("date", "payer", "payment_reference"),
-        "invariant": "Payment-slip payer and reference changes require one unique printed candidate; issue dates are not payment dates.",
+        "reads": ("date", "payer", "account_number", "payment_reference", "ocr_text", "raw_text"),
+        "writes": ("date", "payer", "account_number", "payment_reference"),
+        "invariant": "Payment-slip payer, account and reference changes require one unique printed allowed owner; issue dates are not payment dates.",
     },
     "common_points_payment_reconciliation": {
         "reads": ("total", "points_used", "amount_paid", "ocr_text"),
@@ -218,9 +243,9 @@ _PIPELINE_RECEIPT_MUTATION_PHASES = {
         "invariant": "Final serialization may only normalize schema-owned receipt fields and must return a valid canonical payload.",
     },
     "supplemental_ocr_field_recovery": {
-        "reads": ("location", "line_items", "supplemental_ocr_evidence"),
-        "writes": ("location", "line_items"),
-        "invariant": "Supplemental OCR may change only a validated location or existing item tax categories backed by sealed evidence.",
+        "reads": ("merchant", "location", "line_items", "subtotal", "total", "taxes", "amount_paid", "payment_method", "points_used", "primary_ocr_text", "supplemental_ocr_evidence", "financial_source_identity", "native_owner_ocr_evidence", "native_owner_context", "pixel_marker_context"),
+        "writes": ("merchant", "location", "line_items", "subtotal", "total", "taxes", "amount_paid", "payment_method"),
+        "invariant": "Sealed OCR may copy a unique geometry-owned header mark corroborated by primary OCR or remove its exact separately owned branch suffix when both header reads and the current location agree. It may also copy a validated location, existing tax categories, a complete literal table whose count and rate bases close, or existing qty=1 literal prices whose unique titles and entire basket close against a printed primary subtotal. A printed discount rate requires a unique complete title, gross, deduction and net owner; a model price suffix additionally needs its exact unique primary annotation. A summary trio requires unique same-row literal owners, one exact matching source/model tax rate, amount closure and the complete item sum. A malformed JPY total may use one printed target only when independently image/text/layout-bound evidence proves the complete literal qty1 table sum and unique cash tender/change equal that target and its printed internal tax fits only the inclusive formula; repeated overlapping tokens remain raw evidence, and all financial fields commit together. A separately TEXT-profiled native owner may join exact primary quantities and gray literal money only as one complete unique qty1 bundle closing the printed current total; original image/text/layout/crop identity is independent, every changed unit/net is literal, and the whole item bundle commits atomically. A literal packet bundle may repair exact changed or split item owners only when every primary/native gross, deduction, quantity, purchase count and mixed tax/cash summary agrees; repeated purchase order is preserved. A second native TEXT profile may change only one title prefix when the P opaque code, unique S suffix/barcode, item amount, quantity, subtotal, literal tax packet and grand total all agree; the new title cell must be source-bounded and no other receipt field changes. Original-pixel markers may change tax categories and remove an exact separately owned leading metadata glyph from a title only when distinct same-receipt templates pass held-out positive and local negative calibration, every detected glyph has one disjoint primary owner, and a complete counted qty1 table has exactly one mixed-mode partition consistent with every literal marker, tax component and current amount.",
     },
 }
 
@@ -546,12 +571,21 @@ def _apply_final_supplemental_ocr_evidence(
     result: dict,
     evidence: dict | None,
     mutation_trace: list[dict] | None = None,
+    primary_text: str | None = None,
+    financial_source_identity: dict | None = None,
+    native_owner_ocr_evidence: dict | None = None, native_owner_context: dict | None = None,
+    pixel_marker_context: dict | None = None,
 ) -> None:
     """Validate a supplemental proposal, then copy only its owned fields."""
     if evidence is None or result.get("document_type") != "receipt":
         return
 
-    proposed, proposal_meta = apply_supplemental_ocr_evidence(result, evidence)
+    proposed, proposal_meta = apply_supplemental_ocr_evidence(
+        result, evidence, primary_text=primary_text,
+        financial_source_identity=financial_source_identity,
+        native_owner_ocr_evidence=native_owner_ocr_evidence, native_owner_context=native_owner_context,
+        pixel_marker_context=pixel_marker_context,
+    )
     proposed_payload, _receipt, schema_error = _canonicalize_extracted_receipt(
         proposed
     )
@@ -559,29 +593,112 @@ def _apply_final_supplemental_ocr_evidence(
         return
 
     accepted = set(proposal_meta.get("accepted_fields") or []) & {
+        "merchant",
         "location",
         "tax_categories",
+        "line_items",
+        "financial_summary",
     }
-    if not accepted:
-        return
     current_payload, _receipt, schema_error = _canonicalize_extracted_receipt(result)
     if schema_error or current_payload is None:
         return
-    if "tax_categories" in accepted and len(
+    if "tax_categories" in accepted and "line_items" not in accepted and len(
         proposed_payload.get("line_items") or []
     ) != len(current_payload.get("line_items") or []):
         return
 
     candidate = deepcopy(current_payload)
-    if "location" in accepted:
-        candidate["location"] = proposed_payload.get("location")
-    if "tax_categories" in accepted:
+    for field in ("merchant", "location"):
+        if field in accepted:
+            candidate[field] = proposed_payload.get(field)
+    if "line_items" in accepted:
+        candidate["line_items"] = proposed_payload.get("line_items") or []
+    elif "tax_categories" in accepted:
         for item, proposed_item in zip(
             candidate.get("line_items") or [],
             proposed_payload.get("line_items") or [],
             strict=True,
         ):
             item["tax_category"] = proposed_item["tax_category"]
+
+    summary_fields = "financial_summary" in accepted
+    if summary_fields:
+        for field in ("subtotal", "total", "taxes", "amount_paid", "payment_method"):
+            candidate[field] = proposed_payload[field]
+    if proposal_meta.get("evidence_valid"):
+        from decimal import Decimal
+        from .receipt_postprocess_phases import _reconcile_tax_labels_from_item_arithmetic
+
+        owners = _collect_direct_summary_owners(evidence.get("source_layout") or [])
+        subtotal_owner = owners["unique"]["subtotal"]
+        tax_owner = owners["unique"]["tax"]
+        total_owner = owners["unique"]["total"]
+        if subtotal_owner and tax_owner and total_owner:
+            subtotal = float(subtotal_owner["value"])
+            tax_amount = float(tax_owner["value"])
+            total = float(total_owner["value"])
+            items_sum = sum(
+                float(item.get("total") or 0)
+                for item in candidate.get("line_items") or []
+                if isinstance(item, dict)
+            )
+            closes = (
+                abs(subtotal + tax_amount - total) <= 0.01
+                and min(abs(items_sum - subtotal), abs(items_sum - total)) <= 0.01
+            )
+
+            def exact_rate(value):
+                match = re.fullmatch(
+                    r"\s*(\d+(?:\.\d+)?)\s*[%％]\s*",
+                    normalize_fullwidth(str(value or "")),
+                )
+                return Decimal(match.group(1)) if match else None
+
+            source_rates = {
+                Decimal(match.group(2))
+                for match in re.finditer(
+                    r"(?<![A-Za-z0-9.,+\-])([+-]?)\s*(\d+(?:\.\d+)?)\s*[%％](?![A-Za-z0-9.,%％])\s*(?=対象|消費税|税額|外税|内税)",
+                    normalize_fullwidth(evidence.get("merged_text") or ""),
+                )
+                if not match.group(1)
+            }
+            tax_rows = []
+            other_tax_rows_clear = True
+            for index, tax in enumerate(candidate.get("taxes") or []):
+                if not isinstance(tax, dict):
+                    continue
+                rate = exact_rate(tax.get("rate"))
+                if rate is None or rate == 0:
+                    try:
+                        other_tax_rows_clear &= float(tax.get("amount") or 0) == 0
+                    except (OverflowError, TypeError, ValueError):
+                        other_tax_rows_clear = False
+                else:
+                    tax_rows.append((index, tax, rate))
+
+            points = float(candidate.get("points_used") or 0)
+            amount_paid = candidate.get("amount_paid")
+            try:
+                paid_closes = amount_paid is None or abs(float(amount_paid) + points - total) <= 0.01
+            except (TypeError, ValueError):
+                paid_closes = False
+            if (
+                len(source_rates) == 1
+                and len(tax_rows) == 1
+                and tax_rows[0][2] in source_rates
+                and source_rates <= {exact_rate(rate) for rate in VALID_TAX_RATES}
+                and other_tax_rows_clear
+                and closes
+                and paid_closes
+            ):
+                summary_fields = True
+                candidate["subtotal"] = subtotal
+                candidate["total"] = total
+                candidate["taxes"][tax_rows[0][0]]["amount"] = tax_amount
+                _reconcile_tax_labels_from_item_arithmetic(candidate, primary_text or "")
+
+    if not accepted and not summary_fields:
+        return
 
     canonical_candidate, warnings = _validate_and_serialize_final_receipt_payload(
         candidate,
@@ -595,21 +712,55 @@ def _apply_final_supplemental_ocr_evidence(
         if mutation_trace is not None
         else None
     )
-    if "location" in accepted:
-        result["location"] = canonical_candidate["location"]
-    if "tax_categories" in accepted:
+    for field in ("merchant", "location"):
+        if field in accepted:
+            result[field] = canonical_candidate[field]
+    if "line_items" in accepted:
+        result["line_items"] = canonical_candidate["line_items"]
+    elif "tax_categories" in accepted:
         for item, candidate_item in zip(
             result.get("line_items") or [],
             canonical_candidate.get("line_items") or [],
             strict=True,
         ):
             item["tax_category"] = candidate_item["tax_category"]
+    if summary_fields:
+        result["subtotal"] = canonical_candidate["subtotal"]
+        result["total"] = canonical_candidate["total"]
+        result["taxes"] = canonical_candidate["taxes"]
+        if "financial_summary" in accepted:
+            result["amount_paid"] = canonical_candidate["amount_paid"]
+            result["payment_method"] = canonical_candidate["payment_method"]
     _record_pipeline_receipt_mutation(
         mutation_trace,
         "supplemental_ocr_field_recovery",
         before,
         result,
     )
+    if (mutation_trace and mutation_trace[-1]["stage"] == "supplemental_ocr_field_recovery"
+            and proposal_meta.get("tax_categories", {}).get("mode") == "pixel_owned_complete_mixed_tax_partition"):
+        mutation_trace[-1]["pixel_marker_proof"] = proposal_meta["tax_categories"]
+    result["_warnings"] = warnings
+    result["_line_items_reliable"] = _line_items_are_reliable(warnings)
+
+
+def _apply_final_vision_evidence(result, primary_text, supplemental, pixel_context,
+                                 *, mode="normal", mutation_trace=None):
+    """Explicit validated late phase shared by image and authenticated text paths."""
+    proposed, metadata = recover_with_vision(result, primary_text, supplemental, pixel_context, mode=mode)
+    if metadata is not None:
+        result["_vision_fallback"] = metadata
+    if proposed is None:
+        return
+    candidate, warnings = _validate_and_serialize_final_receipt_payload(proposed, result.get("_warnings"))
+    current, _receipt, error = _canonicalize_extracted_receipt(result)
+    if (candidate is None or current is None or error
+            or any(candidate[field] != current[field] for field in current if field not in {"merchant", "line_items"})):
+        metadata.update(status="abstained", reason="schema_or_field_scope")
+        return
+    before = _snapshot_receipt_mutation_fields(result) if mutation_trace is not None else None
+    result["merchant"], result["line_items"] = candidate["merchant"], candidate["line_items"]
+    _record_pipeline_receipt_mutation(mutation_trace, "last_resort_vision_field_recovery", before, result)
     result["_warnings"] = warnings
     result["_line_items_reliable"] = _line_items_are_reliable(warnings)
 
@@ -624,10 +775,13 @@ def process_document(
     skip_ocr_cache: bool = False,
     capture_ocr_layout: bool = False,
     ocr_cache_only: bool = False,
+    vision_mode: str = "normal",
     **kwargs,
 ) -> dict:
     """Main pipeline. Uses Cloud Vision OCR + LLM extraction (OpenRouter or Ollama)."""
     file_path = Path(file_path)
+    if vision_mode not in VISION_MODES:
+        raise ValueError("vision_mode must be normal, cache_only, or fresh")
     if skip_ocr_cache and ocr_cache_only:
         raise ValueError("skip_ocr_cache and ocr_cache_only are mutually exclusive")
     check_model_available(model)
@@ -763,6 +917,7 @@ def process_document(
     all_ocr_results: list[OCRResult] = []
     text_parts = []
     page_structured_texts = []
+    quantity_primary_layout = None
 
     n_pages = max(1, len(images))
     _OCR_BAND_START, _OCR_BAND_END = 0.05, 0.30
@@ -781,6 +936,7 @@ def process_document(
         ocr_result = run_cloud_vision(page_img, ocr_engine, skip_cache=skip_ocr_cache)
         all_ocr_results.append(ocr_result)
         blocks = ocr_result.blocks
+        quantity_original_frame = True
 
         if len(blocks) < 3:
             # Try all rotations (90°, 180°, 270°), pick best by confidence.
@@ -817,10 +973,23 @@ def process_document(
                 ocr_result = best_result
                 blocks = ocr_result.blocks
                 all_ocr_results[-1] = ocr_result
+                quantity_original_frame = False
 
         if debug:
             assert debug_dir is not None
             draw_ocr_bboxes(page_img, blocks, debug_dir / f"03_page{i+1}_ocr_bboxes.png")
+
+        if i == 0 and quantity_original_frame and ocr_result.layout_trusted:
+            if ocr_result.source == "fresh":
+                quantity_primary_layout = ocr_result.layout_blocks
+            elif ocr_result.source == "cache":
+                image_key = _ocr_cache_key(page_img)
+                replay = load_ocr_replay_evidence(
+                    _OCR_CACHE_DIR / f"{image_key}.txt",
+                    expected_ocr_text=ocr_result.chosen_text,
+                )
+                if replay and replay["provenance"]["source"] == image_key:
+                    quantity_primary_layout = replay["layout_blocks"]
 
         page_text = blocks_to_structured_text(blocks)
         page_structured_texts.append(page_text)
@@ -888,6 +1057,58 @@ def process_document(
                 raise
             logger.warning("Supplemental OCR unavailable; using primary result: %s", exc)
 
+    native_owner_ocr_evidence = native_owner_context = None
+    receipt_repair_text, quantity_row_proposals = reconcile_supplemental_quantity_rows(
+        raw_text, supplemental_ocr_evidence,
+    )
+    if doc_type == "receipt" and len(images) == 1:
+        crop_context = build_quantity_crop_context(
+            images[0], receipt_repair_text, primary_layout_blocks=quantity_primary_layout,
+            supplemental_ocr_evidence=supplemental_ocr_evidence,
+        )
+        if crop_context is not None:
+            try:
+                crop_evidence = acquire_quantity_crop_ocr_evidence(
+                    images[0], crop_context, mode=supplemental_mode, client=ocr_engine,
+                )
+                receipt_repair_text, crop_proposals = reconcile_quantity_crop_rows(
+                    receipt_repair_text, crop_evidence, expected_context=crop_context,
+                )
+                quantity_row_proposals.extend(crop_proposals)
+            except Exception as exc:
+                if supplemental_mode != "normal":
+                    raise
+                logger.warning("Quantity crop OCR unavailable; using primary result: %s", exc)
+        else:
+            native_owner_context = build_native_owner_crop_context(
+                images[0], receipt_repair_text, supplemental_ocr_evidence=supplemental_ocr_evidence)
+            if native_owner_context is not None:
+                try:
+                    native_owner_ocr_evidence = acquire_native_owner_crop_ocr_evidence(
+                        images[0], native_owner_context, mode=supplemental_mode, client=ocr_engine)
+                except Exception as exc:
+                    if supplemental_mode != "normal":
+                        raise
+                    logger.warning("Native owner OCR unavailable; using primary result: %s", exc)
+            else:
+                native_owner_context = build_native_title_crop_context(
+                    images[0], receipt_repair_text, supplemental_ocr_evidence=supplemental_ocr_evidence)
+                if native_owner_context is None:
+                    native_owner_context = build_native_price_column_context(
+                        images[0], receipt_repair_text, supplemental_ocr_evidence=supplemental_ocr_evidence)
+                if native_owner_context is not None:
+                    try:
+                        native_owner_ocr_evidence = acquire_quantity_crop_ocr_evidence(
+                            images[0], native_owner_context, mode=supplemental_mode, client=ocr_engine,
+                            cache_dir=NATIVE_OWNER_CROP_OCR_CACHE_DIR,
+                            fingerprint=native_owner_context["strategy_fingerprint"])
+                    except Exception as exc:
+                        if supplemental_mode != "normal":
+                            raise
+                        logger.warning("Native owner OCR unavailable; using primary result: %s", exc)
+    unified_text = strip_barcode_lines(receipt_repair_text)
+    if quantity_row_proposals:
+        trace.log_step("supplemental_ocr_quantity_rows", data=quantity_row_proposals)
     trace.log_step("ocr_grouped", data=unified_text)
 
     # Step 4–5: LLM extraction → post-processing → validation (shared path)
@@ -953,6 +1174,7 @@ def process_document(
         raw_text,
         mutation_trace=receipt_mutation_trace,
         ocr_layout_blocks=all_layout_blocks,
+        repair_text=receipt_repair_text,
     )
     result = _build_result(
         receipt_payload, final_warnings, pass_history, model, debug=debug, trace=trace,
@@ -963,16 +1185,25 @@ def process_document(
         ocr_text=provider_ocr_text,
         mutation_trace=receipt_mutation_trace,
     )
-    result = _finalize_receipt_result(
-        result,
-        apply_user_rules,
-        mutation_trace=receipt_mutation_trace,
-    )
+    pixel_context = build_pixel_marker_context(
+        images[0], receipt_repair_text, quantity_primary_layout, supplemental_ocr_evidence,
+    ) if doc_type == "receipt" and len(images) == 1 else None
     _apply_final_supplemental_ocr_evidence(
         result,
         supplemental_ocr_evidence,
         mutation_trace=receipt_mutation_trace,
+        primary_text=receipt_repair_text,
+        financial_source_identity=_build_financial_source_identity(
+            images[0], receipt_repair_text, supplemental_ocr_evidence,
+        ) if len(images) == 1 else None,
+        native_owner_ocr_evidence=native_owner_ocr_evidence, native_owner_context=native_owner_context,
+        pixel_marker_context=pixel_context,
     )
+    _apply_final_vision_evidence(result, receipt_repair_text, supplemental_ocr_evidence, pixel_context,
+        mode=vision_mode, mutation_trace=receipt_mutation_trace)
+    result = _finalize_receipt_result(result, apply_user_rules, mutation_trace=receipt_mutation_trace)
+    if quantity_row_proposals:
+        result["_supplemental_ocr_quantity_rows"] = quantity_row_proposals
     _notify(on_stage, "validate", _build_validate_detail(result), 0.95)
     result["_llm_confidence"] = _compute_posthoc_confidence(result, result["_warnings"])
     if capture_ocr_layout:
@@ -1000,11 +1231,7 @@ def _receipt_items_target_gap(extracted: dict) -> float | None:
     subtotal = extracted.get("subtotal")
     total = extracted.get("total")
     taxes = extracted.get("taxes") or []
-    tax_sum = sum(
-        tax.get("amount", 0)
-        for tax in taxes
-        if isinstance(tax, dict) and tax.get("amount") is not None
-    )
+    tax_sum = _sum_taxable_amounts(taxes)
     canonical_subtotal = None
     if total and tax_sum:
         canonical_subtotal = float(total) - float(tax_sum)
@@ -1046,17 +1273,17 @@ def _receipt_printed_tax_gap(extracted: dict, unified_text: str) -> float:
             blocks[rate] = amount
     if not blocks:
         return 0.0
-    taxes_by_rate = {
-        tax.get("rate"): float(tax.get("amount") or 0)
-        for tax in (extracted.get("taxes") or [])
-        if isinstance(tax, dict)
-    }
     gap = 0.0
     for rate, amount in blocks.items():
-        if rate not in taxes_by_rate:
+        matches = [
+            float(tax.get("amount") or 0)
+            for tax in (extracted.get("taxes") or [])
+            if isinstance(tax, dict) and (tax.get("rate"), tax.get("label")) == (rate, "内税")
+        ]
+        if len(matches) != 1:
             gap += 1_000_000.0
         else:
-            gap += abs(taxes_by_rate[rate] - amount)
+            gap += abs(matches[0] - amount)
     return gap
 
 
@@ -1079,6 +1306,10 @@ def _receipt_candidate_score(
     ]
     item_count = len(items)
     qty_count = sum(float(item.get("qty") if item.get("qty") is not None else 1) for item in items)
+    bag_qty = sum(
+        float(item.get("qty") if item.get("qty") is not None else 1)
+        for item in items if _is_bag_description(item.get("description"))
+    )
     printed_counts = {
         int(match.group(1))
         for match in re.finditer(
@@ -1092,6 +1323,7 @@ def _receipt_candidate_score(
         count_gap = min(
             abs(item_count - printed_count),
             abs(qty_count - printed_count),
+            abs(qty_count - bag_qty - printed_count),
         )
     if layout_item_count is None:
         layout_count_state = 1
@@ -1528,6 +1760,12 @@ def process_ocr_text(
     ocr_layout_blocks: list[dict] | None = None,
     ocr_confidence: float | None = None,
     supplemental_ocr_evidence: dict | None = None,
+    quantity_crop_ocr_evidence: dict | None = None,
+    quantity_crop_context: dict | None = None,
+    financial_source_identity: dict | None = None,
+    native_owner_ocr_evidence: dict | None = None, native_owner_context: dict | None = None,
+    pixel_marker_context: dict | None = None,
+    vision_mode: str = "normal",
 ) -> dict:
     """Run the pipeline from OCR text onwards (skip image loading + OCR).
 
@@ -1535,7 +1773,12 @@ def process_ocr_text(
     - Testing against saved OCR variants (regression tests)
     - Debugging with specific OCR output
     - Benchmarking LLM extraction independently of OCR variance
+
+    pixel_marker_context may carry independently authenticated original pixels
+    and their primary OCR geometry; text alone cannot establish pixel markers.
     """
+    if vision_mode not in VISION_MODES:
+        raise ValueError("vision_mode must be normal, cache_only, or fresh")
     ocr_conf = (
         0.9
         if ocr_confidence is None
@@ -1547,6 +1790,17 @@ def process_ocr_text(
     payment_reference_text = normalize_fullwidth(ocr_text)
     unified_text = strip_barcode_lines(payment_reference_text)
     doc_type = detect_document_type(unified_text)
+    receipt_repair_text, quantity_row_proposals = reconcile_supplemental_quantity_rows(
+        payment_reference_text, supplemental_ocr_evidence if doc_type == "receipt" else None,
+    )
+    receipt_repair_text, crop_proposals = reconcile_quantity_crop_rows(
+        receipt_repair_text, quantity_crop_ocr_evidence if doc_type == "receipt" else None,
+        expected_context=quantity_crop_context,
+    )
+    quantity_row_proposals.extend(crop_proposals)
+    if quantity_crop_context is not None or doc_type != "receipt":
+        native_owner_ocr_evidence = native_owner_context = None
+    unified_text = strip_barcode_lines(receipt_repair_text)
     if not unified_text.strip():
         return {
             "_error": "OCR text is empty.",
@@ -1589,6 +1843,7 @@ def process_ocr_text(
         payment_reference_text,
         mutation_trace=receipt_mutation_trace,
         ocr_layout_blocks=ocr_layout_blocks,
+        repair_text=receipt_repair_text,
     )
     result = _build_result(
         receipt_payload, final_warnings, pass_history, model,
@@ -1597,16 +1852,20 @@ def process_ocr_text(
         ocr_text=ocr_text,
         mutation_trace=receipt_mutation_trace,
     )
-    result = _finalize_receipt_result(
-        result,
-        apply_user_rules,
-        mutation_trace=receipt_mutation_trace,
-    )
     _apply_final_supplemental_ocr_evidence(
         result,
         supplemental_ocr_evidence,
         mutation_trace=receipt_mutation_trace,
+        primary_text=receipt_repair_text,
+        financial_source_identity=financial_source_identity,
+        native_owner_ocr_evidence=native_owner_ocr_evidence, native_owner_context=native_owner_context,
+        pixel_marker_context=pixel_marker_context,
     )
+    _apply_final_vision_evidence(result, receipt_repair_text, supplemental_ocr_evidence, pixel_marker_context,
+        mode=vision_mode, mutation_trace=receipt_mutation_trace)
+    result = _finalize_receipt_result(result, apply_user_rules, mutation_trace=receipt_mutation_trace)
+    if quantity_row_proposals:
+        result["_supplemental_ocr_quantity_rows"] = quantity_row_proposals
     _notify(on_stage, "validate", _build_validate_detail(result), 0.95)
     result["_llm_confidence"] = _compute_posthoc_confidence(
         result,

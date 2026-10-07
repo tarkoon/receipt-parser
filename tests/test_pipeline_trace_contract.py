@@ -491,6 +491,33 @@ def test_candidate_selection_prefers_printed_count_over_layout_count(monkeypatch
     assert history[0]["postprocess_selected"] is True
 
 
+def test_candidate_selection_retains_full_basket_when_printed_count_excludes_bag_units(monkeypatch):
+    from receipt_parser import pipeline
+
+    full = _extraction(total=115, amount_paid=115, line_items=[
+        {"description": title, "qty": qty, "unit_price": unit, "total": qty * unit}
+        for title, qty, unit in [
+            ("レジ袋", 1, 5), ("紙袋", 1, 5), ("商品A", 2, 20),
+            ("商品B", 1, 20), ("商品C", 1, 30), ("商品D", 1, 15),
+        ]
+    ])
+    incomplete = deepcopy(full)
+    incomplete["line_items"].pop()
+    incomplete["line_items"][3].update(unit_price=35, total=35)
+    history = _history(incomplete)
+    monkeypatch.setattr(pipeline, "postprocess_receipt", lambda extracted, *_args, **_kwargs: extracted)
+    monkeypatch.setattr(pipeline, "_apply_final_receipt_output_repairs", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pipeline, "_balanced_layout_item_count", lambda *_args: None)
+
+    selected = pipeline._select_receipt_postprocessed_candidate(
+        full, history, "STORE\nお買上商品数:5\n合計 ¥115", 0.9, {}, "test-model", None,
+    )
+
+    assert len(selected["line_items"]) == 6
+    assert selected["line_items"][-1]["description"] == "商品D"
+    assert history[0]["postprocess_selected"] is False
+
+
 def test_candidate_score_ranks_layout_exact_then_absent_then_mismatch():
     from receipt_parser import pipeline
 
@@ -1091,7 +1118,7 @@ def test_injected_supplemental_ocr_is_field_only_traced_and_never_acquired(
 
     monkeypatch.setattr(pipeline, "_finalize_receipt_result", finalize)
 
-    def propose(payload, _evidence):
+    def propose(payload, _evidence, **_kwargs):
         events.append("supplemental")
         candidate = deepcopy(payload)
         candidate["location"] = "新店"
@@ -1125,7 +1152,7 @@ def test_injected_supplemental_ocr_is_field_only_traced_and_never_acquired(
         on_stage=on_stage,
     )
 
-    assert events == ["finalize", "supplemental", "validate", "confidence", "done"]
+    assert events == ["supplemental", "finalize", "validate", "confidence", "done"]
     assert result["location"] == "新店"
     assert result["total"] == 100
     assert result["line_items"][0]["description"] == "商品"
@@ -1141,7 +1168,7 @@ def test_injected_supplemental_ocr_is_field_only_traced_and_never_acquired(
     )
     assert event["owner_phase"] == "supplemental_ocr_field_recovery"
     assert set(event["changes"]) == {"location", "line_items"}
-    assert set(event["writes"]) == {"location", "line_items"}
+    assert set(event["writes"]) == {"merchant", "location", "line_items", "subtotal", "total", "taxes", "amount_paid", "payment_method"}
 
 
 def test_invalid_supplemental_ocr_evidence_is_an_exact_noop():

@@ -2,28 +2,30 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
 
 jobs:
   unit-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
       - run: python scripts/validate_truth.py
-      - run: python -m pytest tests/test_unit.py tests/test_validation.py tests/test_pipeline_guardrails.py tests/test_checks_strict.py tests/test_harness_integrity.py tests/test_item_structure_guards.py tests/test_*_contract.py -v
+      - run: python -m pytest tests/test_unit.py tests/test_validation.py tests/test_pipeline_guardrails.py tests/test_checks_strict.py tests/test_harness_integrity.py tests/test_llm_settings.py tests/test_item_structure_guards.py tests/test_*_contract.py -v
         env:
           PYTHONIOENCODING: utf-8
 
   accuracy-ci:
     runs-on: ubuntu-latest
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     needs: unit-tests
     steps:
@@ -34,7 +36,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: python tests/benchmark.py --ci
+      - run: python tests/benchmark.py --ci --passes 3 --workers 4 --no-save-variants
         env:
           PYTHONIOENCODING: utf-8
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          RECEIPT_TRIAGE_MODELS: ""

@@ -19,6 +19,43 @@ PAYMENT_SLIP_KEYWORDS = re.compile(
 
 RECEIPT_KEYWORDS = re.compile(r'小計|合計|レジ')
 
+_DISCOUNT_RATE_TOKEN_RE = re.compile(
+    r'(?<![A-Za-z0-9.,+\-＋eE])([+\-＋]?\s*\d+(?:\.\d+)?)\s*[%％]'
+    r'(?=OFF(?![A-Za-z0-9.,%％])|[^A-Za-z0-9.,%％]|$)', re.IGNORECASE
+)
+_DISCOUNT_RATE_RAW_RE = re.compile(r'([+\-＋]?\s*\d+(?:\.\d+)?)\s*[%％]')
+_DISCOUNT_RATE_FULL_RE = re.compile(r'\s*-?\s*(\d+(?:\.\d+)?)\s*[%％]\s*')
+_DISCOUNT_RATE_FIELD_RE = re.compile(r'\s*-?\s*(\d+(?:\.\d+)?)\s*(?:[%％])?\s*')
+
+
+def _discount_rate_tokens(value, *, full_match=False, allow_unmarked=False):
+    """Read complete positive discount percentages in the 0..100 range."""
+    text = str(value or "")
+    if full_match:
+        pattern = _DISCOUNT_RATE_FIELD_RE if allow_unmarked else _DISCOUNT_RATE_FULL_RE
+        match = pattern.fullmatch(text)
+        matches = (match,) if match else ()
+    elif allow_unmarked:
+        return ()
+    else:
+        raw_matches = list(_DISCOUNT_RATE_RAW_RE.finditer(text))
+        matches = list(_DISCOUNT_RATE_TOKEN_RE.finditer(text))
+        if len(raw_matches) != len(matches) or any(
+            raw.span() != complete.span()
+            for raw, complete in zip(raw_matches, matches)
+        ):
+            return ()
+    rates = []
+    for match in matches:
+        token = match.group(1).strip()
+        if token.startswith(("+", "＋")):
+            return ()
+        rate = float(token[1:] if token.startswith("-") else token)
+        if not 0 < rate <= 100:
+            return ()
+        rates.append(rate)
+    return tuple(rates)
+
 
 # Match ¥ or ￥ prefix, or 円 suffix amounts
 YEN_INLINE = re.compile(r'[¥￥]\s*([\d,]+)|(?<!\d)([\d,]+)\s*円')
@@ -100,7 +137,6 @@ _BANNER_PHRASE_RE = re.compile(
     r'当店をご利用|またのご利用|またお越し|'
     r'お問い合わせ|営業時間|定休日|'
     r'カードお取扱日|取引内容|伝票番号|承認番号|'
-    r'プロの品質とプロの価格|'
     r'の商品です|まとめ値引|'
     r'^[A-Z]\s*[:：]\s*\d+\s*[個コ点]|'
     r'^\s*消費税等?\s*$'
@@ -118,17 +154,18 @@ _OCR_TRAILING_PRICE_RE = re.compile(
     r'(?:^|[\s(（])([¥￥]?\s*\d[\d,]*)\s*(?:[%％][*※除軽]|[*※除軽])?\s*$'
 )
 _OCR_ZONE_END_RE = re.compile(
-    r'^(小計|合計|現計|外税|内税|消費税|お預り|お釣り|釣銭|WAON|クレジット|お会計)'
+    r'^(小計|合計|現計|外税|内税|消費税|お預り|お釣り|釣銭|WAON|クレジット|お会計)|'
+    r'^(?:[*＊※]\s*){2,}まとめ\s*値引(?:き)?\s*$'
 )
 _OCR_QTY_NOTATION_RE = re.compile(
     r'(?:'
-    r'\d+\s*[コ個点]\s*[xX×Ⅹ]\s*(?:単|@)?\s*\d|'
-    r'(?:単|@)\s*\d[\d,]*\s*[xX×Ⅹ]\s*\d+\s*[コ個点]'
+    r'\d+\s*[コ個点]\s*[xX×Ⅹ]\s*(?:単|@)?\s*[¥￥]?\s*\d[\d,]*|'
+    r'(?:単|@)\s*[¥￥]?\s*\d[\d,]*\s*[xX×Ⅹ]\s*\d+\s*[コ個点]'
     r')'
 )
 _PAID_CONTAINER_DESC_RE = re.compile(
     r'レジ[ブフ]クロ|レジ袋|有料レジ袋|食品ポリ袋|ポリ袋|(?:ごみ|ゴミ)袋|'
-    r'ショッピングバッグ|紙袋|バイオ.*袋|フクロHK'
+    r'ショッピングバッグ|紙袋|バイオ.*袋'
 )
 
 
@@ -155,11 +192,11 @@ def era_to_western_year(era_year: int, era_name: str | None = None) -> int | Non
     """Convert Japanese era year to western year.
 
     Args:
-        era_year: The year within the era (e.g. 8 for 令和8年)
+        era_year: The year within the era.
         era_name: The era name if detected from OCR text (e.g. "令和", "平成")
 
     Returns:
-        Western year (e.g. 2026) or None if era_year is invalid.
+        Western year or None if era_year is invalid.
 
     When no era name is provided, uses a plausibility heuristic:
     - era_year <= 8: assume 令和 (produces 2019-2026, current era)

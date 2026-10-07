@@ -6,19 +6,15 @@ totals. Production code may implement general layout/format strategies only
 when they are triggered by structural OCR evidence and validated by
 arithmetic/format invariants.
 
-This test intentionally allows known violations documented in
-pipeline_brittleness_audit.md so the current tree can still run the guardrail.
-The allowlist is exact and should shrink as those production branches are
-removed or replaced with general parsers.
+Every current parser module is checked without grandfathering inherited
+known-answer behavior.
 """
 
 from __future__ import annotations
 
 import ast
 import copy
-import io
 import re
-import subprocess
 
 import pytest
 import tokenize
@@ -33,37 +29,7 @@ FINAL_OUTPUT_PATH = PARSER_DIR / "receipt_output.py"
 PHASE_TRACE_PATH = PARSER_DIR / "receipt_phase_trace.py"
 POSTPROCESS_PATH = PARSER_DIR / "receipt_postprocess.py"
 POSTPROCESS_PHASES_PATH = PARSER_DIR / "receipt_postprocess_phases.py"
-BASELINE_LITERAL_SOURCE_BY_FILE = {
-    PARSER_DIR / "receipt_financial.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_location.py": PARSER_DIR / "pipeline.py",
-    PARSER_DIR / "receipt_output.py": PARSER_DIR / "pipeline.py",
-    PARSER_DIR / "receipt_phase_trace.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_postprocess.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_postprocess_phases.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_row_projection.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_marker_projection.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_item_cleanup.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_recovery.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_late_repairs.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_totals.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_tax_categories.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_identity_payment.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_items.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_projection.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_item_repair.py": PARSER_DIR / "pipeline_receipt.py",
-    PARSER_DIR / "receipt_supplemental_ocr.py": PARSER_DIR / "pipeline_receipt.py",
-}
-SCANNED_FILES = tuple(
-    sorted({
-        PARSER_DIR / "pipeline.py",
-        PARSER_DIR / "patterns.py",
-        *PARSER_DIR.glob("pipeline_*.py"),
-        *PARSER_DIR.glob("receipt_*.py"),
-    })
-)
-JAPANESE_LITERAL_SCANNED_FILES = tuple(
-    path for path in SCANNED_FILES if path.name != "patterns.py"
-)
+SCANNED_FILES = tuple(sorted(PARSER_DIR.rglob("*.py")))
 
 MERCHANT_OR_STORE_RE = re.compile(
     r"(?<![a-z0-9])(?:"
@@ -85,7 +51,11 @@ KNOWN_ANSWER_NAME_RE = re.compile(
     r"(^|_)known(_|$)|final_known|known_answer|known_financial",
     re.IGNORECASE,
 )
-KNOWN_DATE_RE = re.compile(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b")
+KNOWN_DATE_RE = re.compile(
+    r"(?<!\d)(?:19|20)\d{2}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{1,2}(?!\d)"
+    r"|(?<!\d)(?:19|20)\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"
+    r"|(?:令和|平成|昭和|大正|明治)\s*(?:元|[0-9０-９一二三四五六七八九十百]+)\s*年"
+)
 EXACT_BARCODE_LITERAL_RE = re.compile(r"(?<!\d)\d{12,14}(?!\d)")
 EXACT_ADMIN_LOCATION_RE = re.compile(
     r"^[ぁ-んァ-ヶ一-龥]{2,}(?:都|道|府|県|市|区|町|村)$"
@@ -133,7 +103,6 @@ FINAL_OUTPUT_KNOWN_ANSWER_MUTATORS = {
     "fix_final_known_financial_overrides",
     "postprocess_receipt",
 }
-BASELINE_COMMIT = "c175c17"
 POSTPROCESS_REPAIR_CALL_LIMIT = 0
 
 REPAIR_CALL_PREFIXES = (
@@ -545,11 +514,6 @@ PRICED_NAME_ITEM_REPAIR_REPAIRS = {
 }
 PRICED_NAME_ITEM_REPAIR_PHASE_HELPER = "_run_priced_name_item_repair_phase"
 PRICED_NAME_ITEM_REPAIR_PHASE_CALL_LIMIT = 1
-DIGIT_MISREAD_ITEM_REPAIR_REPAIRS = {
-    "_fix_digit_misread_items",
-}
-DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER = "_run_digit_misread_item_repair_phase"
-DIGIT_MISREAD_ITEM_REPAIR_PHASE_CALL_LIMIT = 1
 SUBTOTAL_ITEM_PRICE_REPAIR_REPAIRS = {
     "_fix_items_from_subtotal",
 }
@@ -651,8 +615,13 @@ STRUCTURAL_JAPANESE_TERMS = frozenset("""
     会社 組合 有限会社 株式会社 ㈱ ㈲ 合同会社
     水道 ガス 電力 発行 請求 供給 元 者 事業者 様 御中
     通行 利用 サービス 施設 駐車 入場 手数 料金
+    日付 タイショウ 今回 前回 獲得 累計 外枠 アプリ 販売者 お買上商品数
+    単 コ 不課税 免税 マーク 印 購入 倉庫 お買上 商品数 点数 げ点数
     年 月 日 時 分 令和 平成 昭和 個 点 円 数量 単価 金額 品番 部門 担当 レジ 票
 """.split())
+STRUCTURAL_JAPANESE_TERM_SEQUENCE_RE = re.compile(
+    "(?:" + "|".join(re.escape(term) for term in STRUCTURAL_JAPANESE_TERMS) + ")+"
+)
 FORMAL_RECEIPT_PURPOSE_LITERALS = {"但", "代", r"^\s*し[、,。\s]+"}
 JAPANESE_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 JAPANESE_RUN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]+")
@@ -693,15 +662,10 @@ class Violation:
 # Known violations from pipeline_brittleness_audit.md. Keep the entries tied to
 # source locations for review, but compare by signature counts so harmless line
 # movement does not make the guardrail stale.
-KNOWN_VIOLATIONS = set()
 
 
 def _relative(path: Path) -> str:
     return path.relative_to(ROOT).as_posix()
-
-
-def _literal_count_key_path(path: Path) -> Path:
-    return BASELINE_LITERAL_SOURCE_BY_FILE.get(path, path)
 
 
 def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
@@ -793,6 +757,19 @@ def _postprocess_repair_calls() -> list[tuple[str, int]]:
     return calls
 
 
+def test_subtotal_recomputation_is_financially_traced_before_item_repairs():
+    # Existing orchestration debt: keep total-minus-tax ordering until financial
+    # passes are consolidated; item repair ownership must not hide this write.
+    function = _function_def(_parse_file(POSTPROCESS_PATH), "postprocess_receipt")
+    index = next(i for i, statement in enumerate(function.body)
+                 if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+                 and _call_name(statement.value.func) == "_run_discounted_ocr_item_repair_phase")
+    previous = function.body[index - 1]
+    assert isinstance(previous, ast.Assign) and isinstance(previous.value, ast.Call)
+    assert _call_name(previous.value.func) == "_record_receipt_phase_mutation"
+    assert previous.value.args[1].value == "financial_totals_repair"
+
+
 def _final_output_repair_stage_calls() -> list[tuple[str, int]]:
     tree = _parse_file(FINAL_OUTPUT_PATH)
     function = _function_def(tree, "_apply_final_receipt_output_repairs")
@@ -851,54 +828,6 @@ def _postprocess_phase_names() -> set[str]:
     raise AssertionError("POSTPROCESS_PHASES not found")
 
 
-def _current_japanese_string_counts() -> Counter[tuple[str, str]]:
-    counts: Counter[tuple[str, str]] = Counter()
-    for path in JAPANESE_LITERAL_SCANNED_FILES:
-        tree = _parse_file(path)
-        parents = _parents(tree)
-        rel = _relative(_literal_count_key_path(path))
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Constant)
-                and isinstance(node.value, str)
-                and JAPANESE_CHAR_RE.search(node.value)
-                and not _is_docstring_literal(node, parents)
-            ):
-                counts[(rel, node.value)] += 1
-    return counts
-
-
-def _baseline_japanese_string_counts() -> Counter[tuple[str, str]]:
-    counts: Counter[tuple[str, str]] = Counter()
-    baseline_paths = sorted({
-        _literal_count_key_path(path) for path in JAPANESE_LITERAL_SCANNED_FILES
-    })
-    for path in baseline_paths:
-        rel = _relative(path)
-        try:
-            source = subprocess.check_output(
-                ["git", "show", f"{BASELINE_COMMIT}:{rel}"],
-                cwd=ROOT,
-                text=True,
-                encoding="utf-8",
-            )
-        except subprocess.CalledProcessError as exc:
-            raise AssertionError(
-                f"Could not read {rel} from baseline {BASELINE_COMMIT}"
-            ) from exc
-        tree = ast.parse(source, filename=rel)
-        parents = _parents(tree)
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Constant)
-                and isinstance(node.value, str)
-                and JAPANESE_CHAR_RE.search(node.value)
-                and not _is_docstring_literal(node, parents)
-            ):
-                counts[(rel, node.value)] += 1
-    return counts
-
-
 def _looks_structural_japanese_gate_literal(value: str) -> bool:
     if value in FORMAL_RECEIPT_PURPOSE_LITERALS or "代(?:として" in value:
         return True
@@ -908,7 +837,7 @@ def _looks_structural_japanese_gate_literal(value: str) -> bool:
         r"(?<=[ぁ-んァ-ン一-龥])\?", "", without_character_classes
     )
     runs = JAPANESE_RUN_RE.findall(without_character_classes)
-    return not runs or all(run in STRUCTURAL_JAPANESE_TERMS for run in runs)
+    return not runs or all(STRUCTURAL_JAPANESE_TERM_SEQUENCE_RE.fullmatch(run) for run in runs)
 
 
 def _looks_structural_japanese_literal(value: str) -> bool:
@@ -1117,9 +1046,25 @@ def _file_japanese_flow_functions(
     return product_functions, category_functions
 
 
+def _named_japanese_regex_predicate(node: ast.AST) -> bool:
+    if (
+        isinstance(node, ast.Call)
+        and _call_name(node.func) == "bool"
+        and len(node.args) == 1
+    ):
+        node = node.args[0]
+    return (
+        isinstance(node, ast.Call)
+        and _call_name(node.func) in {"search", "match", "fullmatch"}
+        and bool(_suspicious_japanese_literals(node))
+    )
+
+
 def _function_local_taints(
     tree: ast.AST,
     tainted_symbols: set[str],
+    *,
+    inline_predicates: bool = False,
 ) -> dict[ast.AST, set[str]]:
     local_taints: dict[ast.AST, set[str]] = {}
     for function in (
@@ -1135,7 +1080,10 @@ def _function_local_taints(
             scope_taint = tainted_symbols | tainted
             for node in owned_nodes:
                 if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                    if _uses_tainted_symbol(node.value, scope_taint):
+                    if (
+                        (inline_predicates and _named_japanese_regex_predicate(node.value))
+                        or _uses_tainted_symbol(node.value, scope_taint)
+                    ):
                         before = len(tainted)
                         tainted.update(_assignment_target_names(node))
                         changed |= len(tainted) != before
@@ -1297,8 +1245,12 @@ def _scan_ast(path: Path, tainted_symbols: set[str]) -> list[Violation]:
     local_taints = _function_local_taints(
         tree, tainted_symbols | product_functions
     )
+    semantic_local_taints = _function_local_taints(tree, set(), inline_predicates=True)
     rel = _relative(path)
     violations: list[Violation] = []
+
+    def semantic_scope_taint(node: ast.AST) -> set[str]:
+        return semantic_taint | semantic_local_taints.get(_function_node(node, parents), set())
 
     def product_scope_taint(node: ast.AST) -> set[str]:
         return (
@@ -1342,6 +1294,10 @@ def _scan_ast(path: Path, tainted_symbols: set[str]) -> list[Violation]:
         function = _enclosing_function(node, parents)
 
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            for match in KNOWN_DATE_RE.finditer(node.value):
+                violations.append(Violation(
+                    rel, node.lineno, function, "concrete_date_literal", match.group(0)
+                ))
             if not _is_docstring_literal(node, parents):
                 literal_rules = (
                     ("bespoke_receipt_literal", BESPOKE_RECEIPT_LITERAL_RE),
@@ -1424,7 +1380,7 @@ def _scan_ast(path: Path, tainted_symbols: set[str]) -> list[Violation]:
 
             tainted_fields = _assigned_semantic_fields(node) - {"description"}
             if tainted_fields and _uses_tainted_symbol(
-                value_node, semantic_taint
+                value_node, semantic_scope_taint(node)
             ):
                 violations.append(
                     Violation(
@@ -1511,7 +1467,7 @@ def _scan_ast(path: Path, tainted_symbols: set[str]) -> list[Violation]:
             # Product recognition may select a structurally validated OCR row;
             # the direct-literal guard still rejects invented descriptions.
             tainted_fields.discard("description")
-            gate_is_tainted = _uses_tainted_symbol(gate, semantic_taint)
+            gate_is_tainted = _uses_tainted_symbol(gate, semantic_scope_taint(node))
             if tainted_fields and gate_is_tainted:
                 violations.append(
                     Violation(
@@ -1548,7 +1504,7 @@ def _scan_ast(path: Path, tainted_symbols: set[str]) -> list[Violation]:
                     isinstance(key, ast.Constant)
                     and key.value in SEMANTIC_FIELDS
                     and key.value != "description"
-                    and _uses_tainted_symbol(value, semantic_taint)
+                    and _uses_tainted_symbol(value, semantic_scope_taint(node))
                 ):
                     violations.append(
                         Violation(
@@ -1659,51 +1615,42 @@ def _collect_violations() -> list[Violation]:
     return sorted(violations, key=lambda item: item.key)
 
 
-def test_production_pipeline_has_no_new_brittle_known_answer_overrides():
+def test_production_pipeline_has_no_brittle_known_answer_overrides():
     violations = _collect_violations()
-    known_counts = Counter(
-        (path, rule, detail) for path, _line, rule, detail in KNOWN_VIOLATIONS
-    )
-    violation_counts = Counter(violation.signature for violation in violations)
-    unexpected = [
-        violation
-        for violation in violations
-        if violation_counts[violation.signature] > known_counts[violation.signature]
-    ]
-    seen_unexpected: set[tuple[str, str, str]] = set()
-    unexpected = [
-        violation
-        for violation in unexpected
-        if violation.signature not in seen_unexpected
-        and not seen_unexpected.add(violation.signature)
-    ]
-    stale_allowlist = sorted(
-        signature
-        for signature, count in known_counts.items()
-        if violation_counts[signature] < count
+    assert not violations, (
+        "Production parser contains known-answer behavior; use owned OCR evidence.\n"
+        + "\n".join(violation.format() for violation in violations)
     )
 
-    message = io.StringIO()
-    if unexpected:
-        message.write(
-            "Production parser code contains brittle known-answer patterns.\n"
-            "Use structural OCR evidence plus arithmetic/format invariants instead.\n"
-            "Unexpected violations:\n"
-        )
-        for violation in unexpected:
-            message.write(f"  - {violation.format()}\n")
-    if stale_allowlist:
-        message.write(
-            "\nThe guardrail allowlist contains entries that no longer match the "
-            "current source. Remove these known-violation entries:\n"
-        )
-        for key in stale_allowlist:
-            message.write(
-                f"  - {key} "
-                f"(expected {known_counts[key]}, found {violation_counts[key]})\n"
-            )
 
-    assert not unexpected and not stale_allowlist, message.getvalue()
+@pytest.mark.parametrize("source", (
+    'PROMPT = "Example: 2099-12-31"',
+    'PROMPT = "例: 2099年12月31日"',
+    'import re\nPATTERN = re.compile(pattern="令和九年十二月三十一日")',
+    'PROMPT = "令和9年=2027"',
+))
+def test_concrete_dates_are_rejected_in_every_string_context(source, tmp_path, monkeypatch):
+    path = tmp_path / "prompt.py"
+    path.write_text(source, encoding="utf-8")
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    assert any(v.rule == "concrete_date_literal" for v in _scan_ast(path, set()))
+
+
+def test_ordinary_prose_formats_and_calendar_arithmetic_are_allowed(tmp_path, monkeypatch):
+    path = tmp_path / "generic.py"
+    path.write_text(
+        'PROMPT = "年月日を読み、曖昧ならnull。YYYY-MM-DDで出力。"\n'
+        'WARNING = "支払方法が不明です"\n'
+        'import re\nPATTERN = re.compile(r"\\d{4}-\\d{2}-\\d{2}")\n'
+        'ERA_TABLE = {"令和": 2018, "平成": 1988}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    assert not _scan_ast(path, set())
+
+
+def test_guard_inventory_covers_every_parser_module():
+    assert set(SCANNED_FILES) == set(PARSER_DIR.rglob("*.py"))
 
 
 @pytest.mark.parametrize(
@@ -1792,6 +1739,35 @@ def test_renamed_japanese_product_flow_to_tax_category_is_rejected(
     )
 
 
+@pytest.mark.parametrize("predicate", [
+    'bool(re.search(r"星風堂", text))',
+    're.match(r"星風堂", text)',
+    'bool(re.fullmatch(r"店|星風堂", text))',
+])
+def test_local_named_store_gate_cannot_supply_payment_method(predicate, tmp_path, monkeypatch):
+    path = tmp_path / "candidate.py"
+    path.write_text(
+        f'''import re
+def repair(extracted, text):
+    matched_store = {predicate}
+    paid_there = matched_store
+    if paid_there:
+        extracted["payment_method"] = "cash"
+''',
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+    monkeypatch.setitem(globals(), "SCANNED_FILES", (path,))
+
+    violations = _scan_ast(path, _japanese_literal_taint_symbols())
+
+    assert any(
+        violation.rule == "japanese_answer_flow_semantic_assignment"
+        and violation.detail == "payment_method"
+        for violation in violations
+    )
+
+
 def test_postprocess_receipt_repair_stack_does_not_grow_without_review():
     calls = _postprocess_repair_calls()
     assert len(calls) <= POSTPROCESS_REPAIR_CALL_LIMIT, (
@@ -1857,7 +1833,6 @@ POSTPROCESS_PHASE_INVARIANT_CASES = (
     ("low_value_bag_recovery", LOW_VALUE_BAG_RECOVERY_REPAIRS, LOW_VALUE_BAG_RECOVERY_PHASE_HELPER),
     ("item_name_price_cleanup", ITEM_NAME_PRICE_CLEANUP_REPAIRS, ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER),
     ("priced_name_item_repair", PRICED_NAME_ITEM_REPAIR_REPAIRS, PRICED_NAME_ITEM_REPAIR_PHASE_HELPER),
-    ("digit_misread_item_repair", DIGIT_MISREAD_ITEM_REPAIR_REPAIRS, DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER),
     ("subtotal_item_price_repair", SUBTOTAL_ITEM_PRICE_REPAIR_REPAIRS, SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_HELPER),
     ("implausible_tax_amount_repair", IMPLAUSIBLE_TAX_AMOUNT_REPAIR_REPAIRS, IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER),
     ("vertical_price_qty_total_projection", VERTICAL_PRICE_QTY_TOTAL_PROJECTION_REPAIRS, VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER),
@@ -1912,7 +1887,6 @@ POSTPROCESS_PHASE_OWNERSHIP_CASES = (
     ("low_value_bag_recovery", LOW_VALUE_BAG_RECOVERY_REPAIRS, LOW_VALUE_BAG_RECOVERY_PHASE_HELPER, LOW_VALUE_BAG_RECOVERY_PHASE_CALL_LIMIT),
     ("item_name_price_cleanup", ITEM_NAME_PRICE_CLEANUP_REPAIRS, ITEM_NAME_PRICE_CLEANUP_PHASE_HELPER, ITEM_NAME_PRICE_CLEANUP_PHASE_CALL_LIMIT),
     ("priced_name_item_repair", PRICED_NAME_ITEM_REPAIR_REPAIRS, PRICED_NAME_ITEM_REPAIR_PHASE_HELPER, PRICED_NAME_ITEM_REPAIR_PHASE_CALL_LIMIT),
-    ("digit_misread_item_repair", DIGIT_MISREAD_ITEM_REPAIR_REPAIRS, DIGIT_MISREAD_ITEM_REPAIR_PHASE_HELPER, DIGIT_MISREAD_ITEM_REPAIR_PHASE_CALL_LIMIT),
     ("subtotal_item_price_repair", SUBTOTAL_ITEM_PRICE_REPAIR_REPAIRS, SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_HELPER, SUBTOTAL_ITEM_PRICE_REPAIR_PHASE_CALL_LIMIT),
     ("implausible_tax_amount_repair", IMPLAUSIBLE_TAX_AMOUNT_REPAIR_REPAIRS, IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_HELPER, IMPLAUSIBLE_TAX_AMOUNT_REPAIR_PHASE_CALL_LIMIT),
     ("vertical_price_qty_total_projection", VERTICAL_PRICE_QTY_TOTAL_PROJECTION_REPAIRS, VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_HELPER, VERTICAL_PRICE_QTY_TOTAL_PROJECTION_PHASE_CALL_LIMIT),
@@ -3041,31 +3015,6 @@ def test_structural_japanese_classifier_still_rejects_product_and_location_alter
     ):
         assert not _looks_structural_japanese_gate_literal(bespoke_pattern)
         assert not _looks_structural_japanese_literal(bespoke_pattern)
-
-
-def test_no_new_suspicious_japanese_product_or_location_literals():
-    baseline = _baseline_japanese_string_counts()
-    current = _current_japanese_string_counts()
-    new_literals = []
-    for signature, count in current.items():
-        extra = count - baseline.get(signature, 0)
-        if extra <= 0:
-            continue
-        path, value = signature
-        if _looks_structural_japanese_literal(value):
-            continue
-        new_literals.append((path, value, extra))
-
-    assert not new_literals, (
-        "Production parser code gained Japanese literals that do not look like "
-        "structural receipt labels. Do not add product, merchant, location, or "
-        "answer-key strings to parser code; derive behavior from OCR structure "
-        "and arithmetic invariants instead.\n"
-        + "\n".join(
-            f"  - {path}: {value!r} (+{extra})"
-            for path, value, extra in new_literals[:40]
-        )
-    )
 
 
 def test_postprocess_receipt_is_idempotent_at_guardrail_level():

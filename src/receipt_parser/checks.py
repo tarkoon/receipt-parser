@@ -684,6 +684,7 @@ def check_payment_reference(result: dict, truth: dict) -> dict:
 
 SLIP_CHECKS = {
     "payer": check_payer,
+    "account_number": check_account_number,
     "payment_reference": check_payment_reference,
 }
 

@@ -271,19 +271,23 @@ def test_every_document_type_checks_the_complete_canonical_contract():
         "tax_amount", "points_used", "service_type", "billing_period",
         "usage_amount", "usage_unit", "usage_cost_per",
         "usage_meter_previous", "usage_meter_current", "payer",
-        "payment_reference",
+        "account_number", "payment_reference",
     }
 
     for document_type in ("receipt", "utility_bill", "payment_slip"):
         assert required <= get_checks_for({"document_type": document_type}).keys()
-        assert "account_number" not in get_checks_for({"document_type": document_type})
+        assert "account_number" in get_checks_for({"document_type": document_type})
 
 
-def test_account_number_is_best_effort_and_excluded_from_tree_score():
+def test_account_number_is_checked_and_remains_excluded_from_tree_score():
     truth = {"document_type": "receipt", "account_number": "customer-123"}
     result = {"document_type": "receipt", "account_number": None}
 
-    assert "account_number" not in get_checks_for(truth)
+    assert "account_number" in get_checks_for(truth)
+    assert not get_checks_for(truth)["account_number"](result, truth)["pass"]
+    assert get_checks_for(truth)["account_number"](
+        {"account_number": "customer-123"}, truth,
+    )["pass"]
     assert check_tree_edit_distance(result, truth)["pass"]
     assert check_tree_edit_distance(result, truth)["score"] == 1
 

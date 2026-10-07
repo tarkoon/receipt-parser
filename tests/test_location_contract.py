@@ -5,11 +5,36 @@ import pytest
 from receipt_parser.receipt_late_repairs import _fix_split_address_location_from_ocr
 from receipt_parser.receipt_location import (
     _location_has_ocr_evidence,
+    _normalize_noisy_city_location,
     _recover_ascii_brand_header_location,
     _recover_header_branch_store_location,
     _resolve_location,
     _trim_purchase_store_metadata_location,
 )
+
+
+def test_exact_source_location_canonicalization_preserves_suffix_and_address_digits():
+    from copy import deepcopy
+
+    for merchant, location, text, expected in [
+        ("SORA", "ソラ 青葉中央店", "ソラ 青葉中央店\n領収証", "青葉中央店"),
+        ("SORA", "SORA 青葉中央店", "SORA 青葉中央店\n領収証", "SORA 青葉中央店"),
+        ("ソラ", "ソラ 青葉中央店", "ソラ 青葉中央店\n領収証", "ソラ 青葉中央店"),
+        ("SORA", "ソラ 青葉中央店", "ソラ 青葉中央店\nソラ 青葉中央店", "ソラ 青葉中央店"),
+        ("SORA", "ソラ 青葉中央店", "ソラ 別の店", "ソラ 青葉中央店"),
+        ("SORA", "ソラ 青葉 中央店", "ソラ 青葉 中央店", "ソラ 青葉 中央店"),
+        ("SORA", "青葉県北丘市中央 12-34-5 1F", "青葉県北丘市中央 12-34-5 1F", "青葉県北丘市中央12-34-5 1F"),
+        ("SORA", "青葉県北丘市Central Hall 12-34-5", "青葉県北丘市Central Hall 12-34-5", "青葉県北丘市Central Hall 12-34-5"),
+        ("SORA", "青葉県北丘市中央 1F", "青葉県北丘市中央 1F", "青葉県北丘市中央 1F"),
+        ("SORA", "青葉県北丘市中央 12-34-5", "青葉県北丘市中央 12-34-5\n青葉県北丘市中央 12-34-5", "青葉県北丘市中央 12-34-5"),
+    ]:
+        extracted = {"merchant": merchant, "location": location, "total": 123, "line_items": [{"description": "商品60", "total": 123}]}
+        other_fields = {key: deepcopy(value) for key, value in extracted.items() if key != "location"}
+        for _ in range(2):
+            _recover_header_branch_store_location(extracted, text)
+            _normalize_noisy_city_location(extracted, text)
+            assert extracted["location"] == expected
+            assert {key: value for key, value in extracted.items() if key != "location"} == other_fields
 
 
 def test_header_contact_recovers_clean_standalone_locality_without_phone_inference():
@@ -400,3 +425,69 @@ def test_purchase_store_disclaimer_is_not_location_evidence():
     _recover_labeled_purchase_site_location(extracted, ocr_text)
 
     assert extracted["location"] == "北丘市"
+def test_complete_literal_store_header_address_owns_only_its_row():
+    from copy import deepcopy
+    from receipt_parser.receipt_output import (
+        _record_final_receipt_output_repair, _run_final_header_location_repair_phase,
+    )
+    from receipt_parser.receipt_supplemental_ocr import _propose_location
+
+    merchant, branch = "EXAMPLE", "試験町店"
+    address = "架空県見本市試験町42-19"
+    other_address = "架空県見本市別町71-23"
+    registration = "登録番号: T1357913579135"
+    phone = "電話 012-345-6789 店コード:246810"
+    boundary = "2028年02月14日 11:23"
+    rows = [merchant, branch, registration, address, "6", phone, boundary, "領収証"]
+    original = {"merchant": merchant, "location": None, "date": None, "time": None,
+                "subtotal": 731, "total": 731, "taxes": [], "line_items": []}
+
+    for current in (None, address + "-6", "見本市"):
+        repaired = deepcopy(original)
+        repaired["location"] = current
+        before = deepcopy(repaired)
+        trace = []
+        _record_final_receipt_output_repair(
+            "header_branch_store_location", repaired, trace,
+            lambda: _run_final_header_location_repair_phase(
+                repaired, "\n".join(rows), ("header_branch_store_location",),
+            ),
+        )
+        assert repaired["location"] == address
+        assert {key: value for key, value in repaired.items() if key != "location"} == {
+            key: value for key, value in before.items() if key != "location"
+        }
+        assert len(trace) == 1 and set(trace[0]["changes"]) == {"location"}
+        assert trace[0]["owner_phase"] == "header_identity_repair"
+    preserved = deepcopy(original)
+    preserved["location"] = other_address
+    _run_final_header_location_repair_phase(
+        preserved, "\n".join(rows + [other_address]), ("header_branch_store_location",),
+    )
+    assert preserved["location"] == other_address
+    rejected_rows = [
+        rows[:4] + [other_address] + rows[4:],
+        rows[:4] + [address] + rows[4:],
+        rows[:3] + ["架空県見本市試験町42-", "19", "6"] + rows[5:],
+        rows[:3] + ["架空県見本市試験町", "42", "19"] + rows[5:],
+        rows[:3] + ["登録番号: T42-19", "6"] + rows[5:],
+        rows[:3] + ["レジ" + address, "6"] + rows[5:],
+        rows[:5] + ["電話 098-765-4321"] + rows[5:],
+        rows[:1] + ["別町店"] + rows[1:],
+        rows[:1] + [merchant] + rows[1:], rows[1:],
+        [merchant, branch, registration, boundary, address, "6", phone, "領収証"],
+    ]
+    rejected_rows.extend(rows[:3] + [scope] + rows[3:]
+                         for scope in ("HQ", "本社", "請求先", "お問い合わせ先", "連絡先", "FAX"))
+    for rejected in rejected_rows:
+        repaired = deepcopy(original)
+        _run_final_header_location_repair_phase(
+            repaired, "\n".join(rejected), ("header_branch_store_location",),
+        )
+        assert repaired.get("location") != address
+    evidence = {"merged_text": "\n".join(rows), "tiles": [
+        {"text": "\n".join(rows)}, {"text": "\n".join(rows)},
+    ]}
+    proposal, detail = _propose_location({"merchant": merchant, "location": branch}, evidence)
+    assert proposal is None
+    assert detail["criteria"]["candidate_has_location_suffix"] is False

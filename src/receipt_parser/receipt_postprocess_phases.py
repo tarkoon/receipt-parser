@@ -3,7 +3,9 @@
 import re
 
 from .patterns import should_override_field
+from .pipeline_slip import _fix_account_number
 from .receipt_financial import (
+    _direct_rate_mode_components,
     extract_rate_bases,
     extract_points_used,
     normalize_tax_label,
@@ -58,7 +60,6 @@ from .receipt_item_repair import (
     _drop_phantom_from_tax_amount,
     _fix_code_table_descriptions_by_order,
     _fix_compact_count_amount_layout,
-    _fix_digit_misread_items,
     _fix_priced_in_name_items,
     _revert_unsupported_qty_inflation,
     _fix_single_item_qty_from_ocr,
@@ -258,13 +259,15 @@ def _run_payment_method_repair_phase(
     unified_text: str,
     ocr_conf: float | None,
     llm_conf: dict | None,
+    account_text: str | None = None,
 ) -> None:
-    """Trigger: OCR-visible cash, card, e-money, tender, or change markers.
+    """Trigger: OCR-visible tender markers or labeled account identifiers.
 
     Invariant: payment_method changes must be backed by visible payment
-    markers and preserve the field's cash-vs-credit consistency.
+    markers; account identifiers require one unambiguous allowed owner.
     """
     _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf)
+    _fix_account_number(extracted, account_text or unified_text)
 
 
 def _run_payment_reference_repair_phase(
@@ -637,8 +640,9 @@ def _run_stacked_name_price_projection_phase(
 ) -> None:
     """Trigger: OCR stacks item names before matching price rows.
 
-    Invariant: projected rows may replace items only when item totals reconcile
-    to printed subtotal, total, printed amount, or rate-base arithmetic.
+    Invariant: complete marked tables require adjacent title/price ownership,
+    a printed count, literal subtotal and marker legend. Legacy unmarked rows
+    must reconcile to printed subtotal, total, printed amount or rate bases.
     """
     _replace_stacked_name_price_rows_when_balanced(extracted, unified_text)
 
@@ -772,6 +776,7 @@ def _run_bare_number_tax_summary_restoration_phase(
 
     Invariant: restored tax entries and subtotal must remain consistent with
     visible rate labels, printed tax amounts, and receipt total arithmetic.
+    One complete purpose item may inherit a unique label-owned inclusive pair.
     """
     for repair in repairs:
         if repair == "bare_number_tax_summary":
@@ -847,12 +852,21 @@ def _restore_tax_entries_from_item_rate_sums(
     """Trigger: item tax categories exist but tax entries are missing or stale.
 
     Invariant: restored tax entries must be derived from item rate sums unless a
-    printed vertical tax block owns the tax amounts.
+    printed vertical tax block owns the tax amounts. Explicit included/added
+    groups, including zero-tax groups, cannot be estimated from rate sums.
     """
     if (
         not extracted.get("line_items")
         or not extracted.get("taxes")
         or _has_printed_vertical_tax_block(unified_text)
+        # A rate sum cannot separate included and added prices at the same rate.
+        or {"内税", "外税"}.issubset({
+            tax.get("label") for tax in extracted["taxes"]
+            if isinstance(tax, dict) and (tax.get("amount") or 0) > 0
+        })
+        or {"内税", "外税"}.issubset({
+            owner["mode"] for owner in _direct_rate_mode_components(unified_text)
+        })
     ):
         return
 
@@ -989,6 +1003,7 @@ def _reconcile_tax_labels_from_item_arithmetic(extracted: dict, unified_text: st
             total=total,
             tax_sum=tax_sum,
             items_sum=items_sum,
+            rate=tax.get("rate"), amount=tax.get("amount"),
         )
 
 
@@ -1065,10 +1080,10 @@ def _run_bag_item_rate_base_reconciliation_phase(
     rate_bases: dict | None,
     repairs: tuple[str, ...],
 ) -> None:
-    """Trigger: tiny printed 10% rate base with paid bag item rows.
+    """Trigger: literal paid-bag OCR amounts with a tiny printed 10% rate base.
 
     Invariant: paid-bag qty, unit_price, and total may change only when their
-    combined total reconciles to the visible 10% rate base.
+    combined literal OCR total reconciles to the visible 10% rate base.
     """
     for repair in repairs:
         if repair == "bag_item_prices_from_rate_bases":
@@ -1192,22 +1207,17 @@ def _run_priced_name_item_repair_phase(extracted: dict, unified_text: str) -> No
     _fix_priced_in_name_items(extracted, unified_text)
 
 
-def _run_digit_misread_item_repair_phase(extracted: dict, unified_text: str) -> None:
-    """Trigger: a +8 gap has one local 0/8 OCR confusion candidate.
 
-    Invariant: malformed percent evidence or a complete printed item count must
-    independently rule out a missing row before arithmetic changes the price.
+
+def _run_code_prefixed_description_cleanup_phase(
+    extracted: dict, unified_text: str = ""
+) -> None:
+    """Trigger: POS prefixes or OCR-proven trailing product codes remain.
+
+    Invariant: leading codes preserve a Japanese name; trailing codes require
+    a unique quantity-matching row and exact nearest-title match.
     """
-    _fix_digit_misread_items(extracted, unified_text)
-
-
-def _run_code_prefixed_description_cleanup_phase(extracted: dict) -> None:
-    """Trigger: visible OCR/POS code prefixes remain in item descriptions.
-
-    Invariant: cleanup may change only item description text when stripping a
-    generic code prefix preserves a Japanese product-name field.
-    """
-    _clean_code_prefixed_item_descriptions(extracted)
+    _clean_code_prefixed_item_descriptions(extracted, unified_text)
 
 
 def _run_duplicate_row_cleanup_phase(

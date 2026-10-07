@@ -34,9 +34,15 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from receipt_parser.checks import get_checks_for
-from receipt_parser.llm import check_model_available, DEFAULT_MODEL
+import receipt_parser
+from receipt_parser.llm import (
+    _configured_triage_models, _triage_max_tokens,
+    check_model_available, DEFAULT_MODEL,
+)
 from receipt_parser.ocr import (
     _OCR_CACHE_DIR,
+    _fulltext_to_blocks,
+    blocks_to_structured_text,
     _ocr_cache_key,
     get_api_usage,
     init_cloud_vision,
@@ -53,11 +59,24 @@ from receipt_parser.pipeline import (
     process_ocr_text,
 )
 from receipt_parser.preprocess import load_image, try_extract_text_layer
+from receipt_parser.receipt_pixel_markers import build_pixel_marker_context
+from receipt_parser.receipt_vision import configured_vision_model, vision_cache_files
 from receipt_parser.receipt_supplemental_ocr import (
     SUPPLEMENTAL_OCR_CACHE_DIR,
     SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
     load_supplemental_ocr_evidence,
     supplemental_ocr_cache_path,
+    QUANTITY_CROP_OCR_CACHE_DIR,
+    build_quantity_crop_context,
+    load_quantity_crop_ocr_evidence,
+    quantity_crop_ocr_cache_path,
+    reconcile_supplemental_quantity_rows,
+    reconcile_quantity_crop_rows,
+    NATIVE_OWNER_CROP_OCR_CACHE_DIR, NATIVE_OWNER_CROP_OCR_FINGERPRINT,
+    build_native_owner_crop_context,
+    build_native_title_crop_context, NATIVE_TITLE_CROP_OCR_FINGERPRINT,
+    build_native_price_column_context, NATIVE_PRICE_COLUMN_OCR_FINGERPRINT,
+    _build_financial_source_identity,
 )
 
 # ---------------------------------------------------------------------------
@@ -74,6 +93,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 OCR_CACHE_DIR = _OCR_CACHE_DIR
 _LAYOUT_NOT_PREFLIGHTED = object()
 _SUPPLEMENTAL_NOT_PREFLIGHTED = object()
+_QUANTITY_NOT_PREFLIGHTED = object()
+_PIXEL_NOT_PREFLIGHTED = object()
+
+
+def _vision_mode() -> str:
+    mode = os.environ.get("RECEIPT_VISION_MODE", "normal").strip()
+    if mode not in {"normal", "cache_only", "fresh"}:
+        raise ValueError("RECEIPT_VISION_MODE must be normal, cache_only, or fresh")
+    return mode
 
 
 class _CacheOnlyOCREngine:
@@ -137,12 +165,12 @@ def discover_fixtures(names: list[str] | None = None) -> list[tuple[str, Path, d
         fixtures.append((base, ocr_file, truth))
         discovered.add(base)
 
-    # Explicit OCR variants (variant text + its base receipt truth, no image needed)
-    if names is not None and VARIANTS_DIR.exists():
+    # Stored OCR variants use their base receipt truth without another image.
+    if VARIANTS_DIR.exists():
         for variant_file in sorted(VARIANTS_DIR.glob("*.txt")):
             stem = variant_file.stem
             base = re.sub(r"_v\d+$", "", stem)
-            if base == stem or stem not in names:
+            if base == stem or (names is not None and stem not in names):
                 continue
             truth_file = FIXTURES_DIR / f"{base}_truth.json"
             if not truth_file.exists():
@@ -181,7 +209,7 @@ def _cached_ocr_artifacts(source: Path) -> list[tuple[str, Path]]:
         if not text_path.exists():
             continue
         artifacts.append((f"page:{page}:ocr_layout", OCR_CACHE_DIR / f"{key}.layout.json"))
-        block_count = len([line for line in text_path.read_text(encoding="utf-8").splitlines() if line.strip()])
+        block_count = len([line for line in text_path.read_text(encoding="utf-8").split("\n") if line.strip()])
         if block_count >= 3:
             continue
         best_count = block_count
@@ -196,7 +224,7 @@ def _cached_ocr_artifacts(source: Path) -> list[tuple[str, Path]]:
                 break
             artifacts.append((f"{prefix}:ocr_layout", OCR_CACHE_DIR / f"{rotated_key}.layout.json"))
             rotated_count = len([
-                line for line in rotated_text.read_text(encoding="utf-8").splitlines()
+                line for line in rotated_text.read_text(encoding="utf-8").split("\n")
                 if line.strip()
             ])
             rotated_confidence = 0.9 if rotated_count else 0.0
@@ -255,7 +283,7 @@ def _supplemental_ocr_artifact(
         "strategy_fingerprint": SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
     }
     return (
-        supplemental_ocr_cache_path(SUPPLEMENTAL_OCR_CACHE_DIR, **identity),
+        supplemental_ocr_cache_path(SUPPLEMENTAL_OCR_CACHE_DIR, **identity, for_read=True),
         identity,
     )
 
@@ -266,9 +294,9 @@ def _selected_cached_ocr_text(image) -> str | None:
     if not text_path.is_file():
         return None
     best_text = text_path.read_text(encoding="utf-8")
-    best_count = len([line for line in best_text.splitlines() if line.strip()])
+    best_count = len([line for line in best_text.split("\n") if line.strip()])
     if best_count >= 3:
-        return "\n".join(line.strip() for line in best_text.splitlines() if line.strip())
+        return blocks_to_structured_text(_fulltext_to_blocks(best_text))
     for rotation in (
         cv2.ROTATE_90_CLOCKWISE,
         cv2.ROTATE_180,
@@ -279,14 +307,122 @@ def _selected_cached_ocr_text(image) -> str | None:
             return None
         rotated_text = rotated_path.read_text(encoding="utf-8")
         rotated_count = len([
-            line for line in rotated_text.splitlines() if line.strip()
+            line for line in rotated_text.split("\n") if line.strip()
         ])
         if rotated_count > best_count:
             best_text = rotated_text
             best_count = rotated_count
         if best_count:
             break
-    return "\n".join(line.strip() for line in best_text.splitlines() if line.strip())
+    return blocks_to_structured_text(_fulltext_to_blocks(best_text))
+
+
+def _quantity_primary_geometry(image, text, text_path):
+    """Equivalent replay text uses the original image cache's frame authority."""
+    image_key = _ocr_cache_key(image)
+    original_path = OCR_CACHE_DIR / f"{image_key}.txt"
+
+    def canonical(value):
+        return normalize_fullwidth(blocks_to_structured_text(_fulltext_to_blocks(value)))
+
+    selected = _selected_cached_ocr_text(image)
+    authority = original_path if selected is not None and canonical(text) == canonical(selected) else text_path
+    if not authority.is_file():
+        return None
+    raw = authority.read_text(encoding="utf-8")
+    if authority == original_path and (selected is None or canonical(selected) != canonical(raw)):
+        return None
+    _, trusted = load_cached_ocr_layout(authority, expected_ocr_text=raw, strict_envelope=True)
+    if not trusted:
+        return None
+    replay = load_ocr_replay_evidence(authority, expected_ocr_text=raw)
+    return replay["layout_blocks"] if replay and replay["provenance"]["source"] == image_key else None
+
+
+def _pixel_marker_artifact(fixture_name, source, supplemental_evidence, crop_bundle=None):
+    """Bind replay pixels independently of whether a native crop was eligible."""
+    if source.suffix != ".txt":
+        return None
+    image_path = _fixture_image(re.sub(r"_v\d+$", "", fixture_name))
+    if image_path is None or (
+        image_path.suffix.lower() == ".pdf" and try_extract_text_layer(str(image_path))
+    ):
+        return None
+    images = load_image(image_path)
+    if len(images) != 1:
+        return None
+    text = source.read_text(encoding="utf-8")
+    if detect_document_type(strip_barcode_lines(normalize_fullwidth(text))) != "receipt":
+        return None
+    primary_layout = _quantity_primary_geometry(images[0], text, source)
+    repair_text, _ = reconcile_supplemental_quantity_rows(normalize_fullwidth(text), supplemental_evidence)
+    if crop_bundle and not crop_bundle.get("native_owner"):
+        repair_text, _ = reconcile_quantity_crop_rows(
+            repair_text, crop_bundle.get("evidence"), expected_context=crop_bundle.get("context"),
+        )
+    return build_pixel_marker_context(images[0], repair_text, primary_layout, supplemental_evidence)
+
+
+def _preflight_pixel_marker_contexts(cases, supplemental, quantity):
+    return {
+        source: _pixel_marker_artifact(name, source, supplemental.get(source), quantity.get(source))
+        for name, source, _truth in cases if source.suffix == ".txt"
+    }
+
+
+def _quantity_crop_artifact(fixture_name, source):
+    supplemental = _supplemental_ocr_artifact(fixture_name, source)
+    if supplemental is None:
+        return None
+    _, identity = supplemental
+    image_path = source if source.suffix != ".txt" else _fixture_image(re.sub(r"_v\d+$", "", fixture_name))
+    image = load_image(image_path)[0]
+    text_path = source if source.suffix == ".txt" else OCR_CACHE_DIR / f'{identity["image_key"]}.txt'
+    text = source.read_text(encoding="utf-8") if source.suffix == ".txt" else _selected_cached_ocr_text(image)
+    primary_layout = _quantity_primary_geometry(image, text, text_path)
+    evidence = load_supplemental_ocr_evidence(SUPPLEMENTAL_OCR_CACHE_DIR, **identity)
+    repair_text, _ = reconcile_supplemental_quantity_rows(normalize_fullwidth(text), evidence)
+    context = build_quantity_crop_context(image, repair_text,
+        primary_layout_blocks=primary_layout, supplemental_ocr_evidence=evidence)
+    if context is not None:
+        return quantity_crop_ocr_cache_path(QUANTITY_CROP_OCR_CACHE_DIR, context), context
+    context = build_native_owner_crop_context(image, repair_text, supplemental_ocr_evidence=evidence)
+    if context is None:
+        context = build_native_title_crop_context(image, repair_text, supplemental_ocr_evidence=evidence)
+    if context is None:
+        context = build_native_price_column_context(image, repair_text, supplemental_ocr_evidence=evidence)
+    if context is None:
+        return None
+    return quantity_crop_ocr_cache_path(
+        NATIVE_OWNER_CROP_OCR_CACHE_DIR, context, fingerprint=context["strategy_fingerprint"]), context
+
+
+def _preflight_quantity_crop(cases, *, cached_images):
+    bundles = {}
+    for name, source, truth in cases:
+        if source.suffix != ".txt" and not cached_images:
+            continue
+        artifact = _quantity_crop_artifact(name, source)
+        if artifact is None:
+            continue
+        path, context = artifact
+        fingerprint = (context or {}).get("strategy_fingerprint")
+        native = fingerprint in {NATIVE_OWNER_CROP_OCR_FINGERPRINT, NATIVE_TITLE_CROP_OCR_FINGERPRINT, NATIVE_PRICE_COLUMN_OCR_FINGERPRINT}
+        evidence = load_quantity_crop_ocr_evidence(
+            NATIVE_OWNER_CROP_OCR_CACHE_DIR if native else QUANTITY_CROP_OCR_CACHE_DIR,
+            expected_context=context, fingerprint=fingerprint)
+        if path.is_file() and evidence is None:
+            raise ValueError(f"Invalid quantity crop OCR sidecar: {path}")
+        if source.suffix == ".txt" and evidence is not None:
+            bundles[source] = dict(evidence=evidence, context=context)
+            if native:
+                bundles[source]["native_owner"] = True
+            if fingerprint == NATIVE_PRICE_COLUMN_OCR_FINGERPRINT:
+                image = load_image(_fixture_image(re.sub(r"_v\d+$", "", name)))[0]
+                sealed = _preflight_supplemental_ocr([(name, source, truth)], cached_images=True).get(source)
+                text, _ = reconcile_supplemental_quantity_rows(normalize_fullwidth(source.read_text(encoding="utf-8")), sealed)
+                bundles[source]["source_identity"] = _build_financial_source_identity(image, text, sealed)
+    return bundles
 
 
 def _update_path_fingerprint(digest, label: str, path: Path) -> None:
@@ -307,6 +443,14 @@ def _fixture_corpus_sha256(
         digest.update(name.encode())
         digest.update(source.read_bytes())
         digest.update(json.dumps(truth, ensure_ascii=False, sort_keys=True).encode())
+        image_source = source if source.suffix != ".txt" else _fixture_image(re.sub(r"_v\d+$", "", name))
+        if image_source is not None:
+            images = load_image(image_source)
+            if len(images) == 1:
+                paths = sorted(vision_cache_files(images[0]))
+                digest.update(b"receipt_vision_cache:present\0" if paths else b"receipt_vision_cache:missing\0")
+                for path in paths:
+                    _update_path_fingerprint(digest, f"receipt_vision:{path.name}", path)
         if cached_ocr and source.suffix != ".txt":
             for label, path in _cached_ocr_artifacts(source):
                 _update_path_fingerprint(digest, label, path)
@@ -316,6 +460,11 @@ def _fixture_corpus_sha256(
                 "ocr_layout_sidecar",
                 ocr_layout_sidecar_path(source),
             )
+            image_source = _fixture_image(re.sub(r"_v\d+$", "", name))
+            if image_source is not None:
+                _update_path_fingerprint(digest, "pixel_original_image", image_source)
+                for label, path in _cached_ocr_artifacts(image_source):
+                    _update_path_fingerprint(digest, f"pixel_original:{label}", path)
         if cached_ocr or source.suffix == ".txt":
             supplemental = _supplemental_ocr_artifact(name, source)
             if supplemental is not None:
@@ -323,6 +472,14 @@ def _fixture_corpus_sha256(
                 _update_path_fingerprint(
                     digest, f"supplemental_ocr:{path.name}", path,
                 )
+            crop = _quantity_crop_artifact(name, source)
+            if crop is not None:
+                path, _context = crop
+                kind = {NATIVE_TITLE_CROP_OCR_FINGERPRINT: 'native_title_ocr',
+                        NATIVE_OWNER_CROP_OCR_FINGERPRINT: 'native_owner_ocr',
+                        NATIVE_PRICE_COLUMN_OCR_FINGERPRINT: 'native_price_column_ocr'}.get(
+                            (_context or {}).get('strategy_fingerprint'), 'quantity_crop_ocr')
+                _update_path_fingerprint(digest, f"{kind}:{path.name}", path)
     return digest.hexdigest()
 
 
@@ -536,7 +693,9 @@ def _estimate_api_calls(
     n_fixtures: int,
     n_runs: int,
     supplemental_fixture_count: int = 0,
+    quantity_crop_fixture_count: int = 0,
 ) -> int:
+    """Estimate Cloud Vision OCR calls; LLM costs use the separate usage ledger."""
     calls_per_fixture_per_run = 1
     retry_estimate = max(1, int(n_fixtures * 0.10))
     rotation_extras = max(1, int(n_fixtures * 0.15))
@@ -545,6 +704,7 @@ def _estimate_api_calls(
         + retry_estimate
         + rotation_extras
         + supplemental_fixture_count * 2
+        + quantity_crop_fixture_count
     ) * n_runs
 
 
@@ -589,9 +749,13 @@ def _run_fixture(
     save_variants: bool = True,
     preflight_layout_blocks=_LAYOUT_NOT_PREFLIGHTED,
     preflight_supplemental_evidence=_SUPPLEMENTAL_NOT_PREFLIGHTED,
+    preflight_quantity_crop=_QUANTITY_NOT_PREFLIGHTED,
+    preflight_pixel_marker_context=_PIXEL_NOT_PREFLIGHTED,
+    vision_mode: str | None = None,
 ) -> tuple[str, dict]:
     """Run all iterations for a single fixture. Returns (name, fixture_data)."""
     is_ocr_text = fixture_source.suffix == ".txt"
+    vision_mode = _vision_mode() if vision_mode is None else vision_mode
     checks = get_checks_for(fixture_truth)
     fixture_runs = []
     replay_evidence = None
@@ -618,6 +782,22 @@ def _run_fixture(
             else preflight_supplemental_evidence
         )
 
+    crop_bundle = None
+    if is_ocr_text:
+        crop_bundle = (
+            _preflight_quantity_crop(
+                [(fixture_name, fixture_source, fixture_truth)], cached_images=False,
+            ).get(fixture_source)
+            if preflight_quantity_crop is _QUANTITY_NOT_PREFLIGHTED
+            else preflight_quantity_crop
+        )
+
+    pixel_context = (
+        _pixel_marker_artifact(fixture_name, fixture_source, supplemental_evidence, crop_bundle)
+        if preflight_pixel_marker_context is _PIXEL_NOT_PREFLIGHTED
+        else preflight_pixel_marker_context
+    ) if is_ocr_text else None
+
     for run_idx in range(1, runs + 1):
         wall_start = time.perf_counter()
         error = None
@@ -631,6 +811,13 @@ def _run_fixture(
                     ocr_layout_blocks=replay_layout_blocks,
                     ocr_confidence=replay_ocr_confidence,
                     supplemental_ocr_evidence=supplemental_evidence,
+                    quantity_crop_ocr_evidence=(crop_bundle or {}).get("evidence") if not (crop_bundle or {}).get("native_owner") else None,
+                    quantity_crop_context=(crop_bundle or {}).get("context") if not (crop_bundle or {}).get("native_owner") else None,
+                    native_owner_ocr_evidence=(crop_bundle or {}).get("evidence") if (crop_bundle or {}).get("native_owner") else None,
+                    native_owner_context=(crop_bundle or {}).get("context") if (crop_bundle or {}).get("native_owner") else None,
+                    financial_source_identity=(crop_bundle or {}).get("source_identity"),
+                    pixel_marker_context=pixel_context,
+                    vision_mode=vision_mode,
                 )
             else:
                 digital_pdf = (
@@ -643,6 +830,7 @@ def _run_fixture(
                     apply_user_rules=False, skip_ocr_cache=skip_cache,
                     ocr_engine=cv_client, capture_ocr_layout=True,
                     ocr_cache_only=not skip_cache,
+                    vision_mode=vision_mode,
                 )
                 if not skip_cache and not digital_pdf and result.get("_ocr_source") != "cache":
                     raise RuntimeError(
@@ -701,6 +889,7 @@ def _run_fixture(
             "warnings": result.get("_warnings", []),
             "warning_count": len(result.get("_warnings", [])),
             "llm_passes_used": result.get("_pass_count", 1),
+            "vision_fallback": deepcopy(result.get("_vision_fallback")),
         }
 
         fixture_runs.append(run_record)
@@ -820,10 +1009,15 @@ def _finalize_fixture(fixture_name: str, fdata: dict, *, save_variants: bool = T
     }
 
     # Determinism
-    summaries = [json.dumps({k: r["fields"][k]["pass"] for k in checks_used}, sort_keys=True)
-                 for r in runs]
-    unique = len(set(summaries))
-    fdata["deterministic"] = unique == 1
+    extractions = [r.get("final_extraction") for r in runs]
+    comparable = all(
+        not r.get("error") and isinstance(extraction, dict) and bool(extraction)
+        for r, extraction in zip(runs, extractions)
+    )
+    fdata["determinism_comparable"] = comparable
+    fdata["deterministic"] = comparable and all(
+        extraction == extractions[0] for extraction in extractions[1:]
+    )
 
     # Status
     all_pass = all(r["passed"] for r in runs)
@@ -876,6 +1070,9 @@ def _compute_summary(per_fixture: dict, metadata: dict) -> dict:
                 if r.get("wall_time_s")]
     # Determinism
     det_count = sum(1 for fd in per_fixture.values() if fd.get("deterministic"))
+    nondeterministic = sorted(
+        name for name, data in per_fixture.items() if not data.get("deterministic")
+    )
     # Variants
     total_variants = sum(fd.get("variants_saved", 0) for fd in per_fixture.values())
 
@@ -887,7 +1084,11 @@ def _compute_summary(per_fixture: dict, metadata: dict) -> dict:
         "fixtures_fragile": len(fragile),
         "fragile": fragile,
         "mean_wall_s": round(sum(all_wall) / len(all_wall), 1) if all_wall else 0,
-        "determinism_rate": round(det_count / n_fixtures, 2) if n_fixtures else 1.0,
+        "determinism_rate": det_count / n_fixtures if n_fixtures else 1.0,
+        "deterministic_fixture_count": det_count,
+        "fixture_count": n_fixtures,
+        "nondeterministic_fixture_count": len(nondeterministic),
+        "nondeterministic_fixtures": nondeterministic,
         "variants_saved": total_variants,
         "field_robustness": {f: round(field_pass[f] / field_total[f], 4) if field_total[f] else 1.0
                              for f in sorted(field_total)},
@@ -922,7 +1123,16 @@ def _print_summary(summary: dict, metadata: dict):
 
     print(f"\nPerformance:")
     print(f"  Mean wall time: {summary['mean_wall_s']:.1f}s")
-    print(f"  Determinism:    {summary['determinism_rate']:.0%}")
+    print(
+        f"  Determinism:    {summary['deterministic_fixture_count']}/"
+        f"{summary['fixture_count']} ({summary['determinism_rate']:.1%})"
+    )
+    if summary["nondeterministic_fixtures"]:
+        print(
+            f"  Non-deterministic fixtures "
+            f"({summary['nondeterministic_fixture_count']}): "
+            f"{', '.join(summary['nondeterministic_fixtures'])}"
+        )
 
     if summary["variants_saved"]:
         print(f"\nOCR variants saved: {summary['variants_saved']} (in {VARIANTS_DIR})")
@@ -1146,9 +1356,13 @@ def _comparison_scope(report: dict) -> dict:
         "fixtures": frozenset(fixtures) if fixtures is not None else None,
         "fixture_corpus_sha256": metadata.get("fixture_corpus_sha256"),
         "model": metadata.get("model"),
+        "triage_models": metadata.get("triage_models"),
+        "triage_max_tokens": metadata.get("triage_max_tokens"),
         "passes": metadata.get("passes"),
         "runs_per_fixture": metadata.get("runs_per_fixture"),
         "ci_mode": metadata.get("ci_mode"),
+        "vision_mode": metadata.get("vision_mode"),
+        "vision_model": metadata.get("vision_model"),
     }
 
 
@@ -1184,7 +1398,11 @@ def _comparison_scope_mismatches(current: dict, previous: dict) -> list[str]:
     )
     if fixture_mismatch:
         mismatches.append(fixture_mismatch)
-    for key in ("fixture_corpus_sha256", "model", "passes", "runs_per_fixture", "ci_mode"):
+    for key in (
+        "fixture_corpus_sha256", "model", "passes", "runs_per_fixture", "ci_mode",
+        "triage_models", "triage_max_tokens",
+        "vision_mode", "vision_model",
+    ):
         current_value = curr_scope[key]
         previous_value = prev_scope[key]
         if current_value is None or previous_value is None:
@@ -1260,6 +1478,7 @@ def run_benchmark(
     use_cached_ocr = ci or cached_ocr
 
     try:
+        vision_mode = _vision_mode()
         fixtures = _select_fixtures(fixture_names)
     except ValueError as exc:
         print(f"ERROR: {exc}")
@@ -1272,6 +1491,8 @@ def run_benchmark(
         preflight_supplemental = _preflight_supplemental_ocr(
             fixtures, cached_images=use_cached_ocr,
         )
+        preflight_quantity = _preflight_quantity_crop(fixtures, cached_images=use_cached_ocr)
+        preflight_pixels = _preflight_pixel_marker_contexts(fixtures, preflight_supplemental, preflight_quantity)
         if use_cached_ocr:
             _preflight_cached_image_layouts(fixtures)
     except ValueError as exc:
@@ -1288,7 +1509,7 @@ def run_benchmark(
     if ci:
         print(f"CI mode: cached OCR, 1 run, exit non-zero on failure")
     elif cached_ocr:
-        print(f"Cached OCR mode: {runs} run(s), no Vision API calls")
+        print(f"Cached OCR mode: {runs} run(s), no Cloud Vision OCR calls; vision fallback={vision_mode}")
 
     if use_cached_ocr:
         missing_cache = _missing_cached_ocr(fixtures)
@@ -1323,7 +1544,7 @@ def run_benchmark(
                 if source.suffix != ".txt"
             )
             estimated = _estimate_api_calls(
-                image_count, runs, supplemental_image_count,
+                image_count, runs, supplemental_image_count, supplemental_image_count,
             )
             if not _check_budget(estimated, budget_limit, force):
                 sys.exit(1)
@@ -1336,6 +1557,11 @@ def run_benchmark(
         "run_id": run_id,
         **_get_git_state(),
         "model": model,
+        "vision_mode": vision_mode,
+        "vision_model": configured_vision_model(),
+        "triage_models": _configured_triage_models(),
+        "triage_max_tokens": _triage_max_tokens(),
+        "package_source": str(Path(receipt_parser.__file__).resolve()),
         "runs_per_fixture": runs,
         "passes": passes,
         "workers": workers,
@@ -1360,7 +1586,7 @@ def run_benchmark(
     per_fixture: dict = {}
     skip_cache = not use_cached_ocr
 
-    if workers > 1 and not ci:
+    if workers > 1:
         # Parallel execution across fixtures
         print(f"\nRunning {n_fixtures} fixtures with {workers} workers...")
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1368,7 +1594,8 @@ def run_benchmark(
                 pool.submit(
                     _run_fixture, name, source, truth, runs, model, passes, cv_client,
                     skip_cache, save_variants, preflight_layouts.get(source),
-                    preflight_supplemental.get(source),
+                    preflight_supplemental.get(source), preflight_quantity.get(source),
+                    preflight_pixels.get(source), vision_mode,
                 ): name
                 for name, source, truth in fixtures
             }
@@ -1382,7 +1609,8 @@ def run_benchmark(
             _, fdata = _run_fixture_sequential(
                 name, source, truth, runs, model, passes, cv_client, skip_cache,
                 save_variants, preflight_layouts.get(source),
-                preflight_supplemental.get(source),
+                preflight_supplemental.get(source), preflight_quantity.get(source),
+                preflight_pixels.get(source), vision_mode,
             )
             per_fixture[name] = fdata
 
@@ -1405,9 +1633,13 @@ def _run_fixture_sequential(
     fixture_name, fixture_source, fixture_truth, runs, model, passes, cv_client, skip_cache,
     save_variants=True, preflight_layout_blocks=_LAYOUT_NOT_PREFLIGHTED,
     preflight_supplemental_evidence=_SUPPLEMENTAL_NOT_PREFLIGHTED,
+    preflight_quantity_crop=_QUANTITY_NOT_PREFLIGHTED,
+    preflight_pixel_marker_context=_PIXEL_NOT_PREFLIGHTED,
+    vision_mode=None,
 ):
     """Sequential fixture runner with progress printing."""
     is_ocr_text = fixture_source.suffix == ".txt"
+    vision_mode = _vision_mode() if vision_mode is None else vision_mode
     checks = get_checks_for(fixture_truth)
     fixture_runs = []
     replay_evidence = None
@@ -1434,6 +1666,22 @@ def _run_fixture_sequential(
             else preflight_supplemental_evidence
         )
 
+    crop_bundle = None
+    if is_ocr_text:
+        crop_bundle = (
+            _preflight_quantity_crop(
+                [(fixture_name, fixture_source, fixture_truth)], cached_images=False,
+            ).get(fixture_source)
+            if preflight_quantity_crop is _QUANTITY_NOT_PREFLIGHTED
+            else preflight_quantity_crop
+        )
+
+    pixel_context = (
+        _pixel_marker_artifact(fixture_name, fixture_source, supplemental_evidence, crop_bundle)
+        if preflight_pixel_marker_context is _PIXEL_NOT_PREFLIGHTED
+        else preflight_pixel_marker_context
+    ) if is_ocr_text else None
+
     for run_idx in range(1, runs + 1):
         wall_start = time.perf_counter()
         error = None
@@ -1447,6 +1695,13 @@ def _run_fixture_sequential(
                     ocr_layout_blocks=replay_layout_blocks,
                     ocr_confidence=replay_ocr_confidence,
                     supplemental_ocr_evidence=supplemental_evidence,
+                    quantity_crop_ocr_evidence=(crop_bundle or {}).get("evidence") if not (crop_bundle or {}).get("native_owner") else None,
+                    quantity_crop_context=(crop_bundle or {}).get("context") if not (crop_bundle or {}).get("native_owner") else None,
+                    native_owner_ocr_evidence=(crop_bundle or {}).get("evidence") if (crop_bundle or {}).get("native_owner") else None,
+                    native_owner_context=(crop_bundle or {}).get("context") if (crop_bundle or {}).get("native_owner") else None,
+                    financial_source_identity=(crop_bundle or {}).get("source_identity"),
+                    pixel_marker_context=pixel_context,
+                    vision_mode=vision_mode,
                 )
             else:
                 digital_pdf = (
@@ -1458,6 +1713,7 @@ def _run_fixture_sequential(
                     apply_user_rules=False, skip_ocr_cache=skip_cache,
                     ocr_engine=cv_client, capture_ocr_layout=True,
                     ocr_cache_only=not skip_cache,
+                    vision_mode=vision_mode,
                 )
                 if not skip_cache and not digital_pdf and result.get("_ocr_source") != "cache":
                     raise RuntimeError(
@@ -1513,6 +1769,7 @@ def _run_fixture_sequential(
             "warnings": result.get("_warnings", []),
             "warning_count": len(result.get("_warnings", [])),
             "llm_passes_used": result.get("_pass_count", 1),
+            "vision_fallback": deepcopy(result.get("_vision_fallback")),
         }
         fixture_runs.append(run_record)
 
@@ -1548,7 +1805,7 @@ def main():
     parser.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT),
                         help=f"JSON output file (default: {DEFAULT_OUTPUT})")
     parser.add_argument("--budget-limit", type=int, default=DEFAULT_BUDGET_LIMIT,
-                        help=f"Max API calls before stopping (default: {DEFAULT_BUDGET_LIMIT})")
+                        help=f"Max Cloud Vision OCR calls before stopping (default: {DEFAULT_BUDGET_LIMIT})")
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
                         help=f"LLM model (default: {DEFAULT_MODEL})")
     parser.add_argument("--passes", type=int, default=2,

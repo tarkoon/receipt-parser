@@ -1,5 +1,6 @@
 """Late receipt postprocess repair helpers."""
 
+from collections import deque
 import re
 
 from .patterns import (
@@ -14,7 +15,6 @@ from .receipt_items import (
     _bag_entries_from_ocr,
 )
 from .receipt_location import _PURCHASE_STORE_METADATA_RE
-from .receipt_projection import _clean_ocr_price_line_desc
 from .receipt_tax_categories import (
     _is_bag_description,
     _rebalance_tax_categories_to_rate_bases,
@@ -22,8 +22,75 @@ from .receipt_tax_categories import (
 from .receipt_totals import _sum_taxable_amounts
 
 
+def _complete_marked_stack_rows(text):
+    """Trigger: letter-tagged titles and marked currency prices before a summary.
+
+    Invariant: each adjacent title block owns exactly as many following prices;
+    unique titles, a printed count and literal subtotal agree before replacement.
+    Every tax marker needs a printed rate legend. No amount is synthesized.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    compact = re.sub(r"\s+", "", text)
+    if not re.search(r"[*＊※]印.{0,12}軽減税率[（(]?8[%％][)）]?.{0,8}(?:適用商品|対象品|対象商品)", compact):
+        return None
+    counts = {int(m.group(1)) for m in re.finditer(r"合計点数\s*(\d+)\s*点", text)}
+    for i, line in enumerate(lines):
+        if line != "合計点数":
+            continue
+        # ponytail: wider numeric-column splits require layout-bound counts.
+        for following in lines[i + 1:i + 13]:
+            count_row = re.fullmatch(r"(\d+)\s*点", following)
+            if count_row:
+                counts.add(int(count_row.group(1)))
+                break
+            if not re.fullmatch(r"[@¥￥\d.,()x×\s]+", following):
+                break
+    subtotals = {int(m.group(1).replace(",", "")) for m in re.finditer(
+        r"小計(?:額)?\s*[¥￥]\s*(\d[\d,]*)(?!\d)", text)}
+    if len(counts) != 1 or len(subtotals) != 1:
+        return None
+    count, subtotal = next(iter(counts)), next(iter(subtotals))
+    start = next((i for i, line in enumerate(lines) if re.fullmatch(r"[A-Za-z]\s*[ぁ-んァ-ン一-龥].+", line)), None)
+    if start is None:
+        return None
+    end = next((i for i in range(start, len(lines)) if re.match(r"伝票|テーブル|小計|合計", lines[i])), len(lines))
+    pending, rows, tag, price_started = deque(), [], None, False
+    for line in lines[start:end]:
+        title = re.fullmatch(r"([A-Za-z])\s*([ぁ-んァ-ン一-龥].+)", line)
+        price = re.fullmatch(r"[¥￥]\s*(\d[\d,]*)\s*[*＊※]", line)
+        if title:
+            if price_started and pending:
+                return None
+            if tag is not None and tag != title.group(1):
+                return None
+            tag = title.group(1)
+            pending.append(re.sub(r"\s+", "", line))
+            price_started = False
+        elif price:
+            if not pending:
+                return None
+            amount = int(price.group(1).replace(",", ""))
+            if amount <= 0:
+                return None
+            rows.append({"description": pending.popleft(), "qty": 1.0,
+                         "unit_price": float(amount), "total": float(amount),
+                         "tax_category": "8%", "discount": 0.0, "discount_rate": ""})
+            price_started = True
+        elif line != "1":
+            return None
+    if (pending or len(rows) != count or len({row["description"] for row in rows}) != count
+            or sum(row["total"] for row in rows) != subtotal):
+        return None
+    return rows
+
+
 def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
     """Parse receipts that stack item names first, then matching price rows."""
+    literal_rows = _complete_marked_stack_rows(unified_text)
+    if literal_rows is not None:
+        extracted["line_items"] = literal_rows
+        return
+
     def _rate_from_marker(marker: str) -> str:
         return "10%" if marker == "外" else "8%" if marker == "軽" else "0%"
 
@@ -55,9 +122,7 @@ def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
 
     def _clean_desc(text: str) -> str:
         text = re.sub(r'^[◎○●内*＊]\s*', '', text.strip())
-        if re.search(r'たまご\s+1$', text):
-            return re.sub(r'\s+', '', text).strip()
-        text = _clean_ocr_price_line_desc(text)
+        text = re.sub(r'\s+[※*＊非外内]\s*$', '', text).strip()
         text = re.sub(r'^\d{3,}[A-Za-z]?\)?\s*', '', text).strip()
         return re.sub(r'\s+', '', text).strip()
 
@@ -80,7 +145,6 @@ def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
 
     pending: list[str] = []
     rows: list[dict] = []
-    low_price_indices: list[int] = []
     pending_qty_detail: tuple[float, float] | None = None
     pending_prices: list[tuple[float, str]] = []
     max_pending_before_price = 0
@@ -172,8 +236,6 @@ def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
                 "discount": 0,
                 "discount_rate": "",
             }
-            if price < 100 and not _is_bag_description(desc):
-                low_price_indices.append(len(rows))
             rows.append(row)
             summary_seen_since_last_price = False
             continue
@@ -258,16 +320,6 @@ def _replace_stacked_name_price_rows_when_balanced(extracted, unified_text):
             0 if option[0] == "subtotal" else 1 if option[0] == "total" else 2,
         ),
     )
-    if abs(row_sum - target) > 2 and len(low_price_indices) == 1:
-        idx = low_price_indices[0]
-        gap = target - (row_sum - float(rows[idx]["total"]))
-        if gap > rows[idx]["total"] and gap < target:
-            low_text = str(int(rows[idx]["total"]))
-            gap_text = str(int(round(gap)))
-            if gap_text.startswith(low_text):
-                rows[idx]["unit_price"] = float(gap)
-                rows[idx]["total"] = float(gap)
-                row_sum = sum(float(row["total"]) for row in rows)
     if abs(row_sum - target) > 2:
         return
     printed_count = None
@@ -734,7 +786,7 @@ def _restore_single_rate_inclusive_tax_block(extracted, unified_text):
             for item in items:
                 if isinstance(item, dict):
                     item["tax_category"] = rate
-    _clean_code_prefixed_item_descriptions(extracted)
+    _clean_code_prefixed_item_descriptions(extracted, unified_text)
 
 
 def _fix_header_store_line_location(extracted, unified_text):

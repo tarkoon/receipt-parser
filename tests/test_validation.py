@@ -2,6 +2,8 @@
 
 from copy import deepcopy
 
+import pytest
+
 from receipt_parser.schema import Receipt
 from receipt_parser.validation import validate_receipt
 
@@ -28,6 +30,39 @@ def test_tax_inclusive_correct():
         taxes=[{"rate": "8%", "label": "内税", "amount": 24}],
     )
     assert validate_receipt(receipt) == []
+
+
+@pytest.mark.parametrize(("total", "gap"), [(3590, 0), (3690, 100)])
+def test_mixed_tax_groups_share_validation_and_candidate_arithmetic(total, gap):
+    from receipt_parser.llm import _items_sum_gap
+    from receipt_parser.pipeline import _receipt_items_target_gap, _receipt_printed_tax_gap
+    from receipt_parser.receipt_postprocess_phases import _restore_tax_entries_from_item_rate_sums
+
+    receipt = Receipt(
+        total=total, subtotal=3400,
+        taxes=[
+            {"rate": "8%", "label": "外税", "amount": 160},
+            {"rate": "10%", "label": "外税", "amount": 30},
+            {"rate": "10%", "label": "内税", "amount": 100},
+        ],
+        line_items=[
+            {"description": "商品甲", "qty": 1, "unit_price": 2000, "total": 2000, "tax_category": "8%"},
+            {"description": "商品乙", "qty": 1, "unit_price": 300, "total": 300, "tax_category": "10%"},
+            {"description": "商品丙", "qty": 1, "unit_price": 1100, "total": 1100, "tax_category": "10%"},
+        ],
+    )
+    assert bool(receipt._soft_warnings) == bool(gap)
+    assert bool(validate_receipt(receipt)) == bool(gap)
+    assert _items_sum_gap(receipt.model_dump()) == gap
+    assert _receipt_items_target_gap(receipt.model_dump()) == gap
+    for taxes in (receipt.taxes, list(reversed(receipt.taxes))):
+        candidate = {**receipt.model_dump(), "taxes": [tax.model_dump() for tax in taxes]}
+        before = deepcopy(candidate)
+        _restore_tax_entries_from_item_rate_sums(candidate, "", {}, {})
+        assert candidate == before
+        assert _receipt_printed_tax_gap(candidate, "(10%対象 ¥1100 内税 ¥100)") == 0
+        candidate["taxes"].append({"rate": "10%", "label": "内税", "amount": 90})
+        assert _receipt_printed_tax_gap(candidate, "(10%対象 ¥1100 内税 ¥100)") > 0
 
 
 def test_tax_rate_unusual_warns():

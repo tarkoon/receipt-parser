@@ -23,6 +23,7 @@ from .receipt_item_repair import (
     _fix_split_item_price_body_total_layout,
 )
 from .receipt_items import (
+    _canonicalize_complete_ocr_title_rows,
     _fix_bag_item_prices_from_rate_bases,
 )
 from .receipt_late_repairs import (
@@ -300,7 +301,7 @@ def _run_final_ocr_description_reconciliation_phase(
     ocr_text: str,
     repairs: tuple[str, ...],
 ) -> None:
-    """Trigger: OCR item-code, JAN, discount-pair, or pre-price context.
+    """Trigger: OCR code, discount-pair, pre-price, or amount-owned literal titles.
 
     Invariant: description changes must remain backed by visible OCR
     neighbors while preserving each item's amount and quantity fields.
@@ -317,6 +318,7 @@ def _run_final_ocr_description_reconciliation_phase(
                 "Unknown final OCR description reconciliation repair: "
                 f"{repair}"
             )
+    _canonicalize_complete_ocr_title_rows(result, ocr_text)
 
 
 def _run_final_adjacent_price_shift_reconciliation_phase(
@@ -368,7 +370,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "Owned by the final header location repair helper until noisy city cleanup moves out of post-serialization repair.",
     ),
     "single_rate_inclusive_tax_block": (
-        "tax_category_assignment",
+        "single_rate_inclusive_tax_restoration",
         "Owned by the final single-rate inclusive tax restoration helper until this serialized tax block repair moves out of post-serialization repair.",
     ),
     "coupon_discount_projection": (
@@ -394,7 +396,7 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
         "Owned by the final stacked name/price projection helper until stacked row projection moves out of post-serialization repair.",
     ),
     "stacked_inclusive_tax_block": (
-        "tax_category_assignment",
+        "stacked_inclusive_tax_restoration",
         "Owned by the final stacked inclusive tax restoration helper until stacked tax summaries move out of post-serialization repair.",
     ),
     "printed_summary_total_tax_balanced": (
@@ -448,7 +450,8 @@ FINAL_RECEIPT_OUTPUT_REPAIR_JUSTIFICATIONS = {
     "bare_number_tax_summary": (
         "bare_number_tax_summary_restoration",
         "Owned by the final bare-number tax summary restoration helper until "
-        "numeric tax-summary stack recovery moves out of post-serialization "
+        "numeric tax-summary stack recovery, including one complete purpose "
+        "item's uniquely owned rate, moves out of post-serialization "
         "repair.",
     ),
     "external_tax_total_from_printed_subtotal": (
@@ -803,6 +806,7 @@ def _prepare_receipt_output_payload(
     mutation_trace: list[dict] | None = None,
     *,
     ocr_layout_blocks=None,
+    repair_text: str | None = None,
 ) -> dict:
     result = receipt.model_dump()
     _record_receipt_output_repair(
@@ -813,7 +817,7 @@ def _prepare_receipt_output_payload(
     )
     _apply_final_receipt_output_repairs(
         result,
-        ocr_text,
+        ocr_text if repair_text is None else repair_text,
         mutation_trace=mutation_trace,
         ocr_layout_blocks=ocr_layout_blocks,
     )

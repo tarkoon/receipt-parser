@@ -17,6 +17,32 @@ def _item(description, total, *, qty=1, unit_price=None, discount=0, rate=""):
     }
 
 
+def test_unheaded_itemization_requires_unique_owned_prices_for_every_row():
+    from copy import deepcopy
+    from receipt_parser.receipt_items import _fix_bare_service_receipt_without_itemization
+
+    original = {"total": 400, "line_items": [_item("商品甲乙", 240), _item("商品丙丁", 160)]}
+    text = "領収証\n商品甲乙\n¥240\n商品丙丁\n¥160\n合計\n¥400"
+    for source in (text, text.replace("商品甲乙\n", "商品甲乙 ").replace("商品丙丁\n", "商品丙丁 ")):
+        result = deepcopy(original)
+        _fix_bare_service_receipt_without_itemization(result, source)
+        assert result["line_items"] == original["line_items"]
+        _fix_bare_service_receipt_without_itemization(result, source)
+        assert result["line_items"] == original["line_items"]
+    for unsupported in (
+        text.replace("商品丙丁\n¥160", "別商品\n¥160"),
+        text.replace("商品甲乙\n¥240", "商品甲乙\n別商品\n¥240"),
+        text.replace("商品甲乙\n¥240", "商品甲乙\n¥240\n商品甲乙\n¥240"),
+        text.replace("商品丙丁\n¥160", "商品丙丁\n合計 ¥160"),
+    ):
+        result = deepcopy(original)
+        _fix_bare_service_receipt_without_itemization(result, unsupported)
+        assert result["line_items"] == []
+    result = {"total": 400, "line_items": [_item("合計", 400)]}
+    _fix_bare_service_receipt_without_itemization(result, "領収証\n合計 ¥400")
+    assert result["line_items"] == []
+
+
 def _four_row_uncounted_bag_text(*, bag_amount=4, reduced_base=626, standard_base=None):
     first_amount = 130 - bag_amount
     standard_base = bag_amount if standard_base is None else standard_base
@@ -96,18 +122,26 @@ def test_dense_projection_four_row_exception_requires_low_bag_and_balanced_rate_
         assert extracted["line_items"] is original
 
 
-def test_dense_projection_recovers_one_prefixed_amount_fragment_in_split_or_joined_shape():
+def test_dense_projection_requires_complete_amount_in_split_or_joined_shape():
     from receipt_parser.receipt_row_projection import (
         _replace_dense_sequence_rows_when_balanced,
     )
 
-    for fragment_lines in (["商品乙", "2"], ["商品乙 2"]):
-        extracted = {"subtotal": 1000, "line_items": []}
+    for fragment_lines in (["商品乙", "2"], ["商品乙 2"], ["商品乙", "238*"], ["商品乙 238*"]):
+        original = []
+        extracted = {"subtotal": 1000, "line_items": original}
 
         _replace_dense_sequence_rows_when_balanced(
             extracted,
             _dense_fragment_text(fragment_lines),
         )
+
+        if fragment_lines in (["商品乙", "2"], ["商品乙 2"]):
+            assert extracted == {"subtotal": 1000, "line_items": []}
+            assert extracted["line_items"] is original
+            _replace_dense_sequence_rows_when_balanced(extracted, _dense_fragment_text(fragment_lines))
+            assert extracted == {"subtotal": 1000, "line_items": []}
+            continue
 
         assert [
             (row["description"], row["total"])
@@ -122,7 +156,7 @@ def test_dense_projection_recovers_one_prefixed_amount_fragment_in_split_or_join
         ]
 
 
-def test_valid_fragment_recovery_can_replace_a_balanced_model_shape():
+def test_partial_amount_keeps_balanced_model_shape_unchanged():
     from receipt_parser.receipt_row_projection import (
         _replace_dense_sequence_rows_when_balanced,
     )
@@ -136,24 +170,20 @@ def test_valid_fragment_recovery_can_replace_a_balanced_model_shape():
         _item("モデル行己", 112),
     ]
     extracted = {"subtotal": 1000, "line_items": original}
+    expected = [dict(row) for row in original]
 
     _replace_dense_sequence_rows_when_balanced(
         extracted,
         _dense_fragment_text(["商品乙", "2"]),
     )
 
-    assert extracted["line_items"] is not original
-    assert [row["total"] for row in extracted["line_items"]] == [
-        100.0,
-        50.0,
-        238.0,
-        200.0,
-        300.0,
-        112.0,
-    ]
+    assert extracted["line_items"] is original
+    assert extracted["line_items"] == expected
+    _replace_dense_sequence_rows_when_balanced(extracted, _dense_fragment_text(["商品乙", "2"]))
+    assert extracted["line_items"] == expected
 
 
-def test_fragment_recovery_preserves_locked_non_tax_and_mixed_rate_ownership():
+def test_mixed_tax_bases_do_not_supply_missing_item_price_digits():
     from receipt_parser.receipt_row_projection import (
         _replace_dense_sequence_rows_when_balanced,
     )
@@ -166,6 +196,7 @@ def test_fragment_recovery_preserves_locked_non_tax_and_mixed_rate_ownership():
         _item("モデル戊", 559),
     ]
     extracted = {"subtotal": 1500, "line_items": original}
+    expected = [dict(row) for row in original]
     text = "\n".join([
         "2099/1/1 00:00",
         "前置商品",
@@ -186,19 +217,10 @@ def test_fragment_recovery_preserves_locked_non_tax_and_mixed_rate_ownership():
 
     _replace_dense_sequence_rows_when_balanced(extracted, text)
 
-    assert extracted["line_items"] is not original
-    assert [
-        (row["description"], row["total"], row["tax_category"])
-        for row in extracted["line_items"]
-    ] == [
-        ("自治体ごみ袋", 600.0, "0%"),
-        ("前置商品", 100.0, "8%"),
-        ("商品甲", 238.0, "8%"),
-        ("食品ポリ袋", 3.0, "10%"),
-        ("標準商品", 180.0, "10%"),
-        ("商品乙", 200.0, "8%"),
-        ("商品丙", 179.0, "8%"),
-    ]
+    assert extracted["line_items"] is original
+    assert extracted["line_items"] == expected
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+    assert extracted["line_items"] == expected
 
 
 def test_fragment_recovery_does_not_treat_an_unmarked_bag_as_count_exempt():
@@ -551,7 +573,7 @@ def test_dense_projection_owns_unlabeled_rate_by_adjacent_discount():
         ("商品甲", 2.0, 100.0, 140.0, "30%", "8%"),
         ("反復商品", 1.0, 200.0, 140.0, "30%", "8%"),
         ("反復商品", 1.0, 453.0, 271.0, "40%", "8%"),
-        ("商品丁", 1.0, 382.0, 229.0, "40%", "8%"),
+        ("商品丁", 1.0, 382.0, 229.0, "", "8%"),
         ("食品ポリ袋", 1.0, 3.0, 3.0, "", "10%"),
         ("商品戊", 2.0, 50.0, 100.0, "", "8%"),
     ]
@@ -632,6 +654,34 @@ def test_dense_projection_applies_adjacent_discount_to_proven_owner():
     assert extracted["line_items"][0]["discount"] == 60
     assert extracted["line_items"][1]["discount"] == 60
     assert extracted["line_items"][1]["discount_rate"] == "40%"
+
+
+def test_dense_projection_preserves_queued_titles_across_unassigned_percent_controls():
+    from copy import deepcopy
+    from receipt_parser.receipt_row_projection import _replace_dense_sequence_rows_when_balanced
+
+    extracted = {"subtotal": 1210, "line_items": []}
+    text = "\n".join([
+        "2099/1/1 00:00",
+        "商品甲 200*", "割引", "40%",
+        "商品乙", "商品丙", "30%", "商品丁", "-80",
+        "100*", "300*", "-90", "400*", "割引", "30%", "-120",
+        "商品戊 500*", "小計", "1210", "外税8%対象額 1210", "お買上商品数:5",
+    ])
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "商品甲", "商品乙", "商品丙", "商品丁", "商品戊",
+    ]
+    assert [item["unit_price"] for item in extracted["line_items"]] == [200, 100, 300, 400, 500]
+    assert [item["total"] for item in extracted["line_items"]] == [120, 100, 210, 280, 500]
+    assert [item["discount"] for item in extracted["line_items"]] == [80, 0, 90, 120, 0]
+    assert [item["discount_rate"] for item in extracted["line_items"]] == ["", "", "", "30%", ""]
+    expected = deepcopy(extracted)
+    _replace_dense_sequence_rows_when_balanced(extracted, text)
+    assert extracted == expected
+    rejected = {"subtotal": 1210, "line_items": []}
+    _replace_dense_sequence_rows_when_balanced(rejected, text.replace("-90", "-75"))
+    assert rejected == {"subtotal": 1210, "line_items": []}
 
 
 def test_dense_projection_rejects_discount_ambiguous_with_pending_item():
@@ -934,13 +984,13 @@ def test_ambiguous_group_discount_clears_unsupported_rate_but_keeps_amount():
     assert items[0]["discount_rate"] == ""
 
 
-def test_unique_local_amount_only_discount_uses_effective_rate():
+def test_unique_local_amount_only_bundle_keeps_money_without_inventing_rate():
     from receipt_parser.receipt_item_cleanup import (
         _clear_discounts_without_nearby_ocr_marker,
     )
 
     items = [
-        _item("一般商品", 394, qty=2, unit_price=297, discount=200)
+        _item("一般商品", 394, qty=2, unit_price=297, discount=200, rate="33.7%")
     ]
 
     _clear_discounts_without_nearby_ocr_marker(
@@ -950,10 +1000,10 @@ def test_unique_local_amount_only_discount_uses_effective_rate():
 
     assert items[0]["discount"] == 200
     assert items[0]["total"] == 394
-    assert items[0]["discount_rate"] == "33.7%"
+    assert items[0]["discount_rate"] == ""
 
 
-def test_stacked_explicit_rates_use_group_effective_rate():
+def test_stacked_explicit_rates_use_printed_compound_rate():
     from receipt_parser.receipt_item_cleanup import (
         _clear_discounts_without_nearby_ocr_marker,
     )
@@ -988,7 +1038,7 @@ def test_stacked_explicit_rates_use_group_effective_rate():
 
     _clear_discounts_without_nearby_ocr_marker(items, text)
 
-    assert [row["discount_rate"] for row in items] == ["33.7%"] * 3
+    assert [row["discount_rate"] for row in items] == ["33.5%"] * 3
 
 
 def test_stacked_price_bundles_keep_uniquely_supported_discounts():
@@ -1035,11 +1085,18 @@ def test_stacked_price_bundles_keep_uniquely_supported_discounts():
     assert [row["total"] for row in items] == [140, 412, 266, 261]
     assert [row["discount"] for row in items] == [8, 209, 135, 133]
     assert [row["discount_rate"] for row in items] == [
-        "5%",
-        "33.7%",
-        "33.7%",
-        "33.7%",
+        "",
+        "",
+        "33.5%",
+        "33.5%",
     ]
+    for foreign_block in (
+        "Early tea\n500\nLater loaf\n500\n20%\n-100",
+        "Early tea\nLater loaf\n500\n20%\n-100",
+    ):
+        earlier = [_item("Early tea", 400, unit_price=500, discount=100, rate="20%")]
+        _clear_discounts_without_nearby_ocr_marker(earlier, foreign_block)
+        assert earlier == [_item("Early tea", 500, unit_price=500)]
 
 
 def test_campaign_projection_keeps_combined_effective_rate():
@@ -1083,9 +1140,9 @@ def test_campaign_projection_keeps_combined_effective_rate():
     _replace_campaign_discount_stream_when_balanced(extracted, text)
 
     assert [row["discount_rate"] for row in extracted["line_items"]][1:4] == [
-        "33.7%",
-        "33.7%",
-        "33.7%",
+        "33.5%",
+        "33.5%",
+        "33.5%",
     ]
 
 
@@ -1144,13 +1201,14 @@ def test_campaign_projection_repairs_pure_description_permutation_when_money_mat
 
     assert [row["description"] for row in extracted["line_items"]] == expected_descriptions
     assert [row["discount_rate"] for row in extracted["line_items"]][1:4] == [
-        "33.7%",
-        "33.7%",
-        "33.7%",
+        "33.5%",
+        "33.5%",
+        "33.5%",
     ]
 
 
-def test_campaign_projection_preserves_descriptions_when_money_already_matches():
+def test_campaign_abstains_on_unrelated_titles_even_when_money_matches():
+    from copy import deepcopy
     from receipt_parser.receipt_marker_projection import (
         _replace_campaign_discount_stream_when_balanced,
     )
@@ -1166,7 +1224,7 @@ def test_campaign_projection_preserves_descriptions_when_money_already_matches()
         ],
         "taxes": [],
     }
-    descriptions = [row["description"] for row in extracted["line_items"]]
+    original = deepcopy(extracted)
     text = "\n".join([
         "2099/1/1 00:00",
         "OCR商品甲 100",
@@ -1197,12 +1255,7 @@ def test_campaign_projection_preserves_descriptions_when_money_already_matches()
 
     _replace_campaign_discount_stream_when_balanced(extracted, text)
 
-    assert [row["description"] for row in extracted["line_items"]] == descriptions
-    assert [row["discount_rate"] for row in extracted["line_items"]][1:4] == [
-        "33.7%",
-        "33.7%",
-        "33.7%",
-    ]
+    assert extracted == original
 
 
 def test_numeric_product_suffix_is_not_cleaned_without_code_prefix():
@@ -1210,11 +1263,115 @@ def test_numeric_product_suffix_is_not_cleaned_without_code_prefix():
         _clean_code_prefixed_item_descriptions,
     )
 
-    extracted = {"line_items": [_item("レジ袋 5", 3)]}
+    descriptions = ["レジ袋 5", "2024 記念品 1", "123-456 商品 1"]
+    extracted = {"line_items": [_item(desc, 3) for desc in descriptions]}
 
     _clean_code_prefixed_item_descriptions(extracted)
 
-    assert extracted["line_items"][0]["description"] == "レジ袋 5"
+    assert [item["description"] for item in extracted["line_items"]] == descriptions
+
+
+def test_numeric_product_suffix_cleanup_uses_unique_code_qty_and_exact_ocr_title():
+    from receipt_parser.receipt_item_repair import (
+        _clean_code_prefixed_item_descriptions,
+    )
+
+    extracted = {"line_items": [
+        _item("Model 2024 No. 2 1234567890123", 500, qty=1),
+        _item("紅茶 2025（2345678901234）", 600, qty=2),
+    ]}
+    before = [dict(item) for item in extracted["line_items"]]
+    ocr_text = "\n".join([
+        "Model 2024 No. 2",
+        "¥500",
+        "1234567890123 1",
+        "軽 2 紅茶 2025",
+        "¥300",
+        "¥600",
+        "2345678901234 2",
+    ])
+
+    _clean_code_prefixed_item_descriptions(extracted, ocr_text)
+    _clean_code_prefixed_item_descriptions(extracted, ocr_text)
+
+    assert [item["description"] for item in extracted["line_items"]] == [
+        "Model 2024 No. 2", "紅茶 2025",
+    ]
+    assert [
+        {key: value for key, value in item.items() if key != "description"}
+        for item in extracted["line_items"]
+    ] == [
+        {key: value for key, value in item.items() if key != "description"}
+        for item in before
+    ]
+
+
+def test_numeric_product_suffix_cleanup_rejects_unproven_or_ambiguous_rows():
+    from receipt_parser.receipt_item_repair import (
+        _clean_code_prefixed_item_descriptions,
+    )
+
+    cases = [
+        ("商品 1234567890123", 1, "商品\n¥100"),
+        ("Product1234567890124", 1, "Product1234567890124\n1234567890124 1"),
+        ("商品 1234567890125", 1, "商品\n1234567890125 1\n1234567890125 1"),
+        ("商品 1234567890126", 1, "商品\n別商品\n1234567890126 1"),
+        ("商品 1234567890127", 2, "商品\n1234567890127 1"),
+        ("商品 1234567890130", 1, "商品\n小計\n¥100\n1234567890130 1"),
+        ("商品 1234567890132", 0, "商品\n1234567890132 1"),
+        ("商品 1234567890133", -1, "商品\n1234567890133 1"),
+        ("商品 1234567890134", float("nan"), "商品\n1234567890134 1"),
+        ("商品 1234567890135", float("inf"), "商品\n1234567890135 1"),
+    ]
+    for description, qty, ocr_text in cases:
+        item = _item(description, 100, qty=qty)
+        extracted = {"line_items": [item]}
+        before = dict(item)
+
+        _clean_code_prefixed_item_descriptions(extracted, ocr_text)
+
+        assert extracted["line_items"][0] == before
+
+    duplicated_owner = {"line_items": [
+        _item("商品甲 1234567890128", 100),
+        _item("商品乙 (1234567890128)", 100),
+    ]}
+    _clean_code_prefixed_item_descriptions(
+        duplicated_owner, "商品甲\n1234567890128 1"
+    )
+    assert [item["description"] for item in duplicated_owner["line_items"]] == [
+        "商品甲 1234567890128", "商品乙 (1234567890128)",
+    ]
+
+    mixed = {"line_items": [
+        _item("470-0244 パンスト 1", 100),
+        _item("商品 1234567890131", 200, qty=2),
+    ]}
+    before = [dict(item) for item in mixed["line_items"]]
+    _clean_code_prefixed_item_descriptions(
+        mixed, "パンスト\n商品\n1234567890131 1"
+    )
+    assert mixed["line_items"] == before
+
+
+def test_numeric_product_suffix_cleanup_stages_multiple_items_atomically():
+    from receipt_parser.receipt_item_repair import (
+        _clean_code_prefixed_item_descriptions,
+    )
+
+    extracted = {"line_items": [
+        _item("商品甲 1234567890129", 100),
+        _item("商品乙 2345678901234", 200, qty=2),
+    ]}
+    before = [dict(item) for item in extracted["line_items"]]
+    ocr_text = "\n".join([
+        "商品甲", "1234567890129 1",
+        "商品乙", "2345678901234 1",
+    ])
+
+    _clean_code_prefixed_item_descriptions(extracted, ocr_text)
+
+    assert extracted["line_items"] == before
 
 
 def test_non_product_cleanup_requires_arithmetic_support_for_over_total_drop():
@@ -1266,7 +1423,10 @@ def test_unsupported_qty_inflation_uses_unique_visible_total():
 
 
 def test_bag_price_ignores_barcode_tail_and_uses_standalone_price():
-    from receipt_parser.receipt_items import _fix_bag_item_prices_from_ocr
+    from receipt_parser.receipt_items import (
+        _bag_entries_from_ocr,
+        _fix_bag_item_prices_from_ocr,
+    )
 
     extracted = {"line_items": [_item("レジ袋", 6)]}
 
@@ -1277,6 +1437,18 @@ def test_bag_price_ignores_barcode_tail_and_uses_standalone_price():
 
     assert extracted["line_items"][0]["unit_price"] == 5
     assert extracted["line_items"][0]["total"] == 5
+
+    assert _bag_entries_from_ocr("有料レジ袋\n2個×5円\n小計") == [
+        {"line": 0, "qty": 2, "unit_price": 5, "total": 10},
+    ]
+    for price in ("¥248", "¥1,248", "2個×248円", "1,248×5", "2×5.5", "2024"):
+        assert _bag_entries_from_ocr(f"有料レジ袋\n{price}\n小計") == []
+    assert _bag_entries_from_ocr("有料レジ袋 2024") == []
+    for description in ("レジ袋248円", "レジ袋1,248円", "レジ袋3.5円"):
+        original = _item(description, 7)
+        extracted = {"line_items": [dict(original)]}
+        _fix_bag_item_prices_from_ocr(extracted, description)
+        assert extracted["line_items"] == [original]
 
 
 def test_mangled_qty_detail_does_not_override_balanced_visible_arithmetic():
@@ -1303,6 +1475,19 @@ def test_plausible_description_is_not_replaced_by_same_price_neighbor():
     )
 
     assert items[0]["description"] == "明示された商品名"
+
+
+def test_hallucinated_price_repair_stops_at_the_next_title_or_summary():
+    from receipt_parser.receipt_item_cleanup import _fix_hallucinated_prices
+
+    items = [_item("商品甲200", 200)]
+    _fix_hallucinated_prices(items, "商品甲200\n90*")
+    assert items == [_item("商品甲200", 90)]
+
+    for boundary in ("商品乙", "商品乙 90", "小計"):
+        items = [_item("商品甲200", 200)]
+        _fix_hallucinated_prices(items, f"商品甲200\n{boundary}\n90*")
+        assert items == [_item("商品甲200", 200)]
 
 
 def test_leading_tax_marker_is_not_part_of_description():
@@ -1346,7 +1531,7 @@ def _recover_gap_group(lines, items, unmatched_prices, target):
     return recovered, extracted["line_items"]
 
 
-def test_gap_recovery_includes_unique_marked_inline_bag_in_three_row_group():
+def test_gap_recovery_requires_complete_prices_in_unique_marked_inline_bag_group():
     lines = [
         "2099/1/1 00:00",
         "既存商品 100*",
@@ -1363,6 +1548,13 @@ def test_gap_recovery_includes_unique_marked_inline_bag_in_three_row_group():
         [_item("既存商品", 100)],
         [(2, 652), (5, 3)],
         993,
+    )
+
+    assert not recovered
+    assert items == [_item("既存商品", 100)]
+    lines[4] = "238*"
+    recovered, items = _recover_gap_group(
+        lines, [_item("既存商品", 100)], [(2, 652), (4, 238), (5, 3)], 993,
     )
 
     assert recovered
@@ -1431,7 +1623,7 @@ def test_gap_recovery_does_not_duplicate_represented_inline_bag():
         "既存商品 100*",
         "行政指定ごみ袋 652非",
         "追加商品",
-        "2",
+        "238*",
         "食品ポリ袋 3除",
         "小計",
         "993",
@@ -1440,7 +1632,7 @@ def test_gap_recovery_does_not_duplicate_represented_inline_bag():
     recovered, items = _recover_gap_group(
         lines,
         original,
-        [(2, 652), (5, 3)],
+        [(2, 652), (4, 238), (5, 3)],
         993,
     )
 
@@ -1451,3 +1643,224 @@ def test_gap_recovery_does_not_duplicate_represented_inline_bag():
         ("追加商品", 238.0),
         ("食品ポリ袋", 3),
     ]
+def test_complete_marked_stack_owns_every_price_count_and_tax_legend():
+    from copy import deepcopy
+    from receipt_parser.receipt_late_repairs import _replace_stacked_name_price_rows_when_balanced
+
+    text = "\n".join([
+        "架空商店", "T 商品アルファ", "¥310*", "1", "T 商品ベータ60", "T 商品ガンマ",
+        "¥220※", "¥140*", "小計額", "¥670", "合計点数", "@670x", "¥670)", "3点",
+        "※印は軽減税率(8%)適用商品",
+    ])
+    original = {"total": 670, "subtotal": 670, "payment_method": "PayPay", "line_items": [
+        {"description": "collapsed", "qty": 1, "unit_price": 670, "total": 670},
+    ]}
+    current = deepcopy(original)
+    _replace_stacked_name_price_rows_when_balanced(current, text)
+    assert [row["description"] for row in current["line_items"]] == ["T商品アルファ", "T商品ベータ60", "T商品ガンマ"]
+    assert [row["total"] for row in current["line_items"]] == [310, 220, 140]
+    assert all(row["qty"] == 1 and row["unit_price"] == row["total"] and row["tax_category"] == "8%" and
+               row["discount"] == 0 and row["discount_rate"] == "" for row in current["line_items"])
+    assert {key: value for key, value in current.items() if key != "line_items"} == {
+        key: value for key, value in original.items() if key != "line_items"}
+    repeat = deepcopy(current)
+    _replace_stacked_name_price_rows_when_balanced(repeat, text)
+    assert repeat == current
+    for altered in (
+        text.replace("¥140*\n", ""), text.replace("T 商品ガンマ\n", ""),
+        text.replace("¥140*", "T 商品デルタ\n¥140*"), text.replace("商品ガンマ", "商品アルファ"),
+        text.replace("3点", "4点"), text.replace("¥670", "¥680"),
+        text.replace("(8%)", "(10%)"), text.split("※印は")[0],
+        text.replace("¥140*", "¥140"), text.replace("\n1\n", "\n2\n"),
+        text.replace("¥220※", "¥220※\n値引 -¥10"),
+        text.replace("合計点数\n@670x", "合計点数\n別のタイトル\n@670x"),
+    ):
+        unchanged = deepcopy(original)
+        _replace_stacked_name_price_rows_when_balanced(unchanged, altered)
+        assert unchanged == original
+
+
+def test_local_literal_title_preserves_product_digits_and_other_business_fields():
+    from copy import deepcopy
+    from receipt_parser.receipt_items import _canonicalize_complete_ocr_title_rows
+
+    item = {"description": "青葉天かす", "qty": 1, "unit_price": 98,
+            "total": 98, "discount": 0, "discount_rate": "", "tax_category": "8%"}
+    basket = {"subtotal": 594, "total": 594, "line_items": [item,
+        {"description": "ちゃんぽん", "qty": 2, "unit_price": 248,
+         "total": 496, "discount": 0, "discount_rate": "", "tax_category": "8%"}]}
+    for source, expected in [
+        ("青葉天かす 60\n98*\nちゃんぽん 2個 X 単248\n小計\n¥594", "青葉天かす 60"),
+        ("青葉天かす 60 ¥98\n小計\n¥594", "青葉天かす 60"),
+        ("青葉天かす 60 98\n小計\n¥594", "青葉天かす"),
+        ("青葉天かす 60 ¥97\n小計\n¥594", "青葉天かす"),
+        ("青葉天かす 60 ¥98\n青葉天かす 80 ¥98\n小計\n¥594", "青葉天かす"),
+        ("小計\n¥594\n青葉天かす 60 ¥98", "青葉天かす"),
+    ]:
+        result = deepcopy(basket)
+        expected_result = deepcopy(basket)
+        expected_result["line_items"][0]["description"] = expected
+        for _ in range(2):
+            _canonicalize_complete_ocr_title_rows(result, source)
+            assert result == expected_result
+
+    for description, source in [
+        ("青葉天かす 80", "青葉天かす 60 ¥98"),
+        ("薄手タイツ", "470-0244 薄手タイツ 1 ¥98"),
+    ]:
+        result = deepcopy(basket)
+        result["line_items"][0]["description"] = description
+        before = deepcopy(result)
+        _canonicalize_complete_ocr_title_rows(result, source)
+        assert result == before
+
+    result = deepcopy(basket)
+    result["line_items"].append(deepcopy(item))
+    before = deepcopy(result)
+    _canonicalize_complete_ocr_title_rows(result, "青葉天かす 60 ¥98")
+    assert result == before
+
+    result = {"line_items": [dict(item, description="植物ポリ袋 (配合30 98除")]}
+    expected = deepcopy(result)
+    expected["line_items"][0]["description"] = "植物ポリ袋 (配合30"
+    _canonicalize_complete_ocr_title_rows(result, "植物ポリ袋 (配合30 98除")
+    assert result == expected
+
+def test_split_weighted_title_requires_unique_owner_and_preserves_digits():
+    from copy import deepcopy
+    from receipt_parser.receipt_items import _canonicalize_complete_ocr_title_rows
+
+    source = "青葉Blend 7\n単\n315 420g\n¥1,323"
+    item = {"description": "青葉Blend 7 単315420g", "qty": 1,
+            "unit_price": 1323, "total": 1323, "discount": 0,
+            "discount_rate": "", "tax_category": "10%"}
+    original = {"subtotal": 1323, "total": 1323, "line_items": [item]}
+    expected = deepcopy(original)
+    expected["line_items"][0]["description"] = "青葉Blend 7"
+    for _ in range(2):
+        result = deepcopy(original)
+        _canonicalize_complete_ocr_title_rows(result, source)
+        assert result == expected
+
+    duplicate_owner = {"subtotal": 2646, "total": 2646,
+                       "line_items": [deepcopy(item), deepcopy(item)]}
+    before = deepcopy(duplicate_owner)
+    _canonicalize_complete_ocr_title_rows(duplicate_owner, source)
+    assert duplicate_owner == before
+
+    model_with_unit_only = {"subtotal": 1323, "total": 1323,
+                            "line_items": [dict(item, description="青葉Blend 7 単")]}
+    before = deepcopy(model_with_unit_only)
+    _canonicalize_complete_ocr_title_rows(model_with_unit_only, "\n".join((source, source)))
+    assert model_with_unit_only == before
+
+    competing_metadata = (
+        "青葉Blend 7\n単\n315 420g\n¥1,323\n"
+        "青葉Blend 7\n単\n316 420g\n¥1,323"
+    )
+    model_with_unit_only = {"subtotal": 1323, "total": 1323,
+                            "line_items": [dict(item, description="青葉Blend 7 単")]}
+    before = deepcopy(model_with_unit_only)
+    _canonicalize_complete_ocr_title_rows(model_with_unit_only, competing_metadata)
+    assert model_with_unit_only == before
+
+    unsupported_close = {"subtotal": 1323, "total": 1323,
+                         "line_items": [dict(item, description="青葉Blend 7)")]}
+    before = deepcopy(unsupported_close)
+    _canonicalize_complete_ocr_title_rows(unsupported_close, "青葉Blend 7 1,322除")
+    assert unsupported_close == before
+
+def test_complete_count_controls_do_not_replace_separately_owned_repeated_titles():
+    from copy import deepcopy
+    from receipt_parser.receipt_item_repair import _valid_ocr_item_desc, _replace_duplicate_desc_from_ocr
+    from receipt_parser.receipt_items import _fix_duplicate_descriptions_from_ocr
+
+    for control in ('1点', '@145点', '@1451点', '3個', '単145円', '2枚', '４袋', '＠145 足'):
+        assert not _valid_ocr_item_desc(control)
+    for title in ('7本指手袋', '4個パック', '2027年モデル', '試作商品3', '2枚入り'):
+        assert _valid_ocr_item_desc(title)
+    items = [{'description': '試作3層コースター', 'qty': 1, 'unit_price': 145,
+              'total': 145, 'tax_category': '10%', 'discount': 0, 'discount_rate': ''}
+             for _ in range(3)]
+    ocr = '\n'.join(['試作3層コースター', 'AB-4567', '@145', '1点', '¥145'] * 3 + ['小計', '¥435'])
+    original = deepcopy(items)
+    _replace_duplicate_desc_from_ocr(items, ocr)
+    assert items == original
+    receipt = {'line_items': items}
+    _fix_duplicate_descriptions_from_ocr(receipt, ocr)
+    assert receipt['line_items'] == original
+
+def test_separately_priced_repeated_purchases_survive_an_unrelated_price_error():
+    from copy import deepcopy
+    from receipt_parser.receipt_item_repair import _dedup_same_total_items
+
+    item = {'description': '試作7層コースター', 'qty': 1, 'unit_price': 146,
+            'total': 146, 'discount': 0, 'discount_rate': ''}
+    other = {'description': '検証保管箱', 'qty': 1, 'unit_price': 600, 'total': 600}
+    receipt = {'subtotal': 700, 'total': 700, 'line_items': [deepcopy(item), deepcopy(item), other]}
+    source = '\n'.join(['試作7層コースター', '¥146', '試作7層コースター ¥146',
+                        '検証保管箱 ¥408', '小計', '¥700'])
+    original = deepcopy(receipt)
+    _dedup_same_total_items(receipt, source)
+    _dedup_same_total_items(receipt, source)
+    assert receipt == original
+
+    phantom = {'subtotal': 554, 'total': 554,
+               'line_items': [deepcopy(item), deepcopy(item), dict(other, unit_price=408, total=408)]}
+    single = '\n'.join(['試作7層コースター ¥146', '検証保管箱 ¥408', '小計', '¥554'])
+    _dedup_same_total_items(phantom, single)
+    assert len(phantom['line_items']) == 2
+    assert sum(row['total'] for row in phantom['line_items']) == 554
+
+    changed_digits = deepcopy(original)
+    _dedup_same_total_items(changed_digits, source.replace('試作7層', '試作8層'))
+    assert len(changed_digits['line_items']) == 2
+
+
+def test_campaign_controls_never_own_price_stream():
+    """Reject numbered header owners while preserving literal discount repairs."""
+    from copy import deepcopy
+    from receipt_parser.receipt_marker_projection import _replace_campaign_discount_stream_when_balanced
+
+    names = ["晴海サブレ", "春風No.25ソーダ", "夕月ラップ", "稲穂もち", "朝霧のり"]
+    gross = [73, 91, 197, 284, 315]
+    discount = [0, 0, 39, 57, 63]
+    expected = [
+        dict(description=name, qty=1.0, unit_price=float(price),
+             total=float(price - off), tax_category="8%", discount=float(off),
+             discount_rate="")
+        for name, price, off in zip(names, gross, discount)
+    ]
+    target = sum(row["total"] for row in expected)
+    # Two inline owners leave the control queue pending until the first stack.
+    # A subtotal can balance even when that queue has two spurious owners.
+    body = [
+        f"371901{names[0]} ¥{gross[0]}",
+        f"482012{names[1]} ¥{gross[1]}",
+        f"593123{names[2]}",
+        f"604234{names[3]}",
+        f"¥{gross[2]}", "割引", f"-{discount[2]}",
+        f"¥{gross[3]}", "割引", f"-{discount[3]}",
+        f"715345{names[4]}",
+        f"¥{gross[4]}", "割引", f"-{discount[4]}",
+        "小計", f"¥{target:g}", "お買上商品数:5",
+    ]
+    for controls in (
+        ["スNo00073192林", "スキャンレジ0027 スキャンNo4931"],
+        ["No.7328 担当者", "レジ 0027"],
+        ["レジ0038 ¥91"],
+    ):
+        text = "\n".join(["見本販売店", "2031/7/14 16:42", *controls, *body])
+        complete = dict(subtotal=target, taxes=[], line_items=deepcopy(expected))
+        before = deepcopy(complete)
+        _replace_campaign_discount_stream_when_balanced(complete, text)
+        assert complete == before
+
+        # Existing campaign repairs remain useful even for a balanced placeholder.
+        missing = dict(subtotal=target, taxes=[], line_items=[
+            dict(description="未分類まとめ", qty=1, unit_price=target, total=target),
+        ])
+        _replace_campaign_discount_stream_when_balanced(missing, text)
+        assert missing["line_items"] == expected
+        assert sum(row["total"] for row in missing["line_items"]) == target
+        assert all(row["discount_rate"] == "" for row in missing["line_items"])

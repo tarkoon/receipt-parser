@@ -4,6 +4,22 @@ from receipt_parser.pipeline_bill import postprocess_utility_bill
 from receipt_parser.pipeline_slip import postprocess_payment_slip
 
 
+@pytest.mark.parametrize(("text", "expected"), (
+    ("取扱店印\n北星中央店\n収納代行\n上記金額を領収いたしました", None),
+    ("領入済\n収納済", None),
+    ("口座引落のご案内", "bank_payment"),
+    ("ご指定の口座から振替させていただきます", "bank_payment"),
+    ("現金 ¥500", "cash"),
+    ("クレジット ¥500", "credit"),
+))
+def test_utility_payment_requires_tender_or_explicit_bank_debit_instruction(text, expected):
+    result = postprocess_utility_bill(
+        {"document_type": "utility_bill", "total": 500, "amount_paid": 500,
+         "payment_method": "cash"}, text,
+    )
+    assert result["payment_method"] == expected
+
+
 @pytest.mark.parametrize(
     ("merchant", "text"),
     [

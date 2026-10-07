@@ -1,4 +1,5 @@
 from collections import defaultdict
+import sys
 from pathlib import Path
 
 # Load .env file so tests pick up GOOGLE_CLOUD_PROJECT etc.
@@ -17,11 +18,8 @@ def pytest_addoption(parser):
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """Print accuracy summary table after test_accuracy.py runs."""
-    try:
-        from test_accuracy import _check_results
-    except ImportError:
-        return
-
+    accuracy = sys.modules.get("test_accuracy") or sys.modules.get("tests.test_accuracy")
+    _check_results = getattr(accuracy, "_check_results", [])
     if not _check_results:
         return
 

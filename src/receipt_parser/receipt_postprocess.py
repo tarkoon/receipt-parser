@@ -1,7 +1,5 @@
 """Receipt postprocess orchestration."""
 
-import re
-
 from .receipt_financial import extract_rate_bases
 from .receipt_phase_trace import (
     _record_receipt_phase_mutation,
@@ -53,7 +51,6 @@ from .receipt_postprocess_phases import (
     _run_single_item_quantity_repair_phase,
     _run_item_name_price_cleanup_phase,
     _run_priced_name_item_repair_phase,
-    _run_digit_misread_item_repair_phase,
     _run_code_prefixed_description_cleanup_phase,
     _run_duplicate_row_cleanup_phase,
     _run_basket_marker_rows_phase,
@@ -319,13 +316,6 @@ def postprocess_receipt(
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
         "ocr_description_reconciliation",
-        trace_snapshot,
-        extracted,
-    )
-    _run_digit_misread_item_repair_phase(extracted, unified_text)
-    trace_snapshot = _record_receipt_phase_mutation(
-        mutation_trace,
-        "digit_misread_item_repair",
         trace_snapshot,
         extracted,
     )
@@ -685,18 +675,6 @@ def postprocess_receipt(
         extracted,
     )
 
-    # Clear account_number when it's a masked card number suffix, not a real account
-    acct = extracted.get("account_number")
-    acct_suffix = str(acct).strip().lstrip('*') if acct else ""
-    if acct_suffix and re.search(r'\*{2,}\s*' + re.escape(acct_suffix), unified_text):
-        extracted["account_number"] = None
-    trace_snapshot = _record_receipt_phase_mutation(
-        mutation_trace,
-        "payment_method_repair",
-        trace_snapshot,
-        extracted,
-    )
-
     # Tax categories
     rate_bases = None
     if extracted.get("line_items"):
@@ -802,23 +780,6 @@ def postprocess_receipt(
         extracted,
     )
 
-    # Fix pre-tax item totals for inclusive-tax receipts
-    if extracted.get("line_items") and extracted.get("total"):
-        item_sum = sum(i.get("total", 0) for i in extracted["line_items"] if isinstance(i, dict))
-        receipt_total = extracted["total"]
-        # Skip adjustment when taxes account for the difference (exclusive tax)
-        tax_total = _sum_taxable_amounts(extracted.get("taxes", []))
-        items_are_pretax = tax_total > 0 and abs(item_sum + tax_total - receipt_total) < 2
-        if len(extracted["line_items"]) == 1 and abs(item_sum - receipt_total) > 1 and not items_are_pretax:
-            item = extracted["line_items"][0]
-            if isinstance(item, dict) and abs(item_sum * 1.10 - receipt_total) < 2:
-                item["total"] = receipt_total
-                if item.get("unit_price") and abs(item["unit_price"] - item_sum) < 1:
-                    item["unit_price"] = receipt_total
-            elif isinstance(item, dict) and abs(item_sum * 1.08 - receipt_total) < 2:
-                item["total"] = receipt_total
-                if item.get("unit_price") and abs(item["unit_price"] - item_sum) < 1:
-                    item["unit_price"] = receipt_total
     _run_tax_category_assignment_phase(
         extracted,
         unified_text,
@@ -931,10 +892,8 @@ def postprocess_receipt(
         extracted,
     )
 
-    # Universal subtotal rule: subtotal = total - sum(taxes), regardless of
-    # 内税 / 外税. Pre-tax base is the canonical definition; for 内税 receipts
-    # this means subtotal != sum(line_items) (line items are post-tax) which is
-    # expected and validated.
+    # Included-only subtotals use the pre-tax base; mixed item prices already
+    # include 内税, so only separately added 外税 is removed from the total.
     #
     # Preserve an existing subtotal when it's close to the computed value —
     # this guards against 1-2 yen rounding flips when the tax was extracted
@@ -1593,7 +1552,7 @@ def postprocess_receipt(
     )
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
-        "discount_consistency_reconciliation",
+        "structural_item_reconstruction",
         trace_snapshot,
         extracted,
     )
@@ -1642,7 +1601,7 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _run_code_prefixed_description_cleanup_phase(extracted)
+    _run_code_prefixed_description_cleanup_phase(extracted, unified_text)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
         "code_prefixed_description_cleanup",
@@ -1654,6 +1613,12 @@ def postprocess_receipt(
         computed_sub = float(extracted["total"]) - tax_sum
         if computed_sub >= 0:
             extracted["subtotal"] = computed_sub
+    trace_snapshot = _record_receipt_phase_mutation(
+        mutation_trace,
+        "financial_totals_repair",
+        trace_snapshot,
+        extracted,
+    )
     _run_discounted_ocr_item_repair_phase(extracted, unified_text)
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
@@ -1714,7 +1679,10 @@ def postprocess_receipt(
         trace_snapshot,
         extracted,
     )
-    _run_payment_method_repair_phase(extracted, unified_text, ocr_conf, llm_conf)
+    _run_payment_method_repair_phase(
+        extracted, unified_text, ocr_conf, llm_conf,
+        account_text=payment_reference_text,
+    )
     trace_snapshot = _record_receipt_phase_mutation(
         mutation_trace,
         "payment_method_repair",

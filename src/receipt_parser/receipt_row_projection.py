@@ -8,6 +8,7 @@ from .patterns import (
     _HEADER_LINE_RE,
     _OCR_TRAILING_PRICE_RE,
     _SKIP_PRICE_LINE,
+    _discount_rate_tokens,
 )
 from .receipt_financial import extract_rate_bases, normalize_tax_rate
 from .receipt_item_cleanup import _clear_discounts_without_nearby_ocr_marker
@@ -607,6 +608,8 @@ def _replace_overage_item_with_low_value_bag(extracted, unified_text):
     items = extracted.get("line_items") or []
     if not items:
         return
+    if any(isinstance(item, dict) and _is_bag_description(item.get("description") or "") for item in items):
+        return
     targets = [
         t for t in (extracted.get("subtotal"), extracted.get("total"))
         if t is not None
@@ -782,10 +785,10 @@ def _replace_service_table_items_when_balanced(extracted, unified_text):
         return
 
     for idx, line in enumerate(lines[start + 1:end], start + 1):
-        if not re.search(r'(\d+(?:\.\d+)?)\s*%\s*OFF|割引|値引', line, re.IGNORECASE):
+        if not re.search(r'[%％]\s*OFF|割引|値引', line, re.IGNORECASE):
             continue
-        rate_m = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
-        rate = float(rate_m.group(1)) / 100.0 if rate_m else None
+        rates = _discount_rate_tokens(line)
+        rate = rates[-1] / 100.0 if rates else None
         discount = None
         for j in range(idx + 1, min(idx + 4, end)):
             dm = re.fullmatch(r'-\s*[¥￥]?\s*(\d[\d,]*)\s*', lines[j])
@@ -810,7 +813,7 @@ def _replace_service_table_items_when_balanced(extracted, unified_text):
         if best is None:
             continue
         best["discount"] = discount
-        best["discount_rate"] = f"{int(rate * 100)}%" if rate is not None else ""
+        best["discount_rate"] = f"{rate * 100:g}%" if rate is not None else ""
         best["total"] = float(best["unit_price"]) - discount
 
     _apply_coupon_discount_blocks({"line_items": rows}, unified_text)
@@ -1096,7 +1099,7 @@ def _replace_dense_item_rows_when_balanced(extracted, unified_text):
 
     def _looks_like_metadata(line: str) -> bool:
         return bool(re.search(
-            r'AEON|TEL|FAX|http|領収|登録番号|株式会社|毎月|ぜひ|レジ|取\d|登\s*:|スキャン|'
+            r'TEL|FAX|http|領収|登録番号|株式会社|毎月|ぜひ|レジ|取\d|登\s*:|スキャン|'
             r'\d{4}/\d{1,2}/\d{1,2}|\d{4}年|^\d{1,2}:\d{2}$',
             line,
             re.IGNORECASE,
@@ -1570,9 +1573,7 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
     pending_names: list[dict] = []
     pending_qty_details: list[tuple[int, float, float]] = []
     pending_leading_amounts: list[tuple[float, str]] = []
-    pending_amount_fragments: list[tuple[dict, str, float]] = []
-    shifted_split_inline_source_idx: int | None = None
-    fragment_follows_shifted_split = False
+    pending_amount_fragments: list[float] = []
     last_row: dict | None = None
     selected_discount_owner: dict | None = None
     pending_discount_rows: list[dict] = []
@@ -1649,21 +1650,10 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
         return f"{int(matches[0] * 100)}%" if len(matches) == 1 else ""
 
     def _rate_matches_discount(gross: float, rate: float, discount: float) -> bool:
-        if (
+        return (
             0 < rate <= 100
             and abs(discount - gross * rate / 100.0)
             <= max(2.0, gross * 0.03)
-        ):
-            return True
-        inferred_rate = _rate_from_discount(gross, discount)
-        if not inferred_rate:
-            return False
-        inferred_value = float(inferred_rate.rstrip("%"))
-        return (
-            rate > 100
-            and rate.is_integer()
-            and inferred_value.is_integer()
-            and str(int(rate)).endswith(str(int(inferred_value)))
         )
 
     def _discount_score(row: dict, discount: float) -> float | None:
@@ -1671,9 +1661,11 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
         if gross <= discount:
             return None
         rate_text = str(row.get("discount_rate") or "")
-        rate_match = re.search(r'(\d+(?:\.\d+)?)\s*%', rate_text)
-        if rate_match:
-            rate = float(rate_match.group(1)) / 100.0
+        row_rates = _discount_rate_tokens(
+            rate_text, full_match=True, allow_unmarked=True
+        )
+        if row_rates:
+            rate = row_rates[0] / 100.0
             expected = gross * rate
             if abs(expected - discount) <= max(2.0, expected * 0.03):
                 return abs(expected - discount)
@@ -1686,16 +1678,17 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
 
     def _apply_discount(discount: float, selected_row: dict | None = None) -> bool:
         if selected_row is not None:
-            selected_rate = re.search(
-                r'(\d+(?:\.\d+)?)\s*%',
-                str(selected_row.get("discount_rate") or ""),
+            selected_rates = _discount_rate_tokens(
+                selected_row.get("discount_rate") or "",
+                full_match=True,
+                allow_unmarked=True,
             )
             if (
                 selected_row.get("discount", 0) not in (0, 0.0, None)
-                or not selected_rate
+                or not selected_rates
                 or not _rate_matches_discount(
                     _row_gross(selected_row),
-                    float(selected_rate.group(1)),
+                    selected_rates[0],
                     discount,
                 )
             ):
@@ -1727,25 +1720,12 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
         if gross <= discount:
             return False
         row["discount"] = float(discount)
-        inferred_rate = _rate_from_discount(gross, discount)
-        printed_rate = re.search(
-            r'(\d+(?:\.\d+)?)\s*%',
-            str(row.get("discount_rate") or ""),
-        )
-        if not printed_rate:
-            row["discount_rate"] = inferred_rate
-        elif inferred_rate:
-            printed_value = float(printed_rate.group(1))
-            inferred_value = float(inferred_rate.rstrip("%"))
-            if (
-                printed_value > 100
-                and printed_value.is_integer()
-                and inferred_value.is_integer()
-                and str(int(printed_value)).endswith(str(int(inferred_value)))
-                and abs(discount - gross * printed_value / 100.0)
-                > max(2.0, gross * 0.03)
-            ):
-                row["discount_rate"] = inferred_rate
+        if not _discount_rate_tokens(
+            row.get("discount_rate") or "",
+            full_match=True,
+            allow_unmarked=True,
+        ):
+            row["discount_rate"] = ""
         if float(row.get("qty") or 1) > 1 and row.get("_printed_amount") and not row.get("unit_price"):
             row["unit_price"] = float(row["_printed_amount"]) / float(row.get("qty") or 1)
         row["total"] = gross - float(discount)
@@ -1812,13 +1792,7 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
             if qty > 1 and (qty, unit) not in candidates:
                 candidates.append((qty, unit))
 
-        has_explicit_count_marker = bool(re.search(r'\d+\s*[個コ]', line))
-        if has_explicit_count_marker:
-            _add(float(qty_text))
-        elif len(qty_text) > 1 and qty_text[0] in "23456789":
-            _add(float(qty_text[0]))
-        else:
-            _add(float(qty_text))
+        _add(float(qty_text))
 
         return candidates
 
@@ -1846,12 +1820,8 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
 
         for left in left_digits:
             qty_candidates = [int(left)]
-            if len(left) > 1 and left[0] in "23456789":
-                qty_candidates.append(int(left[0]))
             for right in right_digits:
                 unit_candidates = [int(right)]
-                if len(right) > 1:
-                    unit_candidates.append(int(right[1:]))
                 for qty in qty_candidates:
                     for unit in unit_candidates:
                         _add(qty, unit)
@@ -1901,6 +1871,21 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
                 _apply_marker_summary(last_row, qty, total)
             continue
 
+        syntactic_rate = re.fullmatch(r'\s*-?\s*\d+(?:\.\d+)?\s*[%％]\s*', line)
+        preceded_by_discount_label = source_idx > 0 and bool(
+            re.fullmatch(r'割引|値引(?:き)?', zone[source_idx - 1])
+        )
+        followed_by_discount_amount = source_idx + 1 < len(zone) and bool(
+            re.fullmatch(r'-\s*[¥￥]?\s*\d[\d,]*', zone[source_idx + 1])
+        )
+        if (
+            syntactic_rate
+            and not _discount_rate_tokens(line, full_match=True)
+            and preceded_by_discount_label
+            and followed_by_discount_amount
+        ):
+            continue
+
         qty_candidates = _qty_detail_candidates(line)
         if qty_candidates and pending_names:
             _queue_qty_details(source_idx, qty_candidates)
@@ -1932,18 +1917,18 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
                 pending_discount_rows.append(last_row)
             continue
 
-        rate_m = re.fullmatch(r'(\d+(?:\.\d+)?)\s*%', line)
+        rate_values = _discount_rate_tokens(line, full_match=True)
         rate_owner_is_unambiguous = (
             not pending_names
             and not pending_qty_details
             and not pending_leading_amounts
         )
-        if rate_m:
+        if rate_values:
             next_discount = re.fullmatch(
                 r'-\s*[¥￥]?\s*(\d[\d,]*)',
                 zone[source_idx + 1] if source_idx + 1 < len(zone) else "",
             )
-            rate = float(rate_m.group(1))
+            rate = rate_values[0]
             rate_text = f"{rate:g}%"
             if next_discount:
                 discount = float(next_discount.group(1).replace(',', ''))
@@ -1987,6 +1972,8 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
                 last_row["discount_rate"] = rate_text
                 selected_discount_owner = last_row
                 continue
+            if selected_discount_owner is not None and pending_names:
+                continue
 
         discount_m = re.fullmatch(r'-\s*[¥￥]?\s*(\d[\d,]*)', line)
         if discount_m:
@@ -2011,7 +1998,6 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
             second = float(split_inline.group(4).replace(',', ''))
             if _valid_desc(desc) and 0 < first <= float(subtotal) and 0 < second <= float(subtotal):
                 if pending_names:
-                    shifted_split_inline_source_idx = source_idx
                     pending_desc = pending_names.pop(0)
                     for row_desc, value, marker in (
                         (desc, first, split_inline.group(3)),
@@ -2041,11 +2027,7 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
                 observed = float(fragment)
                 row = _make_row(desc, observed, "")
                 rows.append(row)
-                pending_amount_fragments.append((row, fragment, observed))
-                fragment_follows_shifted_split = (
-                    shifted_split_inline_source_idx is not None
-                    and source_idx - shifted_split_inline_source_idx in (1, 2)
-                )
+                pending_amount_fragments.append(observed)
                 last_row = row if observed >= 10 else None
                 continue
 
@@ -2104,11 +2086,7 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
             ):
                 row = _make_row(desc, value, "")
                 rows.append(row)
-                pending_amount_fragments.append((row, fragment.group(0), value))
-                fragment_follows_shifted_split = (
-                    shifted_split_inline_source_idx is not None
-                    and source_idx - shifted_split_inline_source_idx in (1, 2)
-                )
+                pending_amount_fragments.append(value)
                 last_row = row if value >= 10 else None
                 continue
             if value < 10 and not _is_bag_description(desc):
@@ -2176,44 +2154,12 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
     ):
         return
 
-    recovered_amount_fragment = False
     initial_row_sum = sum(float(row["total"]) for row in rows)
-    if abs(initial_row_sum - float(subtotal)) > 2 and (
-        len(pending_amount_fragments) == 1
-        and fragment_follows_shifted_split
-        and not pending_names
-        and not pending_qty_details
-        and not pending_leading_amounts
-    ):
-        row, fragment, observed = pending_amount_fragments[0]
-        inferred = float(subtotal) - (initial_row_sum - observed)
-        inferred_rounded = round(inferred)
-        inferred_text = str(int(inferred_rounded))
-        if (
-            inferred > 0
-            and inferred <= float(subtotal)
-            and abs(inferred - inferred_rounded) <= 0.01
-            and len(inferred_text) > len(fragment)
-            and inferred_text.startswith(fragment)
-            and float(row.get("qty") or 1) == 1
-            and not float(row.get("discount") or 0)
-            and abs(float(row.get("unit_price") or 0) - observed) <= 0.01
-            and abs(float(row.get("total") or 0) - observed) <= 0.01
-        ):
-            row["unit_price"] = inferred
-            row["total"] = inferred
-            row["_printed_amount"] = inferred
-            recovered_amount_fragment = (
-                abs(sum(float(row["total"]) for row in rows) - float(subtotal)) <= 0.01
-            )
+    # ponytail: Subtotal agreement cannot supply missing price digits.
     if (
         abs(initial_row_sum - float(subtotal)) > 2
         and pending_amount_fragments
-        and not recovered_amount_fragment
-    ) or (
-        not recovered_amount_fragment
-        and any(observed < 10 for _row, _fragment, observed in pending_amount_fragments)
-    ):
+    ) or any(observed < 10 for observed in pending_amount_fragments):
         return
 
     _apply_marker_summaries()
@@ -2256,64 +2202,6 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
     if vertical_count is not None and len(rows) != vertical_count:
         return
 
-    def _repair_percent_marker_amount_from_arithmetic() -> None:
-        nonlocal row_sum
-        gap = float(subtotal) - row_sum
-        base_sum = sum(float(base) for base in rate_bases.values() if base is not None)
-        if abs(gap - 8) > 0.01 or abs(base_sum - float(subtotal)) > 2:
-            return
-        candidates = [
-            row for row in rows
-            if re.search(r'[%％]', str(row.get("_marker") or ""))
-            and float(row.get("qty") or 1) == 1
-            and not float(row.get("discount") or 0)
-            and float(row.get("total") or 0) >= 10
-        ]
-        if len(candidates) != 1:
-            return
-        row = candidates[0]
-        corrected = float(row.get("total") or 0) + gap
-        row["unit_price"] = corrected
-        row["total"] = corrected
-        row["_printed_amount"] = corrected
-        row_sum += gap
-
-    def _repair_leading_digit_amount_from_subtotal() -> None:
-        nonlocal row_sum
-        gap = row_sum - float(subtotal)
-        if gap <= 0 or abs(gap - round(gap)) > 0.01:
-            return
-        candidates: list[tuple[dict, float]] = []
-        for row in rows:
-            amount = float(row.get("_printed_amount") or row.get("total") or 0)
-            if (
-                amount < 1000
-                or float(row.get("qty") or 1) != 1
-                or float(row.get("discount") or 0)
-                or abs(amount - round(amount)) > 0.01
-            ):
-                continue
-            amount_text = str(int(round(amount)))
-            if len(amount_text) < 4:
-                continue
-            corrected_text = amount_text[1:]
-            if not corrected_text or not corrected_text.isdigit():
-                continue
-            corrected = float(int(corrected_text))
-            if corrected < 10:
-                continue
-            if abs((amount - corrected) - gap) <= 2:
-                candidates.append((row, corrected))
-        if len(candidates) != 1:
-            return
-        row, corrected = candidates[0]
-        row["unit_price"] = corrected
-        row["total"] = corrected
-        row["_printed_amount"] = corrected
-        row_sum = sum(float(row["total"]) for row in rows)
-
-    _repair_leading_digit_amount_from_subtotal()
-    _repair_percent_marker_amount_from_arithmetic()
     if abs(row_sum - float(subtotal)) > 2:
         return
     current_items = [item for item in (extracted.get("line_items") or []) if isinstance(item, dict)]
@@ -2324,7 +2212,7 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
         and len(rows) != printed_count
         and row_qty_sum != printed_count
     )
-    if count_mismatch and not recovered_amount_fragment:
+    if count_mismatch:
         base_sum = sum(float(base) for base in rate_bases.values() if base is not None)
         if base_sum <= 0 or abs(base_sum - float(subtotal)) > 2:
             return
@@ -2432,20 +2320,6 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
 
     if rate_bases and not _rate_base_sums_match():
         _assign_unique_rate_base_subset()
-    if recovered_amount_fragment and (
-        not rate_bases
-        or len(known_rate_bases) != len(rate_bases)
-        or not _rate_base_sums_match()
-    ):
-        return
-    if recovered_amount_fragment and count_mismatch:
-        count_exempt_rows = [
-            row for row in rows
-            if _is_bag_description(row.get("description"))
-            and re.search(r'[非除]', str(row.get("_marker") or ""))
-        ]
-        if len(count_exempt_rows) != len(rows) - printed_count:
-            return
     if rate_bases and abs(
         sum(float(base) for base in rate_bases.values() if base is not None)
         - float(subtotal)
@@ -2456,7 +2330,45 @@ def _replace_dense_sequence_rows_when_balanced(extracted, unified_text):
     if abs(sum(float(row.get("total") or 0) for row in rows) - float(subtotal)) > 2:
         return
 
-    if current_items_are_complete_and_balanced and not recovered_amount_fragment:
+    if current_items_are_complete_and_balanced:
+        finance_keys = ("unit_price", "total", "discount", "tax_category", "discount_rate")
+        ordered_finances_match = len(current_items) == len(rows) and all(
+            abs(float(item["qty"]) - float(row["qty"])) <= 0.01
+            and all(item.get(key) == row.get(key) for key in finance_keys)
+            for item, row in zip(current_items, rows)
+        )
+        if ordered_finances_match:
+            signature_keys = ("qty", *finance_keys)
+            title_counts = Counter(_norm_layout_desc(row["description"]) for row in rows)
+            signature_counts = Counter(tuple(row.get(key) for key in signature_keys) for row in rows)
+            for item, row in zip(current_items, rows):
+                if (
+                    any(
+                        item["description"] == row["description"] + closer
+                        or row["description"] == item["description"] + closer
+                        for closer in (")", "）")
+                    )
+                    and title_counts[_norm_layout_desc(row["description"])] == 1
+                    and signature_counts[tuple(row.get(key) for key in signature_keys)] == 1
+                ):
+                    item["description"] = row["description"]
+            changed = [
+                idx for idx, (item, row) in enumerate(zip(current_items, rows))
+                if _norm_layout_desc(item["description"]) != _norm_layout_desc(row["description"])
+            ]
+            if len(changed) == 1:
+                idx = changed[0]
+                duplicate_title = sum(
+                    _norm_layout_desc(item["description"])
+                    == _norm_layout_desc(current_items[idx]["description"])
+                    for item in current_items
+                ) > 1
+                signature = tuple(rows[idx].get(key) for key in signature_keys)
+                if duplicate_title and sum(
+                    tuple(row.get(key) for key in signature_keys) == signature
+                    for row in rows
+                ) == 1:
+                    current_items[idx]["description"] = rows[idx]["description"]
         if len(jan_barcodes) >= 2:
             _project_balanced_descriptions_to_layout_rows(
                 current_items,

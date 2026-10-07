@@ -269,3 +269,56 @@ def test_blank_reference_label_does_not_steal_owned_numeric_value(
     _fix_payment_reference(extracted, f"{owner_line}\n{candidate}\nレシートNo.")
 
     assert extracted["payment_reference"] is None
+def test_account_identifiers_require_unique_allowed_owner_and_original_text():
+    from copy import deepcopy
+    from receipt_parser.pipeline_slip import _fix_account_number, postprocess_payment_slip
+    from receipt_parser.receipt_postprocess import postprocess_receipt
+    from receipt_parser.pipeline_bill import postprocess_utility_bill
+
+    cases = [
+        (None, '顧客コード\n0012345678901', '0012345678901'),
+        (None, '顧客コード\n¥500\n0012345678901\n¥10', '0012345678901'),
+        (None, '[ご請求コード: AB00987654 ]', 'AB00987654'),
+        (None, '顧客No. 0078', '0078'),
+        ('0012345', 'お客様番号\n0012345', '0012345'),
+        ('0012345', '会員番号 0012345\nお客様番号 0012345', None),
+        ('0012345', '会員番号 9999999\nお客様番号 0012345', '0012345'),
+        ('123', 'お客さま番号\n123\n商品完成後、上記番号でお呼びします。', None),
+        ('0042-0011-3456-260101', 'お客様No.0042-0011-3456-260101\nレシートNo3456\n店No00042', None),
+        ('0042-0011-3456-260101', 'お客様No.0042-0011-3456-260101\nレシートNo9876\n店No00042', '0042-0011-3456-260101'),
+        ('********1234', 'WAON番号\n********1234', None),
+        ('1234', 'WAON番号\n********1234', None),
+        ('1234', 'お客様番号 1234\nWAON番号\n********1234', '1234'),
+        ('77881234', 'Card Number 77881234', None),
+        ('7788', '受取番号 7788', None),
+        ('7788', '伝票No. 7788', None),
+        ('7788', '伝票No. 7788\n顧客No. 0012345', '0012345'),
+        ('0012345', 'お客様番号 0012345\n顧客コード 0098765', None),
+        (None, 'お客様番号\n別の商品\n0012345', None),
+        (None, '請求コード\n¥500\n¥600\n0012345', None),
+    ]
+    for current, text, expected in cases:
+        value = {'account_number': current}
+        _fix_account_number(value, text)
+        assert value['account_number'] == expected
+        before = deepcopy(value)
+        _fix_account_number(value, text)
+        assert value == before
+
+    original = '顧客コード\n0012345678901\n合計\n¥100'
+    normalized = '顧客コード\n合計\n¥100'
+    base = {'document_type': 'receipt', 'merchant': 'Store', 'account_number': None,
+            'total': 100, 'subtotal': 100, 'amount_paid': 100, 'taxes': [], 'line_items': []}
+    receipt = deepcopy(base)
+    trace = []
+    postprocess_receipt(receipt, normalized, 0.9, {}, {}, 'unit-test', payment_reference_text=original, mutation_trace=trace)
+    assert receipt['account_number'] == '0012345678901'
+    account_event = next(event for event in trace if 'account_number' in event.get('changes', {}))
+    assert account_event['stage'] == 'payment_method_repair'
+    assert 'account_number' in account_event['writes']
+    slip = deepcopy(base)
+    postprocess_payment_slip(slip, normalized, raw_text=original)
+    assert slip['account_number'] == '0012345678901'
+    bill = deepcopy(base)
+    postprocess_utility_bill(bill, normalized, payment_reference_text=original)
+    assert bill['account_number'] == '0012345678901'

@@ -21,14 +21,20 @@ import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from pathlib import Path
 
 import cv2
 import pytest
-from receipt_parser.llm import DEFAULT_MODEL
+import receipt_parser
+from receipt_parser.llm import (
+    DEFAULT_MODEL, _configured_triage_models, _triage_max_tokens,
+)
 from receipt_parser.normalize import normalize_fullwidth, strip_barcode_lines
 from receipt_parser.ocr import (
     _OCR_CACHE_DIR,
+    _fulltext_to_blocks,
+    blocks_to_structured_text,
     _ocr_cache_key,
     load_cached_ocr_layout,
     load_ocr_replay_evidence,
@@ -36,11 +42,24 @@ from receipt_parser.ocr import (
 )
 from receipt_parser.preprocess import load_image, try_extract_text_layer
 from receipt_parser.pipeline import detect_document_type
+from receipt_parser.receipt_pixel_markers import build_pixel_marker_context
+from receipt_parser.receipt_vision import configured_vision_model, vision_cache_files
 from receipt_parser.receipt_supplemental_ocr import (
     SUPPLEMENTAL_OCR_CACHE_DIR,
     SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
     load_supplemental_ocr_evidence,
     supplemental_ocr_cache_path,
+    QUANTITY_CROP_OCR_CACHE_DIR,
+    build_quantity_crop_context,
+    load_quantity_crop_ocr_evidence,
+    quantity_crop_ocr_cache_path,
+    reconcile_supplemental_quantity_rows,
+    reconcile_quantity_crop_rows,
+    NATIVE_OWNER_CROP_OCR_CACHE_DIR, NATIVE_OWNER_CROP_OCR_FINGERPRINT,
+    build_native_owner_crop_context,
+    build_native_title_crop_context, NATIVE_TITLE_CROP_OCR_FINGERPRINT,
+    build_native_price_column_context, NATIVE_PRICE_COLUMN_OCR_FINGERPRINT,
+    _build_financial_source_identity,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -49,6 +68,13 @@ VARIANTS = Path(__file__).resolve().parent.parent / ".data" / "ocr_cache" / "var
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OCR_CACHE_DIR = _OCR_CACHE_DIR
 ACCURACY_PASSES = 3
+
+
+def _vision_mode() -> str:
+    mode = os.environ.get("RECEIPT_VISION_MODE", "normal").strip()
+    if mode not in {"normal", "cache_only", "fresh"}:
+        raise ValueError("RECEIPT_VISION_MODE must be normal, cache_only, or fresh")
+    return mode
 
 
 class _CacheOnlyOCREngine:
@@ -225,7 +251,7 @@ def _cached_ocr_artifacts(source: Path) -> list[tuple[str, Path]]:
         if not text_path.exists():
             continue
         artifacts.append((f"page:{page}:ocr_layout", OCR_CACHE_DIR / f"{key}.layout.json"))
-        block_count = len([line for line in text_path.read_text(encoding="utf-8").splitlines() if line.strip()])
+        block_count = len([line for line in text_path.read_text(encoding="utf-8").split("\n") if line.strip()])
         if block_count >= 3:
             continue
         best_count = block_count
@@ -240,7 +266,7 @@ def _cached_ocr_artifacts(source: Path) -> list[tuple[str, Path]]:
                 break
             artifacts.append((f"{prefix}:ocr_layout", OCR_CACHE_DIR / f"{rotated_key}.layout.json"))
             rotated_count = len([
-                line for line in rotated_text.read_text(encoding="utf-8").splitlines()
+                line for line in rotated_text.read_text(encoding="utf-8").split("\n")
                 if line.strip()
             ])
             rotated_confidence = 0.9 if rotated_count else 0.0
@@ -288,7 +314,7 @@ def _supplemental_ocr_artifact(
         "strategy_fingerprint": SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
     }
     return (
-        supplemental_ocr_cache_path(SUPPLEMENTAL_OCR_CACHE_DIR, **identity),
+        supplemental_ocr_cache_path(SUPPLEMENTAL_OCR_CACHE_DIR, **identity, for_read=True),
         identity,
     )
 
@@ -299,9 +325,9 @@ def _selected_cached_ocr_text(image) -> str | None:
     if not text_path.is_file():
         return None
     best_text = text_path.read_text(encoding="utf-8")
-    best_count = len([line for line in best_text.splitlines() if line.strip()])
+    best_count = len([line for line in best_text.split("\n") if line.strip()])
     if best_count >= 3:
-        return "\n".join(line.strip() for line in best_text.splitlines() if line.strip())
+        return blocks_to_structured_text(_fulltext_to_blocks(best_text))
     for rotation in (
         cv2.ROTATE_90_CLOCKWISE,
         cv2.ROTATE_180,
@@ -312,14 +338,123 @@ def _selected_cached_ocr_text(image) -> str | None:
             return None
         rotated_text = rotated_path.read_text(encoding="utf-8")
         rotated_count = len([
-            line for line in rotated_text.splitlines() if line.strip()
+            line for line in rotated_text.split("\n") if line.strip()
         ])
         if rotated_count > best_count:
             best_text = rotated_text
             best_count = rotated_count
         if best_count:
             break
-    return "\n".join(line.strip() for line in best_text.splitlines() if line.strip())
+    return blocks_to_structured_text(_fulltext_to_blocks(best_text))
+
+
+def _quantity_primary_geometry(image, text, text_path):
+    """Equivalent replay text uses the original image cache's frame authority."""
+    image_key = _ocr_cache_key(image)
+    original_path = OCR_CACHE_DIR / f"{image_key}.txt"
+
+    def canonical(value):
+        return normalize_fullwidth(blocks_to_structured_text(_fulltext_to_blocks(value)))
+
+    selected = _selected_cached_ocr_text(image)
+    authority = original_path if selected is not None and canonical(text) == canonical(selected) else text_path
+    if not authority.is_file():
+        return None
+    raw = authority.read_text(encoding="utf-8")
+    if authority == original_path and (selected is None or canonical(selected) != canonical(raw)):
+        return None
+    _, trusted = load_cached_ocr_layout(authority, expected_ocr_text=raw, strict_envelope=True)
+    if not trusted:
+        return None
+    replay = load_ocr_replay_evidence(authority, expected_ocr_text=raw)
+    return replay["layout_blocks"] if replay and replay["provenance"]["source"] == image_key else None
+
+
+def _pixel_marker_artifact(case_id, source, supplemental_evidence, crop_bundle=None):
+    """Bind replay pixels independently of whether a native crop was eligible."""
+    if source["type"] != "ocr_text":
+        return None
+    image_path = _find_image(_extract_base_name(case_id))
+    if image_path is None or (
+        image_path.suffix.lower() == ".pdf" and try_extract_text_layer(str(image_path))
+    ):
+        return None
+    images = load_image(image_path)
+    if len(images) != 1:
+        return None
+    text = source["path"].read_text(encoding="utf-8")
+    if detect_document_type(strip_barcode_lines(normalize_fullwidth(text))) != "receipt":
+        return None
+    primary_layout = _quantity_primary_geometry(images[0], text, source["path"])
+    repair_text, _ = reconcile_supplemental_quantity_rows(normalize_fullwidth(text), supplemental_evidence)
+    if crop_bundle and not crop_bundle.get("native_owner"):
+        repair_text, _ = reconcile_quantity_crop_rows(
+            repair_text, crop_bundle.get("evidence"), expected_context=crop_bundle.get("context"),
+        )
+    return build_pixel_marker_context(images[0], repair_text, primary_layout, supplemental_evidence)
+
+
+def _preflight_pixel_marker_contexts(cases, supplemental, quantity):
+    return {
+        source["path"]: _pixel_marker_artifact(name, source, supplemental.get(source["path"]), quantity.get(source["path"]))
+        for name, source, _truth in cases if source["type"] == "ocr_text"
+    }
+
+
+def _quantity_crop_artifact(case_id, source):
+    supplemental = _supplemental_ocr_artifact(case_id, source)
+    if supplemental is None:
+        return None
+    _, identity = supplemental
+    image_path = source["path"] if source["type"] == "image" else _find_image(_extract_base_name(case_id))
+    image = load_image(image_path)[0]
+    text_path = source["path"] if source["type"] == "ocr_text" else OCR_CACHE_DIR / f'{identity["image_key"]}.txt'
+    text = source["path"].read_text(encoding="utf-8") if source["type"] == "ocr_text" else _selected_cached_ocr_text(image)
+    primary_layout = _quantity_primary_geometry(image, text, text_path)
+    evidence = load_supplemental_ocr_evidence(SUPPLEMENTAL_OCR_CACHE_DIR, **identity)
+    repair_text, _ = reconcile_supplemental_quantity_rows(normalize_fullwidth(text), evidence)
+    context = build_quantity_crop_context(image, repair_text,
+        primary_layout_blocks=primary_layout, supplemental_ocr_evidence=evidence)
+    if context is not None:
+        return quantity_crop_ocr_cache_path(QUANTITY_CROP_OCR_CACHE_DIR, context), context
+    context = build_native_owner_crop_context(image, repair_text, supplemental_ocr_evidence=evidence)
+    if context is None:
+        context = build_native_title_crop_context(image, repair_text, supplemental_ocr_evidence=evidence)
+    if context is None:
+        context = build_native_price_column_context(image, repair_text, supplemental_ocr_evidence=evidence)
+    if context is None:
+        return None
+    return quantity_crop_ocr_cache_path(
+        NATIVE_OWNER_CROP_OCR_CACHE_DIR, context, fingerprint=context["strategy_fingerprint"]), context
+
+
+def _preflight_quantity_crop(cases):
+    bundles = {}
+    for name, source, truth in cases:
+        artifact = _quantity_crop_artifact(name, source)
+        if artifact is None:
+            continue
+        path, context = artifact
+        fingerprint = (context or {}).get("strategy_fingerprint")
+        native = fingerprint in {NATIVE_OWNER_CROP_OCR_FINGERPRINT, NATIVE_TITLE_CROP_OCR_FINGERPRINT, NATIVE_PRICE_COLUMN_OCR_FINGERPRINT}
+        evidence = load_quantity_crop_ocr_evidence(
+            NATIVE_OWNER_CROP_OCR_CACHE_DIR if native else QUANTITY_CROP_OCR_CACHE_DIR,
+            expected_context=context, fingerprint=fingerprint)
+        if path.is_file() and evidence is None:
+            raise ValueError(f"Invalid quantity crop OCR sidecar: {path}")
+        if source["type"] == "ocr_text" and evidence is not None:
+            bundles[source["path"]] = dict(evidence=evidence, context=context)
+            if native:
+                bundles[source["path"]]["native_owner"] = True
+            if fingerprint == NATIVE_PRICE_COLUMN_OCR_FINGERPRINT:
+                image = load_image(_find_image(_extract_base_name(name)))[0]
+                sealed = _SUPPLEMENTAL_OCR_EVIDENCE.get(source["path"])
+                text, _ = reconcile_supplemental_quantity_rows(
+                    normalize_fullwidth(source["path"].read_text(encoding="utf-8")), sealed)
+                bundles[source["path"]]["source_identity"] = _build_financial_source_identity(image, text, sealed)
+    return bundles
+
+
 
 
 def _update_path_fingerprint(digest, label: str, path: Path) -> None:
@@ -339,6 +474,14 @@ def _corpus_sha256(cases) -> str:
         digest.update(source["type"].encode())
         digest.update(source["path"].read_bytes())
         digest.update(json.dumps(truth, ensure_ascii=False, sort_keys=True).encode())
+        image_source = source["path"] if source["type"] == "image" else _find_image(_extract_base_name(case_id))
+        if image_source is not None:
+            images = load_image(image_source)
+            if len(images) == 1:
+                paths = sorted(vision_cache_files(images[0]))
+                digest.update(b"receipt_vision_cache:present\0" if paths else b"receipt_vision_cache:missing\0")
+                for path in paths:
+                    _update_path_fingerprint(digest, f"receipt_vision:{path.name}", path)
         if source["type"] == "image":
             for label, path in _cached_ocr_artifacts(source["path"]):
                 _update_path_fingerprint(digest, label, path)
@@ -348,12 +491,25 @@ def _corpus_sha256(cases) -> str:
                 "ocr_layout_sidecar",
                 ocr_layout_sidecar_path(source["path"]),
             )
+            image_source = _find_image(_extract_base_name(case_id))
+            if image_source is not None:
+                _update_path_fingerprint(digest, "pixel_original_image", image_source)
+                for label, path in _cached_ocr_artifacts(image_source):
+                    _update_path_fingerprint(digest, f"pixel_original:{label}", path)
         supplemental = _supplemental_ocr_artifact(case_id, source)
         if supplemental is not None:
             path, _identity = supplemental
             _update_path_fingerprint(
                 digest, f"supplemental_ocr:{path.name}", path,
             )
+        crop = _quantity_crop_artifact(case_id, source)
+        if crop is not None:
+            path, _context = crop
+            kind = {NATIVE_TITLE_CROP_OCR_FINGERPRINT: 'native_title_ocr',
+                    NATIVE_OWNER_CROP_OCR_FINGERPRINT: 'native_owner_ocr',
+                    NATIVE_PRICE_COLUMN_OCR_FINGERPRINT: 'native_price_column_ocr'}.get(
+                        (_context or {}).get('strategy_fingerprint'), 'quantity_crop_ocr')
+            _update_path_fingerprint(digest, f"{kind}:{path.name}", path)
     return digest.hexdigest()
 
 
@@ -469,6 +625,7 @@ def _git_state() -> dict:
 
 
 try:
+    _VISION_MODE = _vision_mode()
     _REQUESTED_FIXTURES = _requested_fixture_names()
     _RECEIPT_CEILING = _receipt_ceiling()
     _ALL_CASES, _UNAVAILABLE_IMAGE_CASES = _discover_test_cases_with_exclusions()
@@ -505,12 +662,19 @@ _ACCURACY_SCOPE = {
     },
     "cloud_vision_available": _cv_available,
     "model": DEFAULT_MODEL,
+    "vision_mode": _VISION_MODE,
+    "vision_model": configured_vision_model(),
+    "triage_models": _configured_triage_models(),
+    "triage_max_tokens": _triage_max_tokens(),
+    "package_source": str(Path(receipt_parser.__file__).resolve()),
     "passes": ACCURACY_PASSES,
     "apply_user_rules": False,
 }
 _RESULTS_CACHE: dict[str, dict] = {}
 _OCR_TEXT_LAYOUTS: dict[Path, dict | None] = {}
 _SUPPLEMENTAL_OCR_EVIDENCE: dict[Path, dict] = {}
+_QUANTITY_CROP_EVIDENCE: dict[Path, dict] = {}
+_PIXEL_MARKER_CONTEXTS: dict[Path, dict | None] = {}
 
 # Collect check results for summary plugin
 _check_results: list[dict] = []
@@ -528,6 +692,7 @@ def _process_one(case_id: str, source: dict) -> tuple[str, dict, float]:
         result = process_document(
             source["path"], passes=ACCURACY_PASSES, apply_user_rules=False,
             ocr_engine=_CACHE_ONLY_OCR, ocr_cache_only=True,
+            vision_mode=_VISION_MODE,
         )
         if not digital_pdf and result.get("_ocr_source") != "cache":
             raise RuntimeError(
@@ -553,6 +718,20 @@ def _process_one(case_id: str, source: dict) -> tuple[str, dict, float]:
             supplemental_ocr_evidence=_SUPPLEMENTAL_OCR_EVIDENCE.get(
                 source["path"],
             ),
+            quantity_crop_ocr_evidence=_QUANTITY_CROP_EVIDENCE.get(source["path"], {}).get("evidence") if not _QUANTITY_CROP_EVIDENCE.get(source["path"], {}).get("native_owner") else None,
+            quantity_crop_context=_QUANTITY_CROP_EVIDENCE.get(source["path"], {}).get("context") if not _QUANTITY_CROP_EVIDENCE.get(source["path"], {}).get("native_owner") else None,
+            native_owner_ocr_evidence=_QUANTITY_CROP_EVIDENCE.get(source["path"], {}).get("evidence") if _QUANTITY_CROP_EVIDENCE.get(source["path"], {}).get("native_owner") else None,
+            native_owner_context=_QUANTITY_CROP_EVIDENCE.get(source["path"], {}).get("context") if _QUANTITY_CROP_EVIDENCE.get(source["path"], {}).get("native_owner") else None,
+            financial_source_identity=_QUANTITY_CROP_EVIDENCE.get(source["path"], {}).get("source_identity"),
+            pixel_marker_context=(
+                _PIXEL_MARKER_CONTEXTS[source["path"]]
+                if source["path"] in _PIXEL_MARKER_CONTEXTS
+                else _pixel_marker_artifact(
+                    case_id, source, _SUPPLEMENTAL_OCR_EVIDENCE.get(source["path"]),
+                    _QUANTITY_CROP_EVIDENCE.get(source["path"]),
+                )
+            ),
+            vision_mode=_VISION_MODE,
         )
     elapsed = time.perf_counter() - t0
     return case_id, result, elapsed
@@ -565,10 +744,16 @@ def _get_result(case_id: str, source: dict) -> dict:
     return _RESULTS_CACHE[case_id]
 
 
+def _record_vision_fallbacks(scope):
+    scope["vision_fallback"] = {
+        case_id: deepcopy(result.get("_vision_fallback")) for case_id, result in _RESULTS_CACHE.items()
+    }
+
+
 @pytest.fixture(scope="session", autouse=True)
 def preprocess_fixtures(request):
     """Pre-process all fixtures concurrently before tests run."""
-    global _OCR_TEXT_LAYOUTS, _SUPPLEMENTAL_OCR_EVIDENCE
+    global _OCR_TEXT_LAYOUTS, _SUPPLEMENTAL_OCR_EVIDENCE, _QUANTITY_CROP_EVIDENCE, _PIXEL_MARKER_CONTEXTS
     workers = request.config.getoption("--workers", default=4)
     scope = {**_ACCURACY_SCOPE, "workers": workers}
     request.config._metadata = {
@@ -581,6 +766,8 @@ def preprocess_fixtures(request):
     try:
         _OCR_TEXT_LAYOUTS = _preflight_text_layouts(_CASES)
         _SUPPLEMENTAL_OCR_EVIDENCE = _preflight_supplemental_ocr(_CASES)
+        _QUANTITY_CROP_EVIDENCE = _preflight_quantity_crop(_CASES)
+        _PIXEL_MARKER_CONTEXTS = _preflight_pixel_marker_contexts(_CASES, _SUPPLEMENTAL_OCR_EVIDENCE, _QUANTITY_CROP_EVIDENCE)
         _preflight_cached_image_layouts(_CASES)
     except ValueError as exc:
         pytest.fail(str(exc), pytrace=False)
@@ -605,6 +792,7 @@ def preprocess_fixtures(request):
             _, result, elapsed = _process_one(name, source)
             _RESULTS_CACHE[name] = result
             print(f"  {name:25s} {elapsed:5.1f}s")
+        _record_vision_fallbacks(scope)
         return
 
     print(f"\nProcessing {n} fixtures with {workers} workers...")
@@ -619,6 +807,7 @@ def preprocess_fixtures(request):
             _RESULTS_CACHE[case_id] = result
             done += 1
             print(f"  [{done:2d}/{n}] {case_id:25s} {elapsed:5.1f}s")
+    _record_vision_fallbacks(scope)
 
 
 # ---------------------------------------------------------------------------

@@ -1,11 +1,15 @@
 """Receipt identity, date, and payment repair helpers."""
 
 import re
+import unicodedata
+from math import isfinite
 
 from .patterns import (
     ERA_TABLE,
+    _BANNER_PHRASE_RE,
     _COMPANY_SUFFIX_RE,
     _DECORATIVE_RE,
+    _HEADER_LINE_RE,
     _HEADER_PHONE_MERCHANT_RE,
     _OFFICIAL_AUTHORITY_HEADER_RE,
     _OFFICIAL_DEPARTMENT_LINE_RE,
@@ -13,12 +17,15 @@ from .patterns import (
     should_override_field,
 )
 from .normalize import _TOTALS_LABEL_RE
+from .receipt_financial import normalize_tax_rate
 from .receipt_location import (
     _ASCII_BRAND_HEADER_SCAN_LIMIT,
     _is_ascii_brand_location_suffix,
+    _recover_header_branch_store_location,
 )
 from .pipeline_slip import _payer_candidates
 from .receipt_totals import _sum_taxable_amounts
+from .receipt_projection import _group_layout_rows, _layout_block_height
 
 
 _CREDIT_LABEL = ''.join(chr(c) for c in (0x30AF, 0x30EC, 0x30B8, 0x30C3, 0x30C8))
@@ -70,17 +77,28 @@ _WAON_TENDER_RE = re.compile(
     rf'(?P<amount>{_PAYMENT_AMOUNT_PATTERN})?[ \t]*$',
     re.IGNORECASE | re.MULTILINE,
 )
+_PAYPAY_TENDER_RE = re.compile(
+    rf'^[ \t]*[（(]?PayPay[ \t]*(?:[（(][^）)\n]{{1,12}}[）)]?)?'
+    rf'[ \t]*(?:支払(?:い|額)?|(?:事前)?決済|計|お買上|ご利用額)?[）)]?'
+    rf'[ \t]*[:：]?[ \t]*(?P<amount>{_PAYMENT_AMOUNT_PATTERN})?[ \t]*$',
+    re.IGNORECASE,
+)
 _NAMED_NONCASH_TENDER_RE = re.compile(
     rf'^[ \t]*[（(]?(?:'
     rf'{_CREDIT_LABEL}(?:[ \t]*(?:{_CARD_LABEL}|支払(?:い|額)?|決済|計|お買上|ご利用額|A))?'
     rf'|信用(?:[ \t]*\d+)?|{_CARD_LABEL}|'
-    rf'{_ELECTRONIC_MONEY_LABEL}|PayPay|QUICPay|(?<![A-Za-z])(?-i:iD)(?![A-Za-z])|'
+    rf'{_ELECTRONIC_MONEY_LABEL}|QUICPay|(?<![A-Za-z])(?-i:iD)(?![A-Za-z])|'
     rf'Suica|nanaco|{_TRANSPORT_LABEL}(?:[ \t]*IC)?|'
-    rf'(?<![A-Za-z])IC(?![A-Za-z])|VISA|Master(?:Card)?|JCB|AMEX|バーコード決済)'
+    rf'(?<![A-Za-z])IC(?![A-Za-z])|VISA|Master(?:Card)?|JCB|AMEX)'
     rf'[ \t]*(?:[（(][^）)\n]{{1,12}}[）)]?)?'
     rf'[ \t]*(?:支払(?:い|額)?|決済|計|お買上|ご利用額)?[）)]?[ \t]*[:：]?[ \t]*'
     rf'(?P<amount>{_PAYMENT_AMOUNT_PATTERN})?[ \t]*$',
     re.IGNORECASE,
+)
+_GENERIC_BARCODE_TENDER_RE = re.compile(
+    rf'^[ \t]*[（(]?バーコード決済[ \t]*'
+    rf'(?:支払(?:い|額)?|計|お買上|ご利用額)?[）)]?[ \t]*[:：]?[ \t]*'
+    rf'(?P<amount>{_PAYMENT_AMOUNT_PATTERN})?[ \t]*$',
 )
 _DEBIT_TENDER_RE = re.compile(
     rf'^[ \t]*[（(]?(?:デビット(?:[ \t]*カード)?|Debit(?:[ \t]+Card)?)'
@@ -96,7 +114,7 @@ _BANK_PAYMENT_TENDER_RE = re.compile(
 )
 _SETTLEMENT_AMOUNT_RE = re.compile(
     r'^[ \t]*[¥￥]?[ \t]*(?P<amount>\d{1,3}(?:,\d{3})*|\d+)'
-    r'(?:\.\d+)?[ \t]*(?:円|[¥￥\\])?-?[）)]?[ \t]*$'
+    r'(?:\.\d+)?[ \t]*(?:円|[¥￥\\])?-?[）)]?[ \t]*[*＊]?[ \t]*$'
 )
 _CASH_SETTLEMENT_LABEL_RE = re.compile(
     rf'^[ \t]*[（(]?(?:現金|現計)(?:[ \t]*(?:支払(?:い|額)?|決済|計))?'
@@ -105,7 +123,7 @@ _CASH_SETTLEMENT_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 _PAYMENT_ADVERTISING_RE = re.compile(
-    r'カード払(?:い)?で|(?:カード|クレジット).*(?:募集中|おすすめ|特典|なら)|'
+    r'キャンペーン|広告|カード払(?:い)?で|(?:カード|クレジット).*(?:募集中|おすすめ|特典|なら)|'
     r'(?:電子マネー|カード).*(?:チャージ|入金額|残高)',
     re.IGNORECASE,
 )
@@ -113,7 +131,9 @@ _NONCASH_TENDER_PATTERNS = (
     _WAON_TENDER_RE,
     _DEBIT_TENDER_RE,
     _BANK_PAYMENT_TENDER_RE,
+    _PAYPAY_TENDER_RE,
     _NAMED_NONCASH_TENDER_RE,
+    _GENERIC_BARCODE_TENDER_RE,
 )
 _EXPLICIT_SETTLEMENT_AMOUNT_RE = re.compile(
     rf'^[ \t]*(?:取引|ご?利用|支払|決済|売上)(?:金)?額[ \t]*[:：]?[ \t]*'
@@ -191,7 +211,8 @@ def _is_exact_tender_row(line: str) -> bool:
 
 def _allows_backward_tender_amount(lines: list[str], idx: int) -> bool:
     line = lines[idx]
-    named = _NAMED_NONCASH_TENDER_RE.fullmatch(line)
+    named = (_NAMED_NONCASH_TENDER_RE.fullmatch(line) or _PAYPAY_TENDER_RE.fullmatch(line)
+             or _GENERIC_BARCODE_TENDER_RE.fullmatch(line))
     if named:
         nearby = [line]
         for following in lines[idx + 1:]:
@@ -225,6 +246,11 @@ def _owned_tender_amount(
     for following in lines[idx + 1:idx + 3]:
         if not following.strip():
             continue
+        if (
+            not re.search(r'支払|決済|計|お買上|ご利用額', lines[idx])
+            and _PAYMENT_ADVERTISING_RE.search(following)
+        ):
+            return None
         amount = _settlement_amount(following)
         if amount is not None:
             return amount
@@ -398,6 +424,8 @@ def _column_selected_tender(
             return "debit"
         if _BANK_PAYMENT_TENDER_RE.fullmatch(line):
             return "bank_payment"
+        if _PAYPAY_TENDER_RE.fullmatch(line):
+            return "PayPay"
         if _NAMED_NONCASH_TENDER_RE.fullmatch(line):
             return "credit"
         if _CASH_SETTLEMENT_LABEL_RE.fullmatch(line):
@@ -538,6 +566,8 @@ def _settlement_kind(total, text: str, amount_paid=None) -> str | None:
                     if _matches_target(tender - change, targets):
                         balanced_cash = True
 
+    if balanced_cash and any(amount is not None and amount > 0 for amount in noncash_rows.values()):
+        return "ambiguous"
     return "cash" if balanced_cash else None
 
 
@@ -718,6 +748,38 @@ def _fix_company_name_merchant(extracted, unified_text):
             )
         )
     ), None)
+    header_end = next((
+        idx for idx, line in enumerate(lines[:8])
+        if idx == title_idx or _DATE_LINE_RE.search(line)
+    ), None)
+    if header_end is not None and len(merchant_key) >= 3:
+        contact_names = {}
+        for line in lines[:header_end]:
+            contact = _HEADER_PHONE_MERCHANT_RE.match(line.strip())
+            if not contact:
+                continue
+            candidate = _clean_merchant_candidate(contact.group("merchant"))
+            if (
+                _RECEIPT_OWNER_NOISE_RE.fullmatch(candidate)
+                or _HEADER_LINE_RE.search(candidate)
+                or _BANNER_PHRASE_RE.search(candidate)
+                or _merchant_looks_invalid(candidate)
+            ):
+                continue
+            contact_names.setdefault(re.sub(r'\s+', '', candidate).casefold(), candidate)
+        if len(contact_names) == 1:
+            key, candidate = next(iter(contact_names.items()))
+            if (
+                merchant_key != key
+                and merchant_key.startswith(key)
+                and not any(
+                    owner.casefold() != key
+                    for line in lines[:header_end]
+                    if (owner := _clean_receipt_owner_candidate(line.strip()))
+                )
+            ):
+                extracted["merchant"] = candidate
+                return
     if title_idx is not None and len(merchant_key) >= 3:
         header_has_merchant = any(
             merchant_key in re.sub(r'\s+', '', line).casefold()
@@ -739,6 +801,7 @@ def _fix_company_name_merchant(extracted, unified_text):
             following = '\n'.join(lines[idx + 1:idx + 4])
             if (
                 re.sub(r'\s+', '', lines[idx]).casefold().startswith(merchant_key)
+                and not re.search(r'(?:店|店舗|営業所|支店)\s*$', lines[idx])
                 and re.search(
                     r'〒|\d+(?:丁目|番地|番\s*号)|'
                     r'(?:都|道|府|県).{0,20}(?:市|区|町|村|郡)',
@@ -849,14 +912,19 @@ def _fix_company_name_merchant(extracted, unified_text):
             return
     if merchant_text and re.search(r'店$', merchant_text):
         compact_merchant = re.sub(r'\s+', '', merchant_text)
+        candidates = set()
         for raw_line in lines[:4]:
             line = raw_line.strip()
             if line == merchant_text or re.search(r'TEL|FAX|https?://|登録番号|領収', line, re.IGNORECASE):
                 continue
-            for candidate in re.findall(r'[ァ-ヶー]{2,}', line):
-                if compact_merchant.startswith(candidate) and not _merchant_looks_invalid(candidate):
-                    extracted["merchant"] = candidate
-                    return
+            candidate = re.split(r'[!！]', line)[-1].strip()
+            if (re.fullmatch(r'[ァ-ヶー][ァ-ヶー\s・-]+', candidate)
+                    and compact_merchant.startswith(re.sub(r'\s+', '', candidate))
+                    and not _merchant_looks_invalid(candidate)):
+                candidates.add(candidate)
+        if len(candidates) == 1:
+            extracted["merchant"] = next(iter(candidates))
+            return
     if (
         re.fullmatch(r'[A-Z][A-Z0-9&.\'-]{2,}', merchant_text)
         and any(raw_line.strip() == merchant_text for raw_line in lines[:3])
@@ -1141,11 +1209,21 @@ def _apply_financial_overrides(extracted, ocr_totals, ocr_conf, llm_conf):
             ocr_tax = _sum_taxable_amounts(ocr_totals.get("taxes") or [])
             if not (ocr_tax > 0 and abs(ocr_tax - computed_tax) > 5) and abs(llm_tax - computed_tax) > 5:
                 if extracted.get("taxes"):
+                    mixed_llm_labels = set()
+                    for tax in extracted["taxes"]:
+                        if not isinstance(tax, dict) or tax.get("rate") == "0%":
+                            continue
+                        try:
+                            if float(tax.get("amount") or 0) > 0:
+                                mixed_llm_labels.add(tax.get("label"))
+                        except (TypeError, ValueError):
+                            continue
                     if llm_tax > 0:
-                        scale = computed_tax / llm_tax
-                        for t in extracted["taxes"]:
-                            if isinstance(t, dict) and t.get("rate") != "0%":
-                                t["amount"] = round(t["amount"] * scale)
+                        if not {"内税", "外税"} <= mixed_llm_labels:
+                            scale = computed_tax / llm_tax
+                            for t in extracted["taxes"]:
+                                if isinstance(t, dict) and t.get("rate") != "0%":
+                                    t["amount"] = round(t["amount"] * scale)
                     else:
                         extracted["taxes"] = [{"rate": "unknown", "label": None, "amount": computed_tax}]
                 elif computed_tax > 0:
@@ -1172,11 +1250,85 @@ def _apply_financial_overrides(extracted, ocr_totals, ocr_conf, llm_conf):
             and abs(existing_subtotal_f + ocr_tax_sum - existing_total_f) > 5
         ):
             return
-        ocr_rates = {t.get("rate") for t in ocr_totals["taxes"]}
-        llm_extra = [
-            t for t in (extracted.get("taxes") or [])
-            if isinstance(t, dict) and t.get("rate") and t.get("rate") not in ocr_rates
-        ]
+        ocr_positive = []
+        for tax in ocr_totals["taxes"]:
+            if not isinstance(tax, dict) or tax.get("rate") == "0%":
+                continue
+            try:
+                amount = float(tax.get("amount") or 0)
+            except (TypeError, ValueError):
+                continue
+            if isfinite(amount) and amount > 0:
+                ocr_positive.append(tax)
+        ocr_modes = {tax.get("label") for tax in ocr_positive}
+        llm_positive = []
+        current_mixed_complete = True
+        for tax in (extracted.get("taxes") or []):
+            if not isinstance(tax, dict):
+                current_mixed_complete = False
+                continue
+            if tax.get("rate") == "0%":
+                continue
+            try:
+                amount = float(tax.get("amount") or 0)
+            except (TypeError, ValueError):
+                current_mixed_complete = False
+                continue
+            if not isfinite(amount) or amount < 0:
+                current_mixed_complete = False
+                continue
+            if amount > 0:
+                llm_positive.append(tax)
+                rate = normalize_tax_rate(str(tax.get("rate") or ""))
+                if (
+                    tax.get("label") not in {"内税", "外税"}
+                    or not rate.endswith("%")
+                ):
+                    current_mixed_complete = False
+        current_mixed_modes = {tax.get("label") for tax in llm_positive}
+        current_mixed_balanced = (
+            current_mixed_complete
+            and current_mixed_modes == {"内税", "外税"}
+            and existing_total_f is not None
+            and existing_subtotal_f is not None
+            and existing_tax_sum > 0
+            and abs(existing_subtotal_f + existing_tax_sum - existing_total_f) <= 2
+        )
+        try:
+            ocr_subtotal_f = (
+                float(ocr_totals["subtotal"]) if ocr_totals.get("subtotal") is not None else None
+            )
+            ocr_total_f = (
+                float(ocr_totals["total"]) if ocr_totals.get("total") is not None else None
+            )
+        except (TypeError, ValueError):
+            ocr_subtotal_f = ocr_total_f = None
+        partial_ocr_mixed_balanced = (
+            current_mixed_balanced
+            and ocr_modes == {"外税"}
+            and ocr_tax_sum > 0
+            and ocr_subtotal_f is not None
+            and abs(ocr_subtotal_f + ocr_tax_sum - existing_total_f) <= 2
+            and abs(ocr_subtotal_f - existing_subtotal_f) <= 2
+            and (ocr_total_f is None or abs(ocr_total_f - existing_total_f) <= 2)
+        )
+        if ocr_modes == {"内税", "外税"} or partial_ocr_mixed_balanced:
+            ocr_groups = {
+                (normalize_tax_rate(str(t.get("rate") or "")), t.get("label"))
+                for t in ocr_positive
+            }
+            llm_extra = [
+                t for t in (extracted.get("taxes") or [])
+                if isinstance(t, dict)
+                and t.get("rate")
+                and (normalize_tax_rate(str(t.get("rate") or "")), t.get("label")) not in ocr_groups
+            ]
+        else:
+            ocr_rates = {t.get("rate") for t in ocr_totals["taxes"] if isinstance(t, dict)}
+            llm_extra = [
+                t for t in (extracted.get("taxes") or [])
+                if isinstance(t, dict) and t.get("rate") and t.get("rate") not in ocr_rates
+            ]
         extracted["taxes"] = list(ocr_totals["taxes"]) + llm_extra
 
     # Fix per-rate subtotal: when subtotal + tax != total, recompute from total - tax
@@ -1189,6 +1341,469 @@ def _apply_financial_overrides(extracted, ocr_totals, ocr_conf, llm_conf):
             if abs(computed_sub + ocr_tax_sum - ocr_tot) < 2:
                 extracted["subtotal"] = computed_sub
                 ocr_totals["subtotal"] = computed_sub
+
+
+_LOGO_TITLE_RE = re.compile(
+    r"(?:領\s*収\s*(?:書|証)|レシート|お?\s*預\s*(?:り|か\s*り)\s*票|利\s*用\s*証\s*明\s*書)"
+)
+_LOGO_ADDRESS_RE = re.compile(
+    r"(?:〒\s*\d{3}|(?:都|道|府|県).{0,28}(?:市|区|町|村)|"
+    r".{0,16}(?:市|区|町|村).{0,18}\d[\d-]{2,})"
+)
+_ASCII_LOGO_RE = re.compile(r"[A-Za-z][A-Za-z &.'-]{4,}")
+
+
+def _logo_key(text: str) -> str:
+    return "".join(unicodedata.normalize("NFKC", text).split()).casefold()
+
+
+def _logo_source_token(text: str, line: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", line).casefold()
+    positions = [i for i, char in enumerate(normalized) if not char.isspace()]
+    compact = "".join(normalized[i] for i in positions)
+    token = _logo_key(text)
+    for start in range(len(compact)):
+        if not compact.startswith(token, start):
+            continue
+        left = normalized[positions[start] - 1] if positions[start] else ""
+        end = positions[start + len(token) - 1] + 1
+        right = normalized[end] if end < len(normalized) else ""
+        if (not left or left.isspace() or not left.isalnum()) and (
+            not right or right.isspace() or not right.isalnum()
+        ):
+            return True
+    return False
+
+
+def _is_ascii_logo(text: str, *, allow_mixed_case: bool = False) -> bool:
+    candidate = _clean_receipt_owner_candidate(text) or ""
+    return bool(_ASCII_LOGO_RE.fullmatch(candidate) and (allow_mixed_case or candidate.isupper()))
+
+
+def _logo_header_marker(line: str) -> bool:
+    return bool(_HEADER_LINE_RE.search(line) or _HEADER_LINE_RE.search("".join(line.split())))
+
+
+def _logo_row_view(blocks: list[dict]) -> dict | None:
+    if not blocks or any(not block.get("bbox") for block in blocks):
+        return None
+    points = [point for block in blocks for point in block["bbox"]]
+    xs = [float(point[0]) for point in points]
+    ys = [float(point[1]) for point in points]
+    return {
+        "blocks": blocks,
+        "text": "".join(str(block.get("text") or "") for block in blocks).strip(),
+        "key": _logo_key("".join(str(block.get("text") or "") for block in blocks)),
+        "confidence": min(float(block.get("confidence", 0.0)) for block in blocks),
+        "box": [min(xs), min(ys), max(xs), max(ys)],
+        "page": blocks[0].get("page", 0),
+    }
+
+
+def _logo_small_gap_runs(row: list[dict]) -> list[list[dict]]:
+    runs: list[list[dict]] = []
+    current: list[dict] = []
+    right = 0.0
+    previous_height = 0.0
+    for block in row:
+        points = block.get("bbox") or []
+        if not points:
+            continue
+        xs = [float(point[0]) for point in points]
+        left, block_right = min(xs), max(xs)
+        height = max(1.0, _layout_block_height(block))
+        if current and left - right > max(4.0, 0.45 * min(previous_height, height)):
+            runs.append(current)
+            current = []
+        current.append(block)
+        right = max(right, block_right)
+        previous_height = height
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _logo_rows_are_stacked(left: dict, right: dict, *, touching_only: bool = False) -> bool:
+    """Aligned header rows may touch within OCR rounding; overlapping marks compete."""
+    a, b = left["box"], right["box"]
+    height = max(a[3] - a[1], b[3] - b[1], 1.0)
+    gap = max(a[1], b[1]) - min(a[3], b[3])
+    touching_gap = max(1.0, 0.05 * height)
+    left_aligned = abs(a[0] - b[0]) <= max(12.0, 0.15 * height)
+    center_aligned = abs((a[0] + a[2]) / 2 - (b[0] + b[2]) / 2) <= max(12.0, 0.15 * height)
+    right_aligned = abs(a[2] - b[2]) <= max(12.0, 0.15 * height)
+    return (
+        left["page"] == right["page"]
+        and (left_aligned or center_aligned or (gap <= touching_gap and right_aligned))
+        and -touching_gap <= gap <= (touching_gap if touching_only else 0.65 * height)
+    )
+
+
+def _select_header_logo(
+    ocr_text: str, layout_blocks: list[dict] | None, primary_text: str | None,
+    *, current_merchant: str | None = None,
+) -> str | None:
+    """Pick one exact complete primary-header span backed by source geometry;
+    abstain when a different current merchant owns its own complete header line.
+    """
+    if not layout_blocks or not ocr_text:
+        return None
+    lines = [line.strip() for line in ocr_text.splitlines() if line.strip()]
+    boundaries = [
+        (i, line)
+        for i, line in enumerate(lines[:16])
+        if _LOGO_ADDRESS_RE.search(line) or _logo_header_marker(line)
+    ]
+    boundaries.extend(
+        (i + window[:match.start()].count("\n"), match.group())
+        for i in range(len(lines))
+        for width in (1, 2, 3)
+        if (match := _LOGO_TITLE_RE.search(window := "\n".join(lines[i:i + width])))
+    )
+    if not boundaries:
+        return None
+    rows = [
+        view
+        for grouped_row in _group_layout_rows(layout_blocks)
+        for run in _logo_small_gap_runs(grouped_row)
+        if (view := _logo_row_view(run))
+    ]
+    boundary = None
+    end = 0
+    for boundary_index, boundary_text in sorted(boundaries, key=lambda boundary: boundary[0]):
+        key = _logo_key(boundary_text)
+        matches = [
+            row for row in rows
+            if len(row["key"]) >= 2
+            and row["confidence"] >= 0.60
+            and (
+                row["key"] in key
+                or (
+                    _LOGO_ADDRESS_RE.search(boundary_text)
+                    and _LOGO_ADDRESS_RE.search(row["text"])
+                    and key in row["key"]
+                )
+            )
+        ]
+        if not matches:
+            continue
+        boundary_length = max(len(row["key"]) for row in matches)
+        best = [row for row in matches if len(row["key"]) == boundary_length]
+        if len(best) != 1:
+            return None
+        boundary, end = best[0], boundary_index
+        break
+    if boundary is None:
+        return None
+    boundary_y = sum(boundary["box"][1::2]) / 2
+
+    source_rows = []
+    for row in rows:
+        text = row["text"]
+        source_exact = any(i <= end and _logo_source_token(text, line) for i, line in enumerate(lines))
+        source_substring = any(i <= end and _logo_key(text) in _logo_key(line) for i, line in enumerate(lines))
+        if (
+            (row["box"][1] + row["box"][3]) / 2 >= boundary_y
+            or not (source_exact or source_substring)
+            or not text
+            or len(row["key"]) < 2
+            or not re.search(r"[A-Za-zぁ-んァ-ン一-龥]", text)
+            or _merchant_looks_invalid(text)
+            or re.search(r"\d|[¥￥$€£%]", text)
+            or re.fullmatch(r"[A-Z]{1,4}", text)
+            or re.search(r"(?:店|店舗|営業所|支店)$", text)
+            or _COMPANY_SUFFIX_RE.search(text)
+            or _HEADER_LINE_RE.search(text)
+            or _BANNER_PHRASE_RE.search(text)
+            or _RECEIPT_OWNER_NOISE_RE.fullmatch(text)
+            or _PAYMENT_TOKEN_RE.fullmatch(text)
+            or _CASH_TENDER_LABEL_RE.fullmatch(text)
+            or _CASH_CHANGE_LABEL_RE.fullmatch(text)
+        ):
+            continue
+        row["substring_only"] = not source_exact
+        source_rows.append(row)
+    owners = [row for row in source_rows if row["confidence"] >= 0.80]
+    if not owners:
+        return None
+
+    eligible: dict[tuple[str, ...], list[dict]] = {}
+    for i, left in enumerate(owners):
+        for right in owners[i + 1:]:
+            heights = sorted((left["box"][3] - left["box"][1], right["box"][3] - right["box"][1]), reverse=True)
+            if (left["substring_only"] or right["substring_only"]) and not (
+                _is_ascii_logo(left["text"], allow_mixed_case=True)
+                or _is_ascii_logo(right["text"], allow_mixed_case=True)
+            ):
+                continue
+            if _logo_rows_are_stacked(left, right) and heights[0] <= 1.45 * heights[1] and (
+                _is_ascii_logo(left["text"], allow_mixed_case=True)
+                or _is_ascii_logo(right["text"], allow_mixed_case=True)
+            ):
+                near = [
+                    row for row in owners
+                    if row is not left and row is not right
+                    and not row["substring_only"]
+                    and (_logo_rows_are_stacked(left, row) or _logo_rows_are_stacked(right, row))
+                ]
+                if not near:
+                    pair = sorted((left, right), key=lambda row: row["box"][1])
+                    eligible[tuple(row["key"] for row in pair)] = pair
+
+    for row in owners:
+        if row["substring_only"]:
+            continue
+        nearby = [other for other in source_rows if other is not row and _logo_rows_are_stacked(row, other)]
+        height = row["box"][3] - row["box"][1]
+        high_nearby = [other for other in owners if other is not row and _logo_rows_are_stacked(row, other)]
+        if (
+            nearby
+            and not high_nearby
+            and not any(_logo_rows_are_stacked(row, other, touching_only=True) for other in nearby)
+            and height >= 1.4 * max(other["box"][3] - other["box"][1] for other in nearby)
+        ):
+            eligible[(row["key"],)] = [row]
+        elif _is_ascii_logo(row["text"], allow_mixed_case=True):
+            row_block_ids = {id(block) for block in row["blocks"]}
+            raw_stack_fragment = any(
+                id(block) not in row_block_ids
+                and block.get("text")
+                and float(block.get("confidence", 0.0)) >= 0.80
+                and not _logo_header_marker(str(block["text"]))
+                and any(
+                    i <= end and _logo_source_token(str(block["text"]), line)
+                    for i, line in enumerate(lines)
+                )
+                and (block_row := _logo_row_view([block])) is not None
+                and _logo_rows_are_stacked(row, block_row)
+                and (max(height, _layout_block_height(block)) <= 1.45 * min(height, _layout_block_height(block))
+                     or _logo_rows_are_stacked(row, block_row, touching_only=True)
+                     or (re.fullmatch(r'[A-Z]{2,4}', str(block['text']))
+                         and not _RECEIPT_OWNER_NOISE_RE.fullmatch(str(block['text'])))
+                     or _is_ascii_logo(str(block["text"]), allow_mixed_case=True))
+                for block in layout_blocks
+            )
+            if not raw_stack_fragment and not any(
+                other is not row
+                and (max(height, other["box"][3] - other["box"][1])
+                     <= 1.45 * min(height, other["box"][3] - other["box"][1])
+                     or _logo_rows_are_stacked(row, other, touching_only=True)
+                     or _is_ascii_logo(other["text"], allow_mixed_case=True))
+                and (
+                    _logo_rows_are_stacked(row, other)
+                    or (
+                        other["confidence"] >= 0.80
+                        and not other["substring_only"]
+                        and max(0.0, max(row["box"][1], other["box"][1]) - min(row["box"][3], other["box"][3]))
+                        <= max(height, other["box"][3] - other["box"][1])
+                        and max(
+                            0.0,
+                            max(row["box"][0], other["box"][0]) - min(row["box"][2], other["box"][2]),
+                        ) <= max(4.0, 0.45 * min(height, other["box"][3] - other["box"][1]))
+                    )
+                )
+                for other in source_rows
+            ):
+                eligible[(row["key"],)] = [row]
+    if len(eligible) != 1:
+        return None
+    chosen = next(iter(eligible.values()))
+    value = " ".join(_clean_receipt_owner_candidate(row["text"]) or row["text"] for row in chosen)
+    if not primary_text or _logo_key(value) not in _logo_key(ocr_text):
+        return None
+    primary_lines = [line.strip() for line in primary_text.splitlines() if line.strip()]
+    boundaries = [
+        i for i, line in enumerate(primary_lines[:16])
+        if _LOGO_ADDRESS_RE.search(line) or _logo_header_marker(line)
+    ]
+    boundaries.extend(
+        i + window[:match.start()].count("\n")
+        for i in range(len(primary_lines))
+        for width in (1, 2, 3)
+        if (match := _LOGO_TITLE_RE.search(window := "\n".join(primary_lines[i:i + width])))
+    )
+    end = min(boundaries) if boundaries else min(16, len(primary_lines))
+    header = _logo_key(" ".join(primary_lines[:end + 1]))
+    if _logo_key(value) not in header:
+        return None
+    spellings = {
+        spelling for i in range(end + 1)
+        if (spelling := re.sub(r'[®™©]', '', " ".join(primary_lines[i:i + len(chosen)])).strip())
+        and _logo_key(spelling) == _logo_key(value)
+    }
+    if len(spellings) != 1:
+        return None
+    current_key = _logo_key(current_merchant or "")
+    if current_key and current_key != _logo_key(value) and any(
+        _logo_key(line) == current_key for line in primary_lines[:end + 1]
+    ):
+        return None
+    return next(iter(spellings))
+
+
+def _select_header_merchant_without_branch(
+    ocr_text: str, layout_blocks: list[dict] | None, primary_text: str | None,
+    *, current_merchant: str | None, current_location: str | None,
+) -> str | None:
+    """Remove only an exact, separately printed branch suffix from the seller."""
+    if not ocr_text or not primary_text or not layout_blocks:
+        return None
+
+    def literal_key(value: str) -> str:
+        return "".join(unicodedata.normalize("NFKC", value).split())
+
+    def header_lines(value: str) -> list[str]:
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        boundary = next((
+            index for index, line in enumerate(lines[:_ASCII_BRAND_HEADER_SCAN_LIMIT])
+            if _DATE_LINE_RE.search(line) or _LOGO_TITLE_RE.search(line)
+        ), _ASCII_BRAND_HEADER_SCAN_LIMIT)
+        return lines[:boundary]
+
+    phone_pattern = re.compile(
+        r"(?<!\d)(?:\(\s*)?0\d{1,4}\s*\)?"
+        r"(?:[-－‐‑–—ー\s]\s*\d{1,4}){1,2}(?!\d)"
+    )
+
+    def phone_tokens(text: str) -> list[str]:
+        return [
+            re.sub(r"\D", "", match.group())
+            for match in phone_pattern.finditer(unicodedata.normalize("NFKC", text))
+        ]
+
+    primary_lines = header_lines(primary_text)
+    source_lines = header_lines(ocr_text)
+    branch_key = literal_key(str(current_location or ""))
+    merchant_key = literal_key(str(current_merchant or ""))
+    if len(branch_key) < 3 or not branch_key.endswith("店"):
+        return None
+
+    def header_keys(lines: list[str]) -> list[str]:
+        keys = []
+        for line in lines:
+            line = unicodedata.normalize("NFKC", line)
+            phones = list(phone_pattern.finditer(line))
+            if (
+                len(phones) == 1
+                and literal_key(line[:phones[0].start()]) == branch_key
+                and not literal_key(line[phones[0].end():])
+            ):
+                # OCR may join the complete branch and phone cells into one line.
+                keys.extend((branch_key, literal_key(phones[0].group())))
+            else:
+                keys.append(literal_key(line))
+        return keys
+
+    primary_keys = header_keys(primary_lines)
+    source_keys = header_keys(source_lines)
+    if (
+        primary_keys.count(branch_key) != 1
+        or source_keys.count(branch_key) != 1
+    ):
+        return None
+
+    primary_phones = phone_tokens("\n".join(primary_lines))
+    source_phones = phone_tokens("\n".join(source_lines))
+    if len(primary_phones) != 1 or primary_phones != source_phones:
+        return None
+
+    rows = []
+    for group in _group_layout_rows(layout_blocks):
+        for run in _logo_small_gap_runs(group):
+            row = _logo_row_view(run)
+            if row:
+                row["literal_key"] = literal_key(row["text"])
+                rows.append(row)
+
+    def source_owned(row: dict) -> bool:
+        key = row["literal_key"]
+        return (
+            key
+            and primary_keys.count(key) == 1
+            and source_keys.count(key) == 1
+            and row["confidence"] >= 0.80
+        )
+
+    def valid_owner_row(row: dict) -> bool:
+        text = row["text"]
+        return (
+            bool(re.search(r"[A-Za-zぁ-んァ-ン一-龥]", text))
+            and not phone_tokens(text)
+            and not re.search(r"[¥￥$€£%]", text)
+            and not _merchant_looks_invalid(text)
+            and not _COMPANY_SUFFIX_RE.search(text)
+            and not _LOGO_ADDRESS_RE.search(text)
+            and not _LOGO_TITLE_RE.search(text)
+            and not _HEADER_LINE_RE.search(text)
+            and not _BANNER_PHRASE_RE.search(text)
+            and not _RECEIPT_OWNER_NOISE_RE.fullmatch(text)
+            and not _PAYMENT_TOKEN_RE.fullmatch(text)
+        )
+
+    branch_rows = [
+        row for row in rows
+        if row["literal_key"] == branch_key and source_owned(row)
+    ]
+    phone_rows = []
+    for row in rows:
+        text = " ".join(str(block.get("text") or "") for block in row["blocks"])
+        if source_owned(row) and phone_tokens(text) == primary_phones:
+            phone_rows.append(row)
+    if len(branch_rows) != 1 or len(phone_rows) != 1:
+        return None
+    branch, phone = branch_rows[0], phone_rows[0]
+    branch_height = branch["box"][3] - branch["box"][1]
+    phone_height = phone["box"][3] - phone["box"][1]
+    band_overlap = min(branch["box"][3], phone["box"][3]) - max(branch["box"][1], phone["box"][1])
+    horizontal_gap = phone["box"][0] - branch["box"][2]
+    if (
+        branch["page"] != phone["page"]
+        or band_overlap < 0.5 * min(branch_height, phone_height)
+        or horizontal_gap < max(4.0, 0.45 * min(branch_height, phone_height))
+    ):
+        return None
+
+    logo_rows = [
+        row for row in rows
+        if source_owned(row)
+        and row["literal_key"] != branch_key
+        and merchant_key in {row["literal_key"], row["literal_key"] + branch_key}
+        and valid_owner_row(row)
+    ]
+    if len(logo_rows) != 1:
+        return None
+    logo = logo_rows[0]
+    logo_text = next(line for line in primary_lines if literal_key(line) == logo["literal_key"])
+    branch_owner = {"merchant": logo_text, "location": ""}
+    _recover_header_branch_store_location(branch_owner, "\n".join(primary_lines))
+    if literal_key(str(branch_owner.get("location") or "")) != branch_key:
+        return None
+
+    logo_height = logo["box"][3] - logo["box"][1]
+    logo_branch_gap = branch["box"][1] - logo["box"][3]
+    if (
+        logo["page"] != branch["page"]
+        or logo_height < 1.4 * branch_height
+        or logo_branch_gap < max(4.0, 0.15 * logo_height)
+    ):
+        return None
+
+    # A similarly prominent exact header row makes the seller role ambiguous.
+    for row in rows:
+        if row is logo or row["literal_key"] == branch_key:
+            continue
+        if (row["confidence"] < 0.80 or row["literal_key"] not in primary_keys
+                or row["literal_key"] not in source_keys):
+            continue
+        if row["literal_key"].endswith("店"):
+            return None
+        if not valid_owner_row(row):
+            continue
+        height = row["box"][3] - row["box"][1]
+        if height >= 0.80 * logo_height:
+            return None
+
+    return logo_text
 
 
 def _fix_date(extracted, unified_text):
@@ -1405,7 +2020,7 @@ def _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf):
     if settlement_kind in {"mixed", "ambiguous"}:
         extracted["payment_method"] = None
         return
-    if settlement_kind in {"cash", "credit", "debit", "bank_payment", "WAON"}:
+    if settlement_kind in {"cash", "credit", "debit", "bank_payment", "WAON", "PayPay"}:
         extracted["payment_method"] = settlement_kind
         return
 
@@ -1415,6 +2030,7 @@ def _fix_payment_method(extracted, unified_text, ocr_conf, llm_conf):
             ("WAON", (_WAON_TENDER_RE,)),
             ("debit", (_DEBIT_TENDER_RE,)),
             ("bank_payment", (_BANK_PAYMENT_TENDER_RE,)),
+            ("PayPay", (_PAYPAY_TENDER_RE,)),
             ("credit", (_NAMED_NONCASH_TENDER_RE,)),
         )
         if _has_tender_amount(unified_text, patterns, target_values)

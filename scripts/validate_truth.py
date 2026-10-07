@@ -16,7 +16,7 @@ from pathlib import Path
 # ── Allowed values (mirrors Enum Reference in new_schema.md) ─────────
 
 DOCUMENT_TYPES = {"receipt", "utility_bill", "payment_slip"}
-PAYMENT_METHODS = {"cash", "credit", "debit", "bank_payment", "WAON", None}
+PAYMENT_METHODS = {"cash", "credit", "debit", "bank_payment", "WAON", "PayPay", None}
 CURRENCIES = {"JPY", "USD"}
 TAX_CATEGORIES = {"8%", "10%", "0%"}
 SERVICE_TYPES = {"gas", "water", "electric", "sewage", "internet", "phone", None}

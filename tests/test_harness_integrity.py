@@ -17,6 +17,7 @@ from receipt_parser.ocr import (
     write_ocr_layout_sidecar,
 )
 from receipt_parser.receipt_supplemental_ocr import (
+    _LEGACY_STRATEGY_FINGERPRINT,
     build_supplemental_ocr_evidence,
     save_supplemental_ocr_evidence,
 )
@@ -59,7 +60,7 @@ def _image_and_cache(module, monkeypatch, tmp_path: Path):
     return image_path, text_path, layout_path
 
 
-def _write_supplemental_sidecar(module, monkeypatch, image_path: Path, tmp_path: Path):
+def _write_supplemental_sidecar(module, monkeypatch, image_path: Path, tmp_path: Path, *, legacy=False):
     cache_dir = tmp_path / "supplemental"
     monkeypatch.setattr(module, "SUPPLEMENTAL_OCR_CACHE_DIR", cache_dir)
     image = module.load_image(image_path)[0]
@@ -74,7 +75,7 @@ def _write_supplemental_sidecar(module, monkeypatch, image_path: Path, tmp_path:
     evidence = build_supplemental_ocr_evidence(
         image_key=module._ocr_cache_key(image),
         image_shape=image.shape[:2],
-        strategy_fingerprint=module.SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
+        strategy_fingerprint=_LEGACY_STRATEGY_FINGERPRINT if legacy else module.SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT,
         merged_text="SUPPLEMENT",
         source_layout=layout,
         tile_texts=["top", "bottom"],
@@ -106,8 +107,9 @@ def test_corpus_fingerprint_includes_cached_text_and_layout(
 
 
 @pytest.mark.parametrize("module_fixture", ["benchmark_module", "accuracy_module"])
+@pytest.mark.parametrize("legacy", [False, True])
 def test_corpus_fingerprint_includes_supplemental_sidecar_bytes(
-    request, module_fixture, monkeypatch, tmp_path,
+    request, module_fixture, monkeypatch, tmp_path, legacy,
 ):
     module = request.getfixturevalue(module_fixture)
     image_path, _text_path, _layout_path = _image_and_cache(
@@ -127,7 +129,7 @@ def test_corpus_fingerprint_includes_supplemental_sidecar_bytes(
 
     missing = fingerprint()
     _evidence, sidecar = _write_supplemental_sidecar(
-        module, monkeypatch, image_path, tmp_path,
+        module, monkeypatch, image_path, tmp_path, legacy=legacy,
     )
     present = fingerprint()
     sidecar.write_text("{}", encoding="utf-8")
@@ -137,8 +139,9 @@ def test_corpus_fingerprint_includes_supplemental_sidecar_bytes(
 
 
 @pytest.mark.parametrize("module_fixture", ["benchmark_module", "accuracy_module"])
+@pytest.mark.parametrize("legacy", [False, True])
 def test_supplemental_preflight_binds_variant_to_base_image_and_fails_closed(
-    request, module_fixture, monkeypatch, tmp_path,
+    request, module_fixture, monkeypatch, tmp_path, legacy,
 ):
     module = request.getfixturevalue(module_fixture)
     fixtures_dir = tmp_path / "fixtures"
@@ -168,8 +171,10 @@ def test_supplemental_preflight_binds_variant_to_base_image_and_fails_closed(
         preflight()
 
     evidence, sidecar = _write_supplemental_sidecar(
-        module, monkeypatch, image_path, tmp_path,
+        module, monkeypatch, image_path, tmp_path, legacy=legacy,
     )
+    if legacy:
+        evidence["strategy_fingerprint"] = module.SUPPLEMENTAL_OCR_STRATEGY_FINGERPRINT
     assert preflight() == {text_path: evidence}
 
     sidecar.write_text("{}", encoding="utf-8")
@@ -539,8 +544,9 @@ def test_benchmark_saves_scored_replay_text_layout_and_confidence(
     assert evidence["ocr_confidence"] == 0.73
 
 
+@pytest.mark.parametrize("runner", ["_run_fixture", "_run_fixture_sequential"])
 def test_benchmark_forwards_valid_variant_layout(
-    benchmark_module, monkeypatch, tmp_path,
+    benchmark_module, monkeypatch, tmp_path, runner,
 ):
     text_path = tmp_path / "receipt_7_v1.txt"
     text_path.write_text("exact OCR text", encoding="utf-8")
@@ -554,12 +560,19 @@ def test_benchmark_forwards_valid_variant_layout(
     )
     captured = {}
     supplemental = {"image_key": "exact-image-bound-evidence"}
+    crop = {"evidence": {"vision_text": "RAW"}, "context": {"input_text_sha256": "BOUND"}}
+    pixels = {"source_identity": "independently-bound-original-pixels"}
+    vision = {"attempts": 1, "source": "fresh", "cost_usd": 0.001}
 
     def process(_text, **kwargs):
         captured["layout"] = kwargs.get("ocr_layout_blocks")
         captured["confidence"] = kwargs.get("ocr_confidence")
         captured["supplemental"] = kwargs.get("supplemental_ocr_evidence")
-        return {"total": 1, "_ocr_source": "injected", "_ocr_text": _text}
+        captured["crop"] = kwargs.get("quantity_crop_ocr_evidence")
+        captured["context"] = kwargs.get("quantity_crop_context")
+        captured["pixels"] = kwargs.get("pixel_marker_context")
+        captured["vision_mode"] = kwargs.get("vision_mode")
+        return {"total": 1, "_ocr_source": "injected", "_ocr_text": _text, "_vision_fallback": vision}
 
     monkeypatch.setattr(benchmark_module, "process_ocr_text", process)
     monkeypatch.setattr(
@@ -567,16 +580,23 @@ def test_benchmark_forwards_valid_variant_layout(
         "get_checks_for",
         lambda _truth: {"total": lambda result, _expected: {"pass": result["total"] == 1}},
     )
-    benchmark_module._run_fixture_sequential(
+    _, fixture = getattr(benchmark_module, runner)(
         "receipt_7_v1", text_path, {"total": 1}, 1, "model", 1, None, False,
         save_variants=False, preflight_supplemental_evidence=supplemental,
+        preflight_quantity_crop=crop,
+        preflight_pixel_marker_context=pixels, vision_mode="fresh",
     )
 
     assert captured == {
         "layout": layout,
         "confidence": 0.73,
         "supplemental": supplemental,
+        "crop": crop["evidence"],
+        "context": crop["context"],
+        "pixels": pixels,
+        "vision_mode": "fresh",
     }
+    assert fixture["runs"][0]["vision_fallback"] == vision
 
 
 def test_accuracy_forwards_valid_variant_layout(
@@ -596,18 +616,28 @@ def test_accuracy_forwards_valid_variant_layout(
     )
     captured = {}
     supplemental = {"image_key": "exact-image-bound-evidence"}
+    crop = {"evidence": {"vision_text": "RAW"}, "context": {"input_text_sha256": "BOUND"}}
+    pixels = {"source_identity": "independently-bound-original-pixels"}
+    vision = {"attempts": 1, "source": "fresh", "cost_usd": 0.001}
 
     def process(_text, **kwargs):
         captured["layout"] = kwargs.get("ocr_layout_blocks")
         captured["confidence"] = kwargs.get("ocr_confidence")
         captured["supplemental"] = kwargs.get("supplemental_ocr_evidence")
-        return {"total": 1}
+        captured["crop"] = kwargs.get("quantity_crop_ocr_evidence")
+        captured["context"] = kwargs.get("quantity_crop_context")
+        captured["pixels"] = kwargs.get("pixel_marker_context")
+        captured["vision_mode"] = kwargs.get("vision_mode")
+        return {"total": 1, "_vision_fallback": vision}
 
     monkeypatch.setattr(pipeline, "process_ocr_text", process)
     monkeypatch.setattr(
         accuracy_module, "_SUPPLEMENTAL_OCR_EVIDENCE", {text_path: supplemental},
     )
-    accuracy_module._process_one(
+    monkeypatch.setattr(accuracy_module, "_QUANTITY_CROP_EVIDENCE", {text_path: crop})
+    monkeypatch.setattr(accuracy_module, "_PIXEL_MARKER_CONTEXTS", {text_path: pixels})
+    monkeypatch.setattr(accuracy_module, "_VISION_MODE", "fresh")
+    _, result, _ = accuracy_module._process_one(
         "receipt_7_v1", {"type": "ocr_text", "path": text_path},
     )
 
@@ -615,7 +645,12 @@ def test_accuracy_forwards_valid_variant_layout(
         "layout": layout,
         "confidence": 0.73,
         "supplemental": supplemental,
+        "crop": crop["evidence"],
+        "context": crop["context"],
+        "pixels": pixels,
+        "vision_mode": "fresh",
     }
+    assert result["_vision_fallback"] == vision
 
 
 def test_benchmark_archives_each_run_layout(benchmark_module, tmp_path):
@@ -725,7 +760,10 @@ def test_benchmark_selects_exact_variant_with_base_truth(
     monkeypatch.setattr(benchmark_module, "OCR_FIXTURES_DIR", tmp_path / "named")
     monkeypatch.setattr(benchmark_module, "VARIANTS_DIR", variants)
 
-    assert benchmark_module.discover_fixtures() == []
+    assert benchmark_module.discover_fixtures() == [
+        ("receipt_7_v1", variants / "receipt_7_v1.txt", truth),
+        ("receipt_7_v2", selected_variant, truth),
+    ]
     selected = benchmark_module._select_fixtures(["receipt_7_v2"])
 
     assert selected == [("receipt_7_v2", selected_variant, truth)]
@@ -840,13 +878,15 @@ def test_benchmark_preflights_supplemental_cache_before_model_or_vision(
 
 
 @pytest.mark.parametrize("workers", [1, 2])
+@pytest.mark.parametrize("ci", [False, True])
 def test_cached_ocr_mode_keeps_run_count_and_never_initializes_vision(
-    benchmark_module, monkeypatch, tmp_path, workers,
+    benchmark_module, monkeypatch, tmp_path, workers, ci,
 ):
     image = tmp_path / "receipt.png"
     assert cv2.imwrite(str(image), np.zeros((8, 8, 3), dtype=np.uint8))
     fixture = ("receipt_7", image, {"total": 123})
     calls = []
+    runners = []
 
     monkeypatch.setattr(benchmark_module, "_select_fixtures", lambda _names: [fixture])
     monkeypatch.setattr(benchmark_module, "_missing_cached_ocr", lambda _fixtures: [])
@@ -864,12 +904,13 @@ def test_cached_ocr_mode_keeps_run_count_and_never_initializes_vision(
         lambda _fixtures, *, cached_ocr: "cached" if cached_ocr else "fresh",
     )
 
-    def capture_runner(*args):
+    def capture_runner(mode, *args):
         calls.append(args)
+        runners.append(mode)
         return args[0], {"runs": []}
 
-    monkeypatch.setattr(benchmark_module, "_run_fixture", capture_runner)
-    monkeypatch.setattr(benchmark_module, "_run_fixture_sequential", capture_runner)
+    monkeypatch.setattr(benchmark_module, "_run_fixture", lambda *args: capture_runner("parallel", *args))
+    monkeypatch.setattr(benchmark_module, "_run_fixture_sequential", lambda *args: capture_runner("sequential", *args))
     monkeypatch.setattr(
         benchmark_module, "_assemble_results",
         lambda metadata, _fixtures: {"metadata": metadata, "summary": {"fragile": []}},
@@ -878,16 +919,18 @@ def test_cached_ocr_mode_keeps_run_count_and_never_initializes_vision(
     monkeypatch.setattr(benchmark_module, "_print_summary", lambda *_args: None)
 
     result = benchmark_module.run_benchmark(
-        runs=7, workers=workers, cached_ocr=True, output_path=tmp_path / "result.json",
+        runs=7, workers=workers, cached_ocr=not ci, ci=ci, output_path=tmp_path / "result.json",
     )
 
     assert len(calls) == 1
-    assert calls[0][3] == 7
+    expected_runs = 1 if ci else 7
+    assert calls[0][3] == expected_runs
+    assert runners == ["parallel" if workers > 1 else "sequential"]
     assert isinstance(calls[0][6], benchmark_module._CacheOnlyOCREngine)
     assert calls[0][7] is False
-    assert result["metadata"]["runs_per_fixture"] == 7
+    assert result["metadata"]["runs_per_fixture"] == expected_runs
     assert result["metadata"]["cached_ocr"] is True
-    assert result["metadata"]["ci_mode"] is False
+    assert result["metadata"]["ci_mode"] is ci
 
 
 def test_cached_ocr_mode_fails_closed_when_cache_is_missing(
@@ -912,11 +955,12 @@ def test_cached_ocr_mode_fails_closed_when_cache_is_missing(
     assert exc.value.code == 1
 
 
-def test_fresh_api_estimate_counts_two_supplemental_calls_per_receipt(
+def test_fresh_api_estimate_counts_two_supplemental_calls_and_one_optional_crop(
     benchmark_module,
 ):
     assert benchmark_module._estimate_api_calls(3, 4) == 20
     assert benchmark_module._estimate_api_calls(3, 4, 2) == 36
+    assert benchmark_module._estimate_api_calls(3, 4, 2, 2) == 44
 
 
 def test_fresh_budget_eligibility_is_structural_not_cached_classification(
@@ -935,8 +979,9 @@ def test_fresh_budget_eligibility_is_structural_not_cached_classification(
     ) is not None
 
 
+@pytest.mark.parametrize("vision_mode", ["normal", "cache_only", "fresh"])
 def test_cached_harnesses_pass_explicit_cache_only_mode(
-    benchmark_module, accuracy_module, monkeypatch, tmp_path,
+    benchmark_module, accuracy_module, monkeypatch, tmp_path, vision_mode,
 ):
     import receipt_parser.pipeline as pipeline
 
@@ -944,6 +989,8 @@ def test_cached_harnesses_pass_explicit_cache_only_mode(
     image_path.write_bytes(b"not read by patched processors")
     benchmark_kwargs = {}
     accuracy_kwargs = {}
+    monkeypatch.setenv("RECEIPT_VISION_MODE", vision_mode)
+    monkeypatch.setattr(accuracy_module, "_VISION_MODE", vision_mode)
 
     def benchmark_process(*_args, **kwargs):
         benchmark_kwargs.update(kwargs)
@@ -973,6 +1020,7 @@ def test_cached_harnesses_pass_explicit_cache_only_mode(
 
     assert benchmark_kwargs["ocr_cache_only"] is True
     assert accuracy_kwargs["ocr_cache_only"] is True
+    assert benchmark_kwargs["vision_mode"] == accuracy_kwargs["vision_mode"] == vision_mode
 
 
 def test_accuracy_discovers_cached_images_without_vision_configuration(
@@ -1039,6 +1087,11 @@ def _scope(corpus: str):
             "passes": 1,
             "runs_per_fixture": 1,
             "ci_mode": True,
+            "triage_models": [],
+            "triage_max_tokens": 2048,
+            "package_source": "src/receipt_parser/__init__.py",
+            "vision_mode": "normal",
+            "vision_model": "test/vision-model",
         },
         "summary": {},
     }
@@ -1062,3 +1115,203 @@ def test_compare_cli_exits_nonzero_for_missing_file_and_scope_mismatch(
     with pytest.raises(SystemExit) as mismatch_exit:
         benchmark_module.main()
     assert mismatch_exit.value.code == 1
+
+
+def test_determinism_compares_public_extractions_not_pass_booleans(benchmark_module):
+    def run(extraction, *, error=None):
+        return {
+            "fields": {"total": {"pass": True}},
+            "pass_count": 1,
+            "total_fields": 1,
+            "passed": error is None,
+            "error": error,
+            "final_extraction": extraction,
+            "ocr": {"confidence": None},
+            "ocr_text": "",
+        }
+
+    different_but_passing = {"runs": [run({"total": 1}), run({"total": 2})]}
+    benchmark_module._finalize_fixture(
+        "receipt_x", different_but_passing, save_variants=False,
+    )
+    assert different_but_passing["determinism_comparable"]
+    assert not different_but_passing["deterministic"]
+
+    equal_semantic_values = {"runs": [run({"total": 1}), run({"total": 1.0})]}
+    benchmark_module._finalize_fixture(
+        "receipt_x", equal_semantic_values, save_variants=False,
+    )
+    assert equal_semantic_values["deterministic"]
+
+    errored = {"runs": [run({"total": 1}), run({"total": 1}, error="failed")]}
+    benchmark_module._finalize_fixture("receipt_x", errored, save_variants=False)
+    assert not errored["determinism_comparable"]
+    assert not errored["deterministic"]
+
+    missing = {"runs": [run({"total": 1}), run(None)]}
+    benchmark_module._finalize_fixture("receipt_x", missing, save_variants=False)
+    assert not missing["determinism_comparable"]
+    assert not missing["deterministic"]
+
+
+def test_summary_lists_exact_nondeterministic_fixtures(benchmark_module):
+    summary = benchmark_module._compute_summary({
+        "receipt_b": {"runs": [], "deterministic": False},
+        "receipt_a": {"runs": [], "deterministic": True},
+    }, {})
+    assert summary["nondeterministic_fixture_count"] == 1
+    assert summary["nondeterministic_fixtures"] == ["receipt_b"]
+    assert summary["deterministic_fixture_count"] == 1
+    assert summary["fixture_count"] == 2
+
+
+def test_determinism_rate_preserves_single_fixture_variance(benchmark_module):
+    per_fixture = {
+        f"receipt_{i}": {"runs": [], "deterministic": i != 0}
+        for i in range(352)
+    }
+    summary = benchmark_module._compute_summary(per_fixture, {})
+    assert summary["deterministic_fixture_count"] == 351
+    assert summary["fixture_count"] == 352
+    assert summary["determinism_rate"] == 351 / 352
+    assert summary["determinism_rate"] < 1.0
+
+
+def test_comparison_scope_includes_effective_triage_settings(benchmark_module):
+    current = _scope("same")
+    previous = _scope("same")
+    previous["metadata"]["package_source"] = "C:/clean-checkout/receipt_parser/__init__.py"
+    assert benchmark_module._comparison_scope_mismatches(current, previous) == []
+
+    previous = _scope("same")
+    previous["metadata"]["triage_models"] = ["other/model"]
+    mismatches = benchmark_module._comparison_scope_mismatches(current, previous)
+    assert any("triage_models" in mismatch for mismatch in mismatches)
+
+    previous = _scope("same")
+    previous["metadata"]["triage_max_tokens"] = 4096
+    mismatches = benchmark_module._comparison_scope_mismatches(current, previous)
+    assert any("triage_max_tokens" in mismatch for mismatch in mismatches)
+
+    for field, value in (("vision_mode", "fresh"), ("vision_model", "")):
+        previous = _scope("same")
+        previous["metadata"][field] = value
+        assert any(field in mismatch for mismatch in benchmark_module._comparison_scope_mismatches(current, previous))
+
+
+def test_accuracy_scope_records_triage_settings_and_imported_package(accuracy_module):
+    from receipt_parser.llm import _configured_triage_models, _triage_max_tokens
+    import receipt_parser
+
+    assert accuracy_module._ACCURACY_SCOPE["triage_models"] == _configured_triage_models()
+    assert accuracy_module._ACCURACY_SCOPE["triage_max_tokens"] == _triage_max_tokens()
+    assert accuracy_module._ACCURACY_SCOPE["package_source"] == str(
+        Path(receipt_parser.__file__).resolve(),
+    )
+    assert accuracy_module._ACCURACY_SCOPE["vision_mode"] == accuracy_module._VISION_MODE
+    assert accuracy_module._ACCURACY_SCOPE["vision_model"] == accuracy_module.configured_vision_model()
+
+
+@pytest.mark.parametrize("module_fixture", ["benchmark_module", "accuracy_module"])
+def test_crop_corpus_fingerprint_counts_explicit_absence_and_invalid_present_bytes(
+    request, module_fixture, monkeypatch, tmp_path,
+):
+    module = request.getfixturevalue(module_fixture)
+    image_path, _, _ = _image_and_cache(module, monkeypatch, tmp_path)
+    crop_path = tmp_path / "quantity.json"
+    monkeypatch.setattr(module, "_quantity_crop_artifact", lambda *_: (crop_path, None))
+    if module_fixture == "benchmark_module":
+        corpus = [("sample", image_path, {"total": 1})]
+        fingerprint = lambda: module._fixture_corpus_sha256(corpus, cached_ocr=True)
+        preflight = lambda: module._preflight_quantity_crop(corpus, cached_images=True)
+    else:
+        corpus = [("sample", {"type": "image", "path": image_path}, {"total": 1})]
+        fingerprint = lambda: module._corpus_sha256(corpus)
+        preflight = lambda: module._preflight_quantity_crop(corpus)
+    absent = fingerprint()
+    assert preflight() == {}
+    crop_path.write_text("{invalid", encoding="utf-8")
+    present = fingerprint()
+    crop_path.write_text("{}", encoding="utf-8")
+    changed = fingerprint()
+    assert absent != present != changed
+    with pytest.raises(ValueError, match="Invalid quantity crop OCR sidecar"):
+        preflight()
+
+
+@pytest.mark.parametrize("module_fixture", ["benchmark_module", "accuracy_module"])
+def test_replay_pixel_context_requires_original_frame_geometry_without_native_crop(
+    request, module_fixture, monkeypatch, tmp_path,
+):
+    module = request.getfixturevalue(module_fixture)
+    image_path, original_text, _ = _image_and_cache(module, monkeypatch, tmp_path)
+    text_path = tmp_path / "sample_v1.txt"
+    text_path.write_text(original_text.read_text(encoding="utf-8"), encoding="utf-8")
+    image = module.load_image(image_path)[0]
+    layout = [{"text": "one", "x": 1, "y": 1, "confidence": 0.9, "page": 0,
+               "bbox": [[1, 1], [2, 1], [2, 2], [1, 2]]}]
+    write_ocr_layout_sidecar(original_text, layout, provenance_kind="same_call_capture",
+                           provenance_source=module._ocr_cache_key(image))
+    evidence, _ = _write_supplemental_sidecar(module, monkeypatch, image_path, tmp_path)
+    monkeypatch.setattr(module, "detect_document_type", lambda _text: "receipt")
+    if module_fixture == "benchmark_module":
+        monkeypatch.setattr(module, "_fixture_image", lambda _base: image_path)
+        source = text_path
+    else:
+        monkeypatch.setattr(module, "_find_image", lambda _base: image_path)
+        source = {"type": "ocr_text", "path": text_path}
+    context = module._pixel_marker_artifact("sample_v1", source, evidence)
+    assert context is not None and context["primary_layout"] == layout
+    assert np.array_equal(context["image"], image)
+
+    # A different replay's own sidecar must prove its frame; its filename cannot.
+    text_path.write_text("different replay", encoding="utf-8")
+    write_ocr_layout_sidecar(text_path, layout, provenance_kind="same_call_capture",
+                           provenance_source="unrelated-image")
+    assert module._pixel_marker_artifact("sample_v1", source, evidence) is None
+
+
+@pytest.mark.parametrize("module_fixture", ["benchmark_module", "accuracy_module"])
+def test_vision_corpus_hashes_only_bound_cache_inputs_and_records_absence(
+    request, module_fixture, monkeypatch, tmp_path,
+):
+    module = request.getfixturevalue(module_fixture)
+    image_path, _, _ = _image_and_cache(module, monkeypatch, tmp_path)
+    bound = tmp_path / "bound-vision.json"
+    monkeypatch.setattr(module, "vision_cache_files", lambda _image: [bound] if bound.is_file() else [])
+    if module_fixture == "benchmark_module":
+        corpus = [("sample", image_path, {"total": 1})]
+        fingerprint = lambda: module._fixture_corpus_sha256(corpus, cached_ocr=True)
+    else:
+        corpus = [("sample", {"type": "image", "path": image_path}, {"total": 1})]
+        fingerprint = lambda: module._corpus_sha256(corpus)
+    absent = fingerprint()
+    (tmp_path / "unrelated-vision.json").write_text("unrelated", encoding="utf-8")
+    assert fingerprint() == absent
+    bound.write_text("invalid but present", encoding="utf-8")
+    present = fingerprint()
+    bound.write_text("{}", encoding="utf-8")
+    assert absent != present != fingerprint()
+
+
+@pytest.mark.parametrize("module_fixture", ["benchmark_module", "accuracy_module"])
+def test_harness_vision_settings_validate_mode_and_preserve_explicit_disable(
+    request, module_fixture, monkeypatch,
+):
+    module = request.getfixturevalue(module_fixture)
+    monkeypatch.delenv("RECEIPT_VISION_MODE", raising=False)
+    assert module._vision_mode() == "normal"
+    monkeypatch.setenv("RECEIPT_VISION_MODE", "invalid")
+    with pytest.raises(ValueError, match="RECEIPT_VISION_MODE"):
+        module._vision_mode()
+    monkeypatch.setenv("RECEIPT_VISION_MODEL", "")
+    assert module.configured_vision_model() == ""
+
+
+def test_accuracy_records_vision_fallback_metadata_once_per_case(accuracy_module, monkeypatch):
+    fallback = {"attempts": 1, "source": "fresh", "cost_usd": 0.001}
+    monkeypatch.setattr(accuracy_module, "_RESULTS_CACHE", {"sample": {"_vision_fallback": fallback}})
+    scope = {}
+    accuracy_module._record_vision_fallbacks(scope)
+    fallback["attempts"] = 2
+    assert scope["vision_fallback"] == {"sample": {"attempts": 1, "source": "fresh", "cost_usd": 0.001}}

@@ -1,6 +1,7 @@
 """Receipt tax category assignment helpers."""
 
 import re
+from math import isfinite
 from difflib import SequenceMatcher
 from itertools import combinations
 
@@ -11,6 +12,7 @@ from .patterns import (
 )
 from .receipt_financial import (
     _find_subset_sum,
+    _interleaved_rate_tax_summary_entries,
     _jpy_summary_amount_options,
     extract_financial_totals,
     extract_rate_bases,
@@ -22,7 +24,11 @@ from .schema import REDUCED_RATE, STANDARD_RATE, VALID_TAX_RATES
 
 
 def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted_taxes=None):
-    """Assign tax_category to line items using OCR evidence. Mutates in-place."""
+    """Assign tax categories from OCR markers and balanced printed rate bases.
+
+    When complete mixed-rate bases disagree with the basket, preserve unmarked
+    categories; a matching subset alone cannot prove the other items' rates.
+    """
     if not items:
         return
 
@@ -222,6 +228,17 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
             if err_inclusive + 0.5 < err_pretax and base > tax:
                 rate_bases[rate] = base - tax
 
+    balance_tolerance = 5.0 if re.search(r'外税|タイショウ', unified_text) else 2.0
+    complete_rate_bases = all(rate_bases.get(rate) is not None for rate in detected_rates)
+    if (
+        complete_rate_bases
+        and abs(items_sum_total - sum(rate_bases[rate] for rate in detected_rates))
+        > balance_tolerance
+    ):
+        for idx, rate in item_rates.items():
+            items[idx]["tax_category"] = rate
+        return
+
     subset_matched = False
     if minority_rate and unassigned:
         unassigned_items = [(i, items[i].get("total", 0)) for i in unassigned]
@@ -239,14 +256,10 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
             if try_base < 0:
                 continue
             sub_max_k = min(len(unassigned_items), 5)
-            match = _find_subset_sum(unassigned_items, try_base, max_k=sub_max_k, tolerance=50.0)
+            match = _find_subset_sum(unassigned_items, try_base, max_k=sub_max_k, tolerance=2.0)
             if match is not None and other_base is not None and len(unassigned_items) > 3:
-                # Score candidates by (target_err, complement_err) lex tuple — an
-                # exact target hit (e ≤ 2) wins over a fuzzy 2-element match even
-                # if the complement drifts. The unassigned set may be slightly off
-                # from base+other_base because of upstream OCR/LLM noise; in that
-                # case complement error is irreducible noise and shouldn't gate
-                # whether we accept an exact target match.
+                # Prefer exact partitions over rounded ones, while requiring
+                # both printed groups to balance below.
                 best_e = abs(sum(t for i, t in unassigned_items if i in match) - try_base)
                 best_ce = abs(sum(t for i, t in unassigned_items if i not in match) - other_base)
                 best_score = (best_e, best_ce)
@@ -258,7 +271,7 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
                     for combo in combinations(unassigned_items, ext_k):
                         s = sum(t for _, t in combo)
                         e = abs(s - try_base)
-                        if e > 50:
+                        if e > 2:
                             continue
                         c_indices = {i for i, _ in combo}
                         cs = sum(t for i, t in unassigned_items if i not in c_indices)
@@ -271,7 +284,11 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
                                 break
                     if best_score == (0, 0):
                         break
-            if match is not None:
+            if match is not None and (
+                other_base is None
+                or abs(sum(t for i, t in unassigned_items if i not in match) - other_base)
+                <= balance_tolerance
+            ):
                 other_rate = minority_rate if try_rate == majority_rate else majority_rate
                 subset_matched = True
                 for i in match:
@@ -284,7 +301,7 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
         # Fallback: if rate_bases didn't work, compute expected bases from
         # tax amounts and marked item sums. Tax amount / rate = pre-tax base.
         # Subtract already-marked items to get what unassigned items should sum to.
-        if not subset_matched and tax_amounts:
+        if not subset_matched and tax_amounts and not complete_rate_bases:
             marked_sums: dict[str, float] = {}
             for idx, rate in item_rates.items():
                 marked_sums[rate] = marked_sums.get(rate, 0) + items[idx].get("total", 0)
@@ -315,6 +332,11 @@ def assign_tax_categories(items, unified_text, ocr_totals, rate_bases, extracted
                         if i not in item_rates:
                             item_rates[i] = other_rate
                     break
+
+    if complete_rate_bases and not subset_matched:
+        for idx, rate in item_rates.items():
+            items[idx]["tax_category"] = rate
+        return
 
     if subset_matched:
         default_rate = majority_rate
@@ -360,13 +382,27 @@ def _fix_tax_categories_from_ocr_markers(
         return
     lines = unified_text.split('\n')
 
-    def _norm(text: str) -> str:
-        text = re.sub(r'[¥￥]?\s*\d[\d,]*\s*(?:[%％][*※除軽]|[*※除軽非内外xX])?\s*$', '', text or "")
+    def _norm(text: str, *, strip_price: bool = True) -> str:
+        if strip_price:
+            text = re.sub(r'[¥￥]?\s*\d[\d,]*\s*(?:[%％][*※除軽]|[*※除軽非内外xX])?\s*$', '', text or "")
         text = re.sub(r'\s+', '', text)
         text = re.sub(r'[^\wぁ-んァ-ン一-龥]', '', text, flags=re.UNICODE)
         return text.lower()
 
     norm_lines = [_norm(line) for line in lines]
+    included_prefix = re.compile(r'^\d+\s*内\s*[#＃]\s*')
+    included_entries = (
+        _interleaved_rate_tax_summary_entries(lines)
+        if any(included_prefix.match(line.strip()) for line in lines)
+        else []
+    )
+    included_bases = [
+        (rate, value) for rate, kind, value, mode in included_entries
+        if kind == "base" and mode == "内税" and any(
+            tax_rate == rate and tax_kind == "tax" and tax_mode == mode and tax > 0
+            for tax_rate, tax_kind, tax, tax_mode in included_entries
+        )
+    ]
 
     marker_footnote = re.search(
         r'([*＊※☆★A-Za-z])\s*(?:印|マーク)?.{0,12}軽減税率|'
@@ -596,6 +632,47 @@ def _fix_tax_categories_from_ocr_markers(
         if len(row_owners.get(best_idx, ())) != 1:
             continue
         line = lines[best_idx].strip()
+        included_marker = included_prefix.match(line)
+        if included_marker:
+            description = _norm(raw_desc, strip_price=False)
+            matching_rows = [
+                idx for idx, raw in enumerate(lines)
+                if description in _norm(raw, strip_price=False)
+            ]
+            price_line = line[included_marker.end():]
+            price_match = re.search(r'[¥￥]\s*(\d[\d,]*)\s*$', price_line)
+            if price_match is None and best_idx + 1 < len(lines):
+                price_line = lines[best_idx + 1].strip()
+                price_match = re.fullmatch(r'[¥￥]?\s*(\d[\d,]*)\s*', price_line)
+            try:
+                amount = float(item.get("total"))
+                amounts = [
+                    float(candidate.get("total"))
+                    for candidate in items if isinstance(candidate, dict)
+                ]
+            except (TypeError, ValueError):
+                continue
+            rates = [rate for rate, base in included_bases if abs(base - amount) <= 2]
+            if (
+                isfinite(amount) and amount > 0
+                and all(isfinite(value) and value > 0 for value in amounts)
+                and _norm(
+                    re.sub(r'[¥￥]\s*\d[\d,]*\s*$', '', line[included_marker.end():]),
+                    strip_price=False,
+                ) == description
+                and matching_rows == [best_idx]
+                and sum(abs(value - amount) <= 2 for value in amounts) == 1
+                and price_match and abs(float(price_match.group(1).replace(',', '')) - amount) <= 2
+                and not re.search(r'[*＊※軽除非外]', line[included_marker.end():])
+                and len(rates) == 1
+                and item.get("_tax_category_locked") in (None, rates[0])
+                and (
+                    locked_indices is None or item_idx not in locked_indices
+                    or item.get("tax_category") == rates[0]
+                )
+            ):
+                _assign(item_idx, rates[0])
+            continue
         if re.match(r'^内\s*\*', line):
             _assign(item_idx, "8%")
             continue
@@ -1062,6 +1139,42 @@ def _rebalance_tax_categories_to_rate_bases(
     if len(valid_rates) == 1:
         rate = valid_rates[0]
         target = targets[rate]
+        printed_bases = extract_rate_bases(unified_text)
+        printed_taxes = extract_financial_totals(unified_text).get("taxes", [])
+        printed_rates = {
+            candidate for candidate, base in printed_bases.items()
+            if candidate in {"8%", "10%"} and base is not None and float(base) > 0
+        } | {
+            tax.get("rate") for tax in printed_taxes
+            if tax.get("rate") in {"8%", "10%"} and float(tax.get("amount") or 0) > 0
+        }
+        printed_amounts = {
+            float(tax["amount"]) for tax in printed_taxes
+            if tax.get("rate") == rate and tax.get("amount") is not None
+        }
+        printed_tax = next(iter(printed_amounts)) if len(printed_amounts) == 1 else None
+        covered_sum = sum(amount for _idx, amount in item_amounts)
+        pct = float(rate.rstrip("%")) / 100
+        direct_coverage = abs(covered_sum - target) <= 2 and (
+            not printed_amounts or (printed_tax is not None and any(
+                abs(int(base * pct) - printed_tax) <= 1
+                for base in (covered_sum, covered_sum / (1 + pct))
+            ))
+        )
+        inclusive_coverage = (
+            printed_tax is not None and abs(covered_sum + printed_tax - target) <= 2
+            and abs(int(covered_sum * pct) - printed_tax) <= 1
+        )
+        if (
+            printed_rates == {rate}
+            and abs(float(printed_bases.get(rate) or 0) - target) <= 2
+            and not any(items[idx].get("tax_category") != rate for idx in locked_indices
+                        if idx not in locked_nontaxable_indices)
+            and (direct_coverage or inclusive_coverage)
+        ):
+            for idx, _amount in item_amounts:
+                items[idx]["tax_category"] = rate
+            return True
         locked_sum = sum(
             amount for idx, amount in item_amounts
             if idx in locked_indices and items[idx].get("tax_category") == rate

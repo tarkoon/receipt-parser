@@ -13,6 +13,62 @@ from receipt_parser.receipt_postprocess_phases import (
 )
 
 
+@pytest.mark.parametrize(
+    ("ocr_text", "expected"),
+    [
+        ("PayPay支払い 500円", "PayPay"),
+        ("PayPay\n500円", "PayPay"),
+        ("合計\n500円\nPayPay事前決済\n合計点数\n500円\n1点", "PayPay"),
+        ("現金\nPayPay\n0\n500", "PayPay"),
+        ("現金\nPayPay\n500\n0", "cash"),
+        ("現金 200円\nPayPay 300円", None),
+        ("カード決済 500円\nPayPay 500円", None),
+        ("PayPay支払いできます\n500円", None),
+        ("PayPayキャンペーン\n500円", None),
+        ("PayPay", None),
+        ("PayPay 0円", None),
+        ("PayPay 300円", None),
+        ("カード決済 500円", "credit"),
+        ("バーコード決済支払 500円", None),
+        ("バーコード決済\nPayPay\n支払\n500円", "PayPay"),
+    ],
+)
+def test_paypay_requires_owned_tender_and_preserves_mixed_payment_abstention(ocr_text, expected):
+    extracted = {"total": 500, "amount_paid": 500, "payment_method": "credit"}
+
+    _fix_payment_method(extracted, ocr_text, 0.9, {})
+
+    assert extracted["payment_method"] == expected
+
+
+def test_generic_barcode_channel_keeps_noncash_guard_and_owned_paypay_reference_separate():
+    from receipt_parser.receipt_identity_payment import _has_noncash_tender_amount
+
+    text = ("バーコード決済支払\n¥600\nおつり\n¥0\nバーコード決済\nPayPay\n"
+            "支払伝票番号\n2718281828459045\n支払\n¥600")
+    extracted = {"total": 600, "amount_paid": 600, "payment_method": None,
+                 "payment_reference": "2718281828459045", "subtotal": 600}
+    before = extracted.copy()
+    _fix_payment_method(extracted, text, 0.9, {})
+    assert extracted == {**before, "payment_method": "PayPay"}
+    assert _has_noncash_tender_amount(text, (600,))
+    assert _has_noncash_tender_amount("バーコード決済支払\n¥600", (600,))
+
+
+def test_currency_marked_cash_tender_flag_preserves_owned_change_arithmetic():
+    for flag in ('*', '＊'):
+        extracted = {'total': 2200, 'amount_paid': 2200, 'payment_method': None}
+        text = f'合計\n¥2,200\nお預り合計\n¥5,001{flag}\nお釣り\n¥2,801'
+        _fix_payment_method(extracted, text, 0.9, {})
+        assert extracted['payment_method'] == 'cash'
+        mixed = {'total': 2200, 'amount_paid': 2200, 'payment_method': 'cash'}
+        _fix_payment_method(mixed, text + '\nカード決済 ¥500', 0.9, {})
+        assert mixed['payment_method'] is None
+        advertisement = {'total': 2200, 'amount_paid': 2200, 'payment_method': None}
+        _fix_payment_method(advertisement, text + '\nPayPay\nキャンペーン\n¥2,200', 0.9, {})
+        assert advertisement['payment_method'] == 'cash'
+
+
 def test_points_remain_unknown_without_redemption_evidence():
     extracted = {"total": 1200, "amount_paid": 900, "points_used": 0}
 
@@ -545,6 +601,41 @@ def test_contact_row_after_host_store_uses_leading_logo_idempotently():
 
     _fix_company_name_merchant(extracted, ocr_text)
     assert extracted["merchant"] == "NORTHSTAR"
+
+
+def test_unique_header_contact_name_preserves_branch_separation():
+    contact = "青空商会 (0123)45-6789"
+    header = ["中央支店", contact, "領収証", "商品 100円"]
+    original = {"merchant": "青空商会中央支店", "location": "中央支店"}
+    extracted = dict(original)
+    _fix_company_name_merchant(extracted, "\n".join(header))
+    assert extracted == {"merchant": "青空商会", "location": "中央支店"}
+    dated = dict(original)
+    _fix_company_name_merchant(dated, "\n".join([contact, "2025年1月2日", "商品 100円"]))
+    assert dated == extracted
+    logo = {"merchant": "NORTHSTAR"}
+    _fix_company_name_merchant(logo, "\n".join([
+        "ARC", "NORTHSTAR", "NORTHSTAR (0123)45-6789", "ARC株式会社", "領収証",
+    ]))
+    assert logo["merchant"] == "ARC"
+    _fix_company_name_merchant(extracted, "\n".join(header))
+    assert extracted == {"merchant": "青空商会", "location": "中央支店"}
+
+    for merchant, lines in [
+        (original["merchant"], [contact, "星空商会 (0124)45-6789", "領収証"]),
+        (original["merchant"], ["ARC", contact, "領収証"]),
+        (original["merchant"], ["領収証", contact]),
+        (original["merchant"], ["2025年1月2日", contact, "領収証"]),
+        (original["merchant"], [contact, "商品 100円"]),
+        ("FOREIGN SHOP", header),
+        ("青空商会", header),
+        ("お問い合わせ中央店", ["お問い合わせ (0123)45-6789", "領収証"]),
+        ("Tel余計", ["Tel (0123)45-6789", "領収証"]),
+    ]:
+        unchanged = {"merchant": merchant, "location": "中央支店"}
+        before = dict(unchanged)
+        _fix_company_name_merchant(unchanged, "\n".join(lines))
+        assert unchanged == before
 
 
 def test_alphabetic_romanization_still_identifies_following_brand_line():

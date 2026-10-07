@@ -120,12 +120,18 @@ def init_cloud_vision():
         )
 
 
-def _call_cloud_vision(image: np.ndarray, client):
+def _call_cloud_vision(image: np.ndarray, client, *, allow_fallback: bool = True,
+                       feature: str = "DOCUMENT_TEXT_DETECTION", model: str = "builtin/stable"):
     """Make a single Cloud Vision API call. Returns the raw response.
 
-    Pins to builtin/stable model for deterministic OCR within a model cycle.
-    Falls back to default (no model pin) if builtin/stable is unavailable.
+    Pins to an explicit builtin model for deterministic OCR within a model cycle.
+    Falls back to default if builtin/stable is unavailable and allow_fallback is True.
     """
+    if (not isinstance(feature, str) or feature not in {"DOCUMENT_TEXT_DETECTION", "TEXT_DETECTION"}
+            or not isinstance(model, str) or model not in {"builtin/stable", "builtin/latest"}
+            or (feature == "TEXT_DETECTION" and allow_fallback)
+            or (model == "builtin/latest" and (feature != "TEXT_DETECTION" or allow_fallback))):
+        raise ValueError("sparse OCR requires one fixed TEXT feature without fallback")
     from google.cloud import vision
 
     success, buf = cv2.imencode(".png", image)
@@ -136,16 +142,19 @@ def _call_cloud_vision(image: np.ndarray, client):
 
     try:
         features = [vision.Feature(
-            type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION,
-            model="builtin/stable",
+            type_=getattr(vision.Feature.Type, feature),
+            model=model,
         )]
         request = vision.AnnotateImageRequest(
             image=gcp_image,
             features=features,
             image_context=vision.ImageContext(language_hints=["ja", "en"]),
         )
-        response = client.annotate_image(request=request)
+        response = (client.annotate_image(request=request, retry=None) if not allow_fallback
+                    else client.annotate_image(request=request))
     except Exception as e:
+        if not allow_fallback:
+            raise
         import sys
         print(f"WARNING: builtin/stable model unavailable ({e}), "
               f"falling back to default model", file=sys.stderr)
@@ -197,7 +206,8 @@ def _extract_blocks_from_response(response) -> list[dict]:
     return blocks
 
 
-def _extract_words_from_response(response) -> list[dict]:
+def _extract_words_from_response(response, *, use_paragraph_confidence: bool = True,
+                                 preserve_missing_confidence: bool = False) -> list[dict]:
     """Extract word-level OCR geometry from a Cloud Vision response."""
     if not response or not response.full_text_annotation.pages:
         return []
@@ -214,9 +224,15 @@ def _extract_words_from_response(response) -> list[dict]:
                     bbox = [[int(v.x or 0), int(v.y or 0)] for v in vertices]
                     xs = [p[0] for p in bbox]
                     ys = [p[1] for p in bbox]
+                    confidence = (
+                        float(word.confidence) if _proto_field_present(word, "confidence") else None
+                    ) if preserve_missing_confidence else float(
+                        (word.confidence or paragraph.confidence or 0.0)
+                        if use_paragraph_confidence else word.confidence
+                    )
                     words.append({
                         "text": text,
-                        "confidence": float(word.confidence or paragraph.confidence or 0.0),
+                        "confidence": confidence,
                         "x": min(xs) if xs else 0,
                         "y": min(ys) if ys else 0,
                         "bbox": bbox,
@@ -225,6 +241,18 @@ def _extract_words_from_response(response) -> list[dict]:
 
     words.sort(key=lambda b: (b["page"], b["y"], b["x"]))
     return words
+
+
+def _proto_field_present(message, name: str) -> bool:
+    """Check actual protobuf presence through proto-plus wrappers."""
+    message = getattr(message, "_pb", message)
+    try:
+        return bool(message.HasField(name))
+    except (AttributeError, TypeError, ValueError):
+        try:
+            return any(field.name == name for field, _ in message.ListFields())
+        except (AttributeError, TypeError, ValueError):
+            return False
 
 
 def _extract_fulltext_from_response(response) -> str | None:
@@ -577,9 +605,10 @@ def run_cloud_vision(image: np.ndarray, client=None, *, skip_cache: bool = False
     )
 
 
-def blocks_to_structured_text(blocks: list[dict]) -> str:
+def blocks_to_structured_text(blocks: list[dict], *, sort_within_rows: bool = True) -> str:
     """Convert spatial blocks to line-grouped text for the LLM.
     y_tolerance is calculated dynamically from the median bounding box height.
+    Disabling row sorting is only for validating text in legacy OCR caches.
     """
     if not blocks:
         return ""
@@ -605,19 +634,21 @@ def blocks_to_structured_text(blocks: list[dict]) -> str:
 
     for block in blocks:
         if current_y is None or abs(block["y"] - current_y) < y_tolerance:
-            current_line.append(block["text"])
+            current_line.append(block)
             _y_sum += block["y"]
             _y_count += 1
             # Use running average to track line position through gradual drift
             current_y = _y_sum / _y_count
         else:
-            lines.append("  ".join(current_line))
-            current_line = [block["text"]]
+            row = sorted(current_line, key=lambda word: word["x"]) if sort_within_rows else current_line
+            lines.append("  ".join(word["text"] for word in row))
+            current_line = [block]
             current_y = block["y"]
             _y_sum = block["y"]
             _y_count = 1
 
     if current_line:
-        lines.append("  ".join(current_line))
+        row = sorted(current_line, key=lambda word: word["x"]) if sort_within_rows else current_line
+        lines.append("  ".join(word["text"] for word in row))
 
     return "\n".join(lines)

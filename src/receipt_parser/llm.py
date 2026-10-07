@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 import ollama as ollama_client
 from dotenv import load_dotenv
 from .schema import Receipt, generate_extraction_prompt, generate_verification_prompt
+from .receipt_totals import _sum_taxable_amounts
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", encoding="utf-8")
 
@@ -36,6 +37,9 @@ class LLMResult:
     total_duration_ns: int | None = None
     load_duration_ns: int | None = None
     backend: str = "unknown"  # "api" or "ollama"
+    model: str | None = None
+    cost_usd: float | None = None
+    finish_reason: str | None = None
 
 
 def _is_ollama_model(model: str) -> bool:
@@ -221,7 +225,7 @@ def _get_api_client(model: str | None = None):
                     api_key=deepseek_key,
                     timeout=OLLAMA_TIMEOUT_SECONDS,
                 )
-            elif openrouter_key:
+            elif provider == "openrouter" and openrouter_key:
                 _api_clients[provider] = OpenAI(
                     base_url="https://openrouter.ai/api/v1",
                     api_key=openrouter_key,
@@ -288,23 +292,27 @@ def _as_float(value: object) -> float | None:
 def _openrouter_chat(
     model: str,
     messages: list,
-    temperature: float = 0.0,
     max_tokens: int = 8192,
-    seed: int = _LLM_SEED,
+    *, extra_body: dict | None = None, timeout: float | None = None,
+    max_retries: int | None = None,
 ) -> LLMResult:
     """Call DeepSeek/OpenRouter API and return structured result."""
     provider, routed_model = _api_client_key_for_model(model)
     client = _get_api_client(model)
+    options = {key: value for key, value in {"timeout": timeout, "max_retries": max_retries}.items()
+               if value is not None}
+    if options:
+        client = client.with_options(**options)
     t0 = time.perf_counter()
     try:
         response = client.chat.completions.create(
             model=routed_model or model,
             messages=messages,
             response_format={"type": "json_object"},
-            temperature=temperature,
+            temperature=0.0,
             max_tokens=max_tokens,
-            seed=seed,
-            extra_body={"thinking": {"type": "disabled"}},
+            seed=_LLM_SEED,
+            extra_body=extra_body if extra_body is not None else {"thinking": {"type": "disabled"}},
         )
     except Exception as e:
         if provider == "openrouter" and _is_openrouter_credit_error(e):
@@ -314,6 +322,8 @@ def _openrouter_chat(
     usage = response.usage
     input_toks = _as_int(_usage_attr(usage, "prompt_tokens"))
     output_toks = _as_int(_usage_attr(usage, "completion_tokens"))
+    response_model = getattr(response, "model", None) or routed_model or model
+    cost_usd = _as_float(_usage_attr(usage, "cost"))
 
     if provider == "deepseek":
         # DeepSeek returns cache hit/miss breakdown in usage.
@@ -334,8 +344,6 @@ def _openrouter_chat(
         if input_toks is not None:
             cache_miss = max(0, input_toks - (cache_hit or 0))
         reasoning = _as_int(_usage_nested(usage, "completion_tokens_details", "reasoning_tokens"))
-        cost_usd = _as_float(_usage_attr(usage, "cost"))
-        response_model = getattr(response, "model", None) or routed_model or model
 
         from .usage import track_openrouter_call
         track_openrouter_call(
@@ -355,13 +363,14 @@ def _openrouter_chat(
         eval_duration_ns=elapsed_ns,
         total_duration_ns=elapsed_ns,
         backend="api",
+        model=response_model, cost_usd=cost_usd,
+        finish_reason=getattr(response.choices[0], "finish_reason", None),
     )
 
 
 def _instructor_extract(
     model: str,
     messages: list,
-    temperature: float = 0.0,
     max_tokens: int = 8192,
     max_retries: int = 2,
 ) -> tuple[Receipt | None, LLMResult | None]:
@@ -379,7 +388,7 @@ def _instructor_extract(
             model=model,
             messages=messages,
             response_model=Receipt,
-            temperature=temperature,
+            temperature=0.0,
             max_tokens=max_tokens,
             seed=_LLM_SEED,
             max_retries=max_retries,
@@ -456,9 +465,7 @@ def _llm_chat(
     model: str,
     messages: list,
     schema: dict,
-    temperature: float = 0.0,
     max_tokens: int = 8192,
-    seed: int = _LLM_SEED,
 ) -> LLMResult:
     """Unified LLM chat — dispatches to Ollama or OpenRouter."""
     if _is_ollama_model(model):
@@ -466,7 +473,7 @@ def _llm_chat(
             model=_ollama_model_name(model),
             messages=messages,
             format=schema,
-            options={"temperature": temperature, "num_predict": max_tokens, "seed": seed},
+            options={"temperature": 0.0, "num_predict": max_tokens, "seed": _LLM_SEED},
             think=False,
             keep_alive="60m",
         )
@@ -480,7 +487,7 @@ def _llm_chat(
             backend="ollama",
         )
     else:
-        return _openrouter_chat(model, messages, temperature, max_tokens, seed=seed)
+        return _openrouter_chat(model, messages, max_tokens=max_tokens)
 
 
 def extract_with_llm(
@@ -519,19 +526,6 @@ def extract_with_llm(
         if receipt is not None:
             return receipt.model_dump(), instructor_result or llm_result
 
-    # Content quality retry: re-extract when items grossly exceed total
-    if "error" not in parsed and _extraction_is_low_quality(parsed):
-        logger.info("Low-quality extraction detected, retrying with seed=%d", _LLM_SEED + 1)
-        retry_result = _llm_chat(
-            model=model,
-            messages=messages,
-            schema=get_ollama_schema(),
-            temperature=0.3,
-        )
-        retry_parsed = _parse_llm_json(sanitize_llm_response(retry_result.content))
-        if "error" not in retry_parsed and not _extraction_is_low_quality(retry_parsed):
-            return retry_parsed, retry_result
-
     return parsed, llm_result
 
 
@@ -561,29 +555,6 @@ def _has_duplicate_descs(extracted: dict) -> bool:
         if seen[key] >= 2:
             return True
     return False
-
-
-def _alternate_seed_extract_with_result(
-    ocr_text: str, model: str, doc_type: str, seed_offset: int = 1,
-) -> tuple[dict | None, LLMResult | None, str | None]:
-    """Re-run extraction and return enough detail for diagnostic history."""
-    system_prompt, user_prompt = generate_extraction_prompt(ocr_text, doc_type=doc_type)
-    try:
-        result = _llm_chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            schema=get_ollama_schema(),
-            seed=_LLM_SEED + seed_offset,
-        )
-    except Exception as e:
-        return None, None, _format_llm_error(e, model)
-    parsed = _parse_llm_json(sanitize_llm_response(result.content))
-    if "error" in parsed:
-        return parsed, result, str(parsed.get("error") or "parse_error")
-    return parsed, result, None
 
 
 _CROSS_PROMPT_VARIANTS = {
@@ -617,7 +588,6 @@ def _cross_prompt_extract_with_result(
                 {"role": "user", "content": user_prompt},
             ],
             schema=get_ollama_schema(),
-            seed=_LLM_SEED,
             max_tokens=max_tokens,
         )
     except Exception as e:
@@ -672,10 +642,7 @@ def _items_sum_gap(extracted: dict) -> float | None:
     taxes = extracted.get("taxes") or []
     canonical_subtotal = None
     if total and taxes:
-        tax_sum = sum(
-            t.get("amount", 0) for t in taxes
-            if isinstance(t, dict) and t.get("amount") is not None
-        )
+        tax_sum = _sum_taxable_amounts(taxes)
         if tax_sum:
             canonical_subtotal = total - tax_sum
     if subtotal and (
@@ -744,7 +711,7 @@ def _substitute_dup_descs_from_alt(extracted: dict, alt: dict) -> int:
     This addresses the LLM copy-paste failure mode: when the OCR text has
     two distinct adjacent items at the same price, the model sometimes
     duplicates the first item's description over the second. A different
-    seed often picks up the second item's actual description.
+    prompt often picks up the second item's actual description.
     """
     items = extracted.get("line_items", []) or []
     alt_items = alt.get("line_items", []) or []
@@ -865,20 +832,6 @@ def _substitute_dup_descs_from_alt(extracted: dict, alt: dict) -> int:
     return substituted
 
 
-def _extraction_is_low_quality(parsed: dict) -> bool:
-    """Detect structurally valid but content-broken extractions."""
-    items = parsed.get("line_items", [])
-    total = parsed.get("total")
-    if not items or not total or total <= 0:
-        return False
-    item_sum = sum(i.get("total", 0) for i in items if isinstance(i, dict))
-    if item_sum > total * 1.3:
-        return True
-    if len(items) >= 3 and all(i.get("unit_price", 0) == 0 for i in items if isinstance(i, dict)):
-        return True
-    return False
-
-
 def _llm_result_to_timing(result: LLMResult | None) -> dict | None:
     """Convert LLMResult to a serializable timing dict for pass history."""
     if result is None:
@@ -945,18 +898,18 @@ def extract_with_verification(
     })
 
     # Cross-check pass: when pass 1 has duplicate-description items, run a
-    # fresh extraction with a DIFFERENT seed (not the verification prompt —
+    # fresh row-audit prompt (not the verification prompt —
     # that biases toward pass 1's mistake). Then for each duplicate in pass
     # 1, look for an alternate-pass item with the same total but a distinct
     # description. Substitute. This fixes the common LLM failure mode where
     # the model copies a nearby item's name onto a distinct adjacent row.
-    seed43_attempted = False
-    seed43_extracted = None
-    seed43_result = None
-    seed43_error = None
-    seed43_retained = False
+    row_audit_attempted = False
+    row_audit_extracted = None
+    row_audit_result = None
+    row_audit_error = None
+    row_audit_retained = False
     if "error" not in extracted and _has_duplicate_descs(extracted):
-        seed43_attempted = True
+        row_audit_attempted = True
         if _notify is not None and passes >= 2:
             _notify(
                 on_stage, "extract", f"LLM pass 2 of {passes}",
@@ -964,14 +917,14 @@ def extract_with_verification(
                 payload={"pass": 2, "pass_budget": passes,
                          "candidate_only": True, "cross_check": True},
             )
-        seed43_extracted, seed43_result, seed43_error = (
-            _alternate_seed_extract_with_result(
-                ocr_text, model, doc_type, seed_offset=1
+        row_audit_extracted, row_audit_result, row_audit_error = (
+            _cross_prompt_extract_with_result(
+                ocr_text, model, doc_type, variant="row_audit"
             )
         )
-        alt_extracted = seed43_extracted
+        alt_extracted = row_audit_extracted
         if (
-            seed43_error is None
+            row_audit_error is None
             and alt_extracted is not None
             and "error" not in alt_extracted
         ):
@@ -989,9 +942,9 @@ def extract_with_verification(
                     "pass": "1-cross", "extraction": deepcopy(extracted),
                     "warnings": alt_warnings, "alt_extraction": deepcopy(alt_extracted),
                     "substitutions": substituted,
-                    "llm_timing": _llm_result_to_timing(seed43_result),
+                    "llm_timing": _llm_result_to_timing(row_audit_result),
                 })
-                seed43_retained = True
+                row_audit_retained = True
                 warnings = alt_warnings
 
     # Track the best extraction across all passes. Two filters apply:
@@ -1026,9 +979,6 @@ def extract_with_verification(
             validation_warnings=best_llm_warnings,
         )
 
-        # Vary seed across passes so a deterministic LLM (temperature=0,
-        # seed=42) actually produces a different response on retry. Without
-        # this, pass 2+ just repeats pass 1 verbatim.
         llm_result = _llm_chat(
             model=model,
             messages=[
@@ -1036,7 +986,6 @@ def extract_with_verification(
                 {"role": "user", "content": v_user},
             ],
             schema=get_ollama_schema(),
-            seed=_LLM_SEED + pass_num - 1,
         )
 
         raw = sanitize_llm_response(llm_result.content)
@@ -1060,19 +1009,22 @@ def extract_with_verification(
             best_extracted = pass_extracted
             best_warnings = pass_warnings
             best_llm_warnings = pass_llm_warnings
+        else:
+            # ponytail: unchanged best candidate means the next prompt is identical.
+            break
 
     # Retain a duplicate cross-check result even when it made no substitution.
     # A clean receipt otherwise spends only pass 1, so use its remaining pass
-    # budget for the same independent seed-43 candidate.
+    # budget for the same independent row-audit candidate.
     needs_clean_candidate = (
         doc_type == "receipt"
         and passes >= 2
         and clean_early_exit
         and "error" not in extracted
-        and not seed43_attempted
+        and not row_audit_attempted
     )
-    if needs_clean_candidate or (seed43_attempted and not seed43_retained):
-        if not seed43_attempted:
+    if needs_clean_candidate or (row_audit_attempted and not row_audit_retained):
+        if not row_audit_attempted:
             if _notify is not None:
                 _notify(
                     on_stage, "extract", f"LLM pass 2 of {passes}",
@@ -1080,47 +1032,50 @@ def extract_with_verification(
                     payload={"pass": 2, "pass_budget": passes,
                              "candidate_only": True},
                 )
-            seed43_extracted, seed43_result, seed43_error = (
-                _alternate_seed_extract_with_result(
-                    ocr_text, model, doc_type, seed_offset=1
+            row_audit_extracted, row_audit_result, row_audit_error = (
+                _cross_prompt_extract_with_result(
+                    ocr_text, model, doc_type, variant="row_audit"
                 )
             )
+            row_audit_attempted = True
         if (
-            seed43_error is None
-            and seed43_extracted is not None
-            and "error" not in seed43_extracted
+            row_audit_error is None
+            and row_audit_extracted is not None
+            and "error" not in row_audit_extracted
         ):
-            seed43_warnings: list[str] = []
+            row_audit_warnings: list[str] = []
             if validate_fn:
                 try:
-                    seed43_warnings = validate_fn(Receipt(**seed43_extracted))
+                    row_audit_warnings = validate_fn(Receipt(**row_audit_extracted))
                 except Exception:
-                    seed43_warnings = ["Schema validation failed on seed-43 candidate"]
+                    row_audit_warnings = ["Schema validation failed on row-audit candidate"]
             history.append({
-                "pass": "candidate-seed43",
+                "pass": "candidate-row_audit",
                 "retry_kind": "candidate_diversity",
                 "candidate_only": True,
-                "seed": _LLM_SEED + 1,
-                "extraction": deepcopy(seed43_extracted),
-                "warnings": seed43_warnings,
-                "llm_timing": _llm_result_to_timing(seed43_result),
+                "seed": _LLM_SEED,
+                "prompt_variant": "row_audit",
+                "extraction": deepcopy(row_audit_extracted),
+                "warnings": row_audit_warnings,
+                "llm_timing": _llm_result_to_timing(row_audit_result),
             })
         else:
-            rejection_reason = seed43_error or "invalid_extraction"
+            rejection_reason = row_audit_error or "invalid_extraction"
             history.append({
-                "pass": "candidate-seed43",
+                "pass": "candidate-row_audit",
                 "retry_kind": "candidate_diversity",
                 "candidate_only": True,
-                "seed": _LLM_SEED + 1,
+                "seed": _LLM_SEED,
+                "prompt_variant": "row_audit",
                 "accepted": False,
                 "rejection_reason": rejection_reason,
                 "extraction": (
-                    deepcopy(seed43_extracted)
-                    if seed43_extracted is not None
+                    deepcopy(row_audit_extracted)
+                    if row_audit_extracted is not None
                     else {"error": rejection_reason}
                 ),
-                "warnings": [f"Seed-43 candidate failed: {rejection_reason}"],
-                "llm_timing": _llm_result_to_timing(seed43_result),
+                "warnings": [f"Row-audit candidate failed: {rejection_reason}"],
+                "llm_timing": _llm_result_to_timing(row_audit_result),
             })
 
     # Final substitution: if the chosen pass still has duplicate-desc items,
@@ -1137,74 +1092,6 @@ def extract_with_verification(
             if substituted > 0 and not _has_duplicate_descs(best_extracted):
                 break
 
-    # Sanity-retry: if the chosen extraction has items_sum that doesn't match
-    # subtotal/total, try up to 2 fresh-seed extractions (extraction prompt,
-    # NOT verification — verification biases toward the previous pass's
-    # mistake). Pick the one with the smallest items_sum gap.
-    #
-    # Catches LLM API non-determinism: the same seed=42 occasionally
-    # produces different totals across runs. Trying additional seeds gives
-    # multiple chances at the correct extraction. We accept an alternate
-    # only if its gap is strictly better (or matches subtotal exactly).
-    if "error" not in best_extracted:
-        sanity = _items_sum_gap(best_extracted)
-        if sanity is not None and sanity > 5:
-            for offset in (2, 3):  # seeds 44, 45
-                sanity_alt, sanity_llm_result, error_reason = _alternate_seed_extract_with_result(
-                    ocr_text, model, doc_type, seed_offset=offset
-                )
-                sanity_scored = (
-                    _with_financial_anchors(sanity_alt, best_extracted)
-                    if sanity_alt and "error" not in sanity_alt else None
-                )
-                alt_gap = _items_sum_gap(sanity_scored) if sanity_scored else None
-                alt_warnings: list[str] = []
-                if sanity_scored and validate_fn:
-                    try:
-                        receipt_alt = Receipt(**sanity_scored)
-                        alt_warnings = validate_fn(receipt_alt)
-                    except Exception:
-                        alt_warnings = []
-
-                accepted = (
-                    error_reason is None
-                    and sanity_alt is not None
-                    and "error" not in sanity_alt
-                    and alt_gap is not None
-                    and alt_gap < sanity
-                )
-                if error_reason:
-                    rejection_reason = error_reason
-                elif sanity_alt is None or "error" in sanity_alt:
-                    rejection_reason = "invalid_extraction"
-                elif alt_gap is None:
-                    rejection_reason = "items_sum_gap_unavailable"
-                elif not accepted:
-                    rejection_reason = "items_sum_gap_not_improved"
-                else:
-                    rejection_reason = None
-
-                history.append({
-                    "pass": f"sanity-retry-seed{_LLM_SEED + offset}",
-                    "retry_kind": "sanity",
-                    "seed": _LLM_SEED + offset,
-                    "accepted": accepted,
-                    "rejection_reason": rejection_reason,
-                    "financial_anchors_preserved": True,
-                    **_retry_history_extractions(sanity_alt, sanity_scored),
-                    "warnings": alt_warnings,
-                    "items_sum_gap_before": sanity,
-                    "items_sum_gap_after": alt_gap,
-                    "llm_timing": _llm_result_to_timing(sanity_llm_result),
-                })
-
-                if accepted:
-                    best_extracted = sanity_scored
-                    best_warnings = alt_warnings
-                    sanity = alt_gap  # update baseline for next iteration
-                    if sanity <= 2:
-                        break  # close enough; stop spending LLM calls
-
     # Cross-prompt rescue: if validator-visible item-sum inconsistency remains,
     # try a different prompt surface before escalating to a different model.
     if "error" not in best_extracted:
@@ -1213,9 +1100,14 @@ def extract_with_verification(
         )
         if current_gap is not None:
             for variant in _CROSS_PROMPT_VARIANTS:
-                alt, alt_llm_result, error_reason = _cross_prompt_extract_with_result(
-                    ocr_text, model, doc_type, variant=variant
-                )
+                if variant == "row_audit" and row_audit_attempted:
+                    alt, alt_llm_result, error_reason = (
+                        row_audit_extracted, row_audit_result, row_audit_error
+                    )
+                else:
+                    alt, alt_llm_result, error_reason = _cross_prompt_extract_with_result(
+                        ocr_text, model, doc_type, variant=variant
+                    )
                 alt_scored = (
                     _with_financial_anchors(alt, best_extracted)
                     if alt and "error" not in alt else None

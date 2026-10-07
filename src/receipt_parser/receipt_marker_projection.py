@@ -4,9 +4,11 @@ import re
 from difflib import SequenceMatcher
 
 from .patterns import (
+    _HEADER_LINE_RE,
     _OCR_QTY_NOTATION_RE,
     _OCR_TRAILING_PRICE_RE,
     _SKIP_PRICE_LINE,
+    _discount_rate_tokens,
 )
 from .receipt_financial import extract_financial_totals, extract_rate_bases, normalize_tax_label
 from .receipt_item_cleanup import _clear_discounts_without_nearby_ocr_marker
@@ -86,6 +88,8 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
     qty_re = re.compile(r'[<\(（]?\s*(\d+)\s*[個コ]?\s*[xX×Ⅹ]\s*単?\s*(\d{1,5})')
 
     def _clean_desc(text: str) -> str:
+        # Preserve the complete printed Latin prefix after a numeric POS code.
+        text = re.sub(r'^(?!\d+\s*円)\d{3,}(?:-\d{3,})*\)?\s*', '', text.strip())
         text = _clean_ocr_price_line_desc(text)
         text = re.sub(r'^\d{3,}\s*[※*＊]?\s*', '', text).strip()
         text = re.sub(r'^[※*＊]\s*', '', text).strip()
@@ -94,6 +98,11 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
         return text
 
     def _valid_desc(text: str) -> bool:
+        # Numbered header controls cannot own a queued product price.
+        if _HEADER_LINE_RE.search(text) or re.search(
+            r'^[責青ス]?\s*No\.?\s*\d+', text, re.IGNORECASE,
+        ):
+            return False
         text = _clean_desc(text)
         if not _valid_ocr_item_desc(text):
             return False
@@ -131,6 +140,95 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
         if locked:
             row["_tax_category_locked"] = tax_category
         return row
+
+    def _validate_projected_rates(candidate_rows: list[dict], proof=None) -> None:
+        """Rate-only validation; proof indexes own title, gross, label, deduction."""
+        def key(text: str) -> str:
+            return ''.join(char.casefold() for char in text if char.isalnum())
+
+        _clear_discounts_without_nearby_ocr_marker(candidate_rows, unified_text, rates_only=True)
+        if proof is None:
+            # ponytail: only complete two-owner qty=1 stacks; broader stacks
+            # retain the existing source-geometry or individual-owner proof.
+            ordered = sorted(candidate_rows, key=lambda row: int(row.get("_source_idx", -1)))
+            negative = re.compile(r'-\s*[¥￥\\]?\s*(\d[\d,]*)')
+            label = re.compile(r'[^\d%％¥￥-]*(?:割引|値引)')
+            for pos, (first, second) in enumerate(zip(ordered, ordered[1:])):
+                pair = (first, second)
+                owner_indexes = [int(row.get("_source_idx", -1)) for row in pair]
+                first_idx, second_idx = owner_indexes
+                if (not 0 <= first_idx < second_idx < len(zone)
+                        or any(zone[first_idx + 1:second_idx])
+                        or any(row.get("qty") != 1 or not row.get("discount") for row in pair)
+                        or any(inline_re.match(zone[index]) for index in owner_indexes)):
+                    continue
+                owned_titles = [[index for index, line in enumerate(zone)
+                                 if _valid_desc(line) and key(_clean_desc(line)) == key(row["description"])]
+                                for row in pair]
+                if owned_titles != [[first_idx], [second_idx]]:
+                    continue
+                end_idx = int(ordered[pos + 2].get("_source_idx", len(zone))) if pos + 2 < len(ordered) else len(zone)
+                if not second_idx < end_idx <= len(zone):
+                    continue
+                span = zone[second_idx + 1:end_idx]
+                prices = [(index, amount) for index, line in enumerate(span)
+                          if (amount := _amount_from_line(line)) is not None]
+                if (len(prices) != 2 or any(span[:prices[0][0]])
+                        or prices[0][1][0] == prices[1][1][0]
+                        or [amount[0] for _, amount in prices] != [row["unit_price"] for row in pair]):
+                    continue
+                packets = (span[prices[0][0]:prices[1][0]], span[prices[1][0]:])
+                verified = []
+                for row, packet in zip(pair, packets):
+                    controls = [line for line in packet[1:] if line]
+                    if (any(not (negative.fullmatch(line) or label.fullmatch(line)
+                                 or _discount_rate_tokens(line, full_match=True)) for line in controls)
+                            or sum(float(match[1].replace(',', '')) for line in controls
+                                   if (match := negative.fullmatch(line))) != row["discount"]
+                            or row["unit_price"] - row["discount"] != row["total"]):
+                        break
+                    proposed = dict(row, discount_rate="")
+                    owned_packet = '\n'.join([row["description"], *packet])
+                    _clear_discounts_without_nearby_ocr_marker([proposed], owned_packet, rates_only=True)
+                    verified.append(proposed)
+                if len(verified) == 2:
+                    for row, proposed in zip(pair, verified):
+                        row["discount_rate"] = proposed["discount_rate"]
+            return
+        owner_idx, gross_idx, label_idx, deduction_idx = proof
+        owned = [row for row in candidate_rows if row.get("_source_idx") == owner_idx]
+        if len(owned) != 1:
+            return
+        row = owned[0]
+        row["discount_rate"] = ""
+
+        title_owners = [idx for idx, line in enumerate(zone)
+                        if _valid_desc(line) and key(_clean_desc(line)) == key(row["description"])]
+        queued = zone[label_idx + 1:gross_idx - 1]
+        queued_titles = [key(_clean_desc(line)) for line in queued if line]
+        gross = _amount_from_line(zone[gross_idx])
+        deduction = re.fullmatch(r'-\s*[¥￥]?\s*(\d[\d,]*)', zone[deduction_idx])
+        if (title_owners != [owner_idx] or any(zone[owner_idx + 1:label_idx])
+                or any(line and not _valid_desc(line) for line in queued)
+                or any(inline_re.match(line) for line in [zone[owner_idx], *queued])
+                or _amount_from_line(zone[gross_idx - 1]) is None
+                or (queued_titles and (len(queued_titles) != 2 or len(set(queued_titles)) != 2))
+                or any(qty_re.search(line) for line in zone[owner_idx:deduction_idx + 1])
+                or gross is None or deduction is None or row["qty"] != 1
+                or gross[0] != row["qty"] * row["unit_price"]
+                or row["discount"] != float(deduction[1].replace(',', ''))
+                or row["total"] != gross[0] - row["discount"]):
+            return
+        boundary = next((idx for idx in range(deduction_idx + 1, len(zone))
+                         if _amount_from_line(zone[idx]) is not None
+                         or any(other.get("_source_idx") == idx for other in candidate_rows)), len(zone))
+        if any(zone[deduction_idx + 1:boundary]):
+            return
+        packet = '\n'.join([row["description"], zone[gross_idx], zone[label_idx],
+                            *zone[gross_idx + 1:deduction_idx + 1]])
+        proposed = dict(row, discount_rate="")
+        _clear_discounts_without_nearby_ocr_marker([proposed], packet, rates_only=True)
+        row["discount_rate"] = proposed["discount_rate"]
 
     def _update_rates_when_money_matches(candidate_rows: list[dict]) -> bool:
         current_rows = [
@@ -174,8 +272,17 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
         ):
             for current, candidate in zip(current_rows, candidate_rows):
                 current["description"] = candidate["description"]
+        elif current_descriptions != candidate_descriptions:
+            # Matching money already closes this stream; unrelated titles do
+            # not authorize rate edits or a fallback item replacement.
+            return True
         for current, candidate in zip(current_rows, candidate_rows):
-            current["discount_rate"] = candidate.get("discount_rate") or ""
+            rates = _discount_rate_tokens(
+                candidate.get("discount_rate") or "",
+                full_match=True,
+                allow_unmarked=True,
+            )
+            current["discount_rate"] = f"{rates[0]:g}%" if rates else ""
         return True
 
     rows: list[dict] = []
@@ -250,14 +357,14 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
         source_idx = start_idx
         while source_idx < stop_idx:
             inline_m = inline_re.match(zone[source_idx])
-            if not inline_m or not _valid_desc(inline_m.group(1)):
+            if not inline_m or not _valid_desc(zone[source_idx]):
                 desc = _clean_desc(zone[source_idx])
                 next_amount = (
                     _amount_from_line(zone[source_idx + 1])
                     if source_idx + 1 < stop_idx
                     else None
                 )
-                if _valid_desc(desc) and next_amount:
+                if _valid_desc(zone[source_idx]) and next_amount:
                     row = _make_row(desc, next_amount[0], next_amount[1])
                     row["_source_idx"] = source_idx
                     target_rows.append(row)
@@ -285,7 +392,7 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
         discounted_idx = None
         for idx in range(discount_idx - 1, max(discount_idx - 4, -1), -1):
             cand = _clean_desc(zone[idx])
-            if _valid_desc(cand):
+            if _valid_desc(zone[idx]):
                 discounted_desc = cand
                 discounted_idx = idx
                 break
@@ -298,9 +405,9 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
         immediate_discount_idx = None
         if first_after_discount and second_after_discount:
             for idx in range(discount_idx + 3, min(discount_idx + 6, len(zone))):
-                rate_m = re.search(r'^(\d+(?:\.\d+)?)\s*%$', zone[idx])
-                if rate_m:
-                    immediate_rate = f"{int(float(rate_m.group(1)))}%"
+                rates = _discount_rate_tokens(zone[idx], full_match=True)
+                if rates:
+                    immediate_rate = f"{rates[0]:g}%"
                     continue
                 if re.match(r'^-\s*[¥￥]?\s*\d', zone[idx]):
                     immediate_discount_idx = idx
@@ -310,7 +417,7 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
             previous_idx = None
             for idx in range(discounted_idx - 1, max(discounted_idx - 4, -1), -1):
                 cand = _clean_desc(zone[idx])
-                if _valid_desc(cand):
+                if _valid_desc(zone[idx]):
                     previous_desc = cand
                     previous_idx = idx
                     break
@@ -342,8 +449,9 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
                             extracted.get("taxes"),
                             rate_bases,
                         )
-                        _clear_discounts_without_nearby_ocr_marker(
-                            rebuilt, unified_text, rates_only=True
+                        _validate_projected_rates(
+                            rebuilt,
+                            (discounted_idx, discount_idx + 2, discount_idx, immediate_discount_idx),
                         )
                         if abs(sum(float(row.get("total") or 0) for row in rebuilt) - subtotal_target) > 2:
                             return False
@@ -364,7 +472,7 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
             if _amount_from_line(line) or re.search(r'^\d+(?:\.\d+)?\s*%$', line) or re.match(r'^-', line):
                 break
             cand = _clean_desc(line)
-            if _valid_desc(cand):
+            if _valid_desc(line):
                 following.append((cand, scan))
             scan += 1
         if len(following) < 2:
@@ -377,9 +485,9 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
         rate = ""
         discount_line_idx = None
         for idx in range(scan + 2, min(scan + 5, len(zone))):
-            rate_m = re.search(r'^(\d+(?:\.\d+)?)\s*%$', zone[idx])
-            if rate_m:
-                rate = f"{int(float(rate_m.group(1)))}%"
+            rates = _discount_rate_tokens(zone[idx], full_match=True)
+            if rates:
+                rate = f"{rates[0]:g}%"
                 continue
             if re.match(r'^-\s*[¥￥]?\s*\d', zone[idx]):
                 discount_line_idx = idx
@@ -426,8 +534,8 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
             return False
         rate_bases = extract_rate_bases(unified_text)
         _rebalance_tax_categories_to_rate_bases(rebuilt, unified_text, extracted.get("taxes"), rate_bases)
-        _clear_discounts_without_nearby_ocr_marker(
-            rebuilt, unified_text, rates_only=True
+        _validate_projected_rates(
+            rebuilt, (discounted_idx, scan + 1, discount_idx, discount_line_idx),
         )
         if abs(sum(float(row.get("total") or 0) for row in rebuilt) - subtotal_target) > 2:
             return False
@@ -450,9 +558,9 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
             _apply_qty_detail(float(qty_m.group(1)), float(qty_m.group(2)))
             continue
 
-        rate_m = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
-        if _DISCOUNT_WORD in line or (rate_m and not amount_re.match(line)):
-            rate = f"{int(float(rate_m.group(1)))}%" if rate_m else ""
+        rates = _discount_rate_tokens(line)
+        if _DISCOUNT_WORD in line or (rates and not amount_re.match(line)):
+            rate = f"{rates[-1]:g}%" if rates else ""
             _add_discount_marker(rate)
             continue
 
@@ -462,7 +570,7 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
             continue
 
         inline_m = inline_re.match(line)
-        if inline_m and _valid_desc(inline_m.group(1)):
+        if inline_m and _valid_desc(line):
             desc = _clean_desc(inline_m.group(1))
             amount = float(inline_m.group(2).replace(',', ''))
             marker = inline_m.group(3) or ""
@@ -520,9 +628,7 @@ def _replace_campaign_discount_stream_when_balanced(extracted, unified_text):
 
     rate_bases = extract_rate_bases(unified_text)
     _rebalance_tax_categories_to_rate_bases(rows, unified_text, extracted.get("taxes"), rate_bases)
-    _clear_discounts_without_nearby_ocr_marker(
-        rows, unified_text, rates_only=True
-    )
+    _validate_projected_rates(rows)
     if abs(sum(float(row.get("total") or 0) for row in rows) - subtotal_target) > 2:
         return
     for row in rows:
@@ -575,7 +681,7 @@ def _replace_prefixed_tax_marker_item_rows_when_balanced(extracted, unified_text
     amount_re = re.compile(r'^[¥￥]?\s*([\d,]+)\s*(?:円)?\s*$')
     inline_amount_re = re.compile(r'[¥￥]\s*([\d,]+)\s*$')
     marker_item_re = re.compile(r'^内\s*([*＊※])?\s*(.+)$')
-    qty_re = re.compile(r'(\d{1,3})\s*[個コ点]?\s*[xX×Ⅹ]\s*#?\s*(\d{1,5})')
+    qty_re = re.compile(r'(?<!\d)(\d+)\s*[個コ点]?\s*[xX×Ⅹ]\s*[単单@＠#]?\s*(\d[\d,]*)')
 
     def _clean_marker_desc(text: str) -> str:
         text = _clean_ocr_price_line_desc(text)
@@ -631,24 +737,9 @@ def _replace_prefixed_tax_marker_item_rows_when_balanced(extracted, unified_text
         right = m.group(2)
         candidates: list[tuple[float, float]] = []
         try:
-            candidates.append((float(left), float(right)))
+            candidates.append((float(left), float(right.replace(',', ''))))
         except ValueError:
             pass
-        if len(left) > 1 and left[0].isdigit():
-            try:
-                candidates.append((float(left[0]), float(right)))
-            except ValueError:
-                pass
-        if len(right) > 2 and right[0] == "1":
-            try:
-                candidates.append((float(left), float(right[1:])))
-            except ValueError:
-                pass
-        if len(left) > 1 and len(right) > 2 and right[0] == "1":
-            try:
-                candidates.append((float(left[0]), float(right[1:])))
-            except ValueError:
-                pass
         for qty, unit in candidates:
             if qty <= 1 or unit <= 0:
                 continue
@@ -956,7 +1047,7 @@ def _fix_qty_totals_from_ocr_unit_lines(extracted, unified_text):
                 compact_digits = compact_qty.group(1)
                 unit = float(compact_qty.group(2).replace(',', ''))
                 nearby_total = _nearby_standalone_amount(detail_idx)
-                qty = float(compact_digits[0])
+                qty = float(compact_digits)
                 if (
                     qty < 2
                     or unit <= 0
@@ -1246,10 +1337,12 @@ def _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals):
         rows.append(projected)
 
     def _discount_rate_value(row: dict) -> float | None:
-        m = re.search(r'(\d+(?:\.\d+)?)\s*%', str(row.get("discount_rate") or ""))
-        if not m:
+        rates = _discount_rate_tokens(
+            row.get("discount_rate") or "", full_match=True, allow_unmarked=True
+        )
+        if not rates:
             return None
-        return float(m.group(1)) / 100.0
+        return rates[0] / 100.0
 
     def _apply_discount_to_pending(row: dict):
         discount = float(row.get("discount") or 0)
@@ -1328,9 +1421,9 @@ def _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals):
             discount_amount = 0.0
             for k in range(raw_idx, min(raw_idx + 8, len(lines))):
                 kline = lines[k].strip()
-                rate_m = re.search(r'(\d+(?:\.\d+)?)\s*%', kline)
-                if rate_m:
-                    rate_str = f"{int(float(rate_m.group(1)))}%"
+                rates = _discount_rate_tokens(kline)
+                if rates:
+                    rate_str = f"{rates[-1]:g}%"
                 amt_m = re.match(r'^-\s*[¥￥]?\s*(\d[\d,]*)\s*$', kline)
                 if amt_m:
                     discount_amount = float(amt_m.group(1).replace(',', ''))
@@ -1460,6 +1553,7 @@ def _replace_jan_pos_items_when_balanced(extracted, unified_text, ocr_totals):
                     tax.get("label"), unified_text,
                     subtotal=row_sum, total=float(printed_total),
                     tax_sum=printed_tax_sum, items_sum=row_sum,
+                    rate=tax.get("rate"), amount=tax.get("amount"),
                 )
             extracted["taxes"] = sorted(
                 printed_taxes,

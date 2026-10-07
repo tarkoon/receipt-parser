@@ -1,6 +1,7 @@
 {
   "_llm_prompt": "You are analyzing an image of a Japanese financial document. Classify it and extract data into the JSON structure below. RULES: (1) Set document_type to 'receipt' for store purchases, 'utility_bill' for gas/water/electric bills, or 'payment_slip' for bank transfer or convenience store payment slips. (2) Use null for any field you cannot confidently determine. (3) Amounts are numbers without currency symbols. (4) Dates are YYYY-MM-DD. Japanese era: 令和7年=2025, 令和8年=2026. (5) For date: use payment date if visible, else due date for bills, else transaction date for receipts. (5b) For time: 24-hour HH:MM transaction time printed alongside the date (e.g., '17:05', '13時30分'); null if absent or only present as business hours. (6) payment_method: null unless explicitly stated. Use 'bank_payment' only if the document says 口座引落 or 振替. Use 'cash' only if お預り or 現計 is shown. (7) points_used: loyalty points actually applied (d-point, WAON point, etc.). Use null when no redemption is printed, preserve an explicitly printed zero as 0, and use a positive number only when supported by the document. amount_paid = total - points_used when points_used is known. (8) For receipts: extract all line items with prices. tax_category per item: '8%' for items marked ※/軽, '10%' for standard, '0%' if unknown. (9) For utility bills: extract meter readings, usage amount, service type, billing period. (10) For payment slips: merchant is the company receiving the money. payer is who pays. (11) Only fill type-specific sections relevant to the document_type. Leave others null/empty. (12) payment_reference is value-only. Prefer one explicitly labeled receipt or slip number; only if absent, use one uniquely labeled transaction, data, handling, inquiry, acceptance, or reference number.",
   "document_type": null,
+  "_comment_merchant": "Preserve the complete printed seller header name when the same seller also appears as a footer transliteration, including English/Japanese spellings.",
   "merchant": null,
   "date": null,
   "time": null,
@@ -10,10 +11,12 @@
   "total": null,
   "payment_method": null,
   "account_number": null,
+  "_comment_account_number": "Persistent customer, billing, or account identifier only. Exclude loyalty/member/card numbers and one-off pickup, receipt, transaction, or register numbers. Use null when no supported customer/account identifier is printed or ownership is ambiguous.",
   "points_used": null,
   "amount_paid": null,
   "_comment_line_items_per_weight": "When an item is priced per unit weight (e.g. 281 yen per 100g, 467g purchased, total 1313 yen), do NOT encode the per-weight rate. Use qty=1, unit_price=total, total=total. The schema's qty*unit_price=total invariant assumes a 1:1 unit ratio, and the per-weight rate is not used downstream.",
-  "_comment_payment_method": "Allowed values: 'cash', 'credit', 'debit', 'bank_payment', 'WAON', or null. Do NOT use 'credit_card' (use 'credit'). Use 'cash' only if お預り or 現計 is on the receipt — 上記正に領収いたしました alone is NOT enough.",
+  "_comment_discount_rate": "Use the effective percentage from an explicitly printed percentage schedule. For successive printed rates, multiply retained proportions (30% then 5% = 33.5%). Do not calculate a percentage from yen discount amounts, including amount-only bundle offers; use null/empty.",
+  "_comment_payment_method": "Allowed values: 'cash', 'credit', 'debit', 'bank_payment', 'WAON', 'PayPay', or null. Preserve PayPay when it is the established tender, including PayPay事前決済. Do NOT use 'credit_card' (use 'credit'). Use 'cash' only if お預り or 現計 is on the receipt — 上記正に領収いたしました alone is NOT enough.",
   "_comment_time": "Extract a clearly printed transaction or payment time. A receipt-footer time may be retained even when adjacent to register or serial identifiers; reject business hours, phone numbers, and issue or printer timestamps not tied to the transaction.",
   "line_items": [
     {
@@ -26,7 +29,7 @@
       "discount_rate": null
     }
   ],
-  "_comment_subtotal": "Pre-tax base amount, computed as subtotal = total - sum(taxes), regardless of 内税 / 外税 / 非課税. For 0-tax receipts (no taxes or all taxes = 0) subtotal = total. Exception: when only a tax rate or gross rate target is printed and neither a tax amount nor explicit pre-tax base is printed, do not infer either amount; use subtotal=null and taxes=[]. For 内税 receipts where line item prices are post-tax, sum(line_items) will equal total, NOT subtotal — that is expected.",
+  "_comment_subtotal": "For 内税-only receipts, subtotal is the pre-tax base: total minus printed tax amounts. For 外税-only receipts, preserve the printed pre-tax 小計. When independently printed 内税 and 外税 groups coexist, preserve the printed 小計, which already includes 内税: total equals subtotal plus only 外税 amounts. Keep all independent printed tax groups. For receipts without tax, subtotal equals total. When only a tax rate or gross rate target is printed and neither a tax amount nor explicit pre-tax base is printed, do not infer either amount; use subtotal=null and taxes=[]. For 内税-only receipts with post-tax item prices, sum(line_items) equals total rather than subtotal.",
   "subtotal": null,
   "taxes": [
     {

@@ -165,7 +165,7 @@ def test_bare_tender_and_change_following_split_total_are_cash_settlement():
     assert extracted["payment_method"] == "cash"
 
 
-def test_receipt_postprocess_combines_qty_digit_and_unique_subtotal_repairs():
+def test_receipt_postprocess_recovers_owned_quantity_without_guessing_price_from_subtotal():
     from receipt_parser.receipt_postprocess import postprocess_receipt
 
     extracted = {
@@ -224,10 +224,11 @@ def test_receipt_postprocess_combines_qty_digit_and_unique_subtotal_repairs():
         for row in extracted["line_items"]
     ] == [
         (2.0, 298.0, 596.0),
-        (1, 98.0, 98.0),
+        (1, 90, 90),
         (1, 88, 88),
     ]
-    assert sum(row["total"] for row in extracted["line_items"]) == extracted["subtotal"]
+    assert sum(row["total"] for row in extracted["line_items"]) == 774
+    assert extracted["subtotal"] == 782
 
 
 def test_quantity_and_discount_ownership_survive_later_summary_discount():

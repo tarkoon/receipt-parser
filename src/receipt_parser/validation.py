@@ -4,6 +4,8 @@ import re
 from datetime import date, timedelta
 
 from .schema import Receipt, VALID_TAX_RATES
+from .patterns import _discount_rate_tokens
+from .receipt_totals import _sum_taxable_amounts
 
 
 def validate_receipt(receipt: Receipt) -> list[str]:
@@ -60,9 +62,11 @@ def _validate_receipt_fields(receipt: Receipt) -> list[str]:
 
         # Discount rate consistency: if discount_rate is set, verify discount matches
         if item.discount_rate and item.discount > 0 and item.unit_price is not None and item.qty:
-            rate_match = re.match(r'(\d+(?:\.\d+)?)', item.discount_rate)
-            if rate_match:
-                rate_pct = float(rate_match.group(1)) / 100.0
+            rates = _discount_rate_tokens(
+                item.discount_rate, full_match=True, allow_unmarked=True
+            )
+            if rates:
+                rate_pct = rates[0] / 100.0
                 expected_discount = round(item.unit_price * item.qty * rate_pct)
                 if abs(expected_discount - item.discount) > 2:
                     warnings.append(
@@ -115,13 +119,13 @@ def _validate_receipt_fields(receipt: Receipt) -> list[str]:
                 f"mistaken for quantities."
             )
 
-    # Universal rule: subtotal + tax_sum = total
+    # Mixed item prices already include the separately disclosed inner tax.
     if receipt.total is not None and receipt.subtotal is not None and receipt.taxes:
-        tax_sum = sum(t.amount for t in receipt.taxes)
+        tax_sum = _sum_taxable_amounts([tax.model_dump() for tax in receipt.taxes])
         if abs((receipt.subtotal + tax_sum) - receipt.total) > 2:
             warnings.append(
                 f"Total ({receipt.total}) does not match subtotal ({receipt.subtotal}) "
-                f"+ taxes ({tax_sum}). Subtotal must be the pre-tax base."
+                f"+ added taxes ({tax_sum}). Review the printed tax groups."
             )
 
     # Tax ratio cross-check: does subtotal * (1 + rate) ≈ total?
@@ -161,7 +165,7 @@ def _check_tax_ratio(receipt: "Receipt") -> list[str]:
 
     # Skip when there's effectively no tax (0% / non-taxable). subtotal == total
     # is then expected and there's no rate to check.
-    tax_sum = sum(t.amount for t in receipt.taxes)
+    tax_sum = _sum_taxable_amounts([tax.model_dump() for tax in receipt.taxes])
     if tax_sum == 0:
         return warnings
 

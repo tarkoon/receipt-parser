@@ -13,6 +13,7 @@ from .patterns import (
     _OCR_TRAILING_PRICE_RE,
     _OCR_ZONE_END_RE,
     _SKIP_PRICE_LINE,
+    _discount_rate_tokens,
 )
 from .receipt_financial import _parse_amount_fragment, extract_rate_bases, normalize_tax_rate
 from .receipt_item_cleanup import _fill_single_qty_unit_prices_from_totals
@@ -128,7 +129,6 @@ def _recover_multiple_missing_items_from_gap(
             })
 
     clear_candidates: list[dict] = []
-    fragment_candidates: list[dict] = []
     for desc_idx in item_zone:
         desc = _clean_desc(lines[desc_idx])
         if not _valid_orphan_desc(desc, desc_idx):
@@ -152,21 +152,6 @@ def _recover_multiple_missing_items_from_gap(
                     "price_idx": price_idx,
                     "amount": float(unmatched_by_idx[price_idx]),
                     "marker": marker_m.group(1) if marker_m else "",
-                })
-                break
-            fragment_m = re.fullmatch(r'[¥￥]?\s*(\d{1,2})\s*([%％*＊※除軽非]*)', raw)
-            if (
-                fragment_m
-                and price_idx > desc_idx
-                and not _SKIP_PRICE_LINE.search(raw)
-                and not _OCR_QTY_NOTATION_RE.search(raw)
-            ):
-                fragment_candidates.append({
-                    "desc": desc,
-                    "desc_idx": desc_idx,
-                    "price_idx": price_idx,
-                    "fragment": fragment_m.group(1),
-                    "marker": fragment_m.group(2) or "",
                 })
                 break
 
@@ -207,64 +192,18 @@ def _recover_multiple_missing_items_from_gap(
             return False
         required_bag = matches[0]
 
-    def _fill_fragment(group: tuple[dict, ...], fragment: dict, gap: float) -> dict | None:
-        if any(
-            fragment["desc_idx"] == candidate["desc_idx"]
-            or fragment["price_idx"] == candidate["price_idx"]
-            for candidate in group
-        ):
-            return None
-        remaining = gap - sum(float(candidate["amount"]) for candidate in group)
-        if remaining <= 0 or remaining > gap:
-            return None
-        remaining_text = str(int(round(remaining)))
-        if not remaining_text.startswith(str(fragment["fragment"])):
-            return None
-        if len(str(fragment["fragment"])) >= len(remaining_text):
-            return None
-        filled = dict(fragment)
-        filled["amount"] = float(remaining)
-        return filled
-
     def _candidate_groups_for_gap(gap: float) -> list[tuple[dict, ...]]:
         groups: list[tuple[dict, ...]] = []
-        if required_bag is None:
-            for left_idx, left in enumerate(clear_candidates):
-                for right in clear_candidates[left_idx + 1:]:
-                    if (
-                        left["desc_idx"] == right["desc_idx"]
-                        or left["price_idx"] == right["price_idx"]
-                    ):
-                        continue
-                    if abs(float(left["amount"]) + float(right["amount"]) - gap) <= 2:
-                        groups.append((left, right))
-                for fragment in fragment_candidates:
-                    filled = _fill_fragment((left,), fragment, gap)
-                    if filled is not None:
-                        groups.append((left, filled))
-            return groups
-
-        other_clear = [candidate for candidate in clear_candidates if candidate is not required_bag]
-        for clear in other_clear:
-            if (
-                clear["desc_idx"] != required_bag["desc_idx"]
-                and clear["price_idx"] != required_bag["price_idx"]
-                and abs(float(required_bag["amount"]) + float(clear["amount"]) - gap) <= 2
-            ):
-                groups.append((required_bag, clear))
-        for fragment in fragment_candidates:
-            filled = _fill_fragment((required_bag,), fragment, gap)
-            if filled is not None:
-                groups.append((required_bag, filled))
-            for clear in other_clear:
-                if (
-                    clear["desc_idx"] == required_bag["desc_idx"]
-                    or clear["price_idx"] == required_bag["price_idx"]
-                ):
+        for count in range(2, 4 if required_bag is not None else 3):
+            for group in combinations(clear_candidates, count):
+                if required_bag is not None and required_bag not in group:
                     continue
-                filled = _fill_fragment((required_bag, clear), fragment, gap)
-                if filled is not None:
-                    groups.append((required_bag, clear, filled))
+                if (
+                    len({row["desc_idx"] for row in group}) == count
+                    and len({row["price_idx"] for row in group}) == count
+                    and abs(sum(float(row["amount"]) for row in group) - gap) <= 2
+                ):
+                    groups.append(group)
         return groups
 
     successful: list[tuple[float, list[dict]]] = []
@@ -606,43 +545,6 @@ def _recover_missing_items_from_gap(extracted, unified_text):
 
     target, (price_line_idx, price) = successful[0]
 
-    def _clean_candidate(text: str) -> str:
-        """Strip price suffix, count markers, tax markers, and leading product
-        codes from a description candidate."""
-        text = text.strip()
-        # Drop everything from the first ¥ onward (item-and-price merged lines)
-        m = re.search(r'[¥￥]', text)
-        if m:
-            text = text[:m.start()].strip()
-        # Drop a trailing bare price from merged item/price rows.
-        text = re.sub(r'\s+\d[\d,]*\s*(?:[%％]|[*※除軽])?\s*$', '', text).strip()
-        # Drop trailing count markers like "1点", "2個", "3コ"
-        text = re.sub(r'\s+[\d,]+\s*[点個コ]\s*$', '', text).strip()
-        # Drop trailing tax markers
-        text = re.sub(r'\s*[※\*非外]\s*$', '', text).strip()
-        # Strip leading product/department code: 4+ digits, optional letters,
-        # optional ')'. Only when the remainder still has Japanese content.
-        m = re.match(r'^\d{4,}[A-Za-z]{0,3}\)?\s?(.+)$', text)
-        if m and re.search(r'[ぁ-んァ-ン一-龥]', m.group(1)):
-            text = m.group(1).strip()
-        return text
-
-    def _is_existing_desc(text: str) -> bool:
-        # Normalize: strip trailing whitespace+digits to avoid 'X' and 'X  N'
-        # being treated as distinct when N is just an embedded price.
-        norm_text = re.sub(r'\s+[\d,]{1,6}\s*[\*※]?\s*$', '', text).strip()
-        return any(
-            isinstance(o, dict) and (
-                (
-                    (o.get("description") or "").strip() == text
-                    or re.sub(r'\s+[\d,]{1,6}\s*[\*※]?\s*$', '',
-                              (o.get("description") or "").strip()).strip() == norm_text
-                )
-                and abs((o.get("total") or 0) - price) <= 2
-            )
-            for o in items
-        )
-
     def _is_valid_desc(text: str) -> bool:
         if not text or len(text) < 3:
             return False
@@ -674,57 +576,6 @@ def _recover_missing_items_from_gap(extracted, unified_text):
     desc = _find_ocr_item_desc(
         lines[item_start:item_end], price_line_idx - item_start, items
     )
-
-    # First check the price line itself — rejoin_price_lines often merges
-    # the item name with its price on a single line.
-    line_text = lines[price_line_idx]
-    cand = _clean_candidate(line_text)
-    if (
-        _is_valid_desc(cand)
-        and not _is_existing_desc(cand)
-        and not _ocr_desc_fragment_owned_by_existing(lines, price_line_idx, items)
-    ):
-        desc = cand
-
-    # Else search backward up to 15 lines, then forward up to 5 lines.
-    # Prefer product-code-prefixed lines (e.g. "20060SAミタメスッキリ ロック")
-    # since they're unambiguous item starts even when surrounded by OCR garbage.
-    if not desc:
-        candidates_idx = list(range(
-            price_line_idx - 1,
-            max(price_line_idx - 16, item_start - 1),
-            -1,
-        ))
-        candidates_idx += list(range(
-            price_line_idx + 1,
-            min(price_line_idx + 6, item_end),
-        ))
-
-        # First pass: lines with a leading product code (e.g. "20060SA…").
-        # Check the prefix on the raw line, then clean it for the description.
-        for j in candidates_idx:
-            raw = lines[j].strip()
-            if not re.match(r'^\d{4,}', raw):
-                continue
-            cand = _clean_candidate(raw)
-            if (
-                _is_valid_desc(cand)
-                and not _is_existing_desc(cand)
-                and not _ocr_desc_fragment_owned_by_existing(lines, j, items)
-            ):
-                desc = cand
-                break
-        # Second pass: any valid candidate
-        if not desc:
-            for j in candidates_idx:
-                cand = _clean_candidate(lines[j])
-                if (
-                    _is_valid_desc(cand)
-                    and not _is_existing_desc(cand)
-                    and not _ocr_desc_fragment_owned_by_existing(lines, j, items)
-                ):
-                    desc = cand
-                    break
 
     if not desc:
         return
@@ -860,6 +711,8 @@ def _fix_items_from_subtotal(extracted, unified_text, ocr_totals):
                     continue
             except (TypeError, ValueError):
                 continue
+        if sum(desc_key in line for line in ocr_lines) != 1:
+            continue
         for li, ocr_line in enumerate(ocr_lines):
             if desc_key not in ocr_line:
                 continue
@@ -1354,9 +1207,9 @@ def _fix_item_totals_from_following_discount_lines(extracted, unified_text):
             for nearby in lines[idx + 1:min(idx + 4, len(lines))]:
                 if _looks_like_item_desc(nearby):
                     break
-                rm = re.search(r'(\d+(?:\.\d+)?)\s*%', nearby)
-                if rm:
-                    rate_str = f"{int(float(rm.group(1)))}%"
+                rates = _discount_rate_tokens(nearby)
+                if rates:
+                    rate_str = f"{rates[-1]:g}%"
                     continue
                 dm = re.fullmatch(r'-\s*(?:[¥￥\\]|Â¥)?\s*([\d,]+)', nearby)
                 if dm:

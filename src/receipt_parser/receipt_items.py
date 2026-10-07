@@ -1,8 +1,10 @@
 """Receipt line-item repair helpers."""
 
 import re
+import unicodedata
 from collections import Counter
 from difflib import SequenceMatcher
+from math import isfinite
 
 from .patterns import (
     _ADMIN_FEE_DESCRIPTION_RE,
@@ -17,6 +19,7 @@ from .patterns import (
     _SERVICE_TAX_RATE_EVIDENCE_RE,
     _SKIP_PRICE_LINE,
     _is_service_fee_description,
+    _discount_rate_tokens,
 )
 from .receipt_financial import (
     _parse_amount_fragment,
@@ -32,6 +35,7 @@ from .receipt_identity_payment import (
 from .receipt_item_cleanup import (
     _clear_discounts_without_nearby_ocr_marker,
     _detect_ocr_discounts,
+    _discount_line_price,
     _fix_discount_totals,
     _fix_hallucinated_prices,
     _fix_misattributed_discounts,
@@ -50,6 +54,8 @@ from .receipt_item_repair import (
     _fix_qty_hallucinations,
     _fix_single_item_qty_from_ocr,
     _fix_single_service_item_from_ocr,
+    _formal_receipt_purpose_stems,
+    _single_formal_receipt_purpose_description,
     _insert_item_by_ocr_order,
     _remove_unit_rate_phantom_items,
     _replace_duplicate_desc_from_ocr,
@@ -199,7 +205,38 @@ def _fix_bare_service_receipt_without_itemization(extracted, unified_text):
                 unified_text,
             )
         )
-        if abs(item_sum - total) <= 2 and not sole_visible_service:
+        # Printed title/price ownership is itemization even without a heading.
+        priced_owners = set()
+        lines = unified_text.splitlines()
+        for item in items:
+            if not isinstance(item, dict):
+                break
+            description = (item.get("description") or "").strip()
+            owners = set()
+            for idx, line in enumerate(lines):
+                if _SKIP_PRICE_LINE.search(line) or _HEADER_LINE_RE.search(line):
+                    continue
+                if not _service_description_visible_on_row(description, line):
+                    continue
+                price = _discount_line_price(line.strip())
+                if price is not None and abs(price - float(item.get("total") or 0)) <= 2:
+                    owners.add((idx, idx))
+                    continue
+                for price_idx in range(idx + 1, min(len(lines), idx + 6)):
+                    following = lines[price_idx]
+                    if _SKIP_PRICE_LINE.search(following):
+                        break
+                    price = _discount_line_price(following.strip())
+                    if price is not None and abs(price - float(item.get("total") or 0)) <= 2:
+                        owners.add((idx, price_idx))
+                        break
+                    if re.search(r'[A-Za-zぁ-んァ-ヶ一-鿿]', following):
+                        break
+            if len(owners) != 1 or owners & priced_owners:
+                break
+            priced_owners.update(owners)
+        all_items_priced = len(priced_owners) == len(items)
+        if abs(item_sum - total) <= 2 and not (sole_visible_service or all_items_priced):
             extracted["line_items"] = []
     has_cash_evidence = bool(
         _CASH_TENDER_LABEL_RE.search(unified_text)
@@ -763,8 +800,220 @@ def _normalize_single_measured_service_row(extracted, unified_text):
     return True
 
 
+def _canonicalize_complete_ocr_title_rows(extracted, unified_text):
+    """Copy complete-table, counted-size, or uniquely amount-owned literal titles.
+
+    A local title may restore printed product digits or drop an owned price
+    suffix, even in a mixed-quantity basket. All other item fields stay intact;
+    explicit quantity/SKU columns and competing source owners veto that edit.
+    """
+    items = extracted.get("line_items") or []
+    if len(items) == 1 and isinstance(items[0], dict):
+        item = items[0]
+        qty = item.get("qty")
+        counts = re.findall(r'(?:本体合計|小計)\s*[（(]\s*(\d+)\s*点\s*[)）]', unified_text)
+        printed_subtotal = extract_financial_totals(unified_text).get("subtotal")
+        if (isinstance(qty, (int, float)) and isfinite(qty) and qty > 1
+                and counts == [str(int(qty))] and qty == int(qty)
+                and not item.get("discount") and not item.get("discount_rate")
+                and printed_subtotal == extracted.get("subtotal") == item.get("total")
+                and isinstance(item.get("unit_price"), (int, float))
+                and item["unit_price"] * qty == item.get("total")):
+            current = ''.join(char.casefold() for char in (item.get("description") or '') if char.isalnum())
+            titles = []
+            for line in unified_text.splitlines():
+                match = re.fullmatch(r'\s*(\d+)[A-Za-z]\s+(.+?)\s*', line)
+                if match is None or int(match.group(1)) != qty:
+                    continue
+                full = ''.join(char.casefold() for char in line if char.isalnum())
+                body = ''.join(char.casefold() for char in match.group(2) if char.isalnum())
+                if current in {full, body} and _valid_ocr_item_desc(match.group(2)):
+                    titles.append(line.strip())
+            if len(titles) == 1:
+                item["description"] = titles[0]
+                return
+    # Copy only a title supported by one local, explicit amount row. This also
+    # handles a digit-bearing product name in a mixed-quantity basket.
+    source_rows = []
+    title_lines = unified_text.splitlines()
+    for line_index, line in enumerate(title_lines):
+        if _OCR_ZONE_END_RE.match(re.sub(r'\s+', '', line)):
+            break
+        price = re.search(
+            r'(?P<value>(?:[¥￥]\s*)?\d[\d,]*\s*(?:[*＊※除軽])?)\s*$',
+            line,
+        )
+        if price is None:
+            continue
+        value = price.group('value').strip()
+        if not value.startswith(('¥', '￥')) and not re.search(r'[*＊※除軽]$', value):
+            continue
+        title = line[:price.start('value')].strip()
+        if not title:
+            if line_index == 0:
+                continue
+            title = title_lines[line_index - 1].strip()
+            if (
+                not title
+                or re.search(r'(?:[¥￥]\s*\d[\d,]*|\d[\d,]*\s*[*＊※除軽])\s*$', title)
+            ):
+                continue
+        if (
+            re.match(r'^\d{3,6}\s*[-－]\s*\d{3,6}\b', title)
+            or _OCR_QTY_NOTATION_RE.search(title)
+            or re.search(r'\d+\s*[個コ点]', title)
+            or not _valid_ocr_item_desc(title)
+            or _SKIP_PRICE_LINE.search(title)
+        ):
+            continue
+        amount = _parse_amount_fragment(re.sub(r'[*＊※除軽]$', '', value).strip())
+        if amount is not None and isfinite(float(amount)) and float(amount) > 0:
+            source_rows.append((title, float(amount)))
+
+    proposals = {}
+    for title, amount in source_rows:
+        letters = ''.join(c.casefold() for c in title if c.isalpha())
+        source_digits = re.findall(r'\d+', title)
+        trailing_digits = re.search(r'(\d+)$', title)
+        matches = []
+        for index, item in enumerate(items):
+            if (
+                not isinstance(item, dict)
+                or item.get('qty') != 1
+                or item.get('discount')
+                or item.get('discount_rate')
+            ):
+                continue
+            try:
+                if not isfinite(float(item.get('total'))) or float(item['total']) != amount:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            current = str(item.get('description') or '').strip()
+            price_suffix = re.search(r'\s+(\d[\d,]*)\s*[*＊※除軽]\s*$', current)
+            suffix_owned = False
+            if price_suffix is not None:
+                suffix_amount = _parse_amount_fragment(price_suffix.group(1))
+                suffix_owned = suffix_amount is not None and float(suffix_amount) == amount
+                if suffix_owned:
+                    current = current[:price_suffix.start()].rstrip()
+            current_letters = ''.join(c.casefold() for c in current if c.isalpha())
+            current_digits = re.findall(r'\d+', current)
+            source_nfkc = ''.join(unicodedata.normalize('NFKC', title).split())
+            current_without_close = re.sub(r'[)）]\s*$', '', current)
+            unmatched_close = (
+                current_without_close != current
+                and source_nfkc == ''.join(unicodedata.normalize('NFKC', current_without_close).split())
+            )
+            digits_match = source_digits == current_digits or (
+                trailing_digits is not None
+                and source_digits == current_digits + [trailing_digits.group(1)]
+            )
+            if (
+                letters
+                and letters == current_letters
+                and digits_match
+                and (suffix_owned or source_digits != current_digits or unmatched_close)
+            ):
+                matches.append(index)
+        if len(matches) == 1:
+            proposals.setdefault(matches[0], []).append(title)
+    for index, titles in proposals.items():
+        if len(titles) == 1:
+            items[index]['description'] = titles[0]
+
+    weighted_rows = []
+    for line_index in range(1, len(title_lines)):
+        detail = re.fullmatch(
+            r'\s*(単)\s*(\d[\d,]*)\s+(\d[\d,]*)\s*g\s*[¥￥]\s*([\d,]+)\s*',
+            title_lines[line_index], re.IGNORECASE,
+        )
+        title = title_lines[line_index - 1].strip()
+        if detail is not None and _valid_ocr_item_desc(title) and not _SKIP_PRICE_LINE.search(title):
+            weighted_rows.append((title, detail.group(1), detail.group(2), detail.group(3), float(detail.group(4).replace(',', ''))))
+    # OCR can split the unit, literal rate/weight and price into adjacent rows.
+    for line_index in range(len(title_lines) - 3):
+        title = title_lines[line_index].strip()
+        rate_weight = re.fullmatch(r'\s*(\d[\d,]*)\s+(\d[\d,]*)\s*g\s*', title_lines[line_index + 2], re.IGNORECASE)
+        price = re.fullmatch(r'\s*[¥￥]\s*([\d,]+)\s*', title_lines[line_index + 3])
+        if (
+            title_lines[line_index + 1].strip() == '単'
+            and rate_weight is not None
+            and price is not None
+            and _valid_ocr_item_desc(title)
+            and not _SKIP_PRICE_LINE.search(title)
+        ):
+            weighted_rows.append((title, '単', rate_weight.group(1), rate_weight.group(2), float(price.group(1).replace(',', ''))))
+    # ponytail: O(rows×items); index by normalized title and amount if receipt sizes grow.
+    weighted_proposals = {}
+    for title, unit, rate, weight, amount in weighted_rows:
+        title_key = ''.join(char.casefold() for char in title if char.isalnum())
+        matches = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or item.get('qty') != 1 or item.get('discount') or item.get('discount_rate'):
+                continue
+            try:
+                if float(item.get('total')) != amount:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            current = str(item.get('description') or '').strip()
+            tail = re.search(
+                rf'\s+{re.escape(unit)}(?:\s*{re.escape(rate)}\s*{re.escape(weight)}\s*g)?\s*$',
+                current, re.IGNORECASE,
+            )
+            prefix = current[:tail.start()].rstrip() if tail else ''
+            if title_key and ''.join(char.casefold() for char in prefix if char.isalnum()) == title_key:
+                matches.append((index, title))
+        if len(matches) == 1:
+            weighted_proposals.setdefault(matches[0][0], []).append(matches[0][1])
+    for index, titles in weighted_proposals.items():
+        if len(titles) == 1:
+            items[index]['description'] = titles[0]
+
+    if not items or any(
+        not isinstance(item, dict) or item.get("qty") != 1
+        or item.get("discount") or item.get("discount_rate")
+        for item in items
+    ):
+        return
+    lines = [line.strip() for line in unified_text.splitlines()]
+    rows = []
+    for idx, line in enumerate(lines):
+        if _OCR_ZONE_END_RE.match(re.sub(r'\s+', '', line)):
+            break
+        price = _OCR_TRAILING_PRICE_RE.search(line)
+        if not price or not price.group(1).lstrip().startswith(('¥', '￥')):
+            continue
+        title = line[:price.start(1)].strip() or (lines[idx - 1] if idx else '')
+        if not _valid_ocr_item_desc(title) or _SKIP_PRICE_LINE.search(title):
+            continue
+        rows.append((title, _parse_amount_fragment(price.group(1)), bool(re.search(r'[*＊※軽]', line[price.end(1):]))))
+    if len(rows) != len(items):
+        return
+    source_keys = [''.join(char.casefold() for char in title if char.isalnum()) for title, _, _ in rows]
+    current_keys = [''.join(char.casefold() for char in (item.get('description') or '') if char.isalnum()) for item in items]
+    if not all(source_keys) or len(set(source_keys)) != len(source_keys) or current_keys != source_keys:
+        return
+    if sum(amount for _, amount, _ in rows) != extracted.get('subtotal'):
+        return
+    printed_subtotal = extract_financial_totals(unified_text).get('subtotal')
+    if printed_subtotal is not None and printed_subtotal != extracted.get('subtotal'):
+        return
+    for item, (_, amount, reduced) in zip(items, rows, strict=True):
+        if (
+            item.get('unit_price') != amount or item.get('total') != amount
+            or item.get('tax_category') not in {'8%', '10%'}
+            or (reduced and item.get('tax_category') != '8%')
+        ):
+            return
+    for item, (title, _, _) in zip(items, rows, strict=True):
+        item['description'] = title
+
+
 def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
     """Fix line item quantities, prices, and discounts using OCR evidence."""
+    _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text)
     # Fallback: department-coded items
     if not extracted.get("line_items") and extracted.get("total"):
         dept_m = re.search(r'部門\s*(\d+)\s*', unified_text)
@@ -783,24 +1032,34 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
 
     # Fallback: single-service receipt (toll, parking, single-item)
     _AMOUNT_LABELS_RE = re.compile(
-        r'^(金額|合計|小計|税込|税抜|総額|請求額|お会計|お預り|釣銭|No\.?|様)$'
+        r'^(金額|合計|小計|税込|税抜|総額|請求額|お会計|お預り|釣銭|No\.?|様|'
+        r'\d+(?:\.\d+)?%.*(?:金額|税額(?:等)?))$'
     )
     if not extracted.get("line_items") and extracted.get("total"):
         total = extracted["total"]
+        purposes = _formal_receipt_purpose_stems(unified_text)
+        purpose = _single_formal_receipt_purpose_description(unified_text)
+        # A formal purpose owns the receipt amount only without a competing
+        # item table. Dates and preprinted tax forms never own service prices.
         for m in re.finditer(r'[¥￥]\s*([\d,]+)', unified_text):
+            if purposes and not purpose:
+                break
             price = int(m.group(1).replace(',', ''))
             if abs(price - total) < 1:
                 pos = m.start()
                 before = unified_text[:pos].rstrip()
                 lines_before = before.split('\n')
-                desc = lines_before[-1].strip() if lines_before else ""
+                desc = purpose or (lines_before[-1].strip() if lines_before else "")
+                if _HEADER_LINE_RE.search(desc) or _BANNER_PHRASE_RE.search(desc):
+                    desc = ""
                 if (desc and len(desc) >= 2
                         and not re.match(r'^[\d,¥￥\s\-]+$', desc)
+                        and _valid_ocr_item_desc(desc)
                         and not _AMOUNT_LABELS_RE.match(desc)):
                     extracted["line_items"] = [{
                         "description": desc,
                         "qty": 1, "unit_price": total,
-                        "total": total, "tax_category": "10%",
+                        "total": total, "tax_category": "0%",
                         "discount": None, "discount_rate": None,
                     }]
                     break
@@ -861,16 +1120,20 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
             total_f = float(total)
         except (TypeError, ValueError):
             return False
+        if not isfinite(total_f) or total_f <= 0:
+            return False
         row_sum = 0.0
         for item in extracted["line_items"]:
             if not isinstance(item, dict):
                 return False
             try:
-                qty = float(item.get("qty") or 1)
+                qty = float(item.get("qty") if item.get("qty") is not None else 1)
                 unit = float(item.get("unit_price") or 0)
                 discount = float(item.get("discount") or 0)
                 line_total = float(item.get("total") or 0)
             except (TypeError, ValueError):
+                return False
+            if not all(isfinite(value) and value > 0 for value in (qty, unit, line_total)):
                 return False
             if discount or item.get("discount_rate"):
                 return False
@@ -898,16 +1161,27 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
             )
         except (TypeError, ValueError):
             stated_subtotal_matches = False
+        tax_labels = {tax.get("label") for tax in positive_taxes}
+        mixed_subtotal_matches = False
+        if tax_labels == {"内税", "外税"} and stated_subtotal_matches:
+            printed_subtotal = extract_financial_totals(unified_text).get("subtotal")
+            mixed_subtotal_matches = (
+                printed_subtotal is not None
+                and abs(float(printed_subtotal) - float(subtotal)) <= 2
+            )
         if (
             canonical_subtotal is not None
             and positive_taxes
-            and all(tax.get("label") == "外税" for tax in positive_taxes)
-            and (explicit_external or stated_subtotal_matches)
+            and (
+                (tax_labels == {"外税"} and (explicit_external or stated_subtotal_matches))
+                or mixed_subtotal_matches
+            )
         ):
             targets.append(float(canonical_subtotal))
         return any(abs(row_sum - target) <= 2 for target in targets)
 
     if _rows_already_balance_summary():
+        _canonicalize_complete_ocr_title_rows(extracted, unified_text)
         _project_totals_to_layout_rows(extracted, ocr_layout_blocks)
         _expand_collapsed_items(extracted, unified_text)
         original_items = [
@@ -930,6 +1204,7 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
         _fix_compact_count_amount_layout(
             extracted["line_items"], ocr_layout_blocks
         )
+        _detect_ocr_discounts(extracted["line_items"], unified_text, fixed_only=True)
         return
 
     _drop_banner_phantom_items(extracted["line_items"], unified_text)
@@ -957,7 +1232,7 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
     )
     _apply_qty_notation_from_ocr(extracted["line_items"], unified_text)
     _revert_unsupported_qty_inflation(extracted["line_items"], unified_text)
-    _dedup_same_total_items(extracted)
+    _dedup_same_total_items(extracted, unified_text)
     _fix_qty_from_ocr_patterns(extracted["line_items"], unified_text)
     _fix_fuel_volume_qty(extracted["line_items"], unified_text,
                          receipt_total=extracted.get("total") or extracted.get("subtotal"))
@@ -980,7 +1255,7 @@ def _fix_line_items(extracted, unified_text, ocr_layout_blocks=None):
     # unit=228, total=228) — different unit_prices, so first dedup misses —
     # gets corrected to (qty=2, unit=228, total=456) by qty-fix, but the
     # phantom stays.
-    _dedup_same_total_items(extracted)
+    _dedup_same_total_items(extracted, unified_text)
     _fix_compact_count_amount_layout(extracted["line_items"], ocr_layout_blocks)
 
 
@@ -1283,6 +1558,12 @@ def _fix_qty_code_row_descriptions_from_ocr(extracted, unified_text):
 def _bag_entries_from_ocr(unified_text: str) -> list[dict]:
     """Return paid-bag OCR rows in print order with qty/unit/total if visible."""
     lines = [line.strip() for line in unified_text.split('\n')]
+    # Ordinal paid-bag consumers cannot prove owners when exempt bags coexist.
+    # ponytail: abstain for this stream; require literal title owners before
+    # supporting mixed paid/exempt bag recovery.
+    if any(_is_bag_description(line) and re.search(r'\d[\d,]*\s*非\s*$', line)
+           for line in lines):
+        return []
     entries: list[dict] = []
 
     def _small_price(line: str) -> float | None:
@@ -1291,9 +1572,11 @@ def _bag_entries_from_ocr(unified_text: str) -> list[dict]:
             return None
         if re.search(r'\d{1,2}\s*:\s*\d{2}|:', line):
             return None
+        if re.search(r'\d\s*[個コ]?\s*[xX×Ⅹ]', line):
+            return None
         if re.search(r'\d{5,}', stripped):
             return None
-        pm = re.search(r'[¥￥]?\s*(\d{1,2})\s*(?:[%％][*※除軽外]|[*※除軽外])?\s*$', line)
+        pm = re.search(r'[¥￥]?\s*(?<![\d.,])(\d{1,2})\s*(?:[%％][*※除軽外]|[*※除軽外])?\s*$', line)
         if not pm:
             return None
         price = float(pm.group(1))
@@ -1301,7 +1584,7 @@ def _bag_entries_from_ocr(unified_text: str) -> list[dict]:
 
     def _qty_unit(line: str) -> tuple[float, float] | None:
         qty_m = re.search(
-            r'\(?\s*(\d+)\s*[個コ]?\s*[xX×Ⅹ]\s*単?\s*[¥￥]?\s*(\d{1,2})\s*\)?',
+            r'\(?\s*(?<![\d.,])(\d+)\s*[個コ]?\s*[xX×Ⅹ]\s*単?\s*[¥￥]?\s*(\d{1,2})(?![\d.,])\s*\)?',
             line,
         )
         if not qty_m:
@@ -1371,7 +1654,7 @@ def _fix_bag_item_prices_from_ocr(extracted, unified_text):
     used_embedded_price = False
     for item in bag_items:
         desc = item.get("description") or ""
-        price_m = re.search(r'(\d{1,2})\s*円', desc)
+        price_m = re.search(r'(?<![\d.,])(\d{1,2})\s*円', desc)
         if not price_m:
             continue
         price = float(price_m.group(1))
@@ -1400,7 +1683,7 @@ def _fix_bag_item_prices_from_ocr(extracted, unified_text):
 
 
 def _fix_bag_item_prices_from_rate_bases(extracted, rate_bases, unified_text):
-    """Use a tiny printed 10% base as a guardrail for paid bag totals."""
+    """Correct literal OCR bag prices only when a printed 10% base confirms them."""
     items = extracted.get("line_items") or []
     if not items or not rate_bases:
         return
@@ -1427,26 +1710,6 @@ def _fix_bag_item_prices_from_rate_bases(extracted, rate_bases, unified_text):
                 item["unit_price"] = entry["unit_price"]
                 item["total"] = entry["total"]
             return
-
-    if len(bag_items) == 1:
-        item = bag_items[0]
-        qty = float(item.get("qty") or 1)
-        if qty > 1 and abs(round(standard_base / qty) * qty - standard_base) <= 0.01:
-            unit = standard_base / qty
-        else:
-            qty = 1.0
-            unit = standard_base
-        item["qty"] = qty
-        item["unit_price"] = unit
-        item["total"] = standard_base
-        return
-
-    other_total = sum(float(item.get("total") or 0) for item in bag_items[:-1])
-    remainder = standard_base - other_total
-    if 0 < remainder <= 50:
-        bag_items[-1]["qty"] = 1.0
-        bag_items[-1]["unit_price"] = remainder
-        bag_items[-1]["total"] = remainder
 
 
 def _recover_missing_bag_items_from_ocr(extracted, unified_text):
@@ -1750,8 +2013,12 @@ def _recover_repeated_item_from_gap(extracted, unified_text):
 
 
 def _recover_qty_unit_total_item_from_empty_extraction(extracted, unified_text):
-    """Recover a single item from a visible desc / qty x unit / total block."""
-    if extracted.get("line_items"):
+    """Recover one qty/unit/total block when omitted or replaced by the header."""
+    items = extracted.get("line_items") or []
+    if items and not (
+        len(items) == 1 and isinstance(items[0], dict)
+        and (items[0].get("description") or "").strip() == (extracted.get("merchant") or "").strip()
+    ):
         return
     total = extracted.get("total")
     if not total:
@@ -1930,9 +2197,9 @@ def _recover_discounted_item_from_gap(extracted, unified_text):
         discount = None
         discount_rate = ""
         for j in range(idx + 1, min(idx + 5, len(lines))):
-            rm = re.search(r'(\d+)\s*%', lines[j])
-            if rm:
-                discount_rate = rm.group(1) + "%"
+            rates = _discount_rate_tokens(lines[j])
+            if rates:
+                discount_rate = f"{rates[-1]:g}%"
             dm = re.match(r'^-\s*(\d{1,4})\s*$', lines[j])
             if dm:
                 discount = float(dm.group(1))
@@ -1960,8 +2227,70 @@ def _recover_discounted_item_from_gap(extracted, unified_text):
         return
 
 
+def _drop_owned_subtotal_count_row(extracted, unified_text):
+    """Drop one terminal count row only after all sales own prices and close its subtotal/count."""
+    items = extracted.get("line_items") or []
+    if len(items) < 2 or not all(isinstance(item, dict) for item in items):
+        return
+    try:
+        subtotal = float(extracted.get("subtotal"))
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not isfinite(subtotal) or subtotal <= 0:
+        return
+    candidates = [
+        (idx, match) for idx, item in enumerate(items)
+        if (match := re.search(r'(\d+)\s*点\s*$', item.get("description") or ""))
+    ]
+    if len(candidates) != 1:
+        return
+    drop_idx, count = candidates[0]
+    rows = [line.strip() for line in unified_text.splitlines() if line.strip()]
+
+    def norm(text):
+        return re.sub(r'[^\wぁ-んァ-ン一-龥]', '', text or '', flags=re.UNICODE).lower()
+
+    def price(line):
+        match = _OCR_TRAILING_PRICE_RE.search(line)
+        return _parse_amount_fragment(match.group(1)) if match and re.search(r'[¥￥円*＊※除軽外内]', match.group()) else None
+
+    title_rows = [idx for idx, line in enumerate(rows) if norm(_clean_ocr_price_line_desc(line)) == norm(items[drop_idx].get('description'))]
+    if len(title_rows) != 1:
+        return
+    summary_idx = title_rows[0]
+    amount_idx = summary_idx if price(rows[summary_idx]) is not None else summary_idx + 1
+    if amount_idx >= len(rows) or price(rows[amount_idx]) != subtotal:
+        return
+    if not any(_OCR_ZONE_END_RE.match(line.strip()) or _OCR_ZONE_END_RE.match(line.lstrip('()（） *＊※'))
+               for line in rows[amount_idx + 1:amount_idx + 5]):
+        return
+    owned_total = owned_qty = 0
+    for idx, item in enumerate(items):
+        if idx == drop_idx:
+            continue
+        owners = [pos for pos, line in enumerate(rows[:summary_idx]) if norm(_clean_ocr_price_line_desc(line)) == norm(item.get('description'))]
+        if len(owners) != 1:
+            return
+        owner_idx = owners[0]
+        amount = price(rows[owner_idx])
+        if amount is None and owner_idx + 1 < summary_idx:
+            amount = price(rows[owner_idx + 1])
+        try:
+            total = float(item.get('total'))
+            qty = float(1 if item.get('qty') is None else item['qty'])
+        except (TypeError, ValueError, OverflowError):
+            return
+        if amount is None or not isfinite(total) or not isfinite(qty) or total <= 0 or qty <= 0 or amount != total:
+            return
+        owned_total += total
+        owned_qty += qty
+    if owned_total == subtotal and owned_qty == int(count.group(1)):
+        extracted['line_items'] = [item for idx, item in enumerate(items) if idx != drop_idx]
+
+
 def _drop_non_product_line_items(extracted, unified_text):
     """Remove header/payment/footer rows that were extracted as products."""
+    _drop_owned_subtotal_count_row(extracted, unified_text)
     items = extracted.get("line_items") or []
     if not items:
         return
@@ -1985,6 +2314,66 @@ def _drop_non_product_line_items(extracted, unified_text):
         r'^[\(（\s※＊*]*(?:\d+(?:\.\d+)?\s*[%％]\s*)?[内外]\s*(?:税)?[\)）\s]*$'
     )
     lines = [line.strip() for line in unified_text.split('\n')]
+
+    def _norm(text: str) -> str:
+        return re.sub(r'[^\wぁ-んァ-ン一-龥]', '', str(text or ""), flags=re.UNICODE).lower()
+
+    modifier_re = re.compile(r'エクストラ|ライト|カスタム')
+    modifier_extra = None
+    # ponytail: only coalesce a two-row duplicate; larger modifier blocks stay intact.
+    if len(items) == 2 and all(isinstance(item, dict) for item in items):
+        rows = [line for line in lines if line]
+        summaries = [
+            idx for idx, line in enumerate(rows)
+            if re.search(r'本体合計\s*\(\s*1\s*点\s*\)', line)
+        ]
+        if len(summaries) == 1:
+            body_idx = summaries[0]
+            prices = []
+            printed_titles = []
+            for idx, line in enumerate(rows[:body_idx]):
+                price = _OCR_TRAILING_PRICE_RE.search(line)
+                if price and re.search(r'[¥￥円*＊※除軽外内]', price.group(0)):
+                    title = line[:price.start()].strip() or (rows[idx - 1] if idx else "")
+                    prices.append((_norm(title), _parse_amount_fragment(price.group(1))))
+                    printed_titles.append(_norm(line[:price.start()]))
+                else:
+                    printed_titles.append(_norm(line))
+            for idx, item in enumerate(items):
+                desc = item.get("description") or ""
+                matches = [pos for pos, line in enumerate(rows[:body_idx]) if _norm(line) == _norm(desc)]
+                if (
+                    not modifier_re.match(desc)
+                    or _OCR_TRAILING_PRICE_RE.search(desc)
+                    or len(matches) != 1
+                ):
+                    continue
+                tail = rows[matches[0] + 1:body_idx]
+                if not tail or not all(
+                    modifier_re.match(line.strip("()（） "))
+                    and not _OCR_TRAILING_PRICE_RE.search(line)
+                    for line in tail
+                ):
+                    continue
+                other = items[1 - idx]
+                if any(item.get(field) != other.get(field) for field in (
+                    "qty", "unit_price", "total", "discount", "discount_rate", "tax_category",
+                )):
+                    continue
+                try:
+                    total = float(other.get("total") or 0)
+                    qty = float(1 if other.get("qty") is None else other["qty"])
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                other_title = _norm(other.get("description") or "")
+                owners = [amount for title, amount in prices if title == other_title]
+                if (
+                    qty == 1 and total > 0 and printed_titles.count(other_title) == 1
+                    and len(owners) == 1 and owners[0] is not None
+                    and abs(owners[0] - total) <= 2
+                ):
+                    modifier_extra = idx
+
     header_end = next(
         (
             idx
@@ -1995,9 +2384,6 @@ def _drop_non_product_line_items(extracted, unified_text):
     )
     header_lines = lines[:header_end]
     targets = _printed_amount_targets(extracted, unified_text)
-
-    def _norm(text: str) -> str:
-        return re.sub(r'[^\wぁ-んァ-ン一-龥]', '', str(text or ""), flags=re.UNICODE).lower()
 
     def _drop_improves_balance(drop_total: float) -> bool:
         if not targets:
@@ -2037,7 +2423,7 @@ def _drop_non_product_line_items(extracted, unified_text):
         return False
 
     kept = []
-    for item in items:
+    for item_idx, item in enumerate(items):
         if not isinstance(item, dict):
             kept.append(item)
             continue
@@ -2047,10 +2433,7 @@ def _drop_non_product_line_items(extracted, unified_text):
         looks_bad = (
             bool(bad_desc_re.search(desc))
             or desc == "割引"
-            or (
-                re.search(r'本体合計\s*\(\s*1\s*点\s*\)', unified_text)
-                and re.search(r'エクストラ|ライト|カスタム', desc)
-            )
+            or item_idx == modifier_extra
             or (
                 zero_value_modifiers_are_extra
                 and total == 0
@@ -2075,52 +2458,151 @@ def _drop_non_product_line_items(extracted, unified_text):
 def _fix_colon_split_product_names_from_ocr(extracted, unified_text):
     """Join adjacent OCR product fragments where a series/name prefix ends in ':'."""
     items = extracted.get("line_items") or []
-    if not items:
+    if not items or not all(isinstance(item, dict) for item in items):
         return
     lines = [line.strip() for line in unified_text.split('\n')]
 
     def _clean(text: str) -> str:
-        text = re.sub(r'^[\d\s※＊*]+', '', text.strip())
+        text = re.sub(r'^[\s※＊*]+', '', str(text or "").strip())
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
     def _name_key(text: str) -> str:
-        return re.sub(r'[\s:：]+', '', text)
+        return re.sub(r'[\s:：]+', '', str(text or ""))
 
-    for item in items:
-        if not isinstance(item, dict):
+    candidates = []
+    ocr_title_keys = []
+    for line in lines:
+        title = _clean(line)
+        price = _OCR_TRAILING_PRICE_RE.search(title)
+        if price and re.search(r'[¥￥円*＊※除軽外内]', price.group(0)):
+            title = title[:price.start()].strip()
+        ocr_title_keys.append(_name_key(re.sub(r'[:：]\s*$', '', title).strip()))
+    for idx in range(len(lines) - 2):
+        suffix = _clean(lines[idx])
+        prefix_row = _clean(lines[idx + 1])
+        if not re.search(r'[:：]\s*$', prefix_row):
             continue
-        desc = _clean(item.get("description") or "")
-        if not desc or ':' in desc or '：' in desc:
+        prefix = re.sub(r'[:：]\s*$', '', prefix_row).strip()
+        if not all(_valid_ocr_item_desc(text) for text in (suffix, prefix)):
             continue
-        total = item.get("total")
-        for idx, line in enumerate(lines[:-1]):
-            suffix = _clean(line)
-            nxt = _clean(lines[idx + 1])
-            if not re.search(r'[:：]\s*$', nxt):
-                continue
-            if suffix != desc:
-                flattened_match = _name_key(desc) == _name_key(f"{suffix}{nxt}")
-                if not (
-                    flattened_match
-                    and _valid_ocr_item_desc(suffix)
-                    and _valid_ocr_item_desc(nxt)
-                ):
-                    continue
-            if re.search(r'小計|合計|税|対象|ポイント|レジ|登録番号', nxt):
-                continue
-            price_nearby = False
-            for following in lines[idx + 2:min(len(lines), idx + 5)]:
-                m = _OCR_TRAILING_PRICE_RE.search(following)
-                if not m:
-                    continue
-                try:
-                    value = float(m.group(1).strip().lstrip('¥￥').replace(',', ''))
-                except ValueError:
-                    continue
-                if total is None or abs(value - float(total or 0)) <= 1:
-                    price_nearby = True
-                    break
-            if price_nearby:
-                item["description"] = f"{nxt} {suffix}".replace("：", ":")
-                break
+        if any(
+            _HEADER_LINE_RE.search(text)
+            or _BANNER_PHRASE_RE.search(text)
+            or re.search(r'住所|所在地|郵便', text)
+            for text in (suffix, prefix)
+        ):
+            continue
+        price = _OCR_TRAILING_PRICE_RE.fullmatch(lines[idx + 2])
+        marker = re.search(r'[¥￥円*＊※除軽外内]', lines[idx + 2])
+        amount = _parse_amount_fragment(price.group(1)) if price and marker else None
+        candidates.append((suffix, prefix, amount))
+
+    updates = {}
+    drops = set()
+    used_owners = set()
+    financial_fields = ("qty", "unit_price", "total", "discount", "discount_rate", "tax_category")
+    for suffix, prefix, amount in candidates:
+        suffix_key = _name_key(suffix)
+        prefix_key = _name_key(prefix)
+        combined_keys = {_name_key(suffix + prefix), _name_key(f"{prefix}: {suffix}")}
+        suffix_owners = [
+            idx for idx, item in enumerate(items)
+            if _name_key(_clean(item.get("description"))) in {suffix_key, *combined_keys}
+        ]
+        if not suffix_owners:
+            continue
+        if ocr_title_keys.count(suffix_key) != 1 or ocr_title_keys.count(prefix_key) != 1:
+            return
+        prefix_owners = [
+            idx for idx, item in enumerate(items)
+            if _name_key(_clean(item.get("description"))) == prefix_key
+        ]
+        if len(suffix_owners) != 1 or len(prefix_owners) > 1:
+            return
+        owner_idx = suffix_owners[0]
+        if owner_idx in used_owners:
+            return
+        used_owners.add(owner_idx)
+        owner = items[owner_idx]
+        try:
+            owner_total = float(owner.get("total") or 0)
+            owner_qty = float(1 if owner.get("qty") is None else owner["qty"])
+        except (TypeError, ValueError, OverflowError):
+            return
+        if (
+            amount is None
+            or not (0 < owner_total < float("inf"))
+            or not (0 < owner_qty < float("inf"))
+            or abs(amount - owner_total) > 1
+        ):
+            return
+
+        prefix_idx = next((idx for idx in prefix_owners if idx != owner_idx), None)
+        if prefix_idx is not None:
+            if owner_idx in drops or prefix_idx in updates:
+                return
+            duplicate = items[prefix_idx]
+            if any(owner.get(field) != duplicate.get(field) for field in financial_fields):
+                return
+            try:
+                duplicate_total = float(duplicate.get("total") or 0)
+                duplicate_qty = float(1 if duplicate.get("qty") is None else duplicate["qty"])
+                row_values = [
+                    (
+                        float(1 if item.get("qty") is None else item["qty"]),
+                        float(item.get("total") or 0),
+                    )
+                    for item in items
+                ]
+            except (TypeError, ValueError, OverflowError):
+                return
+            if any(not (0 < qty < float("inf") and 0 <= total < float("inf")) for qty, total in row_values):
+                return
+            current_qty = sum(qty for qty, _total in row_values)
+            current_total = sum(total for _qty, total in row_values)
+
+            count_matches = re.findall(
+                r'(?:お買上(?:げ)?(?:商品数|点数)|商品(?:点数|数)|点数)\s*[:：]?\s*(\d+)\s*点',
+                unified_text,
+            )
+            subtotal_rows = [
+                idx for idx, line in enumerate(lines)
+                if re.match(r'^小\s*計(?:\s|$|[¥￥])', line)
+            ]
+            if len(count_matches) != 1 or len(subtotal_rows) != 1:
+                return
+            subtotal_idx = subtotal_rows[0]
+            subtotal_price = _OCR_TRAILING_PRICE_RE.search(lines[subtotal_idx])
+            if not subtotal_price and subtotal_idx + 1 < len(lines):
+                subtotal_price = _OCR_TRAILING_PRICE_RE.fullmatch(lines[subtotal_idx + 1])
+            if not subtotal_price or not re.search(r'[¥￥]', subtotal_price.group(0)):
+                return
+            printed_subtotal = _parse_amount_fragment(subtotal_price.group(1))
+            printed_count = int(count_matches[0])
+            if (
+                printed_subtotal is None
+                or not (0 < duplicate_total < float("inf"))
+                or not (0 < duplicate_qty < float("inf"))
+                or not (0 < current_qty < float("inf"))
+                or not (0 <= current_total < float("inf"))
+                or not (printed_count > 0)
+                or abs(current_qty - duplicate_qty - printed_count) > 0.01
+                or abs(current_total - duplicate_total - printed_subtotal) > 2
+                or abs(current_qty - printed_count) <= 0.01
+                or abs(current_total - printed_subtotal) <= 2
+                # ponytail: defer multiple duplicate drops until they can be reconciled jointly.
+                or drops
+            ):
+                return
+            drops.add(prefix_idx)
+
+        updates[owner_idx] = f"{prefix}: {suffix}".replace("：", ":")
+
+    if updates and not (drops & updates.keys()):
+        for idx, description in updates.items():
+            items[idx]["description"] = description
+        if drops:
+            extracted["line_items"] = [
+                item for idx, item in enumerate(items) if idx not in drops
+            ]

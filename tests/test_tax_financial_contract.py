@@ -1,5 +1,7 @@
 """Structural contracts for printed receipt tax summaries."""
 
+import pytest
+
 from receipt_parser.receipt_financial import (
     _interleaved_rate_tax_summary_entries,
     extract_financial_totals,
@@ -8,8 +10,12 @@ from receipt_parser.receipt_financial import (
     reconcile_points_payment_from_ocr,
 )
 from receipt_parser.receipt_items import _clear_unprinted_rate_only_tax_summary
+from receipt_parser.receipt_identity_payment import _apply_financial_overrides
 from receipt_parser.receipt_late_repairs import _restore_tax_excluded_per_rate_blocks
-from receipt_parser.receipt_totals import _restore_bare_number_tax_summary
+from receipt_parser.receipt_totals import (
+    _restore_bare_number_tax_summary,
+    _sum_taxable_amounts,
+)
 
 
 def _tax_amounts(extracted):
@@ -18,6 +24,71 @@ def _tax_amounts(extracted):
         for tax in extracted.get("taxes", [])
         if tax.get("rate") != "0%" and tax.get("amount", 0) > 0
     }
+
+
+def test_complete_short_mode_table_rows_preserve_literal_owners_and_reject_conflicts():
+    from receipt_parser.receipt_projection import _collect_direct_summary_owners
+    from receipt_parser.receipt_financial import _direct_rate_mode_components
+
+    lines = ["(d外8%対象額¥2,000)", "d外8%¥160", "E外10.0%対象額¥300", "E外10%¥30",
+             "(f内10%対象額¥1,100)", "(f内10%¥100)", "8%外¥160", "内税10%¥100"]
+    blocks = []
+    for row, line in enumerate(lines):
+        blocks.extend(dict(text=char, x=i * 12, y=row * 30,
+                           bbox=[[i * 12, row * 30], [i * 12 + 10, row * 30],
+                                 [i * 12 + 10, row * 30 + 10], [i * 12, row * 30 + 10]])
+                      for i, char in enumerate(line))
+    owners = _collect_direct_summary_owners(blocks)["owners"]["rate_component"]
+    assert [(o["rate"], o["mode"], o["kind"], o["value"]) for o in owners] == [
+        ("8%", "外税", "base", 2000), ("8%", "外税", "tax", 160),
+        ("10%", "外税", "base", 300), ("10%", "外税", "tax", 30),
+        ("10%", "内税", "base", 1100), ("10%", "内税", "tax", 100),
+        ("8%", "外税", "tax", 160), ("10%", "内税", "tax", 100)]
+    assert owners[0]["mode_literal"] == "外" and owners[0]["table_label"] == "d"
+    assert [blocks[i]["text"] for i in owners[0]["table_label_indices"]] == ["d"]
+    assert "".join(blocks[i]["text"] for i in owners[0]["row_indices"]) == "d外8%対象額¥2,000"
+    text = "\n".join(lines[:6])
+    for source in (text, text.replace("¥", "\n¥"), text.replace("E", "Ｅ")):
+        assert [(o["rate"], o["mode"], o["kind"], o["value"]) for o in
+                _direct_rate_mode_components(source)] == [
+                    (o["rate"], o["mode"], o["kind"], o["value"]) for o in owners[:6]]
+        assert normalize_tax_label("内税", source, rate="10%", amount=30) == "外税"
+        assert normalize_tax_label("外税", source, rate="10%", amount=100) == "内税"
+    for invalid in ("注d外8%¥160", "dd外8%¥160", "d8%外¥160", "d外8%内¥160",
+                    "(d外8%¥160", "d外8%¥160)", "d外8%160", "d外8%¥160¥20"):
+        assert not _direct_rate_mode_components(invalid)
+    for duplicate in ("d外10%¥30", "g外10%¥31"):
+        assert normalize_tax_label("内税", text + "\n" + duplicate, rate="10%", amount=30) == "内税"
+
+
+def test_printed_rate_mode_amount_owners_survive_wrong_item_rates_and_zero_tax_inner_group():
+    from copy import deepcopy
+    from receipt_parser.receipt_item_cleanup import _normalize_taxes
+    from receipt_parser.receipt_postprocess_phases import _restore_tax_entries_from_item_rate_sums
+
+    text = "8%外税対象額 ¥260\n8%外税 ¥20\n10%外税対象額 ¥150\n10%外税 ¥15\n10%内税対象額 ¥8\n10%内税 ¥0"
+    taxes = [{"rate": "8%", "label": "外税", "amount": 20},
+             {"rate": "10%", "label": "外税", "amount": 15}]
+    receipt = {"subtotal": 418, "total": 453, "taxes": deepcopy(taxes),
+               "line_items": [{"total": value, "tax_category": "8%"} for value in (150, 150, 72, 30)]
+               + [{"total": 8, "tax_category": "10%"}]}
+    before = deepcopy(receipt)
+    split = text.replace(' ¥', '\n¥')
+    fragmented = split.replace('8%外税\n¥20', '8%\n税\n¥20')
+    for source in (text, split, fragmented, fragmented.replace('8%', '８％')):
+        receipt = deepcopy(before)
+        _restore_tax_entries_from_item_rate_sums(receipt, source, {"taxes": taxes}, {"8%": 260, "10%": 158})
+        _normalize_taxes(receipt, source, {"taxes": taxes})
+        assert receipt == before
+        assert normalize_tax_label('内税', source, rate='8%', amount=20) == '外税'
+    intrusion = fragmented.replace('8%\n税\n¥20', '別項目\n8%\n税\n¥20')
+    assert normalize_tax_label('内税', intrusion, rate='8%', amount=20) == '内税'
+    assert normalize_tax_label("内税", text, rate="10%", amount=15) == "外税"
+    assert normalize_tax_label("外税", text, rate="10%", amount=0) == "内税"
+    for ambiguous in (text + "\n10%外税 ¥15", text + "\n10%外税 ¥16",
+                      text.replace("10%外税 ¥15", "10%外税 15")):
+        assert normalize_tax_label("内税", ambiguous, rate="10%", amount=15) == "内税"
+    assert normalize_tax_label("非課税", text, rate="10%", amount=15) == "非課税"
 
 
 def test_column_split_tax_amount_survives_rate_only_cleanup():
@@ -334,6 +405,12 @@ def test_late_second_tax_recomputes_canonical_subtotal():
 
 
 def test_column_reordered_summary_allows_unprinted_rounds_to_zero_rate_tax():
+    from receipt_parser.receipt_financial import _rate_base_tax_pair_is_valid
+
+    assert _rate_base_tax_pair_is_valid('10%', 9, 0, '外税')
+    assert _rate_base_tax_pair_is_valid('8%', 12, 0, '外税')
+    assert not _rate_base_tax_pair_is_valid('10%', 10, 0, '外税')
+    assert not _rate_base_tax_pair_is_valid('8%', 13, 0, '外税')
     text = "\n".join([
         "小計",
         "税率 8% 課税対象額",
@@ -353,3 +430,184 @@ def test_column_reordered_summary_allows_unprinted_rounds_to_zero_rate_tax():
     ])
 
     assert extract_rate_bases(text) == {"8%": 2274, "10%": 5}
+
+
+@pytest.mark.parametrize(
+    (
+        "text",
+        "expected_subtotal",
+        "expected_total",
+        "expected_taxes",
+        "added_tax_sum",
+        "all_tax_sum",
+    ),
+    [
+        (
+            "\n".join([
+                "小計 ¥3,400",
+                "区分外8%課税対象額 ¥2,000",
+                "区分外8%税額 ¥160",
+                "区分外10%課税対象額 ¥300",
+                "区分外10%税額 ¥30",
+                "区分内10%課税対象額 ¥1,100",
+                "区分内10%税額 ¥100",
+                "合計 ¥3,590",
+            ]),
+            3400,
+            3590,
+            {("8%", "外税", 160), ("10%", "外税", 30), ("10%", "内税", 100)},
+            190,
+            290,
+        ),
+        (
+            "\n".join([
+                "小計 ¥4,100",
+                "区分外8%課税対象額 ¥2,000",
+                "区分外8%税額 ¥160",
+                "区分外10%課税対象額 ¥1,000",
+                "区分外10%税額 ¥100",
+                "区分内10%課税対象額 ¥1,100",
+                "区分内10%税額 ¥100",
+                "合計 ¥4,360",
+            ]),
+            4100,
+            4360,
+            {("8%", "外税", 160), ("10%", "外税", 100), ("10%", "内税", 100)},
+            260,
+            360,
+        ),
+    ],
+)
+def test_mixed_same_rate_groups_use_only_added_tax_and_hide_ambiguous_rate_base(
+    text, expected_subtotal, expected_total, expected_taxes, added_tax_sum, all_tax_sum,
+):
+    extracted = extract_financial_totals(text)
+
+    assert extracted["subtotal"] == expected_subtotal
+    assert extracted["total"] == expected_total
+    assert {
+        (tax["rate"], tax["label"], tax["amount"])
+        for tax in extracted["taxes"]
+    } == expected_taxes
+    assert _sum_taxable_amounts(extracted["taxes"]) == added_tax_sum
+    labels_first = text.replace(
+        "区分内10%課税対象額 ¥1,100\n区分内10%税額 ¥100",
+        "区分内10%課税対象額\n区分内10%税額\n¥1,100\n¥100",
+    )
+    assert extract_financial_totals(labels_first)["taxes"] == extracted["taxes"]
+    expected_mixed_taxes = [dict(tax) for tax in extracted["taxes"]]
+    mismatch_total = expected_total + 10
+    extracted_on_mismatch = {
+        "subtotal": expected_subtotal,
+        "total": mismatch_total,
+        "taxes": [dict(tax) for tax in expected_mixed_taxes],
+    }
+    _apply_financial_overrides(
+        extracted_on_mismatch,
+        {"subtotal": expected_subtotal, "total": mismatch_total},
+        0.9,
+        {},
+    )
+    assert extracted_on_mismatch["taxes"] == expected_mixed_taxes
+    for ocr_has_total in (True, False):
+        partial_ocr = {
+            "subtotal": expected_subtotal,
+            "taxes": [dict(tax) for tax in expected_mixed_taxes if tax["label"] == "外税"],
+        }
+        if ocr_has_total:
+            partial_ocr["total"] = expected_total
+        _apply_financial_overrides(extracted, partial_ocr, 0.9, {})
+        assert extracted["taxes"] == expected_mixed_taxes
+    assert extract_rate_bases(text) == {"8%": 2000, "10%": None}
+    for label in ("内税", "外税"):
+        assert normalize_tax_label(
+            label,
+            text,
+            subtotal=expected_subtotal,
+            total=expected_total,
+            tax_sum=all_tax_sum,
+            items_sum=expected_subtotal + 500,
+        ) == label
+    assert _sum_taxable_amounts([
+        {"rate": "8%", "label": "外税", "amount": 160},
+        {"rate": "10%", "label": "内税", "amount": 0},
+    ]) == 160
+
+
+def test_mixed_tax_restore_is_idempotent_and_rejects_ambiguous_local_pair():
+    text = "\n".join([
+        "小計 ¥3,400",
+        "区分外8%課税対象額 ¥2,000",
+        "区分外8%税額 ¥160",
+        "区分外10%課税対象額 ¥300",
+        "区分外10%税額 ¥30",
+        "区分内10%課税対象額 ¥1,100",
+        "区分内10%税額",
+        "¥91",
+        "¥100",
+        "合計 ¥3,590",
+    ])
+    extracted = {
+        "subtotal": 3400,
+        "total": 3590,
+        "taxes": [
+            {"rate": "8%", "label": "外税", "amount": 160},
+            {"rate": "10%", "label": "外税", "amount": 31},
+        ],
+    }
+
+    _restore_bare_number_tax_summary(extracted, text)
+    once = list(extracted["taxes"])
+    _restore_bare_number_tax_summary(extracted, text)
+
+    assert extracted["taxes"] == once
+    assert {(tax["rate"], tax["label"], tax["amount"]) for tax in once} == {
+        ("8%", "外税", 160),
+        ("10%", "外税", 30),
+        ("10%", "内税", 100),
+    }
+
+    ambiguous = text.replace("¥91", "¥99")
+    assert _interleaved_rate_tax_summary_entries(ambiguous.splitlines()) == []
+    untouched = {
+        "subtotal": 3400,
+        "total": 3590,
+        "taxes": [
+            {"rate": "8%", "label": "外税", "amount": 160},
+            {"rate": "10%", "label": "外税", "amount": 30},
+            {"rate": "10%", "label": "内税", "amount": 100},
+        ],
+    }
+    before = {
+        **untouched,
+        "taxes": [dict(tax) for tax in untouched["taxes"]],
+    }
+    _restore_bare_number_tax_summary(untouched, ambiguous)
+    assert untouched == before
+
+    duplicate_label = text.replace(
+        "区分内10%課税対象額",
+        "区分外10%税額 ¥30\n区分内10%課税対象額",
+    )
+    assert _interleaved_rate_tax_summary_entries(duplicate_label.splitlines()) == []
+
+    wrong_mode_pair = text.replace(
+        "区分外10%課税対象額 ¥300\n区分外10%税額 ¥30",
+        "区分外10%課税対象額 ¥1,100\n区分外10%税額 ¥100",
+    )
+    assert _interleaved_rate_tax_summary_entries(wrong_mode_pair.splitlines()) == []
+
+    aggregate_boundary = text.replace(
+        "区分内10%税額\n¥91\n¥100",
+        "区分内10%税額\n税合計 ¥190\n¥100",
+    )
+    assert _interleaved_rate_tax_summary_entries(aggregate_boundary.splitlines()) == []
+def test_explicit_rated_tax_included_heading_owns_separate_tax_amount_label():
+    text = '10%税込対象額\n¥2,200\n(10%税額\n¥200)\n合計\n¥2,200'
+    for items_sum in (2000, 2200):
+        assert normalize_tax_label('税額', text, subtotal=2000, total=2200,
+                                   tax_sum=200, items_sum=items_sum) == '内税'
+    mixed = text + '\n10%外税対象額\n¥1,000\n10%外税\n¥100'
+    for label in ('内税', '外税'):
+        assert normalize_tax_label(label, mixed, subtotal=3200, total=3300,
+                                   tax_sum=300, items_sum=3200) == label

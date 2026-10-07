@@ -44,6 +44,67 @@ _PAYER_NOISE_RE = re.compile(
 )
 
 
+def _fix_account_number(extracted: dict, text: str) -> None:
+    """Trigger: a printed account owner or an excluded identifier owner.
+
+    Invariant: one distinct customer/billing/account value wins; masked,
+    member, pickup and corroborated composite receipt references cannot win.
+    """
+    owner = re.compile(
+        r'(?:お客(?:様|さま)(?:番号|[ \t]*No\.?)|'
+        r'(?:顧客|ご?請求|契約|口座)(?:番号|コード|[ \t]*No\.?)|'
+        r'\b(?:customer|billing|account)[ \t]+(?:number|no\.?|id))'
+        r'[ \t]*[:：#]?[ \t]*', re.IGNORECASE,
+    )
+    identifier = re.compile(r'(?=[A-Za-z0-9-]*\d)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*')
+    excluded = re.compile(
+        r'(?:会員(?:番号|[ \t]*No\.?)?|メンバー(?:番号)?|'
+        r'\bmember(?:ship)?\b(?:[ \t]*(?:number|no\.?|id))?|'
+        r'\bcard[ \t]+(?:number|no\.?|id)|'
+        r'カード(?:番号|[ \t]*No\.?)|(?:WAON|IC)[ \t]*番号|'
+        r'(?:レシート|取引|受付|受取|注文|伝票|領収書|呼出|呼び出し|整理|レジ)(?:番号|[ \t]*No\.?))'
+        r'[ \t]*[:：#]?[ \t]*(?:\n[ \t]*)?', re.IGNORECASE,
+    )
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    candidates = set()
+    rejected = set()
+    for index, line in enumerate(lines):
+        label = owner.search(line)
+        if not label:
+            continue
+        tail = line[label.end():].strip(' \t[]【】')
+        if not tail:
+            following = lines[index + 1:index + 3]
+            # Currency-marked amounts are not identifiers and cannot compete.
+            if following and re.fullmatch(r'[¥￥][\d,]+(?:\.\d+)?', following[0]):
+                following = following[1:]
+            tail = following[0] if following else ''
+        if not identifier.fullmatch(tail):
+            continue
+        context = ''.join(lines[index + 1:index + 6])
+        nearby = '\n'.join(lines[max(0, index - 8):index + 10])
+        parts = {part.lstrip('0') or '0' for part in tail.split('-')}
+        receipt = re.findall(r'レシート[ \t]*(?:番号|No\.?)\s*(\d+)', nearby, re.IGNORECASE)
+        store = re.findall(r'店[ \t]*(?:番号|No\.?)\s*(\d+)', nearby, re.IGNORECASE)
+        is_composite_receipt = '-' in tail and any(
+            (value.lstrip('0') or '0') in parts for value in receipt
+        ) and any((value.lstrip('0') or '0') in parts for value in store)
+        is_pickup = '上記' in context and re.search(r'呼び|カウンター', context)
+        (rejected if is_composite_receipt or is_pickup else candidates).add(tail)
+
+    current = str(extracted.get('account_number') or '').strip()
+    for value in candidates | {current}:
+        if value and (
+            re.search(excluded.pattern + re.escape(value) + r'(?![A-Za-z0-9])', text, re.IGNORECASE)
+            or (value not in candidates and re.search(r'\*{2,}\s*' + re.escape(value.lstrip('*')), text))
+        ):
+            rejected.add(value)
+    if candidates:
+        extracted['account_number'] = next(iter(candidates)) if len(candidates) == 1 and not candidates & rejected else None
+    elif current in rejected:
+        extracted['account_number'] = None
+
+
 def _payment_reference_candidates(text: str) -> set[str]:
     """Return 13-digit references backed by a label or payment-slip structure."""
     lines = text.splitlines()
@@ -141,6 +202,7 @@ def postprocess_payment_slip(extracted: dict, unified_text: str, raw_text: str =
     # Trigger: a reference label, a payment-reference block, or the composite
     # payment-barcode layout. Invariant: exactly one distinct reference wins.
     text = raw_text or unified_text
+    _fix_account_number(extracted, text)
     references = _payment_reference_candidates(text)
     extracted["payment_reference"] = next(iter(references)) if len(references) == 1 else None
 

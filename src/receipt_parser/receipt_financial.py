@@ -1,6 +1,7 @@
 """Financial and tax parsing helpers for receipt OCR text."""
 
 import re
+from math import isfinite
 from itertools import combinations
 
 from .patterns import YEN_INLINE, YEN_SUFFIX
@@ -20,6 +21,11 @@ _YEN_AMOUNT_LINE_RE = re.compile(r'^[¥￥]\s*([\d,]+)(?:\s*税)?\s*[\)）]?\s*$
 
 
 def _text_says_displayed_prices_are_tax_included(text: str) -> bool:
+    if (
+        re.search(r'\d+(?:\.\d+)?\s*%\s*税込\s*対象', text)
+        and not re.search(r'外税|外枠|税抜\s*\d+\s*%|税抜対象|外\s*\d+\s*%', text)
+    ):
+        return True
     lines = [line.strip() for line in (text or "").splitlines()]
     notice_re = re.compile(r'表示価格.{0,20}税込価格|税込価格.{0,20}表示価格')
     summary_re = re.compile(
@@ -45,24 +51,60 @@ def normalize_tax_rate(rate: str) -> str:
     return rate
 
 
+def _direct_rate_mode_components(text: str) -> list[dict]:
+    """Read complete adjacent rate/mode/yen spans without deriving amounts.
+
+    A plain rated tax span inherits mode only from its immediately preceding
+    same-rate target. Unrelated lines and duplicate owners remain unresolved.
+    """
+    # Local import avoids the financial -> projection -> totals cycle.
+    from .receipt_projection import _collect_direct_summary_owners
+    from .normalize import normalize_fullwidth
+
+    lines = [re.sub(r'\s+', '', normalize_fullwidth(line))
+             for line in (text or "").splitlines() if line.strip()]
+    spans = [(start, start + count, ''.join(lines[start:start + count]))
+             for start in range(len(lines)) if re.match(
+                 r'\(?(?:[A-Za-z](?=[外内]))?(?:外税?|内税?)?(?:8(?:\.0+)?|10(?:\.0+)?)%', lines[start])
+             for count in range(1, min(3, len(lines) - start) + 1)]
+    rows = [{"text": span[2], "x": 0, "y": index * 20,
+             "bbox": [[0, index * 20], [1, index * 20],
+                      [1, index * 20 + 10], [0, index * 20 + 10]]}
+            for index, span in enumerate(spans)]
+    components = _collect_direct_summary_owners(rows)["owners"]["rate_component"]
+    for owner in components:
+        owner["line_start"], owner["line_end"] = spans[owner["row"]][:2]
+    for start, end, line in spans:
+        if match := re.fullmatch(r'(8|10)%(?:税|税額|消費税)[¥￥](\d[\d,]*)', line):
+            bases = [owner for owner in components if owner["kind"] == "base"
+                     and owner["line_end"] == start and owner["rate"] == match[1] + '%']
+            if len(bases) == 1:
+                components.append({"rate": match[1] + '%', "mode": bases[0]["mode"],
+                                   "kind": "tax", "value": int(match[2].replace(',', '')),
+                                   "line_start": start, "line_end": end})
+    return components
+
+
 def normalize_tax_label(
     label: str | None, text: str = "",
     subtotal: float | None = None, total: float | None = None,
     tax_sum: float | None = None,
     items_sum: float | None = None,
+    rate: str | None = None, amount: float | None = None,
 ) -> str:
     """Normalize a tax label to canonical set: 内税, 外税, 非課税.
 
     Priority order:
       1. 非課税 in label (always definitive)
-      2. Unambiguous pre-tax item arithmetic → 外税, unless printed evidence
+      2. A unique printed rate/mode/tax amount owns this entry's label
+      3. Unambiguous pre-tax item arithmetic → 外税, unless printed evidence
          says the displayed prices are inclusive
-      3. Explicit OCR text keywords (外税 / 内税)
-      4. 対象 pattern without 外税 keyword → 内税 (most JP receipts that
+      4. Explicit OCR text keywords (外税 / 内税)
+      5. 対象 pattern without 外税 keyword → 内税 (most JP receipts that
          break out per-rate base in '(N%対象 …)' form are tax-inclusive)
-      5. Remaining items-sum signal: items add to total → 内税
-      6. LLM-supplied label as last resort
-      7. Default 内税 (most common in JP receipts)
+      6. Remaining items-sum signal: items add to total → 内税
+      7. LLM-supplied label as last resort
+      8. Default 内税 (most common in JP receipts)
 
     Under the canonical 'subtotal = total - tax' convention, the receipt's
     item-sum shape distinguishes labels: items that already add to total are
@@ -71,10 +113,37 @@ def normalize_tax_label(
     arithmetic proves the printed item prices are pre-tax.
     """
     label = label or ""
-    prices_are_marked_tax_included = _text_says_displayed_prices_are_tax_included(text)
-
     if '非課税' in label:
         return '非課税'
+    if (rate and isinstance(amount, (int, float))
+            and not isinstance(amount, bool) and isfinite(amount)):
+        printed = [owner for owner in _direct_rate_mode_components(text)
+                   if owner["kind"] == "tax" and owner["rate"] == normalize_tax_rate(rate)]
+        matching = [owner for owner in printed if owner["value"] == amount]
+        if len(matching) == 1 and sum(
+            owner["mode"] == matching[0]["mode"] for owner in printed
+        ) == 1:
+            return matching[0]["mode"]
+    prices_are_marked_tax_included = _text_says_displayed_prices_are_tax_included(text)
+
+    # Keep an already-canonical per-group label when complete receipt
+    # arithmetic proves that the printed tax total includes an inner group.
+    # Item rows can be wrong, so rely on the printed subtotal/total and mixed
+    # tax evidence; zero-tax inner targets do not satisfy the positive excess.
+    try:
+        arithmetic = tuple(float(value) for value in (subtotal, total, tax_sum))
+    except (TypeError, ValueError):
+        arithmetic = ()
+    if (
+        label in {"内税", "外税"}
+        and len(arithmetic) == 3
+        and all(isfinite(value) for value in arithmetic)
+        and arithmetic[1] > arithmetic[0]
+        and arithmetic[2] > arithmetic[1] - arithmetic[0] + 2
+        and re.search(r'外税|外枠|外(?=\s*\d+(?:\.\d+)?\s*[%％年])|\d+(?:\.\d+)?\s*[%％年].{0,4}外', text)
+        and re.search(r'内税|税込\s*対象|内\s*消費税|内(?=\s*\d+(?:\.\d+)?\s*[%％年])|\d+(?:\.\d+)?\s*[%％年].{0,4}内', text)
+    ):
+        return label
 
     if (
         items_sum is not None
@@ -96,7 +165,7 @@ def normalize_tax_label(
     # (informational tax breakdown on either kind) are not strong enough
     # alone — handled below.
     has_strong_exclusive = bool(re.search(r'外税|税抜\s*\d+%|税抜対象', text))
-    has_strong_inclusive = bool(re.search(r'内税', text))
+    has_strong_inclusive = bool(re.search(r'内税|\d+(?:\.\d+)?\s*%\s*税込\s*対象', text))
     # "(内消費税…" / "内消費税等" wording — appears on 内税 receipts as a
     # tax breakdown but is NOT a definitive marker (also appears on 外税
     # receipts as informational text).
@@ -813,10 +882,14 @@ def _extract_financial_totals_impl(text: str) -> dict:
 
     interleaved_tax_entries = _interleaved_rate_tax_summary_entries(lines)
     interleaved_bases = {
-        rate: value for rate, kind, value in interleaved_tax_entries if kind == "base"
+        (rate, label): value
+        for rate, kind, value, label in interleaved_tax_entries
+        if kind == "base"
     }
     interleaved_amounts = {
-        rate: value for rate, kind, value in interleaved_tax_entries if kind == "tax"
+        (rate, label): value
+        for rate, kind, value, label in interleaved_tax_entries
+        if kind == "tax"
     }
     visible_target_rates: set[str] = set()
     target_order: dict[str, int] = {}
@@ -832,9 +905,20 @@ def _extract_financial_totals_impl(text: str) -> dict:
             )
             visible_target_rates.add(target_rate)
             target_order.setdefault(target_rate, len(target_order))
-    interleaved_complete = visible_target_rates <= set(interleaved_bases)
+    interleaved_complete = visible_target_rates <= {
+        rate for rate, _label in interleaved_bases
+    }
     base_sum = sum(interleaved_bases.values())
-    tax_sum = sum(interleaved_amounts.values())
+    positive_modes = {
+        label for (_rate, label), amount in interleaved_amounts.items()
+        if amount > 0 and label in {"内税", "外税"}
+    }
+    mixed_positive = {"内税", "外税"} <= positive_modes
+    external_tax_sum = sum(
+        amount for (_rate, label), amount in interleaved_amounts.items()
+        if label == "外税"
+    )
+    tax_sum = external_tax_sum if mixed_positive else sum(interleaved_amounts.values())
     def _summary_amount_distance(target: float) -> int | None:
         distances: list[int] = []
         for idx, raw in enumerate(lines):
@@ -852,7 +936,10 @@ def _extract_financial_totals_impl(text: str) -> dict:
 
     summary_label = None
     summary_total = None
-    if tax_sum > 0 and interleaved_complete:
+    mixed_summary_matches = False
+    if mixed_positive:
+        summary_total = base_sum + external_tax_sum
+    elif tax_sum > 0 and interleaved_complete:
         exclusive_distance = _summary_amount_distance(base_sum + tax_sum)
         inclusive_distance = _summary_amount_distance(base_sum)
         if exclusive_distance is not None and (
@@ -866,14 +953,34 @@ def _extract_financial_totals_impl(text: str) -> dict:
             summary_label = "内税"
             summary_total = base_sum
     printed_total = result.get("total")
-    if summary_total is not None and (
-        printed_total is None or abs(float(printed_total) - summary_total) <= 2
-    ):
-        result["total"] = summary_total
-        result["subtotal"] = summary_total - tax_sum
+    if summary_total is not None:
+        try:
+            printed_total_f = float(printed_total) if printed_total is not None else None
+        except (TypeError, ValueError):
+            printed_total_f = None
+        try:
+            printed_subtotal_f = (
+                float(result["subtotal"]) if result.get("subtotal") is not None else None
+            )
+        except (TypeError, ValueError):
+            printed_subtotal_f = None
+        if mixed_positive:
+            mixed_summary_matches = (
+                printed_subtotal_f is not None
+                and printed_total_f is not None
+                and abs(printed_subtotal_f - base_sum) <= 2
+                and abs(printed_total_f - summary_total) <= 2
+            )
+            summary_is_printed = mixed_summary_matches
+        else:
+            summary_is_printed = printed_total_f is None or abs(printed_total_f - summary_total) <= 2
+        if summary_is_printed:
+            result["total"] = summary_total
+            result["subtotal"] = base_sum if mixed_positive else summary_total - tax_sum
+    mixed_confirmed = mixed_positive and mixed_summary_matches
     interleaved_taxes = []
-    for rate, amount in interleaved_amounts.items():
-        label = summary_label
+    for (rate, mode), amount in interleaved_amounts.items():
+        label = mode if mixed_positive else summary_label
         if label is None:
             rate_number = re.escape(rate.rstrip('%'))
             if re.search(
@@ -890,36 +997,41 @@ def _extract_financial_totals_impl(text: str) -> dict:
                 label = "内税"
             else:
                 rate_pct = float(rate.rstrip('%')) / 100.0
-                base = interleaved_bases[rate]
+                base = interleaved_bases[(rate, mode)]
                 exclusive_error = abs(amount - round(base * rate_pct))
                 inclusive_error = abs(amount - round(base * rate_pct / (1 + rate_pct)))
                 if min(exclusive_error, inclusive_error) <= 2 and exclusive_error != inclusive_error:
                     label = "外税" if exclusive_error < inclusive_error else "内税"
         if label is not None and amount > 0:
             interleaved_taxes.append({"rate": rate, "label": label, "amount": amount})
-    if interleaved_taxes:
-        replacements = {entry["rate"]: entry for entry in interleaved_taxes}
-        replaced_rates: set[str] = set()
-        merged_taxes = []
-        for tax in taxes:
-            rate = tax.get("rate")
-            if rate in replacements:
-                if rate not in replaced_rates:
-                    replacement = replacements[rate]
-                    merged_taxes.append(
-                        tax
-                        if (
-                            tax.get("amount") == replacement.get("amount")
-                            and tax.get("label") == "税額"
+    if interleaved_taxes and (not mixed_positive or mixed_summary_matches):
+        if mixed_positive:
+            replaced_rates = {entry["rate"] for entry in interleaved_taxes}
+            merged_taxes = [tax for tax in taxes if tax.get("rate") not in replaced_rates]
+            merged_taxes.extend(interleaved_taxes)
+        else:
+            replacements = {entry["rate"]: entry for entry in interleaved_taxes}
+            replaced_rates: set[str] = set()
+            merged_taxes = []
+            for tax in taxes:
+                rate = tax.get("rate")
+                if rate in replacements:
+                    if rate not in replaced_rates:
+                        replacement = replacements[rate]
+                        merged_taxes.append(
+                            tax
+                            if (
+                                tax.get("amount") == replacement.get("amount")
+                                and tax.get("label") == "税額"
+                            )
+                            else replacement
                         )
-                        else replacement
-                    )
-                    replaced_rates.add(rate)
-                continue
-            merged_taxes.append(tax)
-        merged_taxes.extend(
-            entry for rate, entry in replacements.items() if rate not in replaced_rates
-        )
+                        replaced_rates.add(rate)
+                    continue
+                merged_taxes.append(tax)
+            merged_taxes.extend(
+                entry for rate, entry in replacements.items() if rate not in replaced_rates
+            )
         taxes = [
             tax for _idx, tax in sorted(
                 enumerate(merged_taxes),
@@ -929,7 +1041,7 @@ def _extract_financial_totals_impl(text: str) -> dict:
                 ),
             )
         ]
-        if result.get("subtotal") is None and result.get("total") is not None:
+        if not mixed_positive and result.get("subtotal") is None and result.get("total") is not None:
             total_value = float(result["total"])
             if 0 < tax_sum < total_value:
                 result["subtotal"] = total_value - tax_sum
@@ -940,7 +1052,7 @@ def _extract_financial_totals_impl(text: str) -> dict:
         for rate, kind, value in vertical_entries
         if kind == "tax" and value > 0
     ]
-    if {tax["rate"] for tax in vertical_taxes} >= {"8%", "10%"}:
+    if not mixed_positive and {tax["rate"] for tax in vertical_taxes} >= {"8%", "10%"}:
         taxes = [
             tax for tax in taxes
             if tax.get("rate") not in {entry["rate"] for entry in vertical_taxes}
@@ -998,7 +1110,11 @@ def _extract_financial_totals_impl(text: str) -> dict:
     if taxes:
         by_amount: dict[tuple, dict] = {}
         for t in taxes:
-            key = (t.get('rate'), t.get('amount'))
+            key = (
+                (t.get('rate'), t.get('amount'), t.get('label'))
+                if mixed_confirmed and t.get('label') in {'内税', '外税'}
+                else (t.get('rate'), t.get('amount'))
+            )
             existing = by_amount.get(key)
             if not existing:
                 by_amount[key] = t
@@ -1011,7 +1127,10 @@ def _extract_financial_totals_impl(text: str) -> dict:
         tax for tax in taxes
         if tax.get('rate') != '0%' and float(tax.get('amount') or 0) > 0
     ]
-    tax_sum = sum(float(tax['amount']) for tax in taxable_taxes)
+    tax_sum = sum(
+        float(tax['amount']) for tax in taxable_taxes
+        if not mixed_confirmed or tax.get('label') == '外税'
+    )
     total_first = result.get('total_first')
     subtotal = result.get('subtotal')
     if (
@@ -1174,17 +1293,23 @@ def _column_split_label_value_pairs(lines: list[str]) -> list[tuple[str, str]]:
     return []
 
 
-def _rate_base_tax_pair_is_valid(rate: str, base: float, tax: float) -> bool:
-    """Accept a summary pair only when exclusive or inclusive rate math holds."""
+def _rate_base_tax_pair_is_valid(
+    rate: str, base: float, tax: float, mode: str | None = None,
+) -> bool:
+    """Validate the explicit tax mode, or either formula when it is unknown."""
     try:
         rate_pct = float(rate.rstrip('%')) / 100.0
     except (AttributeError, ValueError):
         return False
-    if rate_pct <= 0 or base <= 0 or tax < 0 or tax >= base:
+    if not all(isfinite(value) for value in (rate_pct, base, tax)) or rate_pct <= 0 or base <= 0 or tax < 0 or tax >= base:
         return False
     expected = (base * rate_pct, base * rate_pct / (1 + rate_pct))
+    if mode == "外税":
+        expected = expected[:1]
+    elif mode == "内税":
+        expected = expected[1:]
     if tax == 0:
-        return any(round(value) == 0 for value in expected)
+        return any(value < 1 if mode == "外税" else round(value) == 0 for value in expected)
     return min(abs(tax - round(value)) for value in expected) <= 2.0
 
 
@@ -1494,8 +1619,10 @@ def _bare_number_tax_summary_entries(lines: list[str]) -> list[tuple[str, str, f
     ]
 
 
-def _interleaved_rate_tax_summary_entries(lines: list[str]) -> list[tuple[str, str, float]]:
-    """Map rate targets and explicit tax labels despite OCR column reordering."""
+def _interleaved_rate_tax_summary_entries(
+    lines: list[str],
+) -> list[tuple[str, str, float, str | None]]:
+    """Map locally owned rate/mode groups despite OCR column reordering."""
     if re.search(r'小計\s*\(?\s*税抜\s*\d+\s*%', "\n".join(lines)):
         # The established per-rate tax-excluded restorer owns this layout.
         return []
@@ -1505,20 +1632,38 @@ def _interleaved_rate_tax_summary_entries(lines: list[str]) -> list[tuple[str, s
         r'内訳\s*[（(]\s*(\d+(?:\.\d+)?)\s*[%％年]'
     )
 
-    def _target(line: str) -> tuple[str, int] | None:
+    def _line_mode(line: str) -> str | None:
+        outer = bool(re.search(
+            r'外税|外枠|税抜|外(?=\s*\d+(?:\.\d+)?\s*[%％年])|'
+            r'\d+(?:\.\d+)?\s*[%％年].{0,4}外',
+            line,
+        ))
+        inner = bool(re.search(
+            r'内税|内枠|内\s*消費税|内(?=\s*\d+(?:\.\d+)?\s*[%％年])|'
+            r'\d+(?:\.\d+)?\s*[%％年].{0,4}内',
+            line,
+        ))
+        if outer == inner:
+            return None
+        return "外税" if outer else "内税"
+
+    def _target(line: str) -> tuple[str, int, str | None] | None:
         match = target_pattern.search(line)
         if not match:
             return None
         number = match.group(1) or match.group(2)
-        return normalize_tax_rate(number + "%"), match.end()
+        return normalize_tax_rate(number + "%"), match.end(), _line_mode(line)
 
-    def _tax_label_rate(line: str) -> str | None | bool:
+    def _tax_label(line: str) -> tuple[str | None, str | None] | bool:
         if re.search(r'対象|タイショウ', line):
             return False
-        if not re.search(r'消費税|税額|外税|外枠|\d+(?:\.\d+)?\s*[%％年]\s*内\s*[)）]?\s*$', line):
-            return False
         rate_match = re.search(r'(\d+(?:\.\d+)?)\s*[%％年]', line)
-        return normalize_tax_rate(rate_match.group(1) + "%") if rate_match else None
+        mode = _line_mode(line)
+        has_tax_marker = bool(re.search(r'消費税|税額|外税|外枠', line))
+        if not has_tax_marker and not (mode and rate_match):
+            return False
+        rate = normalize_tax_rate(rate_match.group(1) + "%") if rate_match else None
+        return rate, mode
 
     def _printed_options(fragment: str) -> set[float]:
         options = set(_jpy_summary_amount_options(fragment))
@@ -1534,72 +1679,124 @@ def _interleaved_rate_tax_summary_entries(lines: list[str]) -> list[tuple[str, s
         if (target := _target(raw.strip()))
     ]
     tax_labels = [
-        (idx, rate)
+        (idx, *label)
         for idx, raw in enumerate(lines)
-        if (rate := _tax_label_rate(raw.strip())) is not False
+        if (label := _tax_label(raw.strip())) is not False
     ]
-    solutions: dict[str, set[tuple[float, float]]] = {}
-    implicit_zero_rates: set[str] = set()
-    multiple_target_rates = len({rate for _idx, rate, _end in targets}) > 1
-    for target_pos, rate, target_end in targets:
-        next_target = next((pos for pos, _rate, _end in targets if pos > target_pos), len(lines))
+    labelled_targets = [(rate, mode) for _idx, rate, _end, mode in targets if mode]
+    if len(labelled_targets) != len(set(labelled_targets)):
+        return []
+    target_modes = {mode for _idx, _rate, _end, mode in targets if mode}
+    target_rates = {rate for _idx, rate, _end, _mode in targets}
+    relevant_tax_modes = {
+        mode for _idx, rate, mode in tax_labels
+        if mode and (rate is None or rate in target_rates)
+    }
+    mixed_context = {"内税", "外税"} <= (target_modes | relevant_tax_modes)
+    solutions: dict[tuple[str, str | None], set[tuple[float, float]]] = {}
+    implicit_zero_groups: set[tuple[str, str | None]] = set()
+    multiple_target_groups = len({(rate, mode) for _idx, rate, _end, mode in targets}) > 1
+    duplicate_mixed_label = False
+    boundary_pattern = r'総\s*合\s*計|(?<!税)合\s*計|現\s*計|お預り|お釣り'
+    if mixed_context:
+        boundary_pattern = r'税\s*合\s*計|' + boundary_pattern
+    for target_pos, rate, target_end, target_mode in targets:
+        next_target = next((pos for pos, *_rest in targets if pos > target_pos), len(lines))
         next_boundary = next(
             (
                 pos for pos in range(target_pos + 1, len(lines))
-                if re.search(r'総\s*合\s*計|(?<!税)合\s*計|現\s*計|お預り|お釣り', lines[pos])
+                if re.search(boundary_pattern, lines[pos])
             ),
             len(lines),
         )
         window_end = min(
             next_target,
-            next_boundary if multiple_target_rates else len(lines),
+            next_boundary if multiple_target_groups else len(lines),
             target_pos + 24,
         )
-        exact = [
-            pos for pos, label_rate in tax_labels
-            if target_pos < pos < window_end and label_rate == rate
+        nearby = [
+            (pos, label_rate, mode)
+            for pos, label_rate, mode in tax_labels
+            if target_pos < pos < window_end
         ]
-        unqualified = [
-            pos for pos, label_rate in tax_labels
-            if target_pos < pos < window_end and label_rate is None
-        ]
-        tax_pos = exact[0] if exact else (unqualified[0] if unqualified else None)
-        if tax_pos is None:
-            implicit_zero_rates.add(rate)
+        exact = [entry for entry in nearby if entry[1] == rate]
+        duplicate_group = False
+        if target_mode:
+            exact = [entry for entry in exact if entry[2] in (None, target_mode)]
+            exact.sort(key=lambda entry: entry[2] != target_mode)
+        elif len({mode for _pos, _rate, mode in exact if mode}) > 1:
+            duplicate_group = True
+            exact = []
+        if (mixed_context or target_mode) and len(exact) > 1:
+            duplicate_group = True
+            exact = []
+        unqualified = [entry for entry in nearby if entry[1] is None]
+        if target_mode:
+            unqualified = [entry for entry in unqualified if entry[2] in (None, target_mode)]
+        elif len({mode for _pos, _rate, mode in unqualified if mode}) > 1:
+            duplicate_group = True
+            unqualified = []
+        if (mixed_context or target_mode) and len(unqualified) > 1:
+            duplicate_group = True
+            unqualified = []
+        if duplicate_group:
+            duplicate_mixed_label = True
             continue
+        matched_label = exact[0] if exact else (unqualified[0] if unqualified else None)
+        if matched_label is None:
+            implicit_zero_groups.add((rate, target_mode))
+            continue
+        tax_pos, _label_rate, tax_mode = matched_label
         if tax_pos - target_pos > 24:
             continue
+        mode = target_mode or tax_mode
 
         base_options = _printed_options(lines[target_pos][target_end:])
         for pos in range(target_pos + 1, tax_pos + 1):
             line = lines[pos].strip()
             if pos == tax_pos:
-                label_match = re.search(r'消費税|税額|外税|外枠|\d+(?:\.\d+)?\s*[%％年]\s*内', line)
+                label_match = re.search(
+                    r'消費税(?:等|額)?|税額|外税|外枠|税抜|'
+                    r'外(?=\s*\d+(?:\.\d+)?\s*[%％年])|'
+                    r'内(?=\s*\d+(?:\.\d+)?\s*[%％年])|'
+                    r'\d+(?:\.\d+)?\s*[%％年].{0,4}内',
+                    line,
+                )
                 line = (
                     re.sub(r'\s*[（(]\s*内?\s*$', '', line[:label_match.start()])
                     if label_match else ""
                 )
             base_options.update(_printed_options(line))
 
-        next_tax = next((pos for pos, _rate in tax_labels if pos > tax_pos), min(len(lines), tax_pos + 24))
+        next_tax = next((pos for pos, *_rest in tax_labels if pos > tax_pos), min(len(lines), tax_pos + 24))
+        if mixed_context:
+            next_tax = min(next_tax, window_end)
         tax_options: set[float] = set()
         tax_line = lines[tax_pos].strip()
-        label_match = re.search(r'消費税(?:等|額)?|税額|外税|外枠|\d+(?:\.\d+)?\s*[%％年]\s*内', tax_line)
+        label_match = re.search(
+            r'消費税(?:等|額)?|税額|外税|外枠|税抜|'
+            r'外(?=\s*\d+(?:\.\d+)?\s*[%％年])|'
+            r'内(?=\s*\d+(?:\.\d+)?\s*[%％年])|'
+            r'\d+(?:\.\d+)?\s*[%％年].{0,4}内',
+            tax_line,
+        )
         if label_match:
             tax_options.update(_printed_options(tax_line[label_match.end():]))
         for pos in range(tax_pos + 1, min(len(lines), next_tax)):
             tax_options.update(_printed_options(lines[pos].strip()))
+        if (mixed_context or mode) and not base_options:
+            # OCR may emit both group labels before their two value columns.
+            base_options.update(tax_options)
 
         valid = {
             (base, amount)
             for base in base_options
             for amount in tax_options
-            if _rate_base_tax_pair_is_valid(rate, base, amount)
+            if _rate_base_tax_pair_is_valid(rate, base, amount, mode)
         }
-        if not valid:
-            # Some column readers place the last per-rate value after a later
-            # aggregate-tax label. Widen only after the local window fails;
-            # arithmetic still has to identify one printed pair uniquely.
+        if not valid and not mixed_context and mode is None:
+            # Widen only when local OCR columns lack a value; arithmetic must
+            # still identify the printed pair uniquely.
             for pos in range(tax_pos + 1, min(len(lines), tax_pos + 24)):
                 tax_options.update(_printed_options(lines[pos].strip()))
             valid = {
@@ -1609,23 +1806,34 @@ def _interleaved_rate_tax_summary_entries(lines: list[str]) -> list[tuple[str, s
                 if _rate_base_tax_pair_is_valid(rate, base, amount)
             }
         if valid:
-            solutions.setdefault(rate, set()).update(valid)
+            solutions.setdefault((rate, mode), set()).update(valid)
 
-    entries: list[tuple[str, str, float]] = []
-    for rate, pairs in solutions.items():
+    solved_modes = {mode for (_rate, mode) in solutions if mode}
+    mixed_requested = mixed_context or {"内税", "外税"} <= (target_modes | solved_modes)
+    if mixed_requested and (
+        duplicate_mixed_label
+        or len(solutions) != len(targets)
+        or any(mode not in {"内税", "外税"} or len(pairs) != 1 for (_rate, mode), pairs in solutions.items())
+    ):
+        # Mixed replacement is safe only when every explicit target owns one
+        # unique, locally validated pair.
+        return []
+
+    entries: list[tuple[str, str, float, str | None]] = []
+    for (rate, mode), pairs in solutions.items():
         if len(pairs) != 1:
             continue
         base, amount = next(iter(pairs))
-        entries.append((rate, "base", base))
+        entries.append((rate, "base", base, mode))
         if amount > 0:
-            entries.append((rate, "tax", amount))
+            entries.append((rate, "tax", amount, mode))
 
-    rate_order = list(dict.fromkeys(rate for _idx, rate, _end in targets))
-    if len(rate_order) >= 2:
-        start = min(idx for idx, _rate, _end in targets)
+    rate_order = list(dict.fromkeys(rate for _idx, rate, _end, _mode in targets))
+    if len(rate_order) >= 2 and len(rate_order) == len(targets) and not mixed_requested and not target_modes:
+        start = min(idx for idx, _rate, _end, _mode in targets)
         stop = next(
             (
-                idx for idx in range(max(idx for idx, _rate, _end in targets) + 1, len(lines))
+                idx for idx in range(max(idx for idx, _rate, _end, _mode in targets) + 1, len(lines))
                 if re.search(r'総\s*合\s*計|(?<!税)合\s*計|現\s*計|お預り|お釣り', lines[idx])
             ),
             min(len(lines), start + 32),
@@ -1639,10 +1847,12 @@ def _interleaved_rate_tax_summary_entries(lines: list[str]) -> list[tuple[str, s
             rate_order,
             amount_options,
             _printed_summary_amounts(lines),
-            implicit_zero_rates,
+            {rate for rate, _mode in implicit_zero_groups},
         )
         if {rate for rate, kind, _value in complete if kind == "base"} == set(rate_order):
-            return complete
+            fallback_modes = target_modes or solved_modes
+            fallback_mode = next(iter(fallback_modes)) if len(fallback_modes) == 1 else None
+            return [(rate, kind, value, fallback_mode) for rate, kind, value in complete]
     return entries
 
 
@@ -1908,9 +2118,17 @@ def extract_rate_bases(text: str) -> dict[str, float | None]:
     for rate, kind, value in _bare_number_tax_summary_entries(lines):
         if kind == "base" and (stacked_entries or rate not in paren_rates):
             bases[rate] = value
-    for rate, kind, value in _interleaved_rate_tax_summary_entries(lines):
-        if kind == "base" and rate not in paren_rates:
-            bases[rate] = value
+    interleaved_bases: dict[str, set[float]] = {}
+    for rate, kind, value, _label in _interleaved_rate_tax_summary_entries(lines):
+        if kind == "base":
+            interleaved_bases.setdefault(rate, set()).add(value)
+    for rate, values in interleaved_bases.items():
+        if len(values) > 1:
+            # The public shape is keyed only by rate; incompatible mode bases
+            # cannot be represented without choosing or combining one.
+            bases[rate] = None
+        elif rate not in paren_rates:
+            bases[rate] = next(iter(values))
 
     return bases
 
@@ -2055,7 +2273,7 @@ def _parse_amount_fragment(text: str) -> float | None:
     token. Invariant: this helper only normalizes numeric syntax; the caller
     must still prove the amount with receipt arithmetic or field consistency.
     """
-    text = (text or "").strip().replace(',', '')
+    text = re.sub(r'^[¥￥]\s*', '', (text or "").strip()).replace(',', '')
     if re.match(r'^\d+\.\d{3}$', text):
         text = text.replace('.', '')
     if not re.match(r'^\d+(?:\.\d+)?$', text):
